@@ -13,9 +13,9 @@ class FInAirState : public FCharacterState
 {
 public:
 	FInAirState()
-		: FCharacterState(ECharacterStateType::InAir)
+		: FCharacterState(ECharacterStateType::InAir, EStateGroup::Locomotion)
 	{
 	}
 
-	virtual void Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterStateMachine& SM) override;
+	virtual void Update(float DeltaTime, FRuntimeData& RuntimeData, FGYGOStateManager& SM) override;
 };

@@ -20,7 +20,7 @@
 #include "Pipeline/InputPipeline.h"
 #include "Pipeline/IntentPipeline.h"
 #include "Pipeline/ArbiterPipeline.h"
-#include "StateMachine/CharacterStateMachine.h"
+#include "StateMachine/GGYGOStateManager.h" // ★ 阶段6：纯C++ 并行状态管理器
 #include "Attributes/GGYGOAttributeSet.h"
 #include "Data/UCharConfigData.h"
 #include "BaseCharacter.generated.h"
@@ -91,22 +91,17 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "Animation")
 	float GetAnimSpeed() const { return RuntimeData->AnimSpeed; }
 
+	/** 供 AnimInstance 判断 Moving 状态下选 Walk/Run/Sprint 动画 */
+	EMovementGait GetResolvedGait() const { return RuntimeData->ResolvedGait; }
+
 	/** 获取角色配置（供 AnimInstance 等外部系统读取） */
 	UCharConfigData* GetCharacterConfig() const { return CharacterConfig; }
 
 	// ============================================================
-	// AnimNotify 通知接口（由 GGYGOAnimInstance 回调状态机）
+	// 输入处理接口（BlueprintCallable，供子类蓝图绑定 EnhancedInput）
 	// ============================================================
 
-	void NotifyRunStartFinished() { RuntimeData->bRunStartFinished = true; }
-	void NotifyRunEndFinished()   { RuntimeData->bRunEndFinished = true; }
 
-	/** 由 AnimInstance 调用，把蓝图配置的衔接时间同步到状态机 */
-	void SetRunMinDurations(float RunStartTime, float RunEndTime)
-	{
-		RuntimeData->RunStartMinDuration = RunStartTime;
-		RuntimeData->RunEndMinDuration   = RunEndTime;
-	}
 
 protected:
 	virtual void BeginPlay() override;
@@ -198,8 +193,8 @@ protected:
 	/** 意图管线 */
 	TUniquePtr<FIntentPipeline> IntentPipeline;
 
-	/** 角色状态机 */
-	TUniquePtr<FCharacterStateMachine> StateMachine;
+	/** ★ 阶段6：并行状态管理器（纯 C++，和其他管线风格一致）*/
+	TUniquePtr<FGYGOStateManager> StateManager;
 
 	/** 仲裁管线（Tick 第 1 步） */
 	TUniquePtr<FArbiterPipeline> ArbiterPipeline;

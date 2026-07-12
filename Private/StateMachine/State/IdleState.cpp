@@ -9,15 +9,15 @@
  * 仲裁标记由 ArbiterPipeline 在 Tick 开头写入。
  */
 #include "StateMachine/State/IdleState.h"
-#include "StateMachine/CharacterStateMachine.h"
+#include "StateMachine/GGYGOStateManager.h" // ★ 阶段6：纯C++ 状态管理器
 #include "Data/RuntimeData.h"
 
 void FIdleState::Enter(FRuntimeData& RuntimeData)
 {
-	// TODO: 阶段八 GAS 接入后同步 GameplayTag（State.Idle）
+	// TODO: 阶段7 GAS 接入后同步 GameplayTag（State.Idle）
 }
 
-void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterStateMachine& SM)
+void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FGYGOStateManager& SM)
 {
 	// ============================================================
 	// 优先级 0：ActionArbiter 批准的动作（GAS 层面已通过）
@@ -25,7 +25,7 @@ void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterSt
 
 	if (RuntimeData.ActionGranted != ECharacterStateType::Idle)
 	{
-		SM.TryTransitionTo(RuntimeData.ActionGranted, RuntimeData);
+		SM.RequestState(RuntimeData.ActionGranted);
 		return;
 	}
 
@@ -35,7 +35,7 @@ void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterSt
 
 	if (RuntimeData.bWantsToDodge && !RuntimeData.bBlockDodge)
 	{
-		SM.TryTransitionTo(ECharacterStateType::Dodging, RuntimeData);
+		SM.RequestState(ECharacterStateType::Dodging);
 		return;
 	}
 
@@ -45,17 +45,17 @@ void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterSt
 
 	if (RuntimeData.bWantsToAttack && !RuntimeData.bBlockAttack)
 	{
-		SM.TryTransitionTo(ECharacterStateType::Attacking, RuntimeData);
+		SM.RequestState(ECharacterStateType::Attacking);
 		return;
 	}
 
 	// ============================================================
-	// 优先级 3：移动 → RunStart
+	// 优先级 3：移动 → Moving（速度上限由 MotionDriver 管理）
 	// ============================================================
 
 	if (!RuntimeData.DesiredWorldMoveDir.IsNearlyZero() && !RuntimeData.bBlockMove)
 	{
-		SM.TryTransitionTo(ECharacterStateType::RunStart, RuntimeData);
+		SM.RequestState(ECharacterStateType::Moving);
 		return;
 	}
 }

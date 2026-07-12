@@ -45,7 +45,8 @@ void FInputPipeline::Process(float DeltaTime)
 
     // 5. 持续按住状态
     Current.bSprintHeld = bPendingSprint;
-    Current.bAttackHeld = bPendingAttack;
+	Current.bForceWalkHeld = bPendingForceWalk;
+	Current.bAttackHeld = bPendingAttack;
     Current.bDodgeHeld = bPendingDodge;
 
     // 6. 动作按键缓冲计时器
@@ -61,11 +62,10 @@ void FInputPipeline::Process(float DeltaTime)
         Current.DodgeBufferTimer = FMath::Max(Current.DodgeBufferTimer - DeltaTime, 0.f);
 
     // 7. 清零瞬时输入（下一帧重新从回调写入）
-    PendingLookInput = FVector2D::ZeroVector;
-    bPendingAttack = false;
-    bPendingDodge = false;
-    // 注意：PendingMoveInput 和 bPendingSprint 不清零
-    // 因为它们是持续状态，由 Completed 回调清零
+	PendingLookInput = FVector2D::ZeroVector;
+	bPendingAttack = false;
+	bPendingDodge = false;
+	// bPendingSprint/bPendingForceWalk 不清零 — 持续状态由 Completed 清零
 }
 
 void FInputPipeline::SetMoveInput(const FVector2D& Value)
@@ -96,4 +96,9 @@ void FInputPipeline::SetDodgePressed()
 void FInputPipeline::SetSprintHeld(bool bHeld)
 {
     bPendingSprint = bHeld;
+}
+
+void FInputPipeline::SetForceWalkHeld(bool bHeld)
+{
+    bPendingForceWalk = bHeld;
 }

@@ -54,11 +54,24 @@ void FMotionDriver::Process(float DeltaTime, FRuntimeData& RuntimeData)
 	// 路径 B: 常规移动（AnimSpeed 由 RootMotionParameterProcessor 从 Speed 曲线读取）
 	else if (!RuntimeData.DesiredWorldMoveDir.IsNearlyZero())
 	{
-		ProcessLocomotion(DeltaTime, RuntimeData.DesiredWorldMoveDir, RuntimeData.AnimSpeed);
+		ProcessLocomotion(DeltaTime, RuntimeData.DesiredWorldMoveDir, RuntimeData.AnimSpeed, RuntimeData);
 	}
 
 	// 回写实际速度、移动状态到 RuntimeData 供调试/UI 使用
 	UpdateRuntimeData(RuntimeData);
+
+	// ★ 优化：根据统一解析的步态锁定 MaxWalkSpeed
+	if (Movement)
+	{
+		if (RuntimeData.bBlockMove)
+			Movement->MaxWalkSpeed = 0.f;
+		else switch (RuntimeData.ResolvedGait)
+		{
+		case EMovementGait::Walk:   Movement->MaxWalkSpeed = RuntimeData.GaitThresholds.Walk;   break;
+		case EMovementGait::Sprint: Movement->MaxWalkSpeed = RuntimeData.GaitThresholds.Sprint; break;
+		default:                    Movement->MaxWalkSpeed = RuntimeData.GaitThresholds.Run;    break;
+		}
+	}
 }
 
 void FMotionDriver::ProcessRootMotionMovement(const FVector& Delta, float DeltaTime)
@@ -70,20 +83,29 @@ void FMotionDriver::ProcessRootMotionMovement(const FVector& Delta, float DeltaT
 	Movement->RequestDirectMove(Velocity, false);
 }
 
-void FMotionDriver::ProcessLocomotion(float DeltaTime, const FVector& WorldDir, float InAnimSpeed)
+void FMotionDriver::ProcessLocomotion(float DeltaTime, const FVector& WorldDir, float InAnimSpeed, const FRuntimeData& RuntimeData)
 {
 	FVector Dir = WorldDir.GetSafeNormal();
 
-	if (InAnimSpeed > 0.f)
+	// ★ 优化：根据统一解析的步态限速（由 LocomotionIntentProcessor 每帧写入）
+	float SpeedCap;
+	switch (RuntimeData.ResolvedGait)
 	{
-		// 防滑步核心：输入方向 × 动画速度 → 直设速度，绕过 CMC 加速/减速
-		FVector TargetVelocity = Dir * InAnimSpeed;
+	case EMovementGait::Walk:   SpeedCap = RuntimeData.GaitThresholds.Walk;   break;
+	case EMovementGait::Run:    SpeedCap = RuntimeData.GaitThresholds.Run;    break;
+	case EMovementGait::Sprint: SpeedCap = RuntimeData.GaitThresholds.Sprint; break;
+	default:                    SpeedCap = RuntimeData.GaitThresholds.Run;    break;
+	}
+	float CappedSpeed = FMath::Min(InAnimSpeed, SpeedCap);
+
+	if (CappedSpeed > 0.f)
+	{
+		// 防滑步核心：输入方向 × 动画速度 → 直设速度
+		FVector TargetVelocity = Dir * CappedSpeed;
 		Movement->RequestDirectMove(TargetVelocity, false);
 	}
 	else
 	{
-		// 降级路径：AnimSpeed 不可用时退化为标准 AddMovementInput
-		// 注意：此路径走 CMC 加速度，会产生 ~0.3s 启动延迟
 		Owner->AddMovementInput(Dir, 1.0f);
 	}
 }

@@ -28,31 +28,9 @@ void FRootMotionParameterProcessor::Init(USkeletalMeshComponent* InMesh)
 
 void FRootMotionParameterProcessor::Process(FRuntimeData& RuntimeData, float DeltaTime)
 {
-	RuntimeData.bBip001Found = false;
-	RuntimeData.AnimSpeed = 0.f;
+	// Phase 9: 根运动提取已移除，移动由 MotionDriver 直接驱动
+	RuntimeData.bBip001Found   = false;
+	RuntimeData.AnimSpeed      = 0.f;
 	RuntimeData.RootMotionDelta = FVector::ZeroVector;
-
-	if (!Mesh)
-	{
-		return;
-	}
-
-	// 从 GGYGOAnimInstance 读取根运动数据（新版：直接读 RM 向量）
-	UGGYGOAnimInstance* GGYGOInst = Cast<UGGYGOAnimInstance>(Mesh->GetAnimInstance());
-	if (!GGYGOInst)
-	{
-		return;
-	}
-
-	const FVector& RMDelta = GGYGOInst->GetRootMotionDelta();
-
-	if (!RMDelta.IsNearlyZero())
-	{
-		RuntimeData.RootMotionDelta = RMDelta;
-		RuntimeData.bHasRootMotion = true;
-		// AnimSpeed = 位移大小 / 帧时间 → 换算为 cm/s，供 MotionDriver 兼容使用
-		RuntimeData.AnimSpeed = (DeltaTime > KINDA_SMALL_NUMBER)
-			? RMDelta.Size() / DeltaTime : 0.f;
-		RuntimeData.bBip001Found = true;
-	}
+	RuntimeData.bHasRootMotion  = false;
 }

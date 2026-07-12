@@ -37,7 +37,7 @@ private:
 	void ProcessRootMotionMovement(const FVector& Delta, float DeltaTime);
 
 	/** 常规移动路径：输入方向 × 动画速度 → RequestDirectMove（防滑步核心） */
-	void ProcessLocomotion(float DeltaTime, const FVector& WorldDir, float InAnimSpeed);
+	void ProcessLocomotion(float DeltaTime, const FVector& WorldDir, float InAnimSpeed, const FRuntimeData& RuntimeData);
 
 	/** 回写 RuntimeData 中的 CurrentSpeed/bIsMoving/MoveAngle */
 	void UpdateRuntimeData(FRuntimeData& RuntimeData);

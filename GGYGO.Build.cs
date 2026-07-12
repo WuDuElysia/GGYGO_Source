@@ -24,6 +24,17 @@ public class GGYGO : ModuleRules
 			Path.Combine(ModuleDirectory, "Public/Core")
 });
 
+		// 测试脚手架：让 Private/Tests 下的测试与生成器工具头可被相对解析。
+		// Automation 框架（IMPLEMENT_SIMPLE_AUTOMATION_TEST / FAutomationTestBase）与
+		// FRandomStream 均位于 Core/Engine，已在上方依赖中，无需额外运行时模块。
+		PrivateIncludePaths.Add(Path.Combine(ModuleDirectory, "Private/Tests"));
+
+		// 仅在带编辑器的构建中链接 Automation 控制器模块，避免影响 Shipping/Game 目标。
+		if (Target.bBuildEditor)
+		{
+			PrivateDependencyModuleNames.Add("AutomationController");
+		}
+
 
 		// Uncomment if you are using Slate UI
 		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });

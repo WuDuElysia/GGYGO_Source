@@ -13,7 +13,12 @@ class FDodgingState : public FCharacterState
 {
 public:
 	FDodgingState()
-		: FCharacterState(ECharacterStateType::Dodging)
+		: FCharacterState(ECharacterStateType::Dodging, EStateGroup::Action)
 	{
 	}
+
+	// Phase 7 GAS 接入：闪避时施加无敌+CD GE
+	virtual TArray<TSubclassOf<UGameplayEffect>> GetEnterGameplayEffects() const override;
+	virtual FGameplayTagContainer GetRemoveGEsWithTag() const override;
+	virtual int32 GetLimitFlags() const override;
 };

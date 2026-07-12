@@ -13,7 +13,11 @@ class FDeadState : public FCharacterState
 {
 public:
 	FDeadState()
-		: FCharacterState(ECharacterStateType::Dead)
+		: FCharacterState(ECharacterStateType::Dead, EStateGroup::System)
 	{
 	}
+
+	// 进入死亡时封锁全部操作（Phase 7 GAS 接入）
+	virtual TArray<TSubclassOf<UGameplayEffect>> GetEnterGameplayEffects() const override;
+	virtual int32 GetLimitFlags() const override;
 };

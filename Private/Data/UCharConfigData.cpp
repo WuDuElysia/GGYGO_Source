@@ -33,7 +33,7 @@ float UCharConfigData::GetPlayRateForState(ECharacterStateType State) const
 	switch (State)
 	{
 	case ECharacterStateType::Idle:
-	case ECharacterStateType::RunLoop:
+	case ECharacterStateType::Moving:
 	case ECharacterStateType::InAir:
 	case ECharacterStateType::Stunned:
 	case ECharacterStateType::Interacting:

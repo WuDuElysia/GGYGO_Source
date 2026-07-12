@@ -49,6 +49,9 @@ public:
 	/** 写入冲刺状态 */
 	void SetSprintHeld(bool bHeld);
 
+	/** 写入强制步行状态（Ctrl 键） */
+	void SetForceWalkHeld(bool bHeld);
+
 private:
 	/** 输入数据容器（不拥有，由 BaseCharacter 管理生命周期） */
 	FInputData& InputData;
@@ -65,6 +68,7 @@ private:
 	bool bPendingAttack = false;
 	bool bPendingDodge = false;
 	bool bPendingSprint = false;
+	bool bPendingForceWalk = false;
 
 	/** 移动防抖计时器 */
 	float MoveFlickerTimer = 0.f;

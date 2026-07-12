@@ -24,6 +24,18 @@ struct FMovementConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Sprint")
 	float SprintMultiplier = 1.5f;
 
+	/** 行走最大速度阈值（cm/s，低于此值为 Idle） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gait")
+	float WalkSpeed = 95.f;
+
+	/** 跑步最大速度阈值（cm/s，低于此值为 Walk，≥此值为 Run） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gait")
+	float RunSpeed = 450.f;
+
+	/** 冲刺最小速度阈值（cm/s，≥此值为 Sprint） */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Gait")
+	float SprintSpeed = 600.f;
+
 	/** 空中移动控制系数（0=完全不能控制，1=和地面一样） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Air")
 	float AirControlFactor = 0.3f;

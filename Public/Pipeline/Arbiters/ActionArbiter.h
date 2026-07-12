@@ -21,21 +21,26 @@
 #include "StateMachine/CharacterStateType.h"
 
 class UAbilitySystemComponent;
+class FGYGOStateManager;
 
 class FActionArbiter : public IArbiter
 {
 public:
 	/**
-	 * 注入 ASC 指针
+	 * 注入 ASC 和 StateManager 指针
 	 * @param InASC AbilitySystemComponent
+	 * @param InSM  StateManager（用于预判状态切换可行性）
 	 */
-	void Init(UAbilitySystemComponent* InASC);
+	void Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM);
 
 	virtual void Arbitrate(FRuntimeData& RuntimeData, float DeltaTime) override;
 
 private:
 	/** ASC 指针（不拥有） */
 	UAbilitySystemComponent* ASC = nullptr;
+
+	/** StateManager 指针（不拥有，用于状态预判检查） */
+	FGYGOStateManager* SM = nullptr;
 
 	/**
 	 * 获取指定状态的抗性值

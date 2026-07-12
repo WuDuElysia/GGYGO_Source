@@ -15,7 +15,7 @@
  *   3. 在细节面板填入该角色的混合时间、移动参数等
  *   4. 角色蓝图在 BaseCharacter.CharacterConfig 字段引用此资产
  *
- * 动画资产本身仍在 AnimBP 的 EditAnywhere 属性上配置（IdleAnim / RunLoopAnim 等），
+ * 动画资产本身仍在 AnimBP 的 EditAnywhere 属性上配置（IdleAnim / MovingAnim 等），
  * 本 DataAsset 不重复存储动画引用。
  */
 #pragma once
@@ -75,9 +75,7 @@ public:
 	 *
 	 * 推荐值：
 	 *   Idle:      BlendIn=0.1  BlendOut=0.1
-	 *   RunStart:  BlendIn=0.05 BlendOut=0.1
-	 *   RunLoop:   BlendIn=0.15 BlendOut=0.15
-	 *   RunEnd:    BlendIn=0.15 BlendOut=0.1
+	 *   Moving:    BlendIn=0.1  BlendOut=0.1
 	 *   InAir:     BlendIn=0.1  BlendOut=0.1
 	 *   Attacking: BlendIn=0.0  BlendOut=0.1
 	 *   Dodging:   BlendIn=0.0  BlendOut=0.0
@@ -89,17 +87,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "混合时间")
 	TMap<ECharacterStateType, FStateTransitionBlend> PerStateBlendOverrides;
 
-	// ============================================================
-	// 最短播放时长（防止动画被过早打断）
-	// ============================================================
 
-	/** RunStart 最短播放时间（秒），此后才允许切换到 RunLoop */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "过渡时间")
-	float RunStartMinDuration = 0.25f;
-
-	/** RunEnd 最短播放时间（秒），此后才允许切换到 Idle */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "过渡时间")
-	float RunEndMinDuration = 0.25f;
 
 	// ============================================================
 	// 播放速率

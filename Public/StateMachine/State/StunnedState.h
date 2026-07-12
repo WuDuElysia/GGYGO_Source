@@ -13,7 +13,11 @@ class FStunnedState : public FCharacterState
 {
 public:
 	FStunnedState()
-		: FCharacterState(ECharacterStateType::Stunned)
+		: FCharacterState(ECharacterStateType::Stunned, EStateGroup::Overlay)
 	{
 	}
+
+	// Phase 7 GAS 接入：眩晕时封锁全部操作
+	virtual TArray<TSubclassOf<UGameplayEffect>> GetEnterGameplayEffects() const override;
+	virtual int32 GetLimitFlags() const override;
 };

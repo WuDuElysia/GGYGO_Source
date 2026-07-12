@@ -41,6 +41,9 @@ struct FRuntimeData
 	/** 冲刺意图（LocomotionIntentProcessor 写入） */
 	bool bWantsToSprint = false;
 
+	/** 强制步行意图（Ctrl 键按下，由 LocomotionIntentProcessor 写入） */
+	bool bWantsToForceWalk = false;
+
 	/** 交互意图 */
 	bool bWantsToInteract = false;
 
@@ -53,6 +56,17 @@ struct FRuntimeData
 
 	/** 当前移动速度标量（MotionDriver 写入） */
 	float CurrentSpeed = 0.f;
+
+	/** 统一解析的移动步态（LocomotionIntentProcessor 写入，MotionDriver/AnimInstance 消费） */
+	EMovementGait ResolvedGait = EMovementGait::None;
+
+	/** 步态速度阈值（cm/s，由 BaseCharacter::BeginPlay 从 CharacterConfig 同步） */
+	struct FGaitThresholds
+	{
+		float Walk = 100.f;
+		float Run  = 450.f;
+		float Sprint = 600.f;
+	} GaitThresholds;
 
 	/** 移动角度，相对于角色朝向（MotionDriver 写入） */
 	float MoveAngle = 0.f;
@@ -110,12 +124,12 @@ struct FRuntimeData
 	ECharacterStateType ActionGranted = ECharacterStateType::Idle;
 
 	// ============================================================
-	// 状态机数据（由 FCharacterStateMachine::PerformTransition 写入）
+	// 状态机数据（由 FGYGOStateManager::ActivateState 写入）
 	// ============================================================
 
 	/**
 	 * 当前角色状态
-	 * 由 FCharacterStateMachine 在状态切换时写入。
+	 * 由 FGYGOStateManager 在状态切换时写入。
 	 * 动画蓝图、UI 等只读此字段获取当前状态。
 	 */
 	ECharacterStateType CurrentState = ECharacterStateType::Idle;
@@ -152,22 +166,6 @@ struct FRuntimeData
 	bool bHasRootMotion = false;
 
 	// ============================================================
-	// AnimNotify 通知标记（由 GGYGOAnimInstance::OnRunStartFinished 等写入，状态机读取）
-	// ============================================================
-
-	/** RunStart 动画播放完成标记（AnimNotify 写入，RunStartState::Update 读取后转换到 RunLoop） */
-	bool bRunStartFinished = false;
-
-	/** RunEnd 动画播放完成标记（AnimNotify 写入，RunEndState::Update 读取后转换到 Idle） */
-	bool bRunEndFinished = false;
-
-	/** RunStart 动画最短播放时间（秒），从 MovementConfig 同步 */
-	float RunStartMinDuration = 0.25f;
-
-	/** RunEnd 动画最短播放时间（秒），从 MovementConfig 同步 */
-	float RunEndMinDuration = 0.25f;
-
-	// ============================================================
 	// 动画参数（由 MovementParameterProcessor 写入）
 	// ============================================================
 
@@ -194,6 +192,7 @@ struct FRuntimeData
 		bWantsToAttack = false;
 		bWantsToDodge = false;
 		bWantsToSprint = false;
+		bWantsToForceWalk = false;
 		bWantsToInteract = false;
 		// TODO: ActionGranted = ECharacterStateType::Idle;
 		bJustLanded = false;

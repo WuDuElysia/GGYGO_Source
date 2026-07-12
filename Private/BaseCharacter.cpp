@@ -4,6 +4,8 @@
  */
 #include "BaseCharacter.h"
 #include "Components/CapsuleComponent.h"
+#include "GGYGOGameplayEffects.h" // Phase 7: GE 全局初始化
+#include "Animation/GGYGOAnimInstance.h"
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -35,8 +37,8 @@ ABaseCharacter::ABaseCharacter()
 	// 创建驱动层
 	MotionDriver = MakeUnique<FMotionDriver>();
 
-	// 创建状态机
-	StateMachine = MakeUnique<FCharacterStateMachine>();
+	// ★ 阶段6：创建并行状态管理器（纯 C++，和其他管线风格一致）
+	StateManager = MakeUnique<FGYGOStateManager>();
 
 	// 创建仲裁管线（不给 ASC，在 BeginPlay 中 Init 时注入）
 	ArbiterPipeline = MakeUnique<FArbiterPipeline>();
@@ -52,6 +54,11 @@ void ABaseCharacter::BeginPlay()
 	Super::BeginPlay();
 
 	// ============================================================
+	// GE 全局引用初始化（Phase 7：必须在任何 GE 应用之前）
+	// ============================================================
+	InitGEGlobals();
+
+	// ============================================================
 	// GAS 初始化（必须在所有子系统之前，因为其他系统可能依赖 ASC）
 	// ============================================================
 
@@ -64,13 +71,8 @@ void ABaseCharacter::BeginPlay()
 		ASC->InitAbilityActorInfo(this, this);
 
 		// 注入真实 ASC 到所有依赖 ASC 的子系统
-		ArbiterPipeline->Init(ASC);
+		ArbiterPipeline->Init(ASC, StateManager.Get());
 	}
-
-	// 显示胶囊体，方便观察角色碰撞和位移
-#if !UE_BUILD_SHIPPING
-	GetCapsuleComponent()->SetHiddenInGame(false);
-#endif
 
 	// ============================================================
 	// 管线子系统初始化
@@ -82,8 +84,24 @@ void ABaseCharacter::BeginPlay()
 	// 初始化运动驱动器（缓存组件引用 + 关闭自动 Root Motion）
 	MotionDriver->Init(this);
 
-	// 初始化状态机（创建所有状态实例 + 进入 Idle）
-	StateMachine->Init();
+	// ★ 阶段6：初始化状态管理器（注册状态 + 加载关系矩阵 + 激活 Idle）
+	// DT 可后续通过 CharacterConfig 引入，当前使用内置默认矩阵
+	if (StateManager)
+	{
+		StateManager->Init(*RuntimeData);
+
+		// ★ 阶段7：注入 ASC（GAS 联动，必须在 Init 之后）
+		StateManager->InitASC(ASC);
+	}
+
+	// ★ 阶段8：从 CharacterConfig 同步步态速度阈值到 RuntimeData
+	// MotionDriver 读取这些阈值来管理速度上限
+	if (CharacterConfig)
+	{
+		RuntimeData->GaitThresholds.Walk   = CharacterConfig->MovementConfig.WalkSpeed;
+		RuntimeData->GaitThresholds.Run    = CharacterConfig->MovementConfig.RunSpeed;
+		RuntimeData->GaitThresholds.Sprint = CharacterConfig->MovementConfig.SprintSpeed;
+	}
 }
 
 void ABaseCharacter::GiveDefaultAbilities()
@@ -145,7 +163,11 @@ void ABaseCharacter::Tick(float DeltaTime)
 	IntentPipeline->ProcessParameters(*RuntimeData, DeltaTime);
 
 	// 5. 状态机：读取意图 + 仲裁标记，决定当前状态
-	StateMachine->Update(DeltaTime, *RuntimeData);
+	// ★ 阶段6：使用新的并行状态管理器（纯 C++）
+	if (StateManager)
+	{
+		StateManager->Update(DeltaTime);
+	}
 
 	// 6. 运动驱动：RuntimeData 移动数据 → 实际位移
 	MotionDriver->Process(DeltaTime, *RuntimeData);
@@ -154,32 +176,117 @@ void ABaseCharacter::Tick(float DeltaTime)
 	RuntimeData->ResetFrameIntents();
 
 #if !UE_BUILD_SHIPPING
-	// 调试 UI（左上角叠层，每帧刷新）
-	// Key0: 原始输入 | Key1: BlendSpace 参数 + 状态 | Key2: 实际速度/移动状态/角度
-	// Key3: 动画速度(绿=OK)/缩放 | Key4: Bip001 骨骼状态(绿=OK) + 着地
-	if (GEngine)
+	// ============================================================
+	// 调试 UI（左上角屏幕叠层，每帧刷新）
+	//
+	// 使用 AddOnScreenDebugMessage 按 Key 分组，Key 0~4 各占一行
+	// Key 参数说明：
+	//   - 第一个参数 = Key（同 Key 后写覆盖，不同 Key 各占一行）
+	//   - 第二个参数 = 显示时长（0 = 持续到下次同 Key 写入覆盖）
+	//   - 第三个参数 = 文字颜色
+	//   - 第四个参数 = 文本内容
+	//
+	// 显示顺序（屏幕从上到下）：
+	//   Key0 绿色  — 状态机当前主状态
+	//   Key1 白色  — 输入/移动方向
+	//   Key2 黄色  — 速度信息
+	//   Key3 红色  — 仲裁标记
+	//   Key4 青色  — 当前动画名 + 步态（动画模块专属）
+	// ============================================================
+	if (GEngine && StateManager)
 	{
-		GEngine->AddOnScreenDebugMessage(0, 0.f, FColor::White,
-			FString::Printf(TEXT("Input:%s"),
-				*InputData->CurrentFrame.Move.ToString()));
-		GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::Cyan,
-			FString::Printf(TEXT("Blend X:%.2f Y:%.2f | State:%d"),
-				RuntimeData->AnimBlendX, RuntimeData->AnimBlendY,
-				static_cast<uint8>(RuntimeData->CurrentState)));
+		// ------------------------------------------------------------
+		// Key0: 当前主状态名称 + 活跃状态数量
+		//
+		// StateName: 从 RuntimeData->CurrentState 取枚举名
+		//   字符串处理：去掉 "ECharacterStateType::" 前缀，只保留简短名
+		//   例如 "ECharacterStateType::Idle" → "Idle"
+		//
+		// Active 数量: StateManager 中当前活跃的状态数
+		//   状态管理器是并行状态机，可同时有多个状态活跃
+		//   例如 Idle + InAir 可能同时活跃
+		// ------------------------------------------------------------
+		FString StateName = UEnum::GetValueAsString(RuntimeData->CurrentState);
+		StateName.ReplaceInline(TEXT("ECharacterStateType::"), TEXT(""));
+		GEngine->AddOnScreenDebugMessage(0, 0.f, FColor::Green,
+			FString::Printf(TEXT("State:%s | Active:%d"),
+				*StateName, StateManager->GetActiveStates().Num()));
+
+		// ------------------------------------------------------------
+		// Key1: 原始输入方向 + 期望移动方向
+		//
+		// Input: 输入管线处理后的本帧摇杆输入（2D 向量，X=右 Y=前）
+		//   范围 [-1,1]，(0,0) 表示无输入
+		//
+		// MoveDir: 意图管线计算出的世界空间期望移动方向（3D 向量）
+		//   由 Input 结合 ControlRotation 旋转到世界空间得到
+		//   Z 分量已清零（水平移动）
+		// ------------------------------------------------------------
+		GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::White,
+			FString::Printf(TEXT("Input:%s | MoveDir:%s"),
+				*InputData->CurrentFrame.Move.ToString(),
+				*RuntimeData->DesiredWorldMoveDir.ToString()));
+
+		// ------------------------------------------------------------
+		// Key2: 速度信息
+		//
+		// Speed:    当前水平移动速度（cm/s），MotionDriver 实际驱动
+		// AnimSpd:  动画驱动速度（从 Bip001 骨骼位移提取，cm/s）
+		//           用于防滑步——理想情况下应与 Speed 接近
+		// Moving:   意图层是否在移动（摇杆是否推开）
+		//           注意：与物理速度>0 不同，松手瞬间 Moving=false 但 Speed 可能还有惯性
+		// ------------------------------------------------------------
 		GEngine->AddOnScreenDebugMessage(2, 0.f, FColor::Yellow,
-			FString::Printf(TEXT("Speed:%.1f Move:%d Angle:%.0f"),
-				RuntimeData->CurrentSpeed, RuntimeData->bIsMoving,
-				RuntimeData->MoveAngle));
-		FColor SpeedColor = RuntimeData->AnimSpeed > 0.f ? FColor::Green : FColor::Red;
-		FVector ActorScale = GetActorScale3D();
-		GEngine->AddOnScreenDebugMessage(3, 0.f, SpeedColor,
-			FString::Printf(TEXT("AnimSpd:%.0f | Actual:%.0f | AScale:%.1f"),
-				RuntimeData->AnimSpeed, RuntimeData->CurrentSpeed, ActorScale.X));
-		FColor RMColor = RuntimeData->bBip001Found ? FColor::Green : FColor::Red;
-		GEngine->AddOnScreenDebugMessage(4, 0.f, RMColor,
-			FString::Printf(TEXT("Bip001:%s | Grounded:%s"),
-				RuntimeData->bBip001Found ? TEXT("OK") : TEXT("MISSING"),
-				RuntimeData->bIsGrounded ? TEXT("Y") : TEXT("N")));
+			FString::Printf(TEXT("Speed:%.1f | AnimSpd:%.0f | Moving:%d"),
+				RuntimeData->CurrentSpeed, RuntimeData->AnimSpeed,
+				RuntimeData->bIsMoving));
+
+		// ------------------------------------------------------------
+		// Key3: 仲裁标记（GAS Tag 驱动的状态屏蔽）
+		//
+		// 用于排查"为什么状态不切换/角色不动"的问题
+		// 标记为 true 表示对应行为被仲裁管线屏蔽
+		//
+		// BlockMove:   屏蔽移动（如攻击中、受击硬直）
+		// BlockAtk:    屏蔽攻击（如冷却中）
+		// BlockDodge:  屏蔽闪避（如冷却中）
+		// BlockInput:  屏蔽所有输入（如过场动画中）
+		// ------------------------------------------------------------
+		GEngine->AddOnScreenDebugMessage(3, 0.f, FColor::Red,
+			FString::Printf(TEXT("BlockMove:%d BlockAtk:%d BlockDodge:%d BlockInput:%d"),
+				RuntimeData->bBlockMove ? 1 : 0,
+				RuntimeData->bBlockAttack ? 1 : 0,
+				RuntimeData->bBlockDodge ? 1 : 0,
+				RuntimeData->bBlockInput ? 1 : 0));
+
+		// ------------------------------------------------------------
+		// Key4: 当前支撑脚 + 意图层步态（动画模块专属调试）
+		//
+		// 获取流程：
+		//   1. GetMesh() → USkeletalMeshComponent
+		//   2. GetAnimInstance() → UAnimInstance（期望是 UGGYGOAnimInstance）
+		//   3. Cast<UGGYGOAnimInstance> → 安全转换
+		//   4. 读 Out_DebugFoot → 当前支撑脚调试字符串（"L"/"R"）
+		//
+		// Foot: 当前支撑脚，由循环相位查询得出
+		//   如果显示 "?" 表示 Cast 失败（AnimBP 父类配错）
+		//
+		// Gait: 意图层步态（RuntimeData->ResolvedGait）
+		//   Walk / Run / Sprint / None
+		//   注意：这是意图层每帧重新解析的步态
+		// ------------------------------------------------------------
+		FString AnimName = TEXT("?");
+		if (GetMesh())
+		{
+			UGGYGOAnimInstance* AI = Cast<UGGYGOAnimInstance>(GetMesh()->GetAnimInstance());
+			if (AI) AnimName = AI->Out_DebugFoot.ToString();
+		}
+		GEngine->AddOnScreenDebugMessage(4, 0.f, FColor::Cyan,
+			FString::Printf(TEXT("Foot:%s | Gait:%s"),
+				*AnimName,
+				RuntimeData->ResolvedGait == EMovementGait::Walk ? TEXT("Walk") :
+				RuntimeData->ResolvedGait == EMovementGait::Run  ? TEXT("Run")  :
+				RuntimeData->ResolvedGait == EMovementGait::Sprint ? TEXT("Sprint") : TEXT("None")));
 	}
 #endif
 }

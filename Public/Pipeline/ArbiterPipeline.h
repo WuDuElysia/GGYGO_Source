@@ -16,16 +16,18 @@
 #include "Pipeline/Interfaces/IArbiter.h"
 
 class UAbilitySystemComponent;
+class FGYGOStateManager;
 struct FRuntimeData;
 
 class FArbiterPipeline
 {
 public:
 	/**
-	 * 初始化所有仲裁器，注入 ASC
+	 * 初始化所有仲裁器，注入 ASC 和 StateManager
 	 * @param InASC AbilitySystemComponent 指针
+	 * @param InSM  StateManager 指针
 	 */
-	void Init(UAbilitySystemComponent* InASC);
+	void Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM);
 
 	/**
 	 * 每帧执行所有仲裁器（Tick 第 1 步，先于 InputPipeline）

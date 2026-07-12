@@ -32,6 +32,9 @@ struct FProcessedInput
 	/** 冲刺键持续按住 */
 	bool bSprintHeld = false;
 
+	/** 强制步行键持续按住（Ctrl） */
+	bool bForceWalkHeld = false;
+
 	// ============================================================
 	// 缓冲计时器
 	// 按下时设为缓冲时间（如 0.2 秒），每帧递减

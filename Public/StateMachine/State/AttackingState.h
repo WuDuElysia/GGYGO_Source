@@ -13,7 +13,7 @@ class FAttackingState : public FCharacterState
 {
 public:
 	FAttackingState()
-		: FCharacterState(ECharacterStateType::Attacking)
+		: FCharacterState(ECharacterStateType::Attacking, EStateGroup::Action)
 	{
 	}
 };

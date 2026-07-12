@@ -5,10 +5,12 @@
 #include "Pipeline/Arbiters/ActionArbiter.h"
 #include "Data/RuntimeData.h"
 #include "AbilitySystemComponent.h"
+#include "StateMachine/GGYGOStateManager.h"
 
-void FActionArbiter::Init(UAbilitySystemComponent* InASC)
+void FActionArbiter::Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM)
 {
 	ASC = InASC;
+	SM = InSM;
 }
 
 void FActionArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
@@ -22,15 +24,20 @@ void FActionArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	// 攻击请求
 	if (RuntimeData.bWantsToAttack && !RuntimeData.bBlockAttack)
 	{
-		// 抗性检查：当前状态的抗性 vs 攻击动作的优先级
 		if (GetActionPriority(ECharacterStateType::Attacking) > GetStateResistance(Current))
 		{
-			// TryActivateAbilityByClass 需要 GA 类——目前该类尚未实现
-			// 阶段八-D 完成后取消注释，替换为真实的 GA_Attack
+			// ★ 第二道预判：状态机能切过去吗？（查关系矩阵）
+			if (SM && !SM->CanEnterState(ECharacterStateType::Attacking))
+			{
+				// 关系矩阵拒绝（如 Attacking→Dodging=Blocked 时攻击被闪避打断不能立刻反打）
+				return;
+			}
+
+			// ★ GA 预判（Phase 10 接入）:
 			// TODO: if (ASC->TryActivateAbilityByClass(GA_Attack))
-			// {
-			//     RuntimeData.ActionGranted = ECharacterStateType::Attacking;
-			// }
+			{
+				RuntimeData.ActionGranted = ECharacterStateType::Attacking;
+			}
 		}
 	}
 
@@ -39,10 +46,15 @@ void FActionArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	{
 		if (GetActionPriority(ECharacterStateType::Dodging) > GetStateResistance(Current))
 		{
+			if (SM && !SM->CanEnterState(ECharacterStateType::Dodging))
+			{
+				return;
+			}
+
 			// TODO: if (ASC->TryActivateAbilityByClass(GA_Dodge))
-			// {
-			//     RuntimeData.ActionGranted = ECharacterStateType::Dodging;
-			// }
+			{
+				RuntimeData.ActionGranted = ECharacterStateType::Dodging;
+			}
 		}
 	}
 }
@@ -56,7 +68,7 @@ int32 FActionArbiter::GetStateResistance(ECharacterStateType State)
 	case ECharacterStateType::HitStun:    return 0;   // 受击中完全不能动
 	case ECharacterStateType::Stunned:    return 0;   // 眩晕中完全不能动
 	case ECharacterStateType::Dead:       return 100; // 死亡不可被打断（最高抗性）
-	default:                               return 0;   // Idle/RunStart/RunLoop/InAir → 无抗性
+	default:                               return 0;   // Idle/Moving/InAir → 无抗性
 	}
 }
 

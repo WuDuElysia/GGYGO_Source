@@ -13,7 +13,11 @@ class FHitStunState : public FCharacterState
 {
 public:
 	FHitStunState()
-		: FCharacterState(ECharacterStateType::HitStun)
+		: FCharacterState(ECharacterStateType::HitStun, EStateGroup::Overlay)
 	{
 	}
+
+	// Phase 7 GAS 接入：受击时封锁战斗+减速
+	virtual TArray<TSubclassOf<UGameplayEffect>> GetEnterGameplayEffects() const override;
+	virtual int32 GetLimitFlags() const override;
 };

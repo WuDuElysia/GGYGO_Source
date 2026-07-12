@@ -4,8 +4,10 @@
  */
 #include "StateMachine/CharacterState.h"
 
-FCharacterState::FCharacterState(ECharacterStateType InType)
+FCharacterState::FCharacterState(ECharacterStateType InType, EStateGroup InGroup)
 	: StateType(InType)
+	, StateGroup(InGroup)
+	, StateName(UEnum::GetValueAsString(InType))
 {
 }
 

@@ -8,8 +8,9 @@
 #include "Pipeline/Arbiters/HealthArbiter.h"
 #include "Pipeline/Arbiters/StaminaArbiter.h"
 #include "Data/RuntimeData.h"
+#include "StateMachine/GGYGOStateManager.h"
 
-void FArbiterPipeline::Init(UAbilitySystemComponent* InASC)
+void FArbiterPipeline::Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM)
 {
 	// 按固定顺序注册：GAS → Action → Health → Stamina
 	auto GAS = MakeUnique<FGASArbiter>();
@@ -17,7 +18,7 @@ void FArbiterPipeline::Init(UAbilitySystemComponent* InASC)
 	Arbiters.Add(MoveTemp(GAS));
 
 	auto Action = MakeUnique<FActionArbiter>();
-	Action->Init(InASC);
+	Action->Init(InASC, InSM);
 	Arbiters.Add(MoveTemp(Action));
 
 	auto Health = MakeUnique<FHealthArbiter>();

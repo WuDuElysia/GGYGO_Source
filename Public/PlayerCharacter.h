@@ -51,6 +51,14 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	UInputAction* IA_Look;
 
+	/** 冲刺（Shift），值类型 Digital/Bool */
+	UPROPERTY(EditDefaultsOnly, Category = "Input")
+	UInputAction* IA_Sprint;
+
+	/** 强制步行（Ctrl），值类型 Digital/Bool */
+	UPROPERTY(EditDefaultsOnly, Category = "Input")
+	UInputAction* IA_ForceWalk;
+
 	// ============================================================
 	// 输入回调
 	// ============================================================
@@ -63,6 +71,12 @@ protected:
 
 	/** 视角输入回调，写入 InputPipeline */
 	void OnLookInput(const FInputActionValue& Value);
+
+	/** 冲刺按住/松开 */
+	void OnSprintInput(const FInputActionValue& Value);
+
+	/** 强制步行按住/松开 */
+	void OnForceWalkInput(const FInputActionValue& Value);
 
 	// ============================================================
 	// 输入绑定入口

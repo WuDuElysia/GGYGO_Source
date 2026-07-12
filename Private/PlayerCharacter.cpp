@@ -63,6 +63,24 @@ void APlayerCharacter::SetupPlayerInputComponent(
 		EIC->BindAction(IA_Look, ETriggerEvent::Triggered,
 			this, &APlayerCharacter::OnLookInput);
 	}
+
+	// 绑定冲刺（Shift）
+	if (IA_Sprint)
+	{
+		EIC->BindAction(IA_Sprint, ETriggerEvent::Started,
+			this, &APlayerCharacter::OnSprintInput);
+		EIC->BindAction(IA_Sprint, ETriggerEvent::Completed,
+			this, &APlayerCharacter::OnSprintInput);
+	}
+
+	// 绑定强制步行（Ctrl）
+	if (IA_ForceWalk)
+	{
+		EIC->BindAction(IA_ForceWalk, ETriggerEvent::Started,
+			this, &APlayerCharacter::OnForceWalkInput);
+		EIC->BindAction(IA_ForceWalk, ETriggerEvent::Completed,
+			this, &APlayerCharacter::OnForceWalkInput);
+	}
 }
 
 void APlayerCharacter::OnMoveInput(const FInputActionValue& Value)
@@ -88,4 +106,14 @@ void APlayerCharacter::OnLookInput(const FInputActionValue& Value)
 {
 	FVector2D Input = Value.Get<FVector2D>();
 	InputPipeline->SetLookInput(Input);
+}
+
+void APlayerCharacter::OnSprintInput(const FInputActionValue& Value)
+{
+	InputPipeline->SetSprintHeld(Value.Get<bool>());
+}
+
+void APlayerCharacter::OnForceWalkInput(const FInputActionValue& Value)
+{
+	InputPipeline->SetForceWalkHeld(Value.Get<bool>());
 }

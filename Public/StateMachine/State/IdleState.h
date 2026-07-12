@@ -13,11 +13,11 @@ class FIdleState : public FCharacterState
 {
 public:
 	FIdleState()
-		: FCharacterState(ECharacterStateType::Idle)
+		: FCharacterState(ECharacterStateType::Idle, EStateGroup::Locomotion)
 	{
 	}
 
 	virtual void Enter(FRuntimeData& RuntimeData) override;
-	virtual void Update(float DeltaTime, FRuntimeData& RuntimeData, FCharacterStateMachine& SM) override;
+	virtual void Update(float DeltaTime, FRuntimeData& RuntimeData, FGYGOStateManager& SM) override;
 	virtual void Exit(FRuntimeData& RuntimeData) override;
 };
