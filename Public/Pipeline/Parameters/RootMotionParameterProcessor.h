@@ -2,7 +2,7 @@
  * @file RootMotionParameterProcessor.h
  * @brief 根运动数据提取处理器
  *
- * 从 GGYGOAnimInstance 读取当前动画的根骨骼位移（Root Motion Delta）。
+ * 从 NTEAnimInstance 读取当前动画的根骨骼位移（Root Motion Delta）。
  * 不再依赖自定义 "Speed" 曲线，直接使用 AnimSequence 内置的根骨骼运动数据。
  *
  * 数据流（新版）：

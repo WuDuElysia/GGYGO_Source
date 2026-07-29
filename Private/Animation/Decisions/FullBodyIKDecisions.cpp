@@ -3,7 +3,7 @@
  * @brief 顶层辅助 FullBodyIK 决策模块实现
  */
 #include "Animation/Decisions/FullBodyIKDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"  // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"  // FAnimSnapshot 完整定义
 
 // ----------------------------------------------------------------------------
 

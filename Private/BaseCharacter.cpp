@@ -5,7 +5,7 @@
 #include "BaseCharacter.h"
 #include "Components/CapsuleComponent.h"
 #include "GGYGOGameplayEffects.h" // Phase 7: GE 全局初始化
-#include "Animation/GGYGOAnimInstance.h"
+#include "Animation/NTEAnimInstance.h"  // @NTEAnim: 连接点A - 动画实例引用
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -264,8 +264,8 @@ void ABaseCharacter::Tick(float DeltaTime)
 		//
 		// 获取流程：
 		//   1. GetMesh() → USkeletalMeshComponent
-		//   2. GetAnimInstance() → UAnimInstance（期望是 UGGYGOAnimInstance）
-		//   3. Cast<UGGYGOAnimInstance> → 安全转换
+		//   2. GetAnimInstance() → UAnimInstance（期望是 UNTEAnimInstance）
+		//   3. Cast<UNTEAnimInstance> → 安全转换
 		//   4. 读 Out_DebugFoot → 当前支撑脚调试字符串（"L"/"R"）
 		//
 		// Foot: 当前支撑脚，由循环相位查询得出
@@ -275,10 +275,12 @@ void ABaseCharacter::Tick(float DeltaTime)
 		//   Walk / Run / Sprint / None
 		//   注意：这是意图层每帧重新解析的步态
 		// ------------------------------------------------------------
+		// @NTEAnim: 连接点B - Debug UI 读 NTEAnim 输出变量（Out_DebugFoot）
+		//   如果移除 NTEAnim，此 Cast 需改为 ZZZAnim 或直接删除
 		FString AnimName = TEXT("?");
 		if (GetMesh())
 		{
-			UGGYGOAnimInstance* AI = Cast<UGGYGOAnimInstance>(GetMesh()->GetAnimInstance());
+			UNTEAnimInstance* AI = Cast<UNTEAnimInstance>(GetMesh()->GetAnimInstance());
 			if (AI) AnimName = AI->Out_DebugFoot.ToString();
 		}
 		GEngine->AddOnScreenDebugMessage(4, 0.f, FColor::Cyan,

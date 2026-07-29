@@ -1,5 +1,5 @@
 /**
- * @file GGYGOAnimInstance.h
+ * @file NTEAnimInstance.h
  * @brief NTE 风格移动动画的 C++ 决策层
  *
  * 设计哲学：拓扑在蓝图，决策在 C++，求值在 AnimGraph。
@@ -34,7 +34,7 @@
 #include "Animation/Decisions/CyclesDecisions.h"
 #include "Animation/Decisions/MotionMatchDecisions.h"
 #include "Animation/Decisions/FullBodyIKDecisions.h"
-#include "GGYGOAnimInstance.generated.h"
+#include "NTEAnimInstance.generated.h"
 
 // 前向声明（减少编译依赖）
 class ABaseCharacter;
@@ -53,6 +53,20 @@ struct FAnimSnapshot
 {
 	/** 移动意图（摇杆是否推开） ← ABaseCharacter::IsMoving() */
 	bool bWantMove = false;
+
+	/**
+	 * 停步动画是否已播完（动画层自算，非外部推入）。
+	 * 由 AnimInstance 用"停步计时器 vs 停步动画时长"计算：进 Stop 那刻起计时，累计 ≥ 停步动画长度即为真。
+	 * 供 Stop→NotMoving 出边判定"播完才走"，避免 return true 导致的秒过渡（停步动画被瞬间跳过）。
+	 */
+	bool bStopFinished = false;
+
+	/**
+	 * 起步动画是否已播完（动画层自算，非外部推入）。
+	 * 由 AnimInstance 用"起步计时器 vs 起步动画时长"计算：起步那刻起计时，累计 ≥ 起步动画长度即为真。
+	 * 供 EnterMoveState→Moving 判定"起步动画播完才进移动循环"，取代被 FModel 剥掉的 ExitEnterMoveStateCurve。
+	 */
+	bool bEnterFinished = false;
 
 	/** 是否在地面 ← RuntimeData.bIsGrounded */
 	bool bGrounded = true;
@@ -490,7 +504,7 @@ struct FAnimSourceData
  *   3. 蓝图状态机过渡条件引用决策函数，AnimGraph 节点 Bind 输出变量
  */
 UCLASS()
-class GGYGO_API UGGYGOAnimInstance : public UAnimInstance
+class GGYGO_API UNTEAnimInstance : public UAnimInstance
 {
 	GENERATED_BODY()
 
@@ -1447,6 +1461,37 @@ public:
 	EAnimFoot GetCurrentFoot() const { return Snap.CurrentFoot; }
 
 	// ============================================================
+	// 配表查询（按 key 取 AnimSet 资产，供 NTE 拓扑下各末端状态 Bind）
+	//
+	// 路线 2（复刻 NTE 拓扑）：方向/脚/步态由蓝图状态机分支决定，
+	// 每个末端状态在 Sequence/BlendSpace Player 的资产引脚上 Bind 下列函数，
+	// 传入该状态对应的 key 字面量，即可从 AnimSet 配表取到资产。
+	// 改动画只改细节面板的 AnimSet 配表，不改蓝图、不改 C++。
+	// key 不存在时返回 nullptr（Player 播放空指针 → 不播放，安全降级）。
+	// 只读初始化后不变的 AnimSet 配置，故 BlueprintThreadSafe。
+	// ============================================================
+
+	/** 按 key 取起步序列（AnimSet.EnterSequences），如 "run_enterFL" / "sprint_enterFL" */
+	UFUNCTION(BlueprintPure, Category = "Query|AnimSet", meta = (BlueprintThreadSafe))
+	UAnimSequence* GetEnterSeqByKey(FName Key) const;
+
+	/** 按 key 取停步序列（AnimSet.StopSequences），如 "run_stopL" / "walk_stopR" / "sprint_stopL" */
+	UFUNCTION(BlueprintPure, Category = "Query|AnimSet", meta = (BlueprintThreadSafe))
+	UAnimSequence* GetStopSeqByKey(FName Key) const;
+
+	/** 按 key 取杂项一次性序列（AnimSet.MiscSequences），如 "turnback_L" / "turnback_R" */
+	UFUNCTION(BlueprintPure, Category = "Query|AnimSet", meta = (BlueprintThreadSafe))
+	UAnimSequence* GetMiscSeqByKey(FName Key) const;
+
+	/** 按 key 取循环序列（AnimSet.LoopSequences），如 "Idle" */
+	UFUNCTION(BlueprintPure, Category = "Query|AnimSet", meta = (BlueprintThreadSafe))
+	UAnimSequence* GetLoopSeqByKey(FName Key) const;
+
+	/** 按 key 取混合空间（AnimSet.BlendSpaces），如 "WalkRun_L" / "WalkRun_R" */
+	UFUNCTION(BlueprintPure, Category = "Query|AnimSet", meta = (BlueprintThreadSafe))
+	UBlendSpace* GetBlendSpaceByKey(FName Key) const;
+
+	// ============================================================
 	// 输出变量 — BlendSpace 遥控（被 AnimGraph 节点 Bind）
 	// ============================================================
 
@@ -1531,6 +1576,28 @@ private:
 	/** 存储外部推入的运行时数据（游戏线程写入，CaptureSnapshot 读取） */
 	FAnimRuntimeData StoredRuntimeData;
 
+	/** 上一帧的移动意图（用于地面移动层"动画自算"标志的 1 帧滞后：如 bIsHasInStandIdlePose/bIsCanRunStop） */
+	bool bPrevWantMove = false;
+
+	/**
+	 * 停步支撑脚锁存：在"移动→停止"那一刻锁定当前支撑脚，整个停步过程沿用此脚。
+	 * 否则 Out_StopSeq 每帧按实时 CurrentFoot 重算，停步动画播放时同步相位推进会让脚左右翻，
+	 * 导致停步动画中途切换、Sequence Player 反复重启、永远播不完（AutoRule 无法在播完时触发）。
+	 */
+	EAnimFoot LatchedStopFoot = EAnimFoot::Left;
+
+	/** 停步计时器：进 Stop 那刻清零，之后（无移动意图时）每帧累加，用于判定停步动画是否播完。 */
+	float StopElapsed = 0.f;
+
+	/** 停步动画时长：进 Stop 那刻从锁定脚对应的 StopSequences 资产读取 GetPlayLength()；0 表示无停步动画。 */
+	float StopDuration = 0.f;
+
+	/** 起步计时器：起步那刻（待机→移动）清零，之后（有移动意图时）每帧累加，用于判定起步动画是否播完。 */
+	float EnterElapsed = 0.f;
+
+	/** 起步动画时长：起步那刻按方向+脚从 EnterSequences 资产读取 GetPlayLength()；0 表示无起步动画（立即完成）。 */
+	float EnterDuration = 0.f;
+
 	// ============================================================
 	// 私有方法
 	// ============================================================
@@ -1542,6 +1609,13 @@ private:
 	void CaptureSnapshot();
 
 	/**
+	 * 把当前 Snap 的地址分发给所有决策模块（SetSnap）。
+	 * 无论 Owner 是否有效都必须调用，保证决策函数 Snap 指针非空——
+	 * 否则入口 Conduit 三条出边全 `if(!Snap) return false`，导管无出边会退回参考姿势。
+	 */
+	void BindSnapshotToDecisionModules();
+
+	/**
 	 * 从循环归一化相位推导当前支撑脚
 	 * @return 相位不小于 0.5 返回 Right，否则返回 Left
 	 */
@@ -1549,8 +1623,8 @@ private:
 
 	/**
 	 * 游戏线程：查询 Locomotion 循环的归一化相位（[0,1)）
-	 * SyncGroup 名 "Locomotion" 在 AnimGraph 设置（蓝图侧）；查询失败/无 marker 时返回 0（降级）
-	 * @return 归一化相位，恒落在 [0,1)
+	 * SyncGroup 名 "Locomotion" 在 AnimGraph 设置（蓝图侧）；查询失败/当前没有有效 marker 时保留上一帧相位，
+	 * 首次运行时默认返回 0（降级为 Left），避免 EnterMoveState 使用独立 RunStart/DoNotSync 时脚位被重置。
 	 */
 	float GetLocomotionSyncPhase() const;
 
@@ -1613,7 +1687,9 @@ private:
 	static FName ResolveEnterKey(float InAngleDeg, EAnimFoot InFoot);
 
 	// ============================================================
-	// Decision Modules（DFS 顺序，值语义持有）
+	// @NTEAnim: 连接点F - Decision Modules（9 模块体系，仅 NTEAnim 使用）
+	// 这些模块读取 FAnimSnapshot 做移动动画过渡决策。
+	// 如果移除 NTEAnim，这 9 个模块（18 文件）可以全部删除。
 	// ============================================================
 
 	FMainMovementDecisions  MainDecisions;

@@ -136,13 +136,14 @@ struct FRuntimeData
 
 	// ============================================================
 	// 动画驱动速度（由 RootMotionParameterProcessor 写入）
+	// @NTEAnim: 连接点D - NTEAnim 提取 RootMotion → RM Processor 中转 → 此处写入
 	// ============================================================
 
 	/**
 	 * 动画驱动速度（cm/s），从根运动位移向量换算而来。
 	 * 公式：AnimSpeed = |RootMotionDelta| / DeltaTime
 	 *
-	 * 数据来源：GGYGOAnimInstance::ExtractRootMotionDelta 从当前
+	 * 数据来源：UNTEAnimInstance::ExtractRootMotionDelta 从当前
 	 * AnimSequence 内置根骨骼轨道提取每帧位移 → RootMotionDelta
 	 * → RootMotionParameterProcessor 换算为速度标量。
 	 */
@@ -152,12 +153,13 @@ struct FRuntimeData
 	bool bBip001Found = false;
 
 	// ============================================================
-	// Root Motion（由 GGYGOAnimInstance 提取，RootMotionParameterProcessor 同步）
+	// Root Motion（由 UNTEAnimInstance 提取，RootMotionParameterProcessor 同步）
+	// @NTEAnim: 连接点D - NTEAnim::ExtractRootMotionDelta 写入 → 经 RM Processor 同步
 	// ============================================================
 
 	/**
 	 * 当前帧根骨骼位移向量（cm/帧，本地空间）。
-	 * 由 GGYGOAnimInstance::ExtractRootMotionDelta 从 AnimSequence 内置根骨骼轨道提取。
+	 * 由 UNTEAnimInstance::ExtractRootMotionDelta 从 AnimSequence 内置根骨骼轨道提取。
 	 * RootMotionParameterProcessor 每帧同步此值到 RuntimeData。
 	 */
 	FVector RootMotionDelta = FVector::ZeroVector;

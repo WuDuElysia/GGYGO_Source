@@ -7,6 +7,7 @@
  *   FLocomotionAnimSet key→value 动画资产表（BlendSpace/Loop/Enter/Stop/Misc）
  *   FLocomotionTuning  数值参数（步态速度、停止阈值、转身角度、Lean 钳制等）
  *
+ * @NTEAnim: 连接点H - NTEAnim 的配表与参数配置
  * AnimSet 由美术在 AnimBP 细节面板按 key 填 value；Tuning 使用 NTE 实证默认值。
  * 过渡混合时长不在本文件配置，由蓝图过渡的 Blend Duration 承担。
  */
@@ -81,7 +82,7 @@ struct FLocomotionTuning
 
 	/** 奔跑速度阈值（cm/s），WalkRun 轴映射上界 */
 	UPROPERTY(EditAnywhere, Category = "Gait")
-	float RunSpeed = 470.f;
+	float RunSpeed = 450.f;
 
 	/** 冲刺速度阈值（cm/s） */
 	UPROPERTY(EditAnywhere, Category = "Gait")

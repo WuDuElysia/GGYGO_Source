@@ -13,7 +13,7 @@
 
 #include "CoreMinimal.h"
 #include "Math/RandomStream.h"
-#include "Animation/GGYGOAnimInstance.h"      // FAnimSnapshot、FAnimSourceData
+#include "Animation/NTEAnimInstance.h"      // FAnimSnapshot、FAnimSourceData
 #include "StateMachine/CharacterStateType.h"  // EMovementGait
 #include "Animation/LocomotionConfig.h"        // EAnimFoot
 

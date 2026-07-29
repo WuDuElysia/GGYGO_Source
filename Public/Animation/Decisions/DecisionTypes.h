@@ -9,7 +9,7 @@
 
 #include "CoreMinimal.h"
 
-// 前向声明：快照结构体定义在 GGYGOAnimInstance.h 中
+// 前向声明：快照结构体定义在 NTEAnimInstance.h 中
 struct FAnimSnapshot;
 
 /** 曲线值查询代理：参数 (CurveName, OutValue)，返回是否找到 */

@@ -8,7 +8,7 @@
  *   5 个 MoveL_*   — 左脚循环内 Sprint/RunWalk 切换（与 MoveR 对称）
  */
 #include "Animation/Decisions/CyclesDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"   // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"   // FAnimSnapshot 完整定义
 #include "Animation/LocomotionConfig.h"    // FLocomotionTuning, EMovementGait, EAnimFoot
 
 // 降级默认配置（默认构造使用 NTE 实证默认值）

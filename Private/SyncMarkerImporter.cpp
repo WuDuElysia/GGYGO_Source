@@ -90,7 +90,7 @@ void USyncMarkerImporter::ImportSyncMarkersFromDirectory(
 		}
 
 		// 设置 Sync Group（注意：UE 5.7 中 SyncGroup 在 Montage 上而非 AnimSequence 上，
-		// 这里只写入 Marker 数据，SyncGroup 在 GGYGOAnimInstance 创建动态 Montage 时设置）
+		// 这里只写入 Marker 数据，SyncGroup 在 NTEAnimInstance 创建动态 Montage 时设置）
 		UE_LOG(LogTemp, Log, TEXT("    (SyncGroup 需在动态创建 Montage 时设置: %s)"), *SyncGroupName);
 
 		// 标记修改并保存
@@ -136,7 +136,7 @@ bool USyncMarkerImporter::ImportSingleJson(
 		AnimSeq->AuthoredSyncMarkers.Add(M);
 	}
 	// 注意：SyncGroup 在 UE 5.7 中属于 UAnimMontage 而非 UAnimSequence，
-	// 需在 GGYGOAnimInstance 创建动态 Montage 时通过 SetSyncGroup() 设置
+	// 需在 NTEAnimInstance 创建动态 Montage 时通过 SetSyncGroup() 设置
 	AnimSeq->MarkPackageDirty();
 
 	UE_LOG(LogTemp, Log, TEXT("OK: %s → %d markers, SyncGroup=%s"),

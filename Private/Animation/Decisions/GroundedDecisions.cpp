@@ -3,7 +3,7 @@
  * @brief Layer 2 Grounded 决策模块实现
  */
 #include "Animation/Decisions/GroundedDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"   // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"   // FAnimSnapshot 完整定义
 #include "Animation/LocomotionConfig.h"    // FLocomotionTuning 完整定义
 
 // 降级默认配置（默认构造使用 NTE 实证默认值）

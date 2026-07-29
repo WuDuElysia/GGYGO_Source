@@ -3,7 +3,7 @@
  * @brief Layer 3.5 Direction Dispatcher 决策模块实现
  */
 #include "Animation/Decisions/DirectionDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"   // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"   // FAnimSnapshot 完整定义
 #include "Animation/LocomotionConfig.h"    // EMovementGait, EAnimFoot
 
 // ----------------------------------------------------------------------------

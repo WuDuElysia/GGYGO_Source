@@ -123,7 +123,8 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 	//   - Ctrl/Shift 是意图覆盖（如 Ctrl 强制 Walk，即使速度已超阈值）
 	//
 	// 注意：ResolvedGait 每帧重新解析，可能频繁变化
-	//   AnimInstance 内部有 GaitCooldown 冷却机制防抖，见 GGYGOAnimInstance.cpp
+	// @NTEAnim: 连接点E - ResolvedGait 每帧解析后由 NTEAnim 消费
+	//   NTEAnim 内部有 GaitCooldown 冷却机制防抖，见 NTEAnimInstance.cpp
 	// ============================================================
 
 	if (InputData.CurrentFrame.bForceWalkHeld)

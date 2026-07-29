@@ -3,7 +3,7 @@
  * @brief Layer 1 MainMovement 决策模块实现
  */
 #include "Animation/Decisions/MainMovementDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"  // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"  // FAnimSnapshot 完整定义
 
 // ----------------------------------------------------------------------------
 

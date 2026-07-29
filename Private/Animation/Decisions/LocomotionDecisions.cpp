@@ -3,7 +3,7 @@
  * @brief Layer 3 Locomotion 决策模块实现
  */
 #include "Animation/Decisions/LocomotionDecisions.h"
-#include "Animation/GGYGOAnimInstance.h"   // FAnimSnapshot 完整定义
+#include "Animation/NTEAnimInstance.h"   // FAnimSnapshot 完整定义
 #include "Animation/LocomotionConfig.h"    // FLocomotionTuning, EMovementGait, EAnimFoot
 
 // 降级默认配置（默认构造使用 NTE 实证默认值）
@@ -66,13 +66,13 @@ bool FLocomotionDecisions::Loco_Enter_To_NotMoving() const
 bool FLocomotionDecisions::Loco_Moving_To_LeftStop() const
 {
 	if (!Snap) return false;
-	return !Snap->bWantMove && Snap->Speed < Tuning->ThresholdToStop && Snap->CurrentFoot == EAnimFoot::Left;
+	return !Snap->bWantMove && Snap->CurrentFoot == EAnimFoot::Left;
 }
 
 bool FLocomotionDecisions::Loco_Moving_To_RightStop() const
 {
 	if (!Snap) return false;
-	return !Snap->bWantMove && Snap->Speed < Tuning->ThresholdToStop && Snap->CurrentFoot == EAnimFoot::Right;
+	return !Snap->bWantMove && Snap->CurrentFoot == EAnimFoot::Right;
 }
 
 bool FLocomotionDecisions::Loco_Stop_To_Moving() const
@@ -116,7 +116,11 @@ bool FLocomotionDecisions::Loco3_Conduit_To_NotMoving() const
 
 bool FLocomotionDecisions::Loco3_NotMoving_To_Moving_Auto() const
 {
-	return true;
+	// 直接进入移动（不走起步动画）的兜底：仅当"想动但待机姿势尚未稳定"时用，
+	// 避免抢占正常的起步路径 NotMoving→Conduit_5→Enter*（那条要求 bIsHasInStandIdlePose）。
+	// 待机稳定后（bIsHasInStandIdlePose=true）本条为假，交由 Conduit_5 走起步动画。
+	if (!Snap) return false;
+	return Snap->bWantMove && !Snap->bIsHasInStandIdlePose;
 }
 
 bool FLocomotionDecisions::Loco3_NotMoving_To_Conduit5() const
@@ -127,8 +131,10 @@ bool FLocomotionDecisions::Loco3_NotMoving_To_Conduit5() const
 
 bool FLocomotionDecisions::Loco3_NotMoving_To_Moving_Alt() const
 {
-	if (!Snap) return false;
-	return Snap->bIsHasInStandIdlePose && Snap->bNotMovingToMoving;
+	// 直连 NotMoving→Moving（不走起步）。原条件与 #666 NotMoving→Conduit_5 完全相同，
+	// 会和起步路径互相抢占（优先级高就跳过起步直接进 Moving）。
+	// 现禁用此直连：所有起步统一走 Conduit_5（它再分发到 run 起步 / EnterWalk / 直接 Moving）。
+	return false;
 }
 
 bool FLocomotionDecisions::Loco3_NotMoving_To_Stop_MM() const
@@ -141,31 +147,42 @@ bool FLocomotionDecisions::Loco3_NotMoving_To_Stop_MM() const
 
 bool FLocomotionDecisions::Loco3_Moving_To_NotMoving_Auto() const
 {
-	return true;
+	// 直接回待机（不播停步动画）的兜底：仅当"想停但并非从移动中急停"时用
+	// （bIsCanRunStop=false，即上一帧未在移动的边缘情况）。正常停步走下方 #671→Stop 播停步动画。
+	if (!Snap) return true;   // 无快照时安全退回待机
+	return !Snap->bWantMove && !Snap->bIsCanRunStop;
 }
 
 bool FLocomotionDecisions::Loco3_Moving_To_NotMoving() const
 {
+	// 与 #669 同为"直接回待机"兜底路径；正常停步不走这里（交给 #671→Stop）。
 	if (!Snap) return false;
-	return Snap->bIsCanRunStop && Snap->bMovingToNotMoving;
+	return !Snap->bWantMove && !Snap->bIsCanRunStop;
 }
 
 bool FLocomotionDecisions::Loco3_Moving_To_Conduit1() const
 {
+	// 正常停步主路径：移动中松开输入 → 进 Conduit_1 → Stop（播停步动画）。
+	// 原条件额外要求 bSkillInterruptMove（玩法标志，恒 false），导致普通停步永远走不到 Stop、
+	// 没有停步动画；现改为"有移动意图撤销且处于可跑停状态"即进 Stop。
 	if (!Snap) return false;
-	return Snap->bIsCanRunStop && Snap->bMovingToNotMoving && Snap->bSkillInterruptMove;
+	return !Snap->bWantMove && Snap->bIsCanRunStop;
 }
 
 // ---- Stop transitions (#672-#674) ----
 
 bool FLocomotionDecisions::Loco3_Stop_To_NotMoving_Auto1() const
 {
-	return true;
+	// 主循环 Stop → NotMoving：停步动画播完才走。原 return true 会一进 Stop 就秒过渡、动画被跳过。
+	if (!Snap) return true;
+	return Snap->bStopFinished;
 }
 
 bool FLocomotionDecisions::Loco3_Stop_To_NotMoving_Auto2() const
 {
-	return true;
+	// 同 Auto1：停步动画播完才回待机。
+	if (!Snap) return true;
+	return Snap->bStopFinished;
 }
 
 bool FLocomotionDecisions::Loco3_Stop_To_Conduit4() const
@@ -248,7 +265,9 @@ bool FLocomotionDecisions::Loco3_Conduit2_To_NotMoving1() const
 
 bool FLocomotionDecisions::Loco3_LeftStop1_To_NotMoving1_Auto() const
 {
-	return true;
+	// 巡逻左脚停步 → 待机：停步动画播完才走（原 return true 会秒过渡）。
+	if (!Snap) return true;
+	return Snap->bStopFinished;
 }
 
 bool FLocomotionDecisions::Loco3_Stop1_To_Moving1_Resume() const
@@ -259,7 +278,9 @@ bool FLocomotionDecisions::Loco3_Stop1_To_Moving1_Resume() const
 
 bool FLocomotionDecisions::Loco3_RightStop1_To_NotMoving1_Auto() const
 {
-	return true;
+	// 巡逻右脚停步 → 待机：停步动画播完才走（原 return true 会秒过渡）。
+	if (!Snap) return true;
+	return Snap->bStopFinished;
 }
 
 // ---- CanStop_1 (#688-#689) ----
@@ -310,10 +331,11 @@ bool FLocomotionDecisions::Loco3_Conduit1_To_Stop_B() const
 
 bool FLocomotionDecisions::Loco3_EnterMove_To_Moving() const
 {
-	if (!Snap) return false;
-	float ExitCurve = 0.f;
-	GetCurveValueSafe(FName("ExitEnterMoveStateCurve"), ExitCurve);
-	return ExitCurve != 0.f || Snap->Gait != EMovementGait::Run;
+	// 起步动画播完 → 进移动循环。原依赖动画曲线 ExitEnterMoveStateCurve，但该曲线被 FModel 剥掉了
+	// （恒 0）→ Run 步态永远卡在 EnterMoveState。改用 bEnterFinished（起步计时器达到起步动画时长）。
+	// 非 Run 步态不会进到 EnterMoveState（此处保留 Gait!=Run 作即时兜底）。
+	if (!Snap) return true;
+	return Snap->bEnterFinished || Snap->Gait != EMovementGait::Run;
 }
 
 bool FLocomotionDecisions::Loco3_EnterMove_To_Conduit1() const
@@ -340,8 +362,10 @@ bool FLocomotionDecisions::Loco3_Conduit3_To_EnterState() const
 
 bool FLocomotionDecisions::Loco3_EnterState_To_EnterMove() const
 {
-	if (!Snap) return false;
-	return GetStateWeightSafe(3, 0) >= 1.f;
+	// EnterState 是 0 时长中转态（Conduit_3→EnterState 也是 0s），进入后应立即转到 EnterMoveState。
+	// 原用 GetStateWeightSafe(3,0)>=1 判定，但机器索引 3 是错误的硬编码 → 永远取不到权重 →
+	// 永远进不了 EnterMoveState。改为立即通过（中转态本就无动画、无需等待）。
+	return true;
 }
 
 // ---- Conduit_5 (#699-#701) ----
@@ -368,8 +392,9 @@ bool FLocomotionDecisions::Loco3_Conduit5_To_EnterWalk() const
 
 bool FLocomotionDecisions::Loco3_EnterWalk_To_Moving() const
 {
-	if (!Snap) return false;
-	return GetStateWeightSafe(3, 1) >= 1.f;
+	// 走路无专门起步动画，EnterWalk 直接播 walk 循环即可立即进 Moving（同样播 walk BS）。
+	// 原用 GetStateWeightSafe(3,1)>=1（机器索引硬编码错误）→ 永远为假 → 卡在 EnterWalk。改为立即通过。
+	return true;
 }
 
 // ---- Conduit_4 (#703-#704) ----
