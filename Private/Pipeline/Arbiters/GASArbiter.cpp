@@ -11,7 +11,7 @@
  * 此处只负责将 Tag 翻译为 true。
  */
 #include "Pipeline/Arbiters/GASArbiter.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 #include "GameplayTagContainer.h"
 
@@ -41,7 +41,6 @@ void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 		RuntimeData.bBlockMove   = true;
 		RuntimeData.bBlockAttack = true;
 		RuntimeData.bBlockDodge  = true;
-		RuntimeData.bBlockInput  = true;
 		return; // 死亡是最高优先级，不再检查其他
 	}
 
@@ -80,5 +79,7 @@ void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	}
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantInput))
-		RuntimeData.bBlockInput = true;
+	{
+		// bBlockInput 已移除；如果未来需要，在此处设置具体 block 标记
+	}
 }

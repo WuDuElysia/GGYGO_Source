@@ -3,7 +3,7 @@
  * @brief 体力仲裁器实现
  */
 #include "Pipeline/Arbiters/StaminaArbiter.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 
 void FStaminaArbiter::Init(UAbilitySystemComponent* InASC)

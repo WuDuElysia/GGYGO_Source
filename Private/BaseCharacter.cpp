@@ -5,7 +5,9 @@
 #include "BaseCharacter.h"
 #include "Components/CapsuleComponent.h"
 #include "GGYGOGameplayEffects.h" // Phase 7: GE 全局初始化
-#include "Animation/NTEAnimInstance.h"  // @NTEAnim: 连接点A - 动画实例引用
+#include "Data/Anim/AnimRuntimeData.h"
+#include "Animation/NTEAnimInstance.h"
+#include "Animation/zzzAnim/ZZZAnimInstance.h"
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -94,14 +96,8 @@ void ABaseCharacter::BeginPlay()
 		StateManager->InitASC(ASC);
 	}
 
-	// ★ 阶段8：从 CharacterConfig 同步步态速度阈值到 RuntimeData
-	// MotionDriver 读取这些阈值来管理速度上限
-	if (CharacterConfig)
-	{
-		RuntimeData->GaitThresholds.Walk   = CharacterConfig->MovementConfig.WalkSpeed;
-		RuntimeData->GaitThresholds.Run    = CharacterConfig->MovementConfig.RunSpeed;
-		RuntimeData->GaitThresholds.Sprint = CharacterConfig->MovementConfig.SprintSpeed;
-	}
+	// RuntimeData 的运动配置由 MotionDriver 初始化；
+	// BaseCharacter 只负责系统组装和时序调度。
 }
 
 void ABaseCharacter::GiveDefaultAbilities()
@@ -163,134 +159,21 @@ void ABaseCharacter::Tick(float DeltaTime)
 	IntentPipeline->ProcessParameters(*RuntimeData, DeltaTime);
 
 	// 5. 状态机：读取意图 + 仲裁标记，决定当前状态
-	// ★ 阶段6：使用新的并行状态管理器（纯 C++）
-	if (StateManager)
-	{
-		StateManager->Update(DeltaTime);
-	}
+	if (StateManager) StateManager->Update(DeltaTime);
 
 	// 6. 运动驱动：RuntimeData 移动数据 → 实际位移
 	MotionDriver->Process(DeltaTime, *RuntimeData);
 
+	// 7. 动画驱动：状态机、运动驱动和意图处理器已分别同步 AnimData，
+	//    BaseCharacter 只在所有生产者完成后通知 AnimInstance 抓取快照。
+	//    保证 AnimBP 读到的快照一定是本帧管线刚写完的最新值
+	if (UNTEAnimInstance* AI = Cast<UNTEAnimInstance>(GetMesh()->GetAnimInstance())) AI->PipelineDrive();
+	if (UZZZAnimInstance* ZAI = Cast<UZZZAnimInstance>(GetMesh()->GetAnimInstance())) ZAI->PipelineDrive();
+
 	// 帧末清零
 	RuntimeData->ResetFrameIntents();
 
-#if !UE_BUILD_SHIPPING
-	// ============================================================
-	// 调试 UI（左上角屏幕叠层，每帧刷新）
-	//
-	// 使用 AddOnScreenDebugMessage 按 Key 分组，Key 0~4 各占一行
-	// Key 参数说明：
-	//   - 第一个参数 = Key（同 Key 后写覆盖，不同 Key 各占一行）
-	//   - 第二个参数 = 显示时长（0 = 持续到下次同 Key 写入覆盖）
-	//   - 第三个参数 = 文字颜色
-	//   - 第四个参数 = 文本内容
-	//
-	// 显示顺序（屏幕从上到下）：
-	//   Key0 绿色  — 状态机当前主状态
-	//   Key1 白色  — 输入/移动方向
-	//   Key2 黄色  — 速度信息
-	//   Key3 红色  — 仲裁标记
-	//   Key4 青色  — 当前动画名 + 步态（动画模块专属）
-	// ============================================================
-	if (GEngine && StateManager)
-	{
-		// ------------------------------------------------------------
-		// Key0: 当前主状态名称 + 活跃状态数量
-		//
-		// StateName: 从 RuntimeData->CurrentState 取枚举名
-		//   字符串处理：去掉 "ECharacterStateType::" 前缀，只保留简短名
-		//   例如 "ECharacterStateType::Idle" → "Idle"
-		//
-		// Active 数量: StateManager 中当前活跃的状态数
-		//   状态管理器是并行状态机，可同时有多个状态活跃
-		//   例如 Idle + InAir 可能同时活跃
-		// ------------------------------------------------------------
-		FString StateName = UEnum::GetValueAsString(RuntimeData->CurrentState);
-		StateName.ReplaceInline(TEXT("ECharacterStateType::"), TEXT(""));
-		GEngine->AddOnScreenDebugMessage(0, 0.f, FColor::Green,
-			FString::Printf(TEXT("State:%s | Active:%d"),
-				*StateName, StateManager->GetActiveStates().Num()));
 
-		// ------------------------------------------------------------
-		// Key1: 原始输入方向 + 期望移动方向
-		//
-		// Input: 输入管线处理后的本帧摇杆输入（2D 向量，X=右 Y=前）
-		//   范围 [-1,1]，(0,0) 表示无输入
-		//
-		// MoveDir: 意图管线计算出的世界空间期望移动方向（3D 向量）
-		//   由 Input 结合 ControlRotation 旋转到世界空间得到
-		//   Z 分量已清零（水平移动）
-		// ------------------------------------------------------------
-		GEngine->AddOnScreenDebugMessage(1, 0.f, FColor::White,
-			FString::Printf(TEXT("Input:%s | MoveDir:%s"),
-				*InputData->CurrentFrame.Move.ToString(),
-				*RuntimeData->DesiredWorldMoveDir.ToString()));
-
-		// ------------------------------------------------------------
-		// Key2: 速度信息
-		//
-		// Speed:    当前水平移动速度（cm/s），MotionDriver 实际驱动
-		// AnimSpd:  动画驱动速度（从 Bip001 骨骼位移提取，cm/s）
-		//           用于防滑步——理想情况下应与 Speed 接近
-		// Moving:   意图层是否在移动（摇杆是否推开）
-		//           注意：与物理速度>0 不同，松手瞬间 Moving=false 但 Speed 可能还有惯性
-		// ------------------------------------------------------------
-		GEngine->AddOnScreenDebugMessage(2, 0.f, FColor::Yellow,
-			FString::Printf(TEXT("Speed:%.1f | AnimSpd:%.0f | Moving:%d"),
-				RuntimeData->CurrentSpeed, RuntimeData->AnimSpeed,
-				RuntimeData->bIsMoving));
-
-		// ------------------------------------------------------------
-		// Key3: 仲裁标记（GAS Tag 驱动的状态屏蔽）
-		//
-		// 用于排查"为什么状态不切换/角色不动"的问题
-		// 标记为 true 表示对应行为被仲裁管线屏蔽
-		//
-		// BlockMove:   屏蔽移动（如攻击中、受击硬直）
-		// BlockAtk:    屏蔽攻击（如冷却中）
-		// BlockDodge:  屏蔽闪避（如冷却中）
-		// BlockInput:  屏蔽所有输入（如过场动画中）
-		// ------------------------------------------------------------
-		GEngine->AddOnScreenDebugMessage(3, 0.f, FColor::Red,
-			FString::Printf(TEXT("BlockMove:%d BlockAtk:%d BlockDodge:%d BlockInput:%d"),
-				RuntimeData->bBlockMove ? 1 : 0,
-				RuntimeData->bBlockAttack ? 1 : 0,
-				RuntimeData->bBlockDodge ? 1 : 0,
-				RuntimeData->bBlockInput ? 1 : 0));
-
-		// ------------------------------------------------------------
-		// Key4: 当前支撑脚 + 意图层步态（动画模块专属调试）
-		//
-		// 获取流程：
-		//   1. GetMesh() → USkeletalMeshComponent
-		//   2. GetAnimInstance() → UAnimInstance（期望是 UNTEAnimInstance）
-		//   3. Cast<UNTEAnimInstance> → 安全转换
-		//   4. 读 Out_DebugFoot → 当前支撑脚调试字符串（"L"/"R"）
-		//
-		// Foot: 当前支撑脚，由循环相位查询得出
-		//   如果显示 "?" 表示 Cast 失败（AnimBP 父类配错）
-		//
-		// Gait: 意图层步态（RuntimeData->ResolvedGait）
-		//   Walk / Run / Sprint / None
-		//   注意：这是意图层每帧重新解析的步态
-		// ------------------------------------------------------------
-		// @NTEAnim: 连接点B - Debug UI 读 NTEAnim 输出变量（Out_DebugFoot）
-		//   如果移除 NTEAnim，此 Cast 需改为 ZZZAnim 或直接删除
-		FString AnimName = TEXT("?");
-		if (GetMesh())
-		{
-			UNTEAnimInstance* AI = Cast<UNTEAnimInstance>(GetMesh()->GetAnimInstance());
-			if (AI) AnimName = AI->Out_DebugFoot.ToString();
-		}
-		GEngine->AddOnScreenDebugMessage(4, 0.f, FColor::Cyan,
-			FString::Printf(TEXT("Foot:%s | Gait:%s"),
-				*AnimName,
-				RuntimeData->ResolvedGait == EMovementGait::Walk ? TEXT("Walk") :
-				RuntimeData->ResolvedGait == EMovementGait::Run  ? TEXT("Run")  :
-				RuntimeData->ResolvedGait == EMovementGait::Sprint ? TEXT("Sprint") : TEXT("None")));
-	}
-#endif
 }
 
 void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)

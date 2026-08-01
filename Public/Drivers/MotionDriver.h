@@ -8,7 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 
 class ACharacter;
 class UCharacterMovementComponent;

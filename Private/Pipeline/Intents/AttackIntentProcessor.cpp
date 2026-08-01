@@ -4,7 +4,7 @@
  */
 #include "Pipeline/Intents/AttackIntentProcessor.h"
 #include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 
 void FAttackIntentProcessor::Process(const FInputData& InputData, FRuntimeData& RuntimeData)
 {

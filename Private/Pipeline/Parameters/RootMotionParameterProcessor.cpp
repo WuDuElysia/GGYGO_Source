@@ -17,7 +17,7 @@
  *   - 位移数据与动画 100% 一致（来自同一数据源）
  */
 #include "Pipeline/Parameters/RootMotionParameterProcessor.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/NTEAnimInstance.h"
@@ -30,7 +30,6 @@ void FRootMotionParameterProcessor::Init(USkeletalMeshComponent* InMesh)
 void FRootMotionParameterProcessor::Process(FRuntimeData& RuntimeData, float DeltaTime)
 {
 	// Phase 9: 根运动提取已移除，移动由 MotionDriver 直接驱动
-	RuntimeData.bBip001Found   = false;
 	RuntimeData.AnimSpeed      = 0.f;
 	RuntimeData.RootMotionDelta = FVector::ZeroVector;
 	RuntimeData.bHasRootMotion  = false;

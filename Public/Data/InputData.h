@@ -15,7 +15,8 @@
  * 后处理输入数据
  * 经过防抖缓冲和动作按键缓冲后的输入状态
  */
-struct FProcessedInput
+struct 
+FProcessedInput
 {
 	/** 移动输入（后处理，防抖后） */
 	FVector2D Move = FVector2D::ZeroVector;

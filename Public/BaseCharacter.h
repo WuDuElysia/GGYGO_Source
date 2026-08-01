@@ -15,11 +15,15 @@
 #include "GameFramework/Character.h"
 #include "AbilitySystemInterface.h"
 #include "Drivers/MotionDriver.h"
+
 #include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"       // 逻辑运行时数据（含 AnimData 子结构）
+#include "Data/UCharConfigData.h"
+
 #include "Pipeline/InputPipeline.h"
 #include "Pipeline/IntentPipeline.h"
 #include "Pipeline/ArbiterPipeline.h"
+
 #include "StateMachine/GGYGOStateManager.h" // ★ 阶段6：纯C++ 并行状态管理器
 #include "Attributes/GGYGOAttributeSet.h"
 #include "Data/UCharConfigData.h"
@@ -55,14 +59,6 @@ public:
 	// 不直接暴露 RuntimeData，保持封装
 	// ============================================================
 
-	/** Blend Space X 轴参数（左右，-1~1） */
-	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetAnimBlendX() const { return RuntimeData->AnimBlendX; }
-
-	/** Blend Space Y 轴参数（前后，-1~1） */
-	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetAnimBlendY() const { return RuntimeData->AnimBlendY; }
-
 	/** 当前移动速度（cm/s，水平标量） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
 	float GetCurrentSpeed() const { return RuntimeData->CurrentSpeed; }
@@ -74,10 +70,6 @@ public:
 	/** 当前角色状态（Idle/Locomotion/InAir 等） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
 	ECharacterStateType GetCurrentState() const { return RuntimeData->CurrentState; }
-
-	/** 动画播放倍率（防滑步用） */
-	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetPlayRate() const { return RuntimeData->PlayRate; }
 
 	/** 是否在移动中 */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
@@ -96,6 +88,9 @@ public:
 
 	/** 获取角色配置（供 AnimInstance 等外部系统读取） */
 	UCharConfigData* GetCharacterConfig() const { return CharacterConfig; }
+
+	/** 获取运行时黑板（供 AnimInstance 等外部系统只读访问） */
+	FRuntimeData* GetRuntimeData() const { return RuntimeData.Get(); }
 
 	// ============================================================
 	// 输入处理接口（BlueprintCallable，供子类蓝图绑定 EnhancedInput）
@@ -184,7 +179,7 @@ protected:
 	/** 输入数据容器 */
 	TUniquePtr<FInputData> InputData;
 
-	/** 运行时黑板 */
+	/** 运行时黑板（含 AnimData 子结构） */
 	TUniquePtr<FRuntimeData> RuntimeData;
 
 	/** 输入管线 */

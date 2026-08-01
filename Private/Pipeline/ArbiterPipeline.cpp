@@ -7,7 +7,7 @@
 #include "Pipeline/Arbiters/ActionArbiter.h"
 #include "Pipeline/Arbiters/HealthArbiter.h"
 #include "Pipeline/Arbiters/StaminaArbiter.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "StateMachine/GGYGOStateManager.h"
 
 void FArbiterPipeline::Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM)
@@ -38,7 +38,6 @@ void FArbiterPipeline::Process(FRuntimeData& RuntimeData, float DeltaTime)
 	RuntimeData.bBlockMove   = false;
 	RuntimeData.bBlockAttack = false;
 	RuntimeData.bBlockDodge  = false;
-	RuntimeData.bBlockInput  = false;
 	RuntimeData.ActionGranted = ECharacterStateType::Idle;
 
 	for (auto& Arbiter : Arbiters)

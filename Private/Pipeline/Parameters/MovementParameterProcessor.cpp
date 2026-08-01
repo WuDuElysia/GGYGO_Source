@@ -3,7 +3,7 @@
  * @brief 移动参数处理器实现
  */
 #include "Pipeline/Parameters/MovementParameterProcessor.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 
 void FMovementParameterProcessor::Process(FRuntimeData& RuntimeData, float DeltaTime)
 {
@@ -31,7 +31,4 @@ void FMovementParameterProcessor::Process(FRuntimeData& RuntimeData, float Delta
 	// FInterpTo 平滑插值，避免动画突变
 	SmoothedBlendX = FMath::FInterpTo(SmoothedBlendX, TargetX, DeltaTime, SmoothSpeed);
 	SmoothedBlendY = FMath::FInterpTo(SmoothedBlendY, TargetY, DeltaTime, SmoothSpeed);
-
-	RuntimeData.AnimBlendX = SmoothedBlendX;
-	RuntimeData.AnimBlendY = SmoothedBlendY;
 }

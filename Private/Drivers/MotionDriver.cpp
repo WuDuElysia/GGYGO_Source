@@ -10,11 +10,13 @@
  *   - bHasRootMotion 仅保留给 Montage/技能动画使用
  */
 #include "Drivers/MotionDriver.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
+#include "BaseCharacter.h"
+#include "Data/UCharConfigData.h"
 
 void FMotionDriver::Init(ACharacter* InOwner)
 {
@@ -33,6 +35,19 @@ void FMotionDriver::Init(ACharacter* InOwner)
 	}
 
 	DefaultMaxWalkSpeed = Movement ? Movement->MaxWalkSpeed : 600.f;
+
+	// 速度阈值由运动驱动初始化，不由 BaseCharacter 直接写 RuntimeData。
+	if (const ABaseCharacter* BaseOwner = Cast<ABaseCharacter>(Owner))
+	{
+		FRuntimeData* RuntimeData = BaseOwner->GetRuntimeData();
+		const UCharConfigData* CharacterConfig = BaseOwner->GetCharacterConfig();
+		if (RuntimeData && CharacterConfig)
+		{
+			RuntimeData->GaitThresholds.Walk = CharacterConfig->MovementConfig.WalkSpeed;
+			RuntimeData->GaitThresholds.Run = CharacterConfig->MovementConfig.RunSpeed;
+			RuntimeData->GaitThresholds.Sprint = CharacterConfig->MovementConfig.SprintSpeed;
+		}
+	}
 }
 
 void FMotionDriver::Process(float DeltaTime, FRuntimeData& RuntimeData)
@@ -116,6 +131,7 @@ void FMotionDriver::UpdateRuntimeData(FRuntimeData& RuntimeData)
 
 	FVector Velocity = Owner->GetVelocity();
 	RuntimeData.CurrentSpeed = Velocity.Size2D();
+	RuntimeData.AnimData.VelocityLength = RuntimeData.CurrentSpeed;
 	RuntimeData.bIsMoving = RuntimeData.CurrentSpeed > 10.f;
 
 	if (RuntimeData.bIsMoving)

@@ -4,7 +4,7 @@
  */
 #include "Pipeline/Intents/ViewRotationProcessor.h"
 #include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "GameFramework/Character.h"
 
 void FViewRotationProcessor::Init(ACharacter* InOwner)
@@ -25,6 +25,4 @@ void FViewRotationProcessor::Process(const FInputData& InputData, FRuntimeData& 
 	// 从控制器读取最终旋转（经过 PlayerCameraManager Clamp 后的值）
 	FRotator ControlRot = Owner->GetControlRotation();
 	RuntimeData.ControlRotation = ControlRot;
-	RuntimeData.ViewYaw = ControlRot.Yaw;
-	RuntimeData.ViewPitch = ControlRot.Pitch;
 }

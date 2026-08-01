@@ -9,8 +9,7 @@
 #include "Pipeline/Intents/DodgeIntentProcessor.h"
 #include "Pipeline/Parameters/MovementParameterProcessor.h"
 #include "Pipeline/Parameters/RootMotionParameterProcessor.h"
-#include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+
 
 void FIntentPipeline::Init(ACharacter* InOwner, USkeletalMeshComponent* InMesh)
 {

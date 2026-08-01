@@ -79,14 +79,23 @@ void UNTEAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	// 调用父类实现（UAnimInstance 基类有少量内部处理）
 	Super::NativeUpdateAnimation(DeltaSeconds);
 
-	// 游戏线程每帧更新：唯一能安全读 Owner 的位置。
-	// 从 Owner 与 RuntimeData 抓取只读快照，供 worker 线程并行消费。
-	CaptureSnapshot();
+	if (bDrivenByPipeline)
+	{
+		// 管线已经驱动过，快照和一次性资产都是最新的，跳过重复工作
+		bDrivenByPipeline = false;
+		return;
+	}
 
-	// 按当前脚+步态+方向选一次性资产（Enter/Stop）写入 UObject 指针型输出变量。
-	// 改 UObject 指针在 worker 线程不安全，故放在游戏线程；须在 CaptureSnapshot 之后调用
-	// （CurrentFoot 已在快照中解析完毕）。
+	// 降级路径：管线未驱动（编辑器预览等场景），走默认抓取
+	CaptureSnapshot();
 	RefreshOneShotAssets();
+}
+
+void UNTEAnimInstance::PipelineDrive()
+{
+	CaptureSnapshot();
+	RefreshOneShotAssets();
+	bDrivenByPipeline = true;
 }
 
 void UNTEAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
@@ -96,15 +105,6 @@ void UNTEAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
 
 	// worker 线程每帧更新：只读快照，计算数值型输出变量
 	UpdateOutputs(DeltaSeconds);
-}
-
-// ============================================================================
-// Push Interface（游戏线程，外部系统每帧调用）
-// ============================================================================
-
-void UNTEAnimInstance::SetAnimRuntimeData(const FAnimRuntimeData& InData)
-{
-	StoredRuntimeData = InData;
 }
 
 // ============================================================================
@@ -170,90 +170,11 @@ void UNTEAnimInstance::CaptureSnapshot()
 	// 查询失败/无 marker 时相位保持 0（降级），下游 QueryCurrentFoot 据此返回 Left，不崩溃。
 	Src.LocomotionPhase = GetLocomotionSyncPhase();
 
-	// Copy stored RuntimeData into source data for BuildSnapshot
-	Src.bEntryMovingOrNotMoving = StoredRuntimeData.bEntryMovingOrNotMoving;
-	Src.bSkillInterruptMove     = StoredRuntimeData.bSkillInterruptMove;
-	Src.bIsPatrolMoveAnim       = StoredRuntimeData.bIsPatrolMoveAnim;
-	Src.bIsPatrolState          = StoredRuntimeData.bIsPatrolState;
-	Src.bIsCanRunStop           = StoredRuntimeData.bIsCanRunStop;
-	Src.bShouldMove             = StoredRuntimeData.bShouldMove;
-	Src.bIsSprintStop           = StoredRuntimeData.bIsSprintStop;
-	Src.bNeedMotionMatching     = StoredRuntimeData.bNeedMotionMatching;
-	Src.bIsLeftFootC            = StoredRuntimeData.bIsLeftFootC;
-	Src.bNotMovingToMoving      = StoredRuntimeData.bNotMovingToMoving;
-	Src.bIsHasInStandIdlePose   = StoredRuntimeData.bIsHasInStandIdlePose;
-	Src.bMovingToNotMoving      = StoredRuntimeData.bMovingToNotMoving;
-	Src.bIsCanEnterMoveState    = StoredRuntimeData.bIsCanEnterMoveState;
-	Src.bIsHoldingHands         = StoredRuntimeData.bIsHoldingHands;
-	Src.bIsIgnoreMoveInput      = StoredRuntimeData.bIsIgnoreMoveInput;
-	Src.Gait                    = StoredRuntimeData.Gait;
-	Src.VelocityLength          = StoredRuntimeData.VelocityLength;
-	Src.LastInputDirectionAngle = StoredRuntimeData.LastInputDirectionAngle;
-
-	// ---- 顶层决策补全字段（Layer 1 Main / Layer 2 Grounded / MM / IK）----
-	// 将 StoredRuntimeData 中运行时推入的新字段填入 FAnimSourceData，经 BuildSnapshot 传播进 Snap。
-	// 绝大多数字段当前无确认外部来源，保持 SetAnimRuntimeData 推入值（默认安全降级）。
-
-	// 整型/枚举状态字段（int32）
-	Src.MoveAnimState        = StoredRuntimeData.MoveAnimState;
-	Src.VinesSubAnimState    = StoredRuntimeData.VinesSubAnimState;
-	Src.JumpCurrentCount     = StoredRuntimeData.JumpCurrentCount;
-	Src.GroundAnimState      = StoredRuntimeData.GroundAnimState;
-	Src.VaultSubState        = StoredRuntimeData.VaultSubState;
-
-	// 浮点字段
-	Src.Velocity2DLength     = StoredRuntimeData.Velocity2DLength;
-
-	// Main 层布尔字段
-	Src.bUseJumpTakeOff      = StoredRuntimeData.bUseJumpTakeOff;
-	Src.bSecondJump          = StoredRuntimeData.bSecondJump;
-	Src.bForceJump           = StoredRuntimeData.bForceJump;
-	Src.bWantsToLeaveGround  = StoredRuntimeData.bWantsToLeaveGround;
-	Src.bWantsAirAction      = StoredRuntimeData.bWantsAirAction;
-	Src.bIsLanding           = StoredRuntimeData.bIsLanding;
-	Src.bJumpApexReached     = StoredRuntimeData.bJumpApexReached;
-	Src.bOnVines             = StoredRuntimeData.bOnVines;
-	Src.bVaultTriggered      = StoredRuntimeData.bVaultTriggered;
-	Src.bStartedDriving      = StoredRuntimeData.bStartedDriving;
-	Src.bReturnToGround      = StoredRuntimeData.bReturnToGround;
-	Src.bCanDoubleJump       = StoredRuntimeData.bCanDoubleJump;
-	Src.bSpecialModeInAir    = StoredRuntimeData.bSpecialModeInAir;
-	Src.bLeaveVines          = StoredRuntimeData.bLeaveVines;
-	Src.bVinesAnimComplete   = StoredRuntimeData.bVinesAnimComplete;
-	Src.bVaultExitCondition  = StoredRuntimeData.bVaultExitCondition;
-	Src.bStopGliding         = StoredRuntimeData.bStopGliding;
-	Src.bLanding             = StoredRuntimeData.bLanding;
-	Src.bForceExitGliding    = StoredRuntimeData.bForceExitGliding;
-	Src.bResumeGliding       = StoredRuntimeData.bResumeGliding;
-	Src.bLeaveWater          = StoredRuntimeData.bLeaveWater;
-	Src.bStopDriving         = StoredRuntimeData.bStopDriving;
-
-	// Main 层 provisional ⚠️ 待验证布尔字段
-	Src.bCoyoteTimeJump      = StoredRuntimeData.bCoyoteTimeJump;
-	Src.bEnteredFromAir      = StoredRuntimeData.bEnteredFromAir;
-	Src.bTakeOffComplete     = StoredRuntimeData.bTakeOffComplete;
-	Src.bCancelJump          = StoredRuntimeData.bCancelJump;
-	Src.bTransitionComplete  = StoredRuntimeData.bTransitionComplete;
-
-	// Grounded 层布尔字段
-	Src.bCanStayingTheGround = StoredRuntimeData.bCanStayingTheGround;
-	Src.bIsPlayingAnyMontage = StoredRuntimeData.bIsPlayingAnyMontage;
-	Src.bIsGlidingLanded     = StoredRuntimeData.bIsGlidingLanded;
-	Src.VaultEndToStopL      = StoredRuntimeData.VaultEndToStopL;
-	Src.VaultEndToStopR      = StoredRuntimeData.VaultEndToStopR;
-
-	// MM/IK 层布尔字段
-	Src.bForceExitMotionMatching = StoredRuntimeData.bForceExitMotionMatching;
-	Src.bMotionMatchComplete     = StoredRuntimeData.bMotionMatchComplete;
-	Src.bMotionMatchActive       = StoredRuntimeData.bMotionMatchActive;
-	Src.bFullBodyIKNeeded        = StoredRuntimeData.bFullBodyIKNeeded;
-
 	// ============================================================
 	// 地面移动层（LocomotionStatesMachine）数据补全
-	// 这些标志原靠外部 SetAnimRuntimeData 推入（无来源→恒 false，导致除 NotMoving/Moving
-	// 外的状态永远进不去）。此处按分类就地计算：
+	// 按分类就地计算：
 	//   A类·映射现有移动数据；B类·动画层自算（基于移动意图 + 1 帧滞后）。
-	//   C/D类（牵手/忽略输入/技能打断/MM/巡逻）保持外部默认值（无需求时恒 false）。
+	//   C/D类（牵手/忽略输入/技能打断/MM/巡逻）保持默认值（无需求时恒 false）。
 	// ============================================================
 	{
 		const bool bWant = Src.bWantMove;
@@ -527,7 +448,7 @@ FAnimSnapshot UNTEAnimInstance::BuildSnapshot(const FAnimSourceData& InSource)
 	Snapshot.DesiredGait = InSource.DesiredGait;
 	Snapshot.CurrentFoot = InSource.CurrentFoot;
 
-	// ---- FAnimRuntimeData extension (Layer 3+ decision data) ----
+	// ---- 地面移动层决策数据 ----
 	Snapshot.bEntryMovingOrNotMoving = InSource.bEntryMovingOrNotMoving;
 	Snapshot.bSkillInterruptMove     = InSource.bSkillInterruptMove;
 	Snapshot.bIsPatrolMoveAnim       = InSource.bIsPatrolMoveAnim;
@@ -549,9 +470,6 @@ FAnimSnapshot UNTEAnimInstance::BuildSnapshot(const FAnimSourceData& InSource)
 
 	// ---- 顶层决策补全扩展（Layer 1 Main / Layer 2 Grounded / MM / IK） ----
 	// 整型/枚举状态字段
-	Snapshot.MoveAnimState           = InSource.MoveAnimState;
-	Snapshot.VinesSubAnimState       = InSource.VinesSubAnimState;
-	Snapshot.JumpCurrentCount        = InSource.JumpCurrentCount;
 	Snapshot.GroundAnimState         = InSource.GroundAnimState;
 	Snapshot.VaultSubState           = InSource.VaultSubState;
 

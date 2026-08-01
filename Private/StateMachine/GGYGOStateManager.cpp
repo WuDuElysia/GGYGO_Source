@@ -4,20 +4,13 @@
  */
 #include "StateMachine/GGYGOStateManager.h"
 #include "StateMachine/CharacterState.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 #include "GameplayEffect.h"
 
 // 所有具体状态头文件
 #include "StateMachine/State/IdleState.h"
 #include "StateMachine/State/MovingState.h"
-#include "StateMachine/State/InAirState.h"
-#include "StateMachine/State/AttackingState.h"
-#include "StateMachine/State/DodgingState.h"
-#include "StateMachine/State/HitStunState.h"
-#include "StateMachine/State/StunnedState.h"
-#include "StateMachine/State/DeadState.h"
-#include "StateMachine/State/InteractingState.h"
 
 // ============================================================
 // 构造 / 析构
@@ -43,13 +36,6 @@ void FGYGOStateManager::Init(FRuntimeData& InRuntimeData, UDataTable* InRelation
 
 	RegisterState<FIdleState>(ECharacterStateType::Idle);
 	RegisterState<FMovingState>(ECharacterStateType::Moving);
-	RegisterState<FInAirState>(ECharacterStateType::InAir);
-	RegisterState<FAttackingState>(ECharacterStateType::Attacking);
-	RegisterState<FDodgingState>(ECharacterStateType::Dodging);
-	RegisterState<FHitStunState>(ECharacterStateType::HitStun);
-	RegisterState<FStunnedState>(ECharacterStateType::Stunned);
-	RegisterState<FDeadState>(ECharacterStateType::Dead);
-	RegisterState<FInteractingState>(ECharacterStateType::Interacting);
 
 	// ---- 加载关系矩阵 ----
 	LoadRelationMatrix(InRelationTable);
@@ -150,10 +136,13 @@ bool FGYGOStateManager::ReleaseState(ECharacterStateType StateType)
 
 	DeactivateState(Found->Get());
 
-	// ★ 统一在操作完成后写入最终值
+	// ★ 统一在操作完成后写入最终值，并同步动画数据。
 	if (RuntimeData)
 	{
-		RuntimeData->CurrentState = (ActiveStates.Num() > 0) ? CachedPrimaryState : ECharacterStateType::Idle;
+		const ECharacterStateType FinalState =
+			(ActiveStates.Num() > 0) ? CachedPrimaryState : ECharacterStateType::Idle;
+		RuntimeData->CurrentState = FinalState;
+		RuntimeData->AnimData.CurrentState = FinalState;
 	}
 
 	return true;
@@ -319,101 +308,10 @@ void FGYGOStateManager::BuildDefaultRelationMatrix()
 	// ===== Idle =====
 	Add(ST::Idle,       ST::Idle,     RT::Blocked);
 	Add(ST::Idle,       ST::Moving,   RT::Interrupted);
-	Add(ST::Idle,       ST::InAir,    RT::Interrupted);
-	Add(ST::Idle,       ST::Attacking,RT::Interrupted);
-	Add(ST::Idle,       ST::Dodging,  RT::Interrupted);
-	Add(ST::Idle,       ST::HitStun,  RT::Interrupted);
-	Add(ST::Idle,       ST::Stunned,  RT::Interrupted);
-	Add(ST::Idle,       ST::Dead,     RT::Interrupted);
-	Add(ST::Idle,       ST::Interacting, RT::Interrupted);
 
 	// ===== Moving =====
 	Add(ST::Moving,     ST::Idle,     RT::Interrupted);
 	Add(ST::Moving,     ST::Moving,   RT::Blocked);
-	Add(ST::Moving,     ST::InAir,    RT::Interrupted);
-	Add(ST::Moving,     ST::Attacking,RT::Interrupted);
-	Add(ST::Moving,     ST::Dodging,  RT::Interrupted);
-	Add(ST::Moving,     ST::HitStun,  RT::Interrupted);
-	Add(ST::Moving,     ST::Stunned,  RT::Interrupted);
-	Add(ST::Moving,     ST::Dead,     RT::Interrupted);
-	Add(ST::Moving,     ST::Interacting, RT::Blocked);
-
-	// ===== InAir =====
-	Add(ST::InAir,      ST::Idle,     RT::Interrupted);
-	Add(ST::InAir,      ST::Moving,   RT::Interrupted);
-	Add(ST::InAir,      ST::InAir,    RT::Blocked);
-	Add(ST::InAir,      ST::Attacking,RT::Interrupted);
-	Add(ST::InAir,      ST::Dodging,  RT::Blocked);
-	Add(ST::InAir,      ST::HitStun,  RT::Interrupted);
-	Add(ST::InAir,      ST::Stunned,  RT::Interrupted);
-	Add(ST::InAir,      ST::Dead,     RT::Interrupted);
-	Add(ST::InAir,      ST::Interacting, RT::Blocked);
-
-	// ===== Attacking =====
-	Add(ST::Attacking,  ST::Idle,     RT::Independent);
-	Add(ST::Attacking,  ST::Moving,   RT::Blocked);
-	Add(ST::Attacking,  ST::InAir,    RT::Blocked);
-	Add(ST::Attacking,  ST::Attacking,RT::Blocked);
-	Add(ST::Attacking,  ST::Dodging,  RT::Blocked);
-	Add(ST::Attacking,  ST::HitStun,  RT::Interrupted);
-	Add(ST::Attacking,  ST::Stunned,  RT::Interrupted);
-	Add(ST::Attacking,  ST::Dead,     RT::Interrupted);
-	Add(ST::Attacking,  ST::Interacting, RT::Blocked);
-
-	// ===== Dodging =====
-	Add(ST::Dodging,    ST::Idle,     RT::Independent);
-	Add(ST::Dodging,    ST::Moving,   RT::Blocked);
-	Add(ST::Dodging,    ST::InAir,    RT::Blocked);
-	Add(ST::Dodging,    ST::Attacking,RT::Blocked);
-	Add(ST::Dodging,    ST::Dodging,  RT::Blocked);
-	Add(ST::Dodging,    ST::HitStun,  RT::Interrupted);
-	Add(ST::Dodging,    ST::Stunned,  RT::Interrupted);
-	Add(ST::Dodging,    ST::Dead,     RT::Interrupted);
-	Add(ST::Dodging,    ST::Interacting, RT::Blocked);
-
-	// ===== HitStun =====
-	Add(ST::HitStun,    ST::Idle,     RT::Blocked);
-	Add(ST::HitStun,    ST::Moving,   RT::Blocked);
-	Add(ST::HitStun,    ST::InAir,    RT::Blocked);
-	Add(ST::HitStun,    ST::Attacking,RT::Blocked);
-	Add(ST::HitStun,    ST::Dodging,  RT::Blocked);
-	Add(ST::HitStun,    ST::HitStun,  RT::Independent);
-	Add(ST::HitStun,    ST::Stunned,  RT::Interrupted);
-	Add(ST::HitStun,    ST::Dead,     RT::Interrupted);
-	Add(ST::HitStun,    ST::Interacting, RT::Blocked);
-
-	// ===== Stunned =====
-	Add(ST::Stunned,    ST::Idle,     RT::Blocked);
-	Add(ST::Stunned,    ST::Moving,   RT::Blocked);
-	Add(ST::Stunned,    ST::InAir,    RT::Blocked);
-	Add(ST::Stunned,    ST::Attacking,RT::Blocked);
-	Add(ST::Stunned,    ST::Dodging,  RT::Blocked);
-	Add(ST::Stunned,    ST::HitStun,  RT::Blocked);
-	Add(ST::Stunned,    ST::Stunned,  RT::Blocked);
-	Add(ST::Stunned,    ST::Dead,     RT::Interrupted);
-	Add(ST::Stunned,    ST::Interacting, RT::Blocked);
-
-	// ===== Dead =====
-	Add(ST::Dead,       ST::Idle,     RT::Interrupted);
-	Add(ST::Dead,       ST::Moving,   RT::Interrupted);
-	Add(ST::Dead,       ST::InAir,    RT::Interrupted);
-	Add(ST::Dead,       ST::Attacking,RT::Interrupted);
-	Add(ST::Dead,       ST::Dodging,  RT::Interrupted);
-	Add(ST::Dead,       ST::HitStun,  RT::Interrupted);
-	Add(ST::Dead,       ST::Stunned,  RT::Interrupted);
-	Add(ST::Dead,       ST::Dead,     RT::Blocked);
-	Add(ST::Dead,       ST::Interacting, RT::Interrupted);
-
-	// ===== Interacting =====
-	Add(ST::Interacting,ST::Idle,     RT::Independent);
-	Add(ST::Interacting,ST::Moving,   RT::Blocked);
-	Add(ST::Interacting,ST::InAir,    RT::Blocked);
-	Add(ST::Interacting,ST::Attacking,RT::Blocked);
-	Add(ST::Interacting,ST::Dodging,  RT::Blocked);
-	Add(ST::Interacting,ST::HitStun,  RT::Interrupted);
-	Add(ST::Interacting,ST::Stunned,  RT::Interrupted);
-	Add(ST::Interacting,ST::Dead,     RT::Interrupted);
-	Add(ST::Interacting,ST::Interacting,RT::Blocked);
 }
 
 // ============================================================
@@ -484,8 +382,9 @@ void FGYGOStateManager::ActivateState(FCharacterState* State)
 	// 6. 更新 PrimaryState（必须在写 CurrentState 之前）
 	UpdatePrimaryState();
 
-	// 7. 更新 RuntimeData.CurrentState（供 AnimBP / UI 只读）
+	// 7. 状态机同时写逻辑状态和动画状态，保持同源、同帧。
 	RuntimeData->CurrentState = CachedPrimaryState;
+	RuntimeData->AnimData.CurrentState = CachedPrimaryState;
 }
 
 void FGYGOStateManager::DeactivateState(FCharacterState* State)
@@ -541,7 +440,6 @@ void FGYGOStateManager::ApplyLimitFlags(int32 LimitFlags)
 	RuntimeData->bBlockMove    = !!(LimitFlags & (1 << 0));
 	RuntimeData->bBlockAttack  = !!(LimitFlags & (1 << 1));
 	RuntimeData->bBlockDodge   = !!(LimitFlags & (1 << 2));
-	RuntimeData->bBlockInput   = !!(LimitFlags & (1 << 4));
 }
 
 // ============================================================

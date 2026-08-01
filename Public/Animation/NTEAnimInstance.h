@@ -104,7 +104,7 @@ struct FAnimSnapshot
 	/** 当前支撑脚 ← QueryCurrentFoot()（由 LocomotionPhase 推导） */
 	EAnimFoot CurrentFoot = EAnimFoot::Left;
 
-	// ---- FAnimRuntimeData extension (Layer 3+ decision data) ----
+	// ---- 地面移动层决策数据 ----
 
 	bool bEntryMovingOrNotMoving = false;
 	bool bSkillInterruptMove = false;
@@ -323,7 +323,7 @@ struct FAnimSourceData
 	/** 当前支撑脚 */
 	EAnimFoot CurrentFoot = EAnimFoot::Left;
 
-	// ---- FAnimRuntimeData extension (Layer 3+ decision data) ----
+	// ---- 地面移动层决策数据 ----
 
 	bool bEntryMovingOrNotMoving = false;
 	bool bSkillInterruptMove = false;
@@ -532,6 +532,14 @@ public:
 	 * @param DeltaSeconds 本帧时间增量（秒）
 	 */
 	virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
+
+	/**
+	 * 管线主动驱动（BaseCharacter::Tick 末尾调用）
+	 *
+	 * 在逻辑管线全部完成之后，显式抓取快照并刷新一次性资产。
+	 * 此后引擎调 NativeUpdateAnimation 时检测到标记，跳过重复工作。
+	 */
+	void PipelineDrive();
 
 	// ============================================================
 	// 决策函数 — 第1层 MainMovement（顶层运动模式路由）
@@ -1438,17 +1446,6 @@ public:
 	void OnEnterState(FName InStateName);
 
 	// ============================================================
-	// Push Interface — 运行时数据注入（外部系统每帧调用）
-	// ============================================================
-
-	/**
-	 * 外部系统每帧调用，推入运行时动画数据。
-	 * 游戏线程调用；数据在下一次 CaptureSnapshot 时写入快照。
-	 */
-	UFUNCTION(BlueprintCallable, Category = "Runtime")
-	void SetAnimRuntimeData(const FAnimRuntimeData& InData);
-
-	// ============================================================
 	// 查询辅助（蓝图可读）
 	// ============================================================
 
@@ -1570,11 +1567,11 @@ private:
 	/** 所属角色弱引用（只在游戏线程访问） */
 	TWeakObjectPtr<ABaseCharacter> Owner;
 
+	/** 本帧已由管线驱动过（NativeUpdateAnimation 跳过重复工作） */
+	bool bDrivenByPipeline = false;
+
 	/** 当前动画状态名（由 OnEnterState 写入，仅用于调试屏显） */
 	FName CurrentAnimStateName = FName("?");
-
-	/** 存储外部推入的运行时数据（游戏线程写入，CaptureSnapshot 读取） */
-	FAnimRuntimeData StoredRuntimeData;
 
 	/** 上一帧的移动意图（用于地面移动层"动画自算"标志的 1 帧滞后：如 bIsHasInStandIdlePose/bIsCanRunStop） */
 	bool bPrevWantMove = false;

@@ -4,7 +4,7 @@
  */
 #include "Pipeline/Intents/DodgeIntentProcessor.h"
 #include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 
 void FDodgeIntentProcessor::Process(const FInputData& InputData, FRuntimeData& RuntimeData)
 {

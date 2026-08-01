@@ -61,7 +61,7 @@
  */
 #include "Pipeline/Intents/LocomotionIntentProcessor.h"
 #include "Data/InputData.h"
-#include "Data/RuntimeData.h"
+#include "Data/Logic/RuntimeData.h"
 
 void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeData& RuntimeData)
 {
@@ -73,10 +73,17 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 	// 此时不进入任何步态解析逻辑，ResolvedGait=None
 	// AnimInstance 见 None 不会触发步态切换（见 Moving 阶段逻辑）
 	// ------------------------------------------------------------
+	// 冲刺分流是帧级动画触发开关，每帧先清零，再由本帧步态解析重新设置。
+	RuntimeData.AnimData.bSprintTrigger = false;
+
 	if (MoveInput.IsNearlyZero())
 	{
 		RuntimeData.DesiredWorldMoveDir = FVector::ZeroVector;
 		RuntimeData.ResolvedGait = EMovementGait::None;
+
+		// 动画意图与逻辑意图在同一处理阶段同步写入。
+		RuntimeData.AnimData.bShouldMove = false;
+		RuntimeData.AnimData.Gait = EMovementGait::None;
 		return;
 	}
 
@@ -104,13 +111,6 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 
 	// 归一化后写入期望方向（单位向量）
 	RuntimeData.DesiredWorldMoveDir = WorldDir.GetSafeNormal();
-
-	// ------------------------------------------------------------
-	// 保留原始意图（兼容旧消费者）
-	// 这些 bool 标志是"玩家想要什么"，未经速度仲裁
-	// ------------------------------------------------------------
-	RuntimeData.bWantsToSprint    = InputData.CurrentFrame.bSprintHeld;
-	RuntimeData.bWantsToForceWalk = InputData.CurrentFrame.bForceWalkHeld;
 
 	// ============================================================
 	// ★ 步态解析核心（统一逻辑）
@@ -177,4 +177,10 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 			Spd, StickMag, RuntimeData.GaitThresholds.Walk,
 			RuntimeData.ResolvedGait == EMovementGait::Run ? TEXT("Run") : TEXT("Walk"));
 	}
+
+	// 动画意图在解析逻辑意图的同时写入，避免后续再从顶层字段重复投影。
+	RuntimeData.AnimData.bShouldMove = !RuntimeData.DesiredWorldMoveDir.IsNearlyZero();
+	RuntimeData.AnimData.Gait = RuntimeData.ResolvedGait;
+	RuntimeData.AnimData.bSprintTrigger =
+		RuntimeData.ResolvedGait == EMovementGait::Sprint;
 }

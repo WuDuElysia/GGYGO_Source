@@ -34,9 +34,6 @@ float UCharConfigData::GetPlayRateForState(ECharacterStateType State) const
 	{
 	case ECharacterStateType::Idle:
 	case ECharacterStateType::Moving:
-	case ECharacterStateType::InAir:
-	case ECharacterStateType::Stunned:
-	case ECharacterStateType::Interacting:
 		return LoopAnimPlayRate;
 
 	default:

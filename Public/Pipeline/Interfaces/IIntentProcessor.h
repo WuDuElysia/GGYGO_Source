@@ -20,7 +20,7 @@ public:
 	/**
 	 * 每帧处理意图
 	 * @param InputData  输入数据（只读，由 InputPipeline 写入）
-	 * @param RuntimeData 运行时黑板（写入意图字段）
+	 * @param RuntimeData 运行时黑板（写入意图字段，含 AnimData 子结构）
 	 */
 	virtual void Process(const FInputData& InputData, FRuntimeData& RuntimeData) = 0;
 };
