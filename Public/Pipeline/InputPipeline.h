@@ -8,7 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Data/InputData.h"
+#include "Data/Input/InputData.h"
 
 class FInputPipeline
 {

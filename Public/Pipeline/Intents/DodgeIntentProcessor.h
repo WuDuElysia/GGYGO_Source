@@ -2,7 +2,7 @@
  * @file DodgeIntentProcessor.h
  * @brief 闪避意图处理器
  *
- * 闪避键缓冲（由 InputPipeline 维护）→ bWantsToDodge。
+ * 闪避键缓冲（由 InputPipeline 维护）→ RuntimeData.Intent.bWantsToDodge。
  */
 #pragma once
 

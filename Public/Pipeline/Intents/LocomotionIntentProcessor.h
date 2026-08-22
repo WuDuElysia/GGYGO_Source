@@ -1,9 +1,9 @@
 /**
  * @file LocomotionIntentProcessor.h
- * @brief 移动意图处理器
+ * @brief 移动方向意图处理器
  *
- * 摇杆/WASD 输入 → 结合 ControlRotation → 世界空间方向 DesiredWorldMoveDir。
- * 依赖 ViewRotationProcessor 先写入 ControlRotation。
+ * 仅负责将输入方向转换为世界空间的 RuntimeData.Intent.DesiredWorldMoveDir，并同步
+ * RuntimeData.ZZZAnim.bShouldMove；步态解析由 Gait_Authority 独立负责。
  */
 #pragma once
 

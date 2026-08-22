@@ -9,12 +9,20 @@
 
 #include "Pipeline/Interfaces/IParameterProcessor.h"
 
+class ACharacter;
+
 class FMovementParameterProcessor : public IParameterProcessor
 {
 public:
+	/** 注入角色朝向，用于计算相对 Actor 的动画移动 XY。 */
+	void Init(ACharacter* InOwner);
+
 	virtual void Process(FRuntimeData& RuntimeData, float DeltaTime) override;
 
 private:
+	/** 所属角色；非拥有，仅用于读取当前水平朝向。 */
+	ACharacter* Owner = nullptr;
+
 	/** 平滑插值速度（越大越快到达目标值） */
 	float SmoothSpeed = 8.0f;
 

@@ -2,8 +2,8 @@
  * @file PlayerCharacter.h
  * @brief 玩家角色 - 输入绑定和摄像机控制
  *
- * 负责接收 Enhanced Input 回调，将原始输入传给 InputPipeline。
- * 不再直接操作移动系统，所有输入只写 InputPipeline。
+ * 负责接收 Enhanced Input 回调，通过 BaseCharacter 输入门面传给运行时宿主。
+ * 不直接操作移动系统或纯 C++ InputPipeline。
  */
 
 #pragma once
@@ -63,13 +63,13 @@ protected:
 	// 输入回调
 	// ============================================================
 
-	/** 移动输入回调，写入 InputPipeline */
+	/** 移动输入回调，通过 BaseCharacter 输入门面转发。 */
 	void OnMoveInput(const FInputActionValue& Value);
 
-	/** 移动输入松开回调，通知 InputPipeline 清零 */
+	/** 移动输入松开回调，通过 BaseCharacter 输入门面清零。 */
 	void OnMoveCompleted(const FInputActionValue& Value);
 
-	/** 视角输入回调，写入 InputPipeline */
+	/** 视角输入回调。 */
 	void OnLookInput(const FInputActionValue& Value);
 
 	/** 冲刺按住/松开 */

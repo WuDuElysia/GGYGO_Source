@@ -4,7 +4,7 @@
  */
 #include "StateMachine/GGYGOStateManager.h"
 #include "StateMachine/CharacterState.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 #include "GameplayEffect.h"
 
@@ -59,7 +59,18 @@ void FGYGOStateManager::InitASC(UAbilitySystemComponent* InASC)
 
 void FGYGOStateManager::Update(float DeltaTime)
 {
-	if (!RuntimeData) return;
+	Update(DeltaTime, LastUpdateResult);
+}
+
+void FGYGOStateManager::Update(float DeltaTime, FStateUpdateResult& OutResult)
+{
+	BeginUpdateResult(OutResult);
+
+	if (!RuntimeData)
+	{
+		FinishUpdateResult(OutResult);
+		return;
+	}
 
 	// 遍历副本（状态内部可能调 RequestState 改变 ActiveStates）
 	TArray<FCharacterState*> ActiveSnapshot;
@@ -72,6 +83,46 @@ void FGYGOStateManager::Update(float DeltaTime)
 			State->Update(DeltaTime, *RuntimeData, *this);
 		}
 	}
+
+	FinishUpdateResult(OutResult);
+}
+
+void FGYGOStateManager::BeginUpdateResult(FStateUpdateResult& OutResult)
+{
+	OutResult.Reset(CachedPrimaryState);
+	ActiveUpdateResult = &OutResult;
+}
+
+void FGYGOStateManager::FinishUpdateResult(FStateUpdateResult& OutResult)
+{
+	OutResult.CurrentPrimaryState = CachedPrimaryState;
+	OutResult.bStateChanged = OutResult.PreviousPrimaryState != OutResult.CurrentPrimaryState;
+	ActiveUpdateResult = nullptr;
+	LastUpdateResult = OutResult;
+}
+
+void FGYGOStateManager::RecordTransitionEvent(
+	EStateTransitionEventType EventType,
+	ECharacterStateType RequestedState,
+	ECharacterStateType PreviousPrimaryState,
+	ECharacterStateType CurrentPrimaryState,
+	bool bAccepted,
+	const TArray<ECharacterStateType>& InterruptedStates)
+{
+	if (!ActiveUpdateResult)
+	{
+		return;
+	}
+
+	FStateTransitionEvent Event;
+	Event.Type = EventType;
+	Event.RequestedState = RequestedState;
+	Event.PreviousPrimaryState = PreviousPrimaryState;
+	Event.CurrentPrimaryState = CurrentPrimaryState;
+	Event.bAccepted = bAccepted;
+	Event.bPrimaryStateChanged = PreviousPrimaryState != CurrentPrimaryState;
+	Event.InterruptedStates = InterruptedStates;
+	ActiveUpdateResult->Events.Add(MoveTemp(Event));
 }
 
 // ============================================================
@@ -80,10 +131,10 @@ void FGYGOStateManager::Update(float DeltaTime)
 
 bool FGYGOStateManager::RequestState(ECharacterStateType NewStateType)
 {
-#if !UE_BUILD_SHIPPING
 	FString NewStateName = UEnum::GetValueAsString(NewStateType);
 	NewStateName.ReplaceInline(TEXT("ECharacterStateType::"), TEXT(""));
-#endif
+	const ECharacterStateType PreviousPrimaryState = CachedPrimaryState;
+	const TArray<ECharacterStateType> NoInterruptedStates;
 
 	// 已活跃 → 不重复激活
 	if (IsInState(NewStateType))
@@ -95,6 +146,13 @@ bool FGYGOStateManager::RequestState(ECharacterStateType NewStateType)
 	TUniquePtr<FCharacterState>* Found = AllStates.Find(NewStateType);
 	if (!Found || !*Found)
 	{
+		RecordTransitionEvent(
+			EStateTransitionEventType::Rejected,
+			NewStateType,
+			PreviousPrimaryState,
+			CachedPrimaryState,
+			false,
+			NoInterruptedStates);
 		UE_LOG(LogTemp, Error, TEXT("[SM] %s NOT FOUND in AllStates!"), *NewStateName);
 		return false;
 	}
@@ -103,6 +161,13 @@ bool FGYGOStateManager::RequestState(ECharacterStateType NewStateType)
 	FRelationCheckResult Result = CheckRelations(NewStateType);
 	if (!Result.bAllowed)
 	{
+		RecordTransitionEvent(
+			EStateTransitionEventType::Rejected,
+			NewStateType,
+			PreviousPrimaryState,
+			CachedPrimaryState,
+			false,
+			NoInterruptedStates);
 #if !UE_BUILD_SHIPPING
 		UE_LOG(LogTemp, Warning, TEXT("[SM] %s BLOCKED (ActiveCount=%d)"),
 			*NewStateName, ActiveStates.Num());
@@ -110,14 +175,27 @@ bool FGYGOStateManager::RequestState(ECharacterStateType NewStateType)
 		return false;
 	}
 
-	// 先中断所有需要中断的旧状态
+	// 先中断所有需要中断的旧状态，同时把实际中断对象写入结果事件。
+	TArray<ECharacterStateType> InterruptedStateTypes;
 	for (FCharacterState* ToInterrupt : Result.StatesToInterrupt)
 	{
+		if (ToInterrupt)
+		{
+			InterruptedStateTypes.Add(ToInterrupt->GetStateType());
+		}
 		DeactivateState(ToInterrupt);
 	}
 
-	// 激活新状态
+	// 激活新状态；状态规则、Enter/Exit、GE 和 RuntimeData 同步仍由 StateManager 完成。
 	ActivateState(Found->Get());
+
+	RecordTransitionEvent(
+		EStateTransitionEventType::Activated,
+		NewStateType,
+		PreviousPrimaryState,
+		CachedPrimaryState,
+		true,
+		InterruptedStateTypes);
 
 #if !UE_BUILD_SHIPPING
 	UE_LOG(LogTemp, Log, TEXT("[SM] %s ACTIVATED (Active=%d)"),
@@ -134,16 +212,26 @@ bool FGYGOStateManager::ReleaseState(ECharacterStateType StateType)
 
 	if (!(*Found)->IsActive()) return false;
 
+	const ECharacterStateType PreviousPrimaryState = CachedPrimaryState;
 	DeactivateState(Found->Get());
 
-	// ★ 统一在操作完成后写入最终值，并同步动画数据。
+	// 统一在操作完成后写入最终值，并同步动画数据。
 	if (RuntimeData)
 	{
 		const ECharacterStateType FinalState =
 			(ActiveStates.Num() > 0) ? CachedPrimaryState : ECharacterStateType::Idle;
-		RuntimeData->CurrentState = FinalState;
-		RuntimeData->AnimData.CurrentState = FinalState;
+		RuntimeData->State.CurrentState = FinalState;
+		RuntimeData->ZZZAnim.CurrentState = FinalState;
 	}
+
+	const TArray<ECharacterStateType> NoInterruptedStates;
+	RecordTransitionEvent(
+		EStateTransitionEventType::Released,
+		StateType,
+		PreviousPrimaryState,
+		CachedPrimaryState,
+		true,
+		NoInterruptedStates);
 
 	return true;
 }
@@ -181,6 +269,8 @@ void FGYGOStateManager::ForceSetPrimaryState(ECharacterStateType NewState)
 	// 如果已经是 PrimaryState 且已活跃，跳过
 	if ((*Found)->IsActive() && CachedPrimaryState == NewState) return;
 
+	const ECharacterStateType PreviousPrimaryState = CachedPrimaryState;
+
 	// 先停用当前 Locomotion 组的所有活跃状态
 	TArray<FCharacterState*> ToDeactivate;
 	for (FCharacterState* State : ActiveStates)
@@ -198,6 +288,15 @@ void FGYGOStateManager::ForceSetPrimaryState(ECharacterStateType NewState)
 	// 激活新主状态
 	ActivateState(Found->Get());
 	CachedPrimaryState = NewState;
+
+	const TArray<ECharacterStateType> NoInterruptedStates;
+	RecordTransitionEvent(
+		EStateTransitionEventType::Forced,
+		NewState,
+		PreviousPrimaryState,
+		CachedPrimaryState,
+		true,
+		NoInterruptedStates);
 }
 
 // ============================================================
@@ -383,8 +482,8 @@ void FGYGOStateManager::ActivateState(FCharacterState* State)
 	UpdatePrimaryState();
 
 	// 7. 状态机同时写逻辑状态和动画状态，保持同源、同帧。
-	RuntimeData->CurrentState = CachedPrimaryState;
-	RuntimeData->AnimData.CurrentState = CachedPrimaryState;
+	RuntimeData->State.CurrentState = CachedPrimaryState;
+	RuntimeData->ZZZAnim.CurrentState = CachedPrimaryState;
 }
 
 void FGYGOStateManager::DeactivateState(FCharacterState* State)
@@ -407,7 +506,7 @@ void FGYGOStateManager::DeactivateState(FCharacterState* State)
 	// 4. 更新 PrimaryState（缓存层）
 	UpdatePrimaryState();
 
-	// ★ 注意：不在这里更新 RuntimeData->CurrentState
+	// ★ 注意：不在这里更新 RuntimeData->State.CurrentState
 	// CurrentState 统一由 RequestState/ReleaseState 在操作完成后写入，
 	// 避免 Deactivate→Activate 中间出现"空档期"的回退值
 }
@@ -437,9 +536,9 @@ void FGYGOStateManager::ApplyLimitFlags(int32 LimitFlags)
 {
 	if (!RuntimeData) return;
 
-	RuntimeData->bBlockMove    = !!(LimitFlags & (1 << 0));
-	RuntimeData->bBlockAttack  = !!(LimitFlags & (1 << 1));
-	RuntimeData->bBlockDodge   = !!(LimitFlags & (1 << 2));
+	RuntimeData->Arbiter.bBlockMove    = !!(LimitFlags & (1 << 0));
+	RuntimeData->Arbiter.bBlockAttack  = !!(LimitFlags & (1 << 1));
+	RuntimeData->Arbiter.bBlockDodge   = !!(LimitFlags & (1 << 2));
 }
 
 // ============================================================

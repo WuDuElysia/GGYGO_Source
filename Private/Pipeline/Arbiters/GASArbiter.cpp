@@ -11,7 +11,7 @@
  * 此处只负责将 Tag 翻译为 true。
  */
 #include "Pipeline/Arbiters/GASArbiter.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 #include "GameplayTagContainer.h"
 
@@ -38,9 +38,9 @@ void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	// ============================================================
 	if (ASC->HasMatchingGameplayTag(Tag_Dead))
 	{
-		RuntimeData.bBlockMove   = true;
-		RuntimeData.bBlockAttack = true;
-		RuntimeData.bBlockDodge  = true;
+		RuntimeData.Arbiter.bBlockMove   = true;
+		RuntimeData.Arbiter.bBlockAttack = true;
+		RuntimeData.Arbiter.bBlockDodge  = true;
 		return; // 死亡是最高优先级，不再检查其他
 	}
 
@@ -49,9 +49,9 @@ void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	// ============================================================
 	if (ASC->HasMatchingGameplayTag(Tag_Stunned))
 	{
-		RuntimeData.bBlockMove   = true;
-		RuntimeData.bBlockAttack = true;
-		RuntimeData.bBlockDodge  = true;
+		RuntimeData.Arbiter.bBlockMove   = true;
+		RuntimeData.Arbiter.bBlockAttack = true;
+		RuntimeData.Arbiter.bBlockDodge  = true;
 		// 眩晕不阻断输入处理，只是禁止动作执行
 		// （与 GE_BlockAll 的 LimitFlags 不同，这里只设动作标记）
 	}
@@ -63,19 +63,19 @@ void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	// ============================================================
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantMove))
-		RuntimeData.bBlockMove = true;
+		RuntimeData.Arbiter.bBlockMove = true;
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantAttack))
-		RuntimeData.bBlockAttack = true;
+		RuntimeData.Arbiter.bBlockAttack = true;
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantDodge))
-		RuntimeData.bBlockDodge = true;
+		RuntimeData.Arbiter.bBlockDodge = true;
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantJump))
 	{
 		// CantJump 目前没有独立的 RuntimeData 字段，
 		// 通过 bBlockMove 间接禁止跳跃（MotionDriver 层判断）
-		RuntimeData.bBlockMove = true;
+		RuntimeData.Arbiter.bBlockMove = true;
 	}
 
 	if (ASC->HasMatchingGameplayTag(Tag_CantInput))

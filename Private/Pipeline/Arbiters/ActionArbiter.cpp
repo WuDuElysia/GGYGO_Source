@@ -6,7 +6,7 @@
  * GAS 接入后在此处实现攻击/闪避的优先级判断。
  */
 #include "Pipeline/Arbiters/ActionArbiter.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 
 void FActionArbiter::Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM)
 {

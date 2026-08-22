@@ -2,7 +2,7 @@
  * @file ViewRotationProcessor.h
  * @brief 视角旋转处理器
  *
- * 鼠标/摇杆增量 → AddControllerYawInput/PitchInput → 写入 ControlRotation。
+ * 鼠标/摇杆增量 → AddControllerYawInput/PitchInput → 写入 RuntimeData.View.ControlRotation。
  * 必须在 LocomotionIntentProcessor 之前执行（后者依赖 ControlRotation）。
  * 需要 ACharacter 指针，通过 Init 注入，UObject 生命周期由 GC 管理所以用指针。
  */

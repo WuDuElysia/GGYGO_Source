@@ -8,6 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Pipeline/Gait/GaitAuthorityProcessor.h"
 #include "Pipeline/Interfaces/IIntentProcessor.h"
 #include "Pipeline/Interfaces/IParameterProcessor.h"
 
@@ -33,15 +34,29 @@ public:
 	void ProcessIntents(const FInputData& InputData, FRuntimeData& RuntimeData);
 
 	/**
+	 * 执行步态决策阶段（Tick 第 3.5 步）
+	 * 前置条件: ProcessIntents() 已执行；必须早于 ProcessParameters()、MotionDriver 与动画驱动
+	 */
+	void ProcessGait(const FInputData& InputData, FRuntimeData& RuntimeData, float DeltaTime);
+
+	/**
 	 * 执行所有参数处理器（Tick 第 4 步）
 	 * 前置条件: ProcessIntents() 已执行
 	 */
 	void ProcessParameters(FRuntimeData& RuntimeData, float DeltaTime);
-
 private:
 	/** 意图处理器列表（按执行顺序） */
 	TArray<TUniquePtr<IIntentProcessor>> IntentProcessors;
 
 	/** 参数处理器列表（按执行顺序） */
 	TArray<TUniquePtr<IParameterProcessor>> ParameterProcessors;
+
+	/** 步态决策者：具名成员，不加入任何处理器数组。 */
+	FGaitAuthorityProcessor GaitAuthority;
+
+	/** 最近一次成功执行步态阶段的引擎帧号。 */
+	uint64 LastGaitFrameCounter = 0;
+
+	/** 看门狗诊断节流：步态阶段恢复执行后复位。 */
+	bool bGaitStageMissReported = false;
 };

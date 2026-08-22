@@ -52,7 +52,7 @@ void APlayerCharacter::SetupPlayerInputComponent(
 		// 按住时每帧触发
 		EIC->BindAction(IA_Move, ETriggerEvent::Triggered,
 			this, &APlayerCharacter::OnMoveInput);
-		// 松开时触发，通知 InputPipeline 清零
+		// 松开时触发，通知 BaseCharacter 输入门面清零
 		EIC->BindAction(IA_Move, ETriggerEvent::Completed,
 			this, &APlayerCharacter::OnMoveCompleted);
 	}
@@ -86,7 +86,7 @@ void APlayerCharacter::SetupPlayerInputComponent(
 void APlayerCharacter::OnMoveInput(const FInputActionValue& Value)
 {
 	FVector2D Input = Value.Get<FVector2D>();
-	InputPipeline->SetMoveInput(Input);
+	SetMoveInput(Input);
 
 #if !UE_BUILD_SHIPPING
 	if (GEngine)
@@ -99,21 +99,21 @@ void APlayerCharacter::OnMoveInput(const FInputActionValue& Value)
 
 void APlayerCharacter::OnMoveCompleted(const FInputActionValue& Value)
 {
-	InputPipeline->ClearMoveInput();
+	ClearMoveInput();
 }
 
 void APlayerCharacter::OnLookInput(const FInputActionValue& Value)
 {
 	FVector2D Input = Value.Get<FVector2D>();
-	InputPipeline->SetLookInput(Input);
+	SetLookInput(Input);
 }
 
 void APlayerCharacter::OnSprintInput(const FInputActionValue& Value)
 {
-	InputPipeline->SetSprintHeld(Value.Get<bool>());
+	SetSprintHeld(Value.Get<bool>());
 }
 
 void APlayerCharacter::OnForceWalkInput(const FInputActionValue& Value)
 {
-	InputPipeline->SetForceWalkHeld(Value.Get<bool>());
+	SetForceWalkHeld(Value.Get<bool>());
 }

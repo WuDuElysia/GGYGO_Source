@@ -3,30 +3,22 @@
  * @brief 所有角色的基类 - 管线时序分发中心 + GAS 宿主
  *
  * 职责：
- * 1. 创建所有子系统（管线、状态机、驱动）并在 Tick 中按严格时序分发
+ * 1. 托管运行时宿主组件，并保留唯一的 Tick 时序入口
  * 2. 托管 AbilitySystemComponent 和 AttributeSet（GAS 中枢）
  * 3. 实现 IAbilitySystemInterface，让外部系统通过 GAS API 找到 ASC
  *
- * 不包含具体游戏逻辑，只做组件整合和时序控制。
+ * 纯 C++ 管线、状态机和驱动由 UGGYGOCharacterRuntimeComponent 持有；
+ * 本类只做 Unreal 对象整合、输入门面和时序入口。
  */
 #pragma once
 
 #include "CoreMinimal.h"
 #include "GameFramework/Character.h"
 #include "AbilitySystemInterface.h"
-#include "Drivers/MotionDriver.h"
-
-#include "Data/InputData.h"
-#include "Data/Logic/RuntimeData.h"       // 逻辑运行时数据（含 AnimData 子结构）
-#include "Data/UCharConfigData.h"
-
-#include "Pipeline/InputPipeline.h"
-#include "Pipeline/IntentPipeline.h"
-#include "Pipeline/ArbiterPipeline.h"
-
-#include "StateMachine/GGYGOStateManager.h" // ★ 阶段6：纯C++ 并行状态管理器
+#include "Components/GGYGOCharacterRuntimeComponent.h"
+#include "Data/Runtime/RuntimeData.h"
+#include "Data/Config/UCharConfigData.h"
 #include "Attributes/GGYGOAttributeSet.h"
-#include "Data/UCharConfigData.h"
 #include "BaseCharacter.generated.h"
 
 class UGameplayAbility;
@@ -61,44 +53,49 @@ public:
 
 	/** 当前移动速度（cm/s，水平标量） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetCurrentSpeed() const { return RuntimeData->CurrentSpeed; }
+	float GetCurrentSpeed() const { return RuntimeComponent->GetRuntimeData()->Movement.CurrentSpeed; }
 
 	/** 移动角度（相对于角色朝向，-180~180°） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetMoveAngle() const { return RuntimeData->MoveAngle; }
+	float GetMoveAngle() const { return RuntimeComponent->GetRuntimeData()->Movement.MoveAngle; }
 
 	/** 当前角色状态（Idle/Locomotion/InAir 等） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	ECharacterStateType GetCurrentState() const { return RuntimeData->CurrentState; }
+	ECharacterStateType GetCurrentState() const { return RuntimeComponent->GetRuntimeData()->State.CurrentState; }
 
 	/** 是否在移动中 */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	bool IsMoving() const { return RuntimeData->bIsMoving; }
+	bool IsMoving() const { return RuntimeComponent->GetRuntimeData()->Movement.bIsMoving; }
 
 	/** 是否在地面上 */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	bool IsGrounded() const { return RuntimeData->bIsGrounded; }
+	bool IsGrounded() const { return RuntimeComponent->GetRuntimeData()->Movement.bIsGrounded; }
 
 	/** 动画驱动速度（从 Bip001 骨骼位移提取，cm/s） */
 	UFUNCTION(BlueprintCallable, Category = "Animation")
-	float GetAnimSpeed() const { return RuntimeData->AnimSpeed; }
+	float GetAnimSpeed() const { return RuntimeComponent->GetRuntimeData()->RootMotion.AnimSpeed; }
 
-	/** 供 AnimInstance 判断 Moving 状态下选 Walk/Run/Sprint 动画 */
-	EMovementGait GetResolvedGait() const { return RuntimeData->ResolvedGait; }
+	/** 供 AnimInstance 读取 Moving 状态下的 Walk/Run 步态 */
+	EMovementGait GetResolvedGait() const { return RuntimeComponent->GetRuntimeData()->Gait.ResolvedGait; }
 
 	/** 获取角色配置（供 AnimInstance 等外部系统读取） */
 	UCharConfigData* GetCharacterConfig() const { return CharacterConfig; }
 
 	/** 获取运行时黑板（供 AnimInstance 等外部系统只读访问） */
-	FRuntimeData* GetRuntimeData() const { return RuntimeData.Get(); }
-
-	// ============================================================
-	// 输入处理接口（BlueprintCallable，供子类蓝图绑定 EnhancedInput）
-	// ============================================================
-
-
+	FRuntimeData* GetRuntimeData() const { return RuntimeComponent ? RuntimeComponent->GetRuntimeData() : nullptr; }
 
 protected:
+	// ============================================================
+	// 输入处理门面
+	// ============================================================
+
+	/** 将玩家输入转发给运行时宿主组件。 */
+	void SetMoveInput(const FVector2D& Value);
+	void ClearMoveInput();
+	void SetLookInput(const FVector2D& Value);
+	void SetSprintHeld(bool bHeld);
+	void SetForceWalkHeld(bool bHeld);
+
 	virtual void BeginPlay() override;
 
 public:
@@ -170,27 +167,10 @@ protected:
 	void ApplyDefaultEffects();
 
 	// ============================================================
-	// 管线子系统（纯 C++ 类，TUniquePtr 管理生命周期）
+	// 运行时宿主组件
 	// ============================================================
 
-	/** 运动驱动器 */
-	TUniquePtr<FMotionDriver> MotionDriver;
-
-	/** 输入数据容器 */
-	TUniquePtr<FInputData> InputData;
-
-	/** 运行时黑板（含 AnimData 子结构） */
-	TUniquePtr<FRuntimeData> RuntimeData;
-
-	/** 输入管线 */
-	TUniquePtr<FInputPipeline> InputPipeline;
-
-	/** 意图管线 */
-	TUniquePtr<FIntentPipeline> IntentPipeline;
-
-	/** ★ 阶段6：并行状态管理器（纯 C++，和其他管线风格一致）*/
-	TUniquePtr<FGYGOStateManager> StateManager;
-
-	/** 仲裁管线（Tick 第 1 步） */
-	TUniquePtr<FArbiterPipeline> ArbiterPipeline;
+	/** 组件负责纯 C++ 子系统的生命周期；组件自身不 Tick。 */
+	UPROPERTY(VisibleAnywhere, Category = "Runtime")
+	UGGYGOCharacterRuntimeComponent* RuntimeComponent;
 };

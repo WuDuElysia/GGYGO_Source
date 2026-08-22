@@ -21,6 +21,7 @@
 #include "CoreMinimal.h"
 #include "GameplayTagContainer.h"
 #include "StateMachine/CharacterStateType.h"
+#include "Contracts/State/StateUpdateResult.h"
 #include "StateMachine/Data/FStateRelationRow.h"
 
 // 前向声明
@@ -88,10 +89,20 @@ public:
 	// ====== 帧更新 ======
 
 	/**
-	 * 手动触发状态更新（由 BaseCharacter::Tick 第5步调用）
-	 * 保证执行顺序：Arbiter → Input → Intent → Parameter → **StateManager** → MotionDriver
+	 * 手动触发状态更新（由 BaseCharacter::Tick 第5步调用）。
+	 * 兼容旧调用方，结果写入 GetLastUpdateResult()。
 	 */
 	void Update(float DeltaTime);
+
+	/**
+	 * 手动触发状态更新并输出本次状态操作结果。
+	 * StateManager 仍在此调用内完成状态规则、生命周期和状态侧副作用；
+	 * OutResult 只向 Pipeline 报告已完成的结果，不供 Pipeline 重放状态操作。
+	 */
+	void Update(float DeltaTime, FStateUpdateResult& OutResult);
+
+	/** 返回最近一次 Update 产生的状态结果。 */
+	const FStateUpdateResult& GetLastUpdateResult() const { return LastUpdateResult; }
 
 	// ====== 核心接口 ======
 
@@ -185,6 +196,12 @@ private:
 	/** 缓存的主状态（Locomotion 组的唯一活跃状态）*/
 	ECharacterStateType CachedPrimaryState = ECharacterStateType::Idle;
 
+	/** 最近一次状态更新产生的结果；用于兼容无输出参数的 Update 调用。 */
+	FStateUpdateResult LastUpdateResult;
+
+	/** 当前正在执行 Update 时的结果接收地址；状态内部请求通过它告知 Pipeline。 */
+	FStateUpdateResult* ActiveUpdateResult = nullptr;
+
 	// ====== 内部方法 ======
 
 	/** 注册一个状态实例到 AllStates */
@@ -199,6 +216,21 @@ private:
 
 	/** 检查新状态与所有当前活跃状态的关系 */
 	FRelationCheckResult CheckRelations(ECharacterStateType NewStateType);
+
+	/** 开始收集一次 Update 的状态结果，并让状态请求写入 OutResult。 */
+	void BeginUpdateResult(FStateUpdateResult& OutResult);
+
+	/** 完成一次 Update 的状态结果，刷新最终 PrimaryState 并解除结果收集。 */
+	void FinishUpdateResult(FStateUpdateResult& OutResult);
+
+	/** 将已完成的状态操作写入当前 Update 结果；不改变状态规则或副作用。 */
+	void RecordTransitionEvent(
+		EStateTransitionEventType EventType,
+		ECharacterStateType RequestedState,
+		ECharacterStateType PreviousPrimaryState,
+		ECharacterStateType CurrentPrimaryState,
+		bool bAccepted,
+		const TArray<ECharacterStateType>& InterruptedStates);
 
 	/** 激活一个状态（Enter + 设标记 + 加集合 + 更新 PrimaryState）*/
 	void ActivateState(FCharacterState* State);

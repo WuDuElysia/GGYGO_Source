@@ -5,23 +5,36 @@
  * 设计哲学：拓扑在蓝图，决策在 C++，求值在 AnimGraph。
  *
  * 本类只提供三类产物供 AnimBP 引用：
- *   1. 决策函数（UFUNCTION → bool）：被蓝图过渡条件 Can Enter Transition 引用
- *   2. 状态回调（UFUNCTION → void）：被蓝图状态的 On Entry 引用
+ *   1. 移动过渡判定（UFUNCTION → bool）：NotMoving/Stop → Conduit 的入口条件，以及
+ *      Conduit 的分流条件、Moving → Stop、EnterMove → Stop 两个独立 Blueprint 入口；两个入口共享
+ *      LocomotionDecisions.ShouldStopMoving() 的停止移动输入判定；Direct Conduit
+ *      仅依据本帧 Snapshot_Gait == Run。EnterMove → Moving 的动画播放完成条件由
+ *      AnimBP 直接使用 Time Remaining (ratio) <= 0 处理，不需要 C++ 函数
+ *   2. 表现参数维护：Moving 子状态、StopValue、GaitValue 与 GaitBlendY 的维护由 C++ pipeline 完成；
+ *      Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
  *   3. 配表查询（UFUNCTION → UAnimSequence*）：被 AnimGraph 节点 Bind
  *
- * 本类不维护状态机循环——谁在哪个状态、什么时候切，全部由 AnimBP 状态机管理。
+ * 本类不维护状态机循环，也不维护步态取值、Walk→Run 升级或 Sprint
+ * 触发消费；步态由逻辑侧提供，动画层只消费快照并推进 GaitBlendY，维护 StopValue。
+ * EnterMove 早停计时与 Moving 子状态、TurnBack 返回握手均由 FZZZLocomotionEvents 在 C++ 每帧逻辑中集中维护，
+ * AnimBP 只保留状态机拓扑、过渡条件调用和动画播放。
  */
 #pragma once
 
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
-#include "Animation/zzzAnim/CombatConfig.h"
-#include "Animation/zzzAnim/CombatDecisions/ZZZLocomotionDecisions.h"
-#include "Animation/zzzAnim/ZZZAnimSnapshot.h"
-#include "Animation/zzzAnim/ZZZAnimSnapshotCapture.h"
+#include "Animation/zzzAnim/Data/ZZZAnimSet.h"
+#include "Animation/zzzAnim/Data/ZZZAnimTuning.h"
+#include "Animation/zzzAnim/Data/ZZZAnimContext.h"
+#include "Animation/zzzAnim/Locomotion/ZZZLocomotionDecisions.h"
+#include "Animation/zzzAnim/Data/ZZZAnimSnapshot.h"
+#include "Animation/zzzAnim/Capture/ZZZAnimSnapshotCapture.h"
+#include "Animation/zzzAnim/Data/ZZZAnimStateMemory.h"
+#include "Animation/zzzAnim/Locomotion/ZZZLocomotionEvents.h"
 #include "ZZZAnimInstance.generated.h"
 
 class ABaseCharacter;
+class UBlendSpace;
 
 UCLASS()
 class GGYGO_API UZZZAnimInstance : public UAnimInstance
@@ -44,23 +57,18 @@ public:
 	 * 此后引擎调 NativeUpdateAnimation 时检测到标记，跳过重复工作。
 	 * 保证 AnimBP 读到的 Snap 一定是本帧管线刚写完的最新值。
 	 */
-	void PipelineDrive();
+	void PipelineDrive(float DeltaSeconds);
 
 	// ============================================================
 	// ★★ Locomotion 过渡决策函数（AnimBP 过渡条件引用） ★★
 	//
-	// 来这里加你的移动过渡函数，模板：
-	//   UFUNCTION(BlueprintPure, Category="Cond|Locomotion", meta=(BlueprintThreadSafe))
-	//   bool Locomotion_Idle_To_WalkStart() const;
-	//
-	// NTEAnim 参考（MainMovementDecisions / LocomotionDecisions）：
-	//   Idle→WalkStart:    bShouldMove && Gait==Walk
-	//   Walk→Run:          Gait==Run
-	//   WalkStart→WalkLoop: Start 动画播完
-	//   WalkLoop→WalkEnd:  !bShouldMove
-	//   WalkEnd→Idle:      End 动画播完
-	//   RunLoop→RunEnd:    !bShouldMove || Gait==Walk
-	//   RunEnd→Idle:       End 动画播完
+	// 移动过渡判定保持为快照只读视图：NotMoving → Conduit、Stop → Conduit、Conduit 的
+	// Direct/EnterMove 互补分流，以及 Moving → Stop、EnterMove → Stop 两个独立
+	// Blueprint 入口；两个 Stop 入口共同转发同一个停止输入判定。
+	// 停止判定不读取速度；EnterMove → Moving 的动画播放完成条件由 AnimBP 直接使用
+	// Time Remaining (ratio) <= 0 处理，不需要 C++ 函数。Direct 分支仅
+	// 依据 Snapshot_Gait == Run；走跑表现由 GaitBlendY 驱动，
+	// 不再通过 Moving 内 Walk→Run 状态过渡或动画层计时判定实现。
 	// ============================================================
 
 	/**
@@ -72,29 +80,49 @@ public:
 	bool Locomotion_NotMoving_To_Conduit() const;
 
 	/**
-	 * Conduit → EnterMove：当前帧没有冲刺触发。
+	 * Stop → Conduit：重新启动移动入口，仅当本帧有移动输入/意图时返回 true。
+	 * 上下文缺失时返回 false；不读取速度、Gait 或 StateMemory。
+	 */
+	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
+	bool Locomotion_Stop_To_Conduit() const;
+
+	/**
+	 * Conduit → EnterMove：本帧 Snapshot_Gait 不是 Run，走起步路径；上下文缺失时同样成立。
 	 */
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_Conduit_To_EnterMove() const;
 
 	/**
-	 * Conduit → Moving（Sprint）：有冲刺触发，条件成立后消费本帧开关。
+	 * Conduit → Moving：本帧 Snapshot_Gait 已是 Run，走直接进入路径。
+	 *
+	 * 只读取快照，不产生副作用。
 	 */
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_Conduit_To_Moving_Sprint() const;
+	bool Locomotion_Conduit_To_Moving_Direct() const;
 
-	// ============================================================
-	// ★★ Locomotion 状态回调（AnimBP 状态的 On Entry 引用） ★★
-	//
-	// 来这里加状态进入时的回调，模板：
-	//   UFUNCTION(BlueprintCallable, Category="Event|Locomotion", meta=(BlueprintThreadSafe))
-	//   void OnEnter_Idle();
-	//
-	// NTEAnim 参考：OnEnter_WalkStart 时设置 FootLock 曲线、
-	//   OnEnter_WalkLoop 时设置 Enable_FootIK 等
-	// ============================================================
+	/**
+	 * Moving → Stop 的独立 Blueprint 入口。
+	 * 本帧没有移动输入时通常返回 true；TurnBack 仍处于 Frozen 阶段时保持 false，避免转身尚未解冻就提前离开 Moving。
+	 * 底层转发 ShouldExitMoving()，不是速度为零判断。
+	 */
+	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
+	bool Locomotion_Moving_To_Stop() const;
 
-	// TODO: 在这里加你的 Locomotion 状态回调
+	/**
+	 * EnterMove → Stop 的独立 Blueprint 入口。
+	 * 仅当本帧没有移动输入时返回 true；底层直接转发 ShouldStopMoving()，不负责 EnterMove → Moving
+	 * 的动画完成判断。
+	 */
+	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
+	bool Locomotion_EnterMove_To_Stop() const;
+
+	/** WalkRun → TurnBack：有输入且摄像机修正后的输入接近角色前向的反方向。 */
+	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
+	bool Locomotion_WalkRun_To_TurnBack() const;
+
+	// TurnBack 相位由逻辑层 FTurnBackPhaseProcessor 维护，经快照读取；
+	// Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
+	// sig_turnback 与可选 RM_Yaw 曲线由管线统一采样，动画侧不再需要 Notify 回写逻辑层。
 
 	// ============================================================
 	// 配表查询（AnimBP 的 SequencePlayer 节点 Bind 此函数）
@@ -108,14 +136,6 @@ public:
 	UBlendSpace* GetBlendSpaceByKey(FName Key) const;
 
 	// ============================================================
-	// 输出变量
-	// ============================================================
-
-	// TODO: 在这里加 AnimGraph 输出变量，如:
-	//   UPROPERTY(BlueprintReadOnly, Category="Out")
-	//   TObjectPtr<UAnimSequence> Out_IdleSeq;
-
-	// ============================================================
 	// 配置（全部由蓝图细节面板填写）
 	// ============================================================
 
@@ -125,14 +145,44 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "配置|Tuning")
 	FZZZAnimTuning Tuning;
 
+	// ============================================================
+	// 动画状态机记忆（C++ pipeline 写入，决策函数与 AnimGraph 只读）
+	// ============================================================
+
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	FZZZAnimStateMemory StateMemory;
+
+	/** 相对 Actor 当前水平朝向的平滑移动方向 X（右）和 Y（前），供 AnimBP BlendSpace 使用。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	float AnimBlendX = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	float AnimBlendY = 0.f;
+
+	/** 当前 RM_Yaw 源曲线采样值（度）；不代表最终输入方向。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
+	float TurnBackSourceYaw = 0.f;
+
+	/**
+	 * 用于 AnimBP Rotate Root Bone 的逆向姿势补偿值（度）。
+	 * 保留原始 Bip001 转身姿势时，将此值接到 Bone_Root 的根姿势旋转；
+	 * 使用真正 In-Place 副本时该值应为 0 或不接入。
+	 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
+	float TurnBackPoseYawCorrection = 0.f;
+
 protected:
-	/** 动画决策快照（管线捕获；决策函数读取，冲刺分流时消费一次性开关） */
+	/** 动画决策快照（游戏线程写入，worker 线程与决策函数只读） */
 	FZZZAnimSnapshot Snap;
 
 private:
+	/** 抓取快照 → 注入上下文（判定层只读视图、事件层可写上下文）→ 推进。 */
+	void RefreshDecisionContext(float DeltaSeconds);
+
 	TWeakObjectPtr<ABaseCharacter> Owner;
 	bool bDrivenByPipeline = false;
 
 	FZZZAnimSnapshotCapture SnapshotCapture;
 	FZZZLocomotionDecisions LocomotionDecisions;
+	FZZZLocomotionEvents LocomotionEvents;
 };

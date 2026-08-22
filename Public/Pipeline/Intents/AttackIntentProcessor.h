@@ -2,7 +2,7 @@
  * @file AttackIntentProcessor.h
  * @brief 攻击意图处理器
  *
- * 攻击键缓冲（由 InputPipeline 维护）→ bWantsToAttack。
+ * 攻击键缓冲（由 InputPipeline 维护）→ RuntimeData.Intent.bWantsToAttack。
  */
 #pragma once
 

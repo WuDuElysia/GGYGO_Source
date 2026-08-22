@@ -3,8 +3,8 @@
  * @brief 视角旋转处理器实现
  */
 #include "Pipeline/Intents/ViewRotationProcessor.h"
-#include "Data/InputData.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Input/InputData.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "GameFramework/Character.h"
 
 void FViewRotationProcessor::Init(ACharacter* InOwner)
@@ -24,5 +24,5 @@ void FViewRotationProcessor::Process(const FInputData& InputData, FRuntimeData& 
 
 	// 从控制器读取最终旋转（经过 PlayerCameraManager Clamp 后的值）
 	FRotator ControlRot = Owner->GetControlRotation();
-	RuntimeData.ControlRotation = ControlRot;
+	RuntimeData.View.ControlRotation = ControlRot;
 }

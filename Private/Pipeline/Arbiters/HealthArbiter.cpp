@@ -3,7 +3,7 @@
  * @brief 血量仲裁器实现
  */
 #include "Pipeline/Arbiters/HealthArbiter.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "AbilitySystemComponent.h"
 
 void FHealthArbiter::Init(UAbilitySystemComponent* InASC)
@@ -35,9 +35,9 @@ void FHealthArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 	// TODO: 阶段八完成后，从 AttributeSet 读取 Health 并判断死亡：
 	// if (Health <= 0.f)
 	// {
-	//     RuntimeData.bBlockMove   = true;
-	//     RuntimeData.bBlockAttack = true;
-	//     RuntimeData.bBlockDodge  = true;
+	//     RuntimeData.Arbiter.bBlockMove   = true;
+	//     RuntimeData.Arbiter.bBlockAttack = true;
+	//     RuntimeData.Arbiter.bBlockDodge  = true;
 	//     RuntimeData.bBlockInput  = true;
 	// }
 }

@@ -3,11 +3,8 @@
  * @brief 所有角色的基类实现 - 管线时序分发 + GAS 初始化
  */
 #include "BaseCharacter.h"
-#include "Components/CapsuleComponent.h"
+#include "Components/GGYGOCharacterRuntimeComponent.h"
 #include "GGYGOGameplayEffects.h" // Phase 7: GE 全局初始化
-#include "Data/Anim/AnimRuntimeData.h"
-#include "Animation/NTEAnimInstance.h"
-#include "Animation/zzzAnim/ZZZAnimInstance.h"
 
 ABaseCharacter::ABaseCharacter()
 {
@@ -24,26 +21,8 @@ ABaseCharacter::ABaseCharacter()
 	// 如果在 BeginPlay 里 NewObject，ASC 发现不了它
 	AttributeSet = CreateDefaultSubobject<UGGYGOAttributeSet>(TEXT("AttributeSet"));
 
-	// ============================================================
-	// 管线子系统（纯 C++ 类，TUniquePtr 管理生命周期）
-	// ============================================================
-
-	// 创建数据容器
-	InputData = MakeUnique<FInputData>();
-	RuntimeData = MakeUnique<FRuntimeData>();
-
-	// 创建管线
-	InputPipeline = MakeUnique<FInputPipeline>(*InputData);
-	IntentPipeline = MakeUnique<FIntentPipeline>();
-
-	// 创建驱动层
-	MotionDriver = MakeUnique<FMotionDriver>();
-
-	// ★ 阶段6：创建并行状态管理器（纯 C++，和其他管线风格一致）
-	StateManager = MakeUnique<FGYGOStateManager>();
-
-	// 创建仲裁管线（不给 ASC，在 BeginPlay 中 Init 时注入）
-	ArbiterPipeline = MakeUnique<FArbiterPipeline>();
+	// 单一运行时宿主：内部拥有纯 C++ 数据/管线/状态/驱动，但自身不 Tick。
+	RuntimeComponent = CreateDefaultSubobject<UGGYGOCharacterRuntimeComponent>(TEXT("RuntimeComponent"));
 }
 
 UAbilitySystemComponent* ABaseCharacter::GetAbilitySystemComponent() const
@@ -61,9 +40,8 @@ void ABaseCharacter::BeginPlay()
 	InitGEGlobals();
 
 	// ============================================================
-	// GAS 初始化（必须在所有子系统之前，因为其他系统可能依赖 ASC）
+	// GAS 初始化（必须在运行时宿主初始化之前）
 	// ============================================================
-
 	if (ASC)
 	{
 		// InitAbilityActorInfo 告诉 ASC "我属于谁"
@@ -71,33 +49,13 @@ void ABaseCharacter::BeginPlay()
 		// 参数2 AvatarActor — Ability 的"物理表现"（通常是 Character 自己）
 		// 单人游戏简单处理：两个参数都传 this
 		ASC->InitAbilityActorInfo(this, this);
-
-		// 注入真实 ASC 到所有依赖 ASC 的子系统
-		ArbiterPipeline->Init(ASC, StateManager.Get());
 	}
 
-	// ============================================================
-	// 管线子系统初始化
-	// ============================================================
-
-	// 初始化意图管线（注入 ACharacter 和 Mesh 依赖）
-	IntentPipeline->Init(this, GetMesh());
-
-	// 初始化运动驱动器（缓存组件引用 + 关闭自动 Root Motion）
-	MotionDriver->Init(this);
-
-	// ★ 阶段6：初始化状态管理器（注册状态 + 加载关系矩阵 + 激活 Idle）
-	// DT 可后续通过 CharacterConfig 引入，当前使用内置默认矩阵
-	if (StateManager)
+	// 组件内部继续按原顺序初始化 Arbiter、Intent、Motion 和 StateManager。
+	if (RuntimeComponent)
 	{
-		StateManager->Init(*RuntimeData);
-
-		// ★ 阶段7：注入 ASC（GAS 联动，必须在 Init 之后）
-		StateManager->InitASC(ASC);
+		RuntimeComponent->InitializeRuntime(this, ASC, GetMesh());
 	}
-
-	// RuntimeData 的运动配置由 MotionDriver 初始化；
-	// BaseCharacter 只负责系统组装和时序调度。
 }
 
 void ABaseCharacter::GiveDefaultAbilities()
@@ -146,34 +104,51 @@ void ABaseCharacter::Tick(float DeltaTime)
 {
 	Super::Tick(DeltaTime);
 
-	// 1. 仲裁管线：读 GAS Tag → 写仲裁标记（最先执行，后续管线依赖）
-	ArbiterPipeline->Process(*RuntimeData, DeltaTime);
+	// 唯一运行时调度入口。完整阶段顺序由组件的 ProcessFrame 显式维护。
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->ProcessFrame(DeltaTime);
+	}
+}
 
-	// 2. 输入管线：原始输入 → 防抖/缓冲 → InputData
-	InputPipeline->Process(DeltaTime);
+void ABaseCharacter::SetMoveInput(const FVector2D& Value)
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->SetMoveInput(Value);
+	}
+}
 
-	// 3. 意图处理：InputData → RuntimeData 意图
-	IntentPipeline->ProcessIntents(*InputData, *RuntimeData);
+void ABaseCharacter::ClearMoveInput()
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->ClearMoveInput();
+	}
+}
 
-	// 4. 参数处理：RuntimeData 意图 → RuntimeData 动画参数
-	IntentPipeline->ProcessParameters(*RuntimeData, DeltaTime);
+void ABaseCharacter::SetLookInput(const FVector2D& Value)
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->SetLookInput(Value);
+	}
+}
 
-	// 5. 状态机：读取意图 + 仲裁标记，决定当前状态
-	if (StateManager) StateManager->Update(DeltaTime);
+void ABaseCharacter::SetSprintHeld(bool bHeld)
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->SetSprintHeld(bHeld);
+	}
+}
 
-	// 6. 运动驱动：RuntimeData 移动数据 → 实际位移
-	MotionDriver->Process(DeltaTime, *RuntimeData);
-
-	// 7. 动画驱动：状态机、运动驱动和意图处理器已分别同步 AnimData，
-	//    BaseCharacter 只在所有生产者完成后通知 AnimInstance 抓取快照。
-	//    保证 AnimBP 读到的快照一定是本帧管线刚写完的最新值
-	if (UNTEAnimInstance* AI = Cast<UNTEAnimInstance>(GetMesh()->GetAnimInstance())) AI->PipelineDrive();
-	if (UZZZAnimInstance* ZAI = Cast<UZZZAnimInstance>(GetMesh()->GetAnimInstance())) ZAI->PipelineDrive();
-
-	// 帧末清零
-	RuntimeData->ResetFrameIntents();
-
-
+void ABaseCharacter::SetForceWalkHeld(bool bHeld)
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->SetForceWalkHeld(bHeld);
+	}
 }
 
 void ABaseCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)

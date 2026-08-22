@@ -4,9 +4,10 @@
  */
 
 #include "Animation/zzzAnim/ZZZAnimInstance.h"
+#include "Animation/zzzAnim/ZZZAnimLog.h"
 #include "BaseCharacter.h"
-
-DEFINE_LOG_CATEGORY_STATIC(LogZZZAnim, Log, All);
+#include "Components/SkeletalMeshComponent.h"
+#include "Data/Runtime/RuntimeData.h"
 
 // ============================================================================
 // AnimInstance 生命周期
@@ -29,15 +30,73 @@ void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	}
 
 	// 降级路径：管线未驱动（编辑器预览等场景）
-	SnapshotCapture.Capture(Snap, Owner.Get());
-	LocomotionDecisions.SetSnap(&Snap);
+	RefreshDecisionContext(DeltaSeconds);
 }
 
-void UZZZAnimInstance::PipelineDrive()
+void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
 {
-	SnapshotCapture.Capture(Snap, Owner.Get());
-	LocomotionDecisions.SetSnap(&Snap);
+	RefreshDecisionContext(DeltaSeconds);
 	bDrivenByPipeline = true;
+}
+
+void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
+{
+	// 固定顺序：抓取快照 → 注入上下文 → 由 C++ 同步 Moving 子状态 → 推进表现记忆。
+	SnapshotCapture.Capture(Snap, Owner.Get());
+	AnimBlendX = Snap.AnimBlendX;
+	AnimBlendY = Snap.AnimBlendY;
+
+	const ABaseCharacter* Character = Owner.Get();
+	const FRuntimeData* RuntimeData = Character
+		? Character->GetRuntimeData()
+		: nullptr;
+	TurnBackSourceYaw = RuntimeData ? RuntimeData->RootMotion.AnimCurveYaw : 0.f;
+	TurnBackPoseYawCorrection = -TurnBackSourceYaw;
+
+	FZZZAnimWriteContext WriteContext;
+	WriteContext.Snap = &Snap;
+	WriteContext.Tuning = &Tuning;
+	WriteContext.Memory = &StateMemory;
+
+	LocomotionDecisions.SetContext(WriteContext.ToRead());
+	LocomotionEvents.SetContext(WriteContext);
+	LocomotionEvents.SynchronizeMovingSubState();
+	LocomotionEvents.AdvanceGaitBlend(DeltaSeconds);
+
+	if (Snap.TurnBackPhase != ETurnBackPhase::None
+		|| StateMemory.MovingSubState == EZZZAnimMovingSubState::TurnBack)
+	{
+		const FVector DesiredMoveDir = RuntimeData
+			? RuntimeData->Intent.DesiredWorldMoveDir.GetSafeNormal2D()
+			: FVector::ZeroVector;
+		const FVector ActorForward = Character
+			? Character->GetActorForwardVector().GetSafeNormal2D()
+			: FVector::ZeroVector;
+		const float ActorDesiredDot = !DesiredMoveDir.IsNearlyZero()
+			&& !ActorForward.IsNearlyZero()
+			? FVector::DotProduct(ActorForward, DesiredMoveDir)
+			: 1.0f;
+		const float ActorYaw = Character ? Character->GetActorRotation().Yaw : 0.0f;
+		const float DesiredYaw = DesiredMoveDir.IsNearlyZero()
+			? 0.0f
+			: DesiredMoveDir.Rotation().Yaw;
+		const float CurrentVelocity = RuntimeData
+			? RuntimeData->Movement.CurrentSpeed
+			: 0.0f;
+
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[TurnBack][Snapshot] Phase=%d SubState=%d State=%d Gait=%d ShouldMove=%d InputForwardDot=%.3f ActorDesiredDot=%.3f ActorYaw=%.2f DesiredYaw=%.2f Velocity=%.2f"),
+			static_cast<uint8>(Snap.TurnBackPhase),
+			static_cast<uint8>(StateMemory.MovingSubState),
+			static_cast<uint8>(Snap.CurrentState),
+			static_cast<uint8>(Snap.Gait),
+			Snap.bShouldMove ? 1 : 0,
+			Snap.InputForwardDot,
+			ActorDesiredDot,
+			ActorYaw,
+			DesiredYaw,
+			CurrentVelocity);
+	}
 }
 
 void UZZZAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
@@ -54,14 +113,34 @@ bool UZZZAnimInstance::Locomotion_NotMoving_To_Conduit() const
 	return LocomotionDecisions.NotMoving_To_Conduit();
 }
 
+bool UZZZAnimInstance::Locomotion_Stop_To_Conduit() const
+{
+	return LocomotionDecisions.Stop_To_Conduit();
+}
+
 bool UZZZAnimInstance::Locomotion_Conduit_To_EnterMove() const
 {
 	return LocomotionDecisions.Conduit_To_EnterMove();
 }
 
-bool UZZZAnimInstance::Locomotion_Conduit_To_Moving_Sprint() const
+bool UZZZAnimInstance::Locomotion_Conduit_To_Moving_Direct() const
 {
-	return LocomotionDecisions.Conduit_To_Moving_Sprint();
+	return LocomotionDecisions.Conduit_To_Moving_Direct();
+}
+
+bool UZZZAnimInstance::Locomotion_Moving_To_Stop() const
+{
+	return LocomotionDecisions.ShouldExitMoving();
+}
+
+bool UZZZAnimInstance::Locomotion_EnterMove_To_Stop() const
+{
+	return LocomotionDecisions.ShouldStopMoving();
+}
+
+bool UZZZAnimInstance::Locomotion_WalkRun_To_TurnBack() const
+{
+	return LocomotionDecisions.WalkRun_To_TurnBack();
 }
 
 // ============================================================================

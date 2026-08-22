@@ -7,7 +7,7 @@
 #include "Pipeline/Arbiters/ActionArbiter.h"
 #include "Pipeline/Arbiters/HealthArbiter.h"
 #include "Pipeline/Arbiters/StaminaArbiter.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "StateMachine/GGYGOStateManager.h"
 
 void FArbiterPipeline::Init(UAbilitySystemComponent* InASC, FGYGOStateManager* InSM)
@@ -35,10 +35,10 @@ void FArbiterPipeline::Process(FRuntimeData& RuntimeData, float DeltaTime)
 {
 	// 每帧先重置仲裁标记，由各仲裁器重新写入
 	// 帧末只需 ResetFrameIntents 清零意图，仲裁标记由这里的仲裁器维护
-	RuntimeData.bBlockMove   = false;
-	RuntimeData.bBlockAttack = false;
-	RuntimeData.bBlockDodge  = false;
-	RuntimeData.ActionGranted = ECharacterStateType::Idle;
+	RuntimeData.Arbiter.bBlockMove   = false;
+	RuntimeData.Arbiter.bBlockAttack = false;
+	RuntimeData.Arbiter.bBlockDodge  = false;
+	RuntimeData.Arbiter.ActionGranted = ECharacterStateType::Idle;
 
 	for (auto& Arbiter : Arbiters)
 	{

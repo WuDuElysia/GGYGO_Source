@@ -50,5 +50,19 @@ enum class EMovementGait : uint8
 	None    UMETA(DisplayName="无（静止）"),
 	Walk    UMETA(DisplayName="行走"),
 	Run     UMETA(DisplayName="跑步"),
-	Sprint  UMETA(DisplayName="冲刺"),
+};
+
+/**
+ * TurnBack 相位（急停转身的唯一真相，逻辑层写入，MotionDriver 与动画快照读取）
+ *
+ * None     不在转身
+ * Frozen   已触发转身：移动方向冻结在进入转身前的方向，等待动画信号
+ * Released sig_turnback 曲线已越过阈值：解冻，跟随当前输入方向并平滑转向
+ */
+UENUM(BlueprintType)
+enum class ETurnBackPhase : uint8
+{
+	None      UMETA(DisplayName="未转身"),
+	Frozen    UMETA(DisplayName="冻结方向"),
+	Released  UMETA(DisplayName="已解冻"),
 };

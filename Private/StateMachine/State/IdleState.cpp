@@ -7,7 +7,7 @@
  */
 #include "StateMachine/State/IdleState.h"
 #include "StateMachine/GGYGOStateManager.h"
-#include "Data/Logic/RuntimeData.h"
+#include "Data/Runtime/RuntimeData.h"
 
 void FIdleState::Enter(FRuntimeData& RuntimeData)
 {
@@ -16,14 +16,14 @@ void FIdleState::Enter(FRuntimeData& RuntimeData)
 void FIdleState::Update(float DeltaTime, FRuntimeData& RuntimeData, FGYGOStateManager& SM)
 {
 	// Priority 0: ActionArbiter 批准的动作（GAS 接入后启用）
-	if (RuntimeData.ActionGranted != ECharacterStateType::Idle)
+	if (RuntimeData.Arbiter.ActionGranted != ECharacterStateType::Idle)
 	{
-		SM.RequestState(RuntimeData.ActionGranted);
+		SM.RequestState(RuntimeData.Arbiter.ActionGranted);
 		return;
 	}
 
 	// Priority 1: 移动 → Moving（速度上限由 MotionDriver 管理）
-	if (!RuntimeData.DesiredWorldMoveDir.IsNearlyZero() && !RuntimeData.bBlockMove)
+	if (!RuntimeData.Intent.DesiredWorldMoveDir.IsNearlyZero() && !RuntimeData.Arbiter.bBlockMove)
 	{
 		SM.RequestState(ECharacterStateType::Moving);
 		return;
