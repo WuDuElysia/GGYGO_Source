@@ -7,14 +7,20 @@
 #include "CoreMinimal.h"
 #include "StateMachine/CharacterStateType.h"
 
-/** TurnBack 相位及其 Frozen 阶段的方向契约。 */
+/** TurnBack 相位运行时模型；生命周期和第二段标记由逻辑层时间轴维护。 */
 struct FTurnBackRuntimeModel
 {
 	/** 急停转身的唯一逻辑相位。 */
 	ETurnBackPhase Phase = ETurnBackPhase::None;
 
-	/** Frozen 阶段保持的进入转身前世界方向。 */
-	FVector EntryDirection = FVector::ZeroVector;
+	/** CanYaw AnimNotify 是否已经到达；该信号到达后立即允许输入接管朝向和 d1 位移。 */
+	bool bCanYaw = false;
+
+	/** 是否已经到达第二段；MotionDriver 仅在缺少有效根轨迹方向时用它选择兼容 d1。 */
+	bool bSecondSegment = false;
+
+	/** 从本次 TurnBack 进入 Frozen 起累计的逻辑时间（秒），仅作为诊断和状态权威。 */
+	float ElapsedSeconds = 0.f;
 };
 
 /** MotionDriver 产生的实际移动结果，以及 TurnBack 运行时状态。 */

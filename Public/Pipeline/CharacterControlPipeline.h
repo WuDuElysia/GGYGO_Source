@@ -112,6 +112,9 @@ public:
 	void SetSprintHeld(bool bHeld);
 	void SetForceWalkHeld(bool bHeld);
 
+	/** 接收 AnimNotify_CanYaw，并转发给 TurnBack 参数处理器。 */
+	void NotifyCanYaw();
+
 	/** 返回最近一次完成 ResolveDecision 的本帧计划，只读且由管线拥有。 */
 	const FCharacterFramePlan& GetLastFramePlan() const { return LastFramePlan; }
 

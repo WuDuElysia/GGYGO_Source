@@ -27,17 +27,42 @@ struct FZZZAnimSnapshot
 	float AnimBlendX = 0.f;
 	float AnimBlendY = 0.f;
 
+	/** RM_PosX/RM_PosY 差分得到的固定动画曲线坐标速度（cm/s）。 */
+	FVector AnimCurveVelocity = FVector::ZeroVector;
+
+	/** RM_PosX/RM_PosY 差分速度的归一化方向，仍处于固定动画曲线坐标。 */
+	FVector AnimCurveVelocityDirection = FVector::ZeroVector;
+
+	/** 动画曲线速度方向角（度），等同于 RootMotionRuntimeModel.AnimCurveAngle。 */
+	float AnimCurveVelocityAngle = 0.f;
+
 	/** 摄像机修正后的移动输入与角色当前水平前向的点积；1 为同向，-1 为完全反向。仅诊断用途。 */
 	float InputForwardDot = 1.f;
 
 	/** TurnBack 相位 ← RuntimeData.Movement.TurnBack.Phase；WalkRun/TurnBack 过渡判定的唯一依据。 */
 	ETurnBackPhase TurnBackPhase = ETurnBackPhase::None;
 
+	/** CanYaw AnimNotify 是否已经到达。 */
+	bool bCanYaw = false;
+
+	/** TurnBack 是否已经进入逻辑第二段；动画层只读该标记，不从动画曲线反推分段。 */
+	bool bTurnBackSecondSegment = false;
+
 	/** 当前角色状态 ← ZZZAnimRuntimeModel.CurrentState */
 	ECharacterStateType CurrentState = ECharacterStateType::Idle;
 
 	/** 当前速度标量（cm/s）← AnimRuntimeData.VelocityLength */
 	float VelocityLength = 0.f;
+
+	/** 角色实际水平速度的世界空间单位方向 ← ZZZAnimRuntimeModel.ActualVelocityDirection。 */
+	FVector ActualVelocityDirection = FVector::ZeroVector;
+
+	/** 角色实际速度相对 Actor 的 BlendSpace 分量：X=右，Y=前。 */
+	float ActualVelocityBlendX = 0.f;
+	float ActualVelocityBlendY = 0.f;
+
+	/** 角色实际速度相对 Actor 的方向角（度）。 */
+	float ActualVelocityAngle = 0.f;
 
 	// ---- 通用 ----
 

@@ -48,13 +48,21 @@ struct FMovementConfig
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Knockback")
 	float KnockbackDecay = 5.f;
 
-	/** 转向插值速度（越大转向越快） */
-	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rotation")
-	float RotationInterpSpeed = 10.f;
-
 	/** Root Motion 位移缩放系数（1.0=原始数据） */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "RootMotion")
 	float RootMotionScale = 1.0f;
+
+	/** TurnBack 第一段结束并进入 Released 的时间点（秒）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TurnBack", meta = (ClampMin = "0.0"))
+	float TurnBackReleaseTimeSeconds = 0.17f;
+
+	/** TurnBack 第二段开始使用 d1 的时间点（秒）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TurnBack", meta = (ClampMin = "0.0"))
+	float TurnBackSecondSegmentTimeSeconds = 1.03f;
+
+	/** TurnBack 自然结束的总时长（秒）。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "TurnBack", meta = (ClampMin = "0.0"))
+	float TurnBackDurationSeconds = 2.40f;
 
 	/** 调试：可视化移动数据 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Debug")

@@ -158,12 +158,17 @@ void FCharacterControlPipeline::BuildFramePlan(const FStateUpdateResult& StateUp
 	// 只把当前源码已有的移动提交所需字段复制到命令缓冲；RuntimeData 仍是 canonical model。
 	FCharacterMovementCommand& MovementCommand = LastFramePlan.Commands.Movement;
 	MovementCommand.bShouldCommit = true;
+	MovementCommand.bShouldMove = RuntimeData->ZZZAnim.bShouldMove;
 	MovementCommand.bBlockMove = RuntimeData->Arbiter.bBlockMove;
 	MovementCommand.DesiredWorldMoveDir = RuntimeData->Intent.DesiredWorldMoveDir;
 	MovementCommand.TurnBackPhase = RuntimeData->Movement.TurnBack.Phase;
-	MovementCommand.TurnBackEntryDirection = RuntimeData->Movement.TurnBack.EntryDirection;
+	MovementCommand.bTurnBackSecondSegment = RuntimeData->Movement.TurnBack.bSecondSegment;
 	MovementCommand.AnimCurveSpeed = RuntimeData->RootMotion.AnimCurveSpeed;
-	MovementCommand.AnimCurveYaw = RuntimeData->RootMotion.AnimCurveYaw;
+	MovementCommand.AnimCurveYawDelta = RuntimeData->RootMotion.AnimCurveYawDelta;
+	MovementCommand.AnimCurveVelocity = RuntimeData->RootMotion.AnimCurveVelocity;
+	MovementCommand.AnimCurveVelocityDirection = RuntimeData->RootMotion.AnimCurveVelocityDirection;
+	MovementCommand.bHasAuthoredVelocityDirection = RuntimeData->RootMotion.bHasAuthoredVelocityDirection;
+	MovementCommand.bHasRootMotionCurveSource = RuntimeData->RootMotion.bHasRootMotionCurveSource;
 	MovementCommand.RootMotionDelta = RuntimeData->RootMotion.RootMotionDelta;
 	MovementCommand.bHasRootMotion = RuntimeData->RootMotion.bHasRootMotion;
 
@@ -200,3 +205,12 @@ void FCharacterControlPipeline::SetForceWalkHeld(bool bHeld)
 {
 	InputPipeline->SetForceWalkHeld(bHeld);
 }
+
+void FCharacterControlPipeline::NotifyCanYaw()
+{
+	if (IntentPipeline)
+	{
+		IntentPipeline->NotifyCanYaw();
+	}
+}
+

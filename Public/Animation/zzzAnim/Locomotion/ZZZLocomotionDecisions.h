@@ -64,8 +64,8 @@ public:
 
 	/**
 	 * Moving → Stop 的停止输入判定。
-	 * 与 ShouldStopMoving 相同地检查无输入，但 TurnBack 处于 Frozen 阶段时保持 false，
-	 * 以保证转身尚未解冻时不会因中途松开输入而提前退出顶层 Moving。
+	 * 与 ShouldStopMoving 相同地检查无输入，但 TurnBack 处于任一非 None 阶段时保持 false，
+	 * 以保证逻辑时间轴完成前不会因中途松开输入而提前退出顶层 Moving。
 	 */
 	bool ShouldExitMoving() const;
 

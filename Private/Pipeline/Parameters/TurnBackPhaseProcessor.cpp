@@ -1,9 +1,10 @@
 /**
  * @file TurnBackPhaseProcessor.cpp
- * @brief TurnBack 相位处理器实现
+ * @brief TurnBack 逻辑时间轴处理器实现
  */
 #include "Pipeline/Parameters/TurnBackPhaseProcessor.h"
-#include "Pipeline/Parameters/AnimSignalParameterProcessor.h"
+#include "BaseCharacter.h"
+#include "Data/Config/UCharConfigData.h"
 #include "Data/Runtime/RuntimeData.h"
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionRules.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
@@ -11,35 +12,70 @@
 
 namespace
 {
-	/** sig_turnback 视为"已解冻"的阈值；0/1 阶梯曲线用 0.5 兜住关键帧间插值。 */
-	constexpr float SignalReleaseThreshold = 0.5f;
-
-	/** Released 阶段角色前向与输入方向的点积达到此值即视为转向完成，回到 None（约 11°）。 */
-	constexpr float AlignedExitDot = 0.98f;
+	constexpr float DefaultReleaseTimeSeconds = 0.17f;
+	constexpr float DefaultDurationSeconds = 2.40f;
 }
 
 void FTurnBackPhaseProcessor::Init(ACharacter* InOwner)
 {
 	Owner = InOwner;
-}
+	ReleaseTimeSeconds = DefaultReleaseTimeSeconds;
+	DurationSeconds = DefaultDurationSeconds;
+	bTurnBackInputLatched = false;
+	bCanYawNotified = false;
 
-void FTurnBackPhaseProcessor::Process(FRuntimeData& RuntimeData, float /*DeltaTime*/)
-{
-	if (!Owner)
+	const ABaseCharacter* BaseOwner = Cast<ABaseCharacter>(Owner);
+	const UCharConfigData* CharacterConfig = BaseOwner
+		? BaseOwner->GetCharacterConfig()
+		: nullptr;
+	if (!CharacterConfig)
 	{
-		RuntimeData.Movement.TurnBack.Phase = ETurnBackPhase::None;
-		RuntimeData.Movement.TurnBack.EntryDirection = FVector::ZeroVector;
 		return;
 	}
 
-	// 离开 Moving 直接复位，避免相位残留到下一次移动。
+	const FMovementConfig& MovementConfig = CharacterConfig->MovementConfig;
+	const float ConfigDuration = MovementConfig.TurnBackDurationSeconds;
+	DurationSeconds = FMath::IsFinite(ConfigDuration)
+		? FMath::Max(ConfigDuration, KINDA_SMALL_NUMBER)
+		: DefaultDurationSeconds;
+
+	const float ConfigRelease = MovementConfig.TurnBackReleaseTimeSeconds;
+	ReleaseTimeSeconds = FMath::IsFinite(ConfigRelease)
+		? FMath::Clamp(ConfigRelease, 0.f, DurationSeconds)
+		: FMath::Min(DefaultReleaseTimeSeconds, DurationSeconds);
+}
+
+void FTurnBackPhaseProcessor::NotifyCanYaw()
+{
+	bCanYawNotified = true;
+}
+
+void FTurnBackPhaseProcessor::Process(FRuntimeData& RuntimeData, float DeltaTime)
+{
+	FTurnBackRuntimeModel& TurnBack = RuntimeData.Movement.TurnBack;
+
+	const auto ResetTurnBack = [&TurnBack]()
+	{
+		TurnBack.Phase = ETurnBackPhase::None;
+		TurnBack.bCanYaw = false;
+		TurnBack.bSecondSegment = false;
+		TurnBack.ElapsedSeconds = 0.f;
+	};
+
+	if (!Owner)
+	{
+		ResetTurnBack();
+		bTurnBackInputLatched = false;
+		bCanYawNotified = false;
+		return;
+	}
+
+	// 离开 Moving 直接复位，避免相位和边沿锁存残留到下一次移动。
 	if (RuntimeData.State.CurrentState != ECharacterStateType::Moving)
 	{
-		if (RuntimeData.Movement.TurnBack.Phase != ETurnBackPhase::None)
-		{
-			RuntimeData.Movement.TurnBack.Phase = ETurnBackPhase::None;
-			RuntimeData.Movement.TurnBack.EntryDirection = FVector::ZeroVector;
-		}
+		ResetTurnBack();
+		bTurnBackInputLatched = false;
+		bCanYawNotified = false;
 		return;
 	}
 
@@ -48,69 +84,123 @@ void FTurnBackPhaseProcessor::Process(FRuntimeData& RuntimeData, float /*DeltaTi
 	const float ForwardDot = (!DesiredDir.IsNearlyZero() && !ActorForward.IsNearlyZero())
 		? FVector::DotProduct(ActorForward, DesiredDir)
 		: 1.0f;
-
 	const float ReverseThreshold = ZZZLocomotionRules::DefaultTurnBackReverseInputDotThreshold;
-	const float TurnBackSignal = RuntimeData.GetAnimSignal(GGYGOAnimSignals::TurnBack());
 
-	switch (RuntimeData.Movement.TurnBack.Phase)
+	const bool bReverseRunInput =
+		RuntimeData.Gait.ResolvedGait == EMovementGait::Run
+		&& RuntimeData.ZZZAnim.bShouldMove
+		&& !DesiredDir.IsNearlyZero()
+		&& !ActorForward.IsNearlyZero()
+		&& ForwardDot <= ReverseThreshold;
+
+	const auto AdvanceElapsed = [this, &TurnBack](float InDeltaTime)
+	{
+		if (FMath::IsFinite(InDeltaTime) && InDeltaTime > 0.f)
+		{
+			TurnBack.ElapsedSeconds = FMath::Min(
+				TurnBack.ElapsedSeconds + InDeltaTime,
+				DurationSeconds);
+		}
+	};
+
+	const auto ApplyCanYaw = [this, &TurnBack]()
+	{
+		if (!bCanYawNotified || TurnBack.Phase == ETurnBackPhase::None)
+		{
+			return;
+		}
+
+		TurnBack.bCanYaw = true;
+		TurnBack.bSecondSegment = true;
+		bCanYawNotified = false;
+
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[TurnBack][Phase] CanYaw->D1 Elapsed=%.3f"),
+			TurnBack.ElapsedSeconds);
+	};
+
+	if (TurnBack.Phase != ETurnBackPhase::None)
+	{
+		ApplyCanYaw();
+	}
+
+	switch (TurnBack.Phase)
 	{
 	case ETurnBackPhase::None:
 	{
-		// 只有 Run + 有移动输入 + 输入接近角色前向的反方向时才进入转身。
-		const bool bReverseRunInput =
-			RuntimeData.Gait.ResolvedGait == EMovementGait::Run
-			&& RuntimeData.ZZZAnim.bShouldMove
-			&& !DesiredDir.IsNearlyZero()
-			&& !ActorForward.IsNearlyZero()
-			&& ForwardDot <= ReverseThreshold;
+		// CanYaw 只对当前 TurnBack 生效；在 None 阶段丢弃旧动画留下的待处理信号。
+		bCanYawNotified = false;
 
-		if (bReverseRunInput)
+		// TurnBack 完成后，持续按住同一个反向输入只回到 WalkRun，不立即开启下一次转身。
+		// 必须先离开反向阈值（松开或改变方向）才能消费下一次反向输入边沿。
+		if (!bReverseRunInput)
 		{
-			// 冻结进入转身前的实际移动方向：此刻 Actor 仍朝旧移动方向，前向即为要保持的方向。
-			RuntimeData.Movement.TurnBack.EntryDirection = ActorForward;
-			RuntimeData.Movement.TurnBack.Phase = ETurnBackPhase::Frozen;
-
-			UE_LOG(LogZZZAnim, Log,
-				TEXT("[TurnBack][Phase] None->Frozen ForwardDot=%.3f EntryYaw=%.2f InputYaw=%.2f"),
-				ForwardDot,
-				ActorForward.Rotation().Yaw,
-				DesiredDir.IsNearlyZero() ? 0.0f : DesiredDir.Rotation().Yaw);
+			bTurnBackInputLatched = false;
+			break;
 		}
+
+		if (bTurnBackInputLatched)
+		{
+			break;
+		}
+
+		TurnBack.Phase = ETurnBackPhase::Frozen;
+		TurnBack.bSecondSegment = false;
+		TurnBack.ElapsedSeconds = 0.f;
+		bTurnBackInputLatched = true;
+
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[TurnBack][Phase] None->Frozen ForwardDot=%.3f EntryYaw=%.2f InputYaw=%.2f Release=%.3f Duration=%.3f"),
+			ForwardDot,
+			ActorForward.Rotation().Yaw,
+			DesiredDir.IsNearlyZero() ? 0.0f : DesiredDir.Rotation().Yaw,
+			ReleaseTimeSeconds,
+			DurationSeconds);
 		break;
 	}
 
 	case ETurnBackPhase::Frozen:
 	{
-		// 动画信号越过阈值 → 解冻，交给 MotionDriver 在 Released 首个 Commit 中解析方向并转向。
-		if (TurnBackSignal >= SignalReleaseThreshold)
+		// 第一段不可打断；即使输入已经松开，也必须推进到 Released/第二段。
+		AdvanceElapsed(DeltaTime);
+
+		if (TurnBack.ElapsedSeconds >= ReleaseTimeSeconds)
 		{
-			RuntimeData.Movement.TurnBack.Phase = ETurnBackPhase::Released;
+			TurnBack.Phase = ETurnBackPhase::Released;
 
 			UE_LOG(LogZZZAnim, Log,
-				TEXT("[TurnBack][Phase] Frozen->Released Signal=%.3f InputYaw=%.2f"),
-				TurnBackSignal,
-				DesiredDir.IsNearlyZero() ? 0.0f : DesiredDir.Rotation().Yaw);
+				TEXT("[TurnBack][Phase] Frozen->Released Elapsed=%.3f ReleaseTime=%.3f"),
+				TurnBack.ElapsedSeconds,
+				ReleaseTimeSeconds);
 		}
+
 		break;
 	}
 
 	case ETurnBackPhase::Released:
 	{
-		// 无输入，或角色前向已对齐输入方向（转向完成）→ 回到普通移动。
-		const bool bAligned = !DesiredDir.IsNearlyZero()
-			&& !ActorForward.IsNearlyZero()
-			&& ForwardDot >= AlignedExitDot;
+		AdvanceElapsed(DeltaTime);
 
-		if (!RuntimeData.ZZZAnim.bShouldMove || bAligned)
+		const bool bNaturalComplete =
+			TurnBack.ElapsedSeconds >= DurationSeconds;
+		const bool bInterrupted =
+			TurnBack.bSecondSegment && !RuntimeData.ZZZAnim.bShouldMove;
+		if (!bNaturalComplete && !bInterrupted)
 		{
-			RuntimeData.Movement.TurnBack.Phase = ETurnBackPhase::None;
-			RuntimeData.Movement.TurnBack.EntryDirection = FVector::ZeroVector;
-
-			UE_LOG(LogZZZAnim, Log,
-				TEXT("[TurnBack][Phase] Released->None ForwardDot=%.3f ShouldMove=%d"),
-				ForwardDot,
-				RuntimeData.ZZZAnim.bShouldMove ? 1 : 0);
+			break;
 		}
+
+		const float ElapsedBeforeReset = TurnBack.ElapsedSeconds;
+		const bool bSecondSegmentBeforeReset = TurnBack.bSecondSegment;
+		ResetTurnBack();
+
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[TurnBack][Phase] Released->None Elapsed=%.3f NaturalComplete=%d SecondSegment=%d Interrupted=%d ShouldMove=%d"),
+			ElapsedBeforeReset,
+			bNaturalComplete ? 1 : 0,
+			bSecondSegmentBeforeReset ? 1 : 0,
+			bInterrupted ? 1 : 0,
+			RuntimeData.ZZZAnim.bShouldMove ? 1 : 0);
 		break;
 	}
 	}

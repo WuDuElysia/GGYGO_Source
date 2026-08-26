@@ -56,13 +56,13 @@ enum class EMovementGait : uint8
  * TurnBack 相位（急停转身的唯一真相，逻辑层写入，MotionDriver 与动画快照读取）
  *
  * None     不在转身
- * Frozen   已触发转身：移动方向冻结在进入转身前的方向，等待动画信号
- * Released sig_turnback 曲线已越过阈值：解冻，跟随当前输入方向并平滑转向
+ * Frozen   已触发转身：逻辑时间轴第一段，输入不能打断
+ * Released 已到达释放时间点：第一段继续到第二段，第二段允许无输入打断；该相位不直接写入 Actor rotation
  */
 UENUM(BlueprintType)
 enum class ETurnBackPhase : uint8
 {
 	None      UMETA(DisplayName="未转身"),
-	Frozen    UMETA(DisplayName="冻结方向"),
+	Frozen    UMETA(DisplayName="转身等待"),
 	Released  UMETA(DisplayName="已解冻"),
 };

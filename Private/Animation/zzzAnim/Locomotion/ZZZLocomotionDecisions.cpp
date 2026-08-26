@@ -61,7 +61,7 @@ bool FZZZLocomotionDecisions::ShouldExitMoving() const
 		return false;
 	}
 
-	if (Context.Snap->TurnBackPhase == ETurnBackPhase::Frozen)
+	if (Context.Snap->TurnBackPhase != ETurnBackPhase::None)
 	{
 		return false;
 	}
@@ -71,8 +71,9 @@ bool FZZZLocomotionDecisions::ShouldExitMoving() const
 
 bool FZZZLocomotionDecisions::WalkRun_To_TurnBack() const
 {
-	// 反向输入检测的唯一真相在逻辑层；此处只读相位：进入 Frozen 即触发 WalkRun → TurnBack。
+	// 反向输入检测的唯一真相在逻辑层；此处只读相位：整个 TurnBack 生命周期都允许进入 TurnBack。
+	// 使用 Phase != None 而不是只等待 Frozen，避免蓝图求值晚于释放时间点时错过进入窗口。
 	return Context.Snap
 		&& Context.Snap->CurrentState == ECharacterStateType::Moving
-		&& Context.Snap->TurnBackPhase == ETurnBackPhase::Frozen;
+		&& Context.Snap->TurnBackPhase != ETurnBackPhase::None;
 }

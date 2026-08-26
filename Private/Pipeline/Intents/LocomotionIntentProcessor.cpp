@@ -11,8 +11,10 @@
  * 依赖 ViewRotationProcessor 先写入 ControlRotation。
  */
 #include "Pipeline/Intents/LocomotionIntentProcessor.h"
+#include "CoreGlobals.h"
 #include "Data/Input/InputData.h"
 #include "Data/Runtime/RuntimeData.h"
+#include "Animation/zzzAnim/ZZZAnimLog.h"
 
 void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeData& RuntimeData)
 {
@@ -24,6 +26,19 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 	{
 		RuntimeData.Intent.DesiredWorldMoveDir = FVector::ZeroVector;
 		RuntimeData.ZZZAnim.bShouldMove = false;
+
+#if !UE_BUILD_SHIPPING
+		// 只在 TurnBack 期间打印，避免普通移动每帧刷屏。
+		if (RuntimeData.Movement.TurnBack.Phase != ETurnBackPhase::None)
+		{
+			UE_LOG(LogZZZAnim, Log,
+				TEXT("[MoveDiag][Intent] Frame=%llu MoveInput=(%.3f,%.3f) ControlRotationYaw=%.2f DesiredWorldMoveDir=(0.000,0.000,0.000)"),
+				GFrameCounter,
+				MoveInput.X,
+				MoveInput.Y,
+				RuntimeData.View.ControlRotation.Yaw);
+		}
+#endif
 		return;
 	}
 
@@ -41,4 +56,26 @@ void FLocomotionIntentProcessor::Process(const FInputData& InputData, FRuntimeDa
 
 	// 动画移动意图与方向处理在同一阶段同步。
 	RuntimeData.ZZZAnim.bShouldMove = !RuntimeData.Intent.DesiredWorldMoveDir.IsNearlyZero();
+
+#if !UE_BUILD_SHIPPING
+	// 只在 TurnBack 期间打印，避免普通移动每帧刷屏。
+	if (RuntimeData.Movement.TurnBack.Phase != ETurnBackPhase::None)
+	{
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[MoveDiag][Intent] Frame=%llu MoveInput=(%.3f,%.3f) ControlRotationYaw=%.2f Forward=(%.3f,%.3f,%.3f) Right=(%.3f,%.3f,%.3f) DesiredWorldMoveDir=(%.3f,%.3f,%.3f)"),
+			GFrameCounter,
+			MoveInput.X,
+			MoveInput.Y,
+			RuntimeData.View.ControlRotation.Yaw,
+			Forward.X,
+			Forward.Y,
+			Forward.Z,
+			Right.X,
+			Right.Y,
+			Right.Z,
+			RuntimeData.Intent.DesiredWorldMoveDir.X,
+			RuntimeData.Intent.DesiredWorldMoveDir.Y,
+			RuntimeData.Intent.DesiredWorldMoveDir.Z);
+	}
+#endif
 }

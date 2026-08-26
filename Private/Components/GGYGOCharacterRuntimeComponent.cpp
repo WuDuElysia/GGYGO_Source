@@ -78,6 +78,14 @@ void UGGYGOCharacterRuntimeComponent::SetForceWalkHeld(bool bHeld)
 	}
 }
 
+void UGGYGOCharacterRuntimeComponent::NotifyCanYaw()
+{
+	if (ControlPipeline)
+	{
+		ControlPipeline->NotifyCanYaw();
+	}
+}
+
 bool UGGYGOCharacterRuntimeComponent::IsInitialized() const
 {
 	return ControlPipeline && ControlPipeline->IsInitialized();

@@ -10,7 +10,6 @@
 
 #include "CoreMinimal.h"
 #include "Contracts/Animation/ZZZAnimRuntimeModel.h" // FZZZAnimRuntimeModel：ZZZ 游戏线程投影
-#include "Contracts/Animation/AnimSignalFrame.h"
 #include "Data/Runtime/ArbiterRuntimeModel.h"
 #include "Data/Runtime/GaitRuntimeModel.h"
 #include "Data/Runtime/IntentRuntimeModel.h"
@@ -34,16 +33,9 @@ struct FRuntimeData
 	FArbiterRuntimeModel Arbiter;
 	FStateRuntimeModel State;
 	FRootMotionRuntimeModel RootMotion;
-	FAnimSignalFrame AnimSignals;
 
 	/** 新版 ZZZ 动画层的游戏线程运行时投影。 */
 	FZZZAnimRuntimeModel ZZZAnim;
-
-	/** 兼容旧调用方的动画信号读取入口。 */
-	float GetAnimSignal(FName SignalName) const
-	{
-		return AnimSignals.Get(SignalName);
-	}
 
 	/** 帧末只清理攻击/闪避意图；跨帧 model 状态不在此处清零。 */
 	void ResetFrameIntents()

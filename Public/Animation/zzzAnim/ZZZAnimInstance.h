@@ -59,6 +59,10 @@ public:
 	 */
 	void PipelineDrive(float DeltaSeconds);
 
+	/** TurnBack 动画中名为 CanYaw 的 AnimNotify 回调。 */
+	UFUNCTION()
+	void AnimNotify_CanYaw();
+
 	// ============================================================
 	// ★★ Locomotion 过渡决策函数（AnimBP 过渡条件引用） ★★
 	//
@@ -120,9 +124,8 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_WalkRun_To_TurnBack() const;
 
-	// TurnBack 相位由逻辑层 FTurnBackPhaseProcessor 维护，经快照读取；
+	// TurnBack 相位和第二段标记由逻辑层 FTurnBackPhaseProcessor 维护，经快照读取；
 	// Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
-	// sig_turnback 与可选 RM_Yaw 曲线由管线统一采样，动画侧不再需要 Notify 回写逻辑层。
 
 	// ============================================================
 	// 配表查询（AnimBP 的 SequencePlayer 节点 Bind 此函数）
@@ -159,17 +162,40 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float AnimBlendY = 0.f;
 
-	/** 当前 RM_Yaw 源曲线采样值（度）；不代表最终输入方向。 */
-	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
-	float TurnBackSourceYaw = 0.f;
+	/** RM_PosX/RM_PosY 差分得到的固定动画曲线坐标速度（cm/s）。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
+	FVector AnimCurveVelocity = FVector::ZeroVector;
 
-	/**
-	 * 用于 AnimBP Rotate Root Bone 的逆向姿势补偿值（度）。
-	 * 保留原始 Bip001 转身姿势时，将此值接到 Bone_Root 的根姿势旋转；
-	 * 使用真正 In-Place 副本时该值应为 0 或不接入。
-	 */
+	/** RM_PosX/RM_PosY 差分速度的归一化方向，仍处于固定动画曲线坐标。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
+	FVector AnimCurveVelocityDirection = FVector::ZeroVector;
+
+	/** 动画曲线速度方向角（度）。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
+	float AnimCurveVelocityAngle = 0.f;
+
+	/** 角色实际水平速度的世界空间单位方向。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	FVector ActualVelocityDirection = FVector::ZeroVector;
+
+	/** 角色实际速度相对 Actor 的 BlendSpace 分量：X=右，Y=前。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	float ActualVelocityBlendX = 0.f;
+
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	float ActualVelocityBlendY = 0.f;
+
+	/** 角色实际速度相对 Actor 的方向角（度）：0=前，+90=右。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
+	float ActualVelocityAngle = 0.f;
+
+	/** 当前是否已收到 TurnBack 动画的 CanYaw Notify。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
-	float TurnBackPoseYawCorrection = 0.f;
+	bool bCanYaw = false;
+
+	/** 当前是否已经进入逻辑第二段；AnimBP 只读逻辑标记。 */
+	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
+	bool bTurnBackSecondSegment = false;
 
 protected:
 	/** 动画决策快照（游戏线程写入，worker 线程与决策函数只读） */

@@ -15,6 +15,7 @@
 class ACharacter;
 class USkeletalMeshComponent;
 class FInputData;
+class FTurnBackPhaseProcessor;
 struct FRuntimeData;
 
 class FIntentPipeline
@@ -44,12 +45,21 @@ public:
 	 * 前置条件: ProcessIntents() 已执行
 	 */
 	void ProcessParameters(FRuntimeData& RuntimeData, float DeltaTime);
+
+	/**
+	 * 动画 CanYaw Notify 的事件边界；实际状态仍由 TurnBackPhaseProcessor 权威维护。
+	 */
+	void NotifyCanYaw();
+
 private:
 	/** 意图处理器列表（按执行顺序） */
 	TArray<TUniquePtr<IIntentProcessor>> IntentProcessors;
 
 	/** 参数处理器列表（按执行顺序） */
 	TArray<TUniquePtr<IParameterProcessor>> ParameterProcessors;
+
+	/** TurnBack 参数处理器的非拥有引用，用于接收动画 CanYaw Notify。 */
+	FTurnBackPhaseProcessor* TurnBackPhaseProcessor = nullptr;
 
 	/** 步态决策者：具名成员，不加入任何处理器数组。 */
 	FGaitAuthorityProcessor GaitAuthority;

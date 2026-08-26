@@ -3,42 +3,118 @@
  * @brief 运动驱动器实现
  *
  * 动画曲线驱动架构：
- *   - DesiredWorldMoveDir 由摄像机相对输入生成；TurnBack Frozen 期间由锁定的进入方向覆盖，Released 首帧按 RootMotionDelta 与目标输入方向的一致性选择方向，后续使用当前输入方向
- *   - RM_Speed 是实际速度主值（cm/s），RootMotionScale 继续缩放最终动画速度
+ *   - RM_Speed 是实际速度主值（cm/s），RootMotionScale 只缩放最终速度
+ *   - 普通 walkrun 无 dir 曲线：移动方向 = 玩家输入方向 DesiredWorldMoveDir
+ *   - TurnBack 有固定方向曲线（dir 约定 X=左右、Y=前后）：
+ *       · d0 段移动方向 = dir 曲线相对进入时捕获的角色前/右方向映射到世界
+ *       · d1 段像 walkrun 朝输入方向移动
  *   - RM_Dist 仅保留为距离增量诊断，不参与最终速度计算
- *   - RM_PosX / RM_PosY 差分保留为局部曲线位移，并在 TurnBack Released 首帧作为方向候选；与目标输入同向时直接使用，相反时才取 180°反向
- *   - sig_turnback 解冻信号驱动 Actor 旋转；RM_Yaw 仅保留为源动画旋转诊断/姿态数据
  *   - SetRootMotionMode(IgnoreRootMotion) 保证曲线驱动不会与引擎 Root Motion 叠加
  */
 #include "Drivers/MotionDriver.h"
+#include "CoreGlobals.h"
 #include "Data/Runtime/RuntimeData.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/zzzAnim/ZZZAnimInstance.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionRules.h"
 #include "BaseCharacter.h"
 #include "Data/Config/UCharConfigData.h"
 
+namespace
+{
+	const TCHAR* GetCurveDirectionSource(const FCharacterMovementCommand& Command)
+	{
+		if (!Command.AnimCurveVelocityDirection.IsNearlyZero())
+		{
+			return Command.bHasAuthoredVelocityDirection
+				? TEXT("RM_VelocityDir")
+				: TEXT("RM_PosDelta");
+		}
+
+		if (!Command.RootMotionDelta.IsNearlyZero())
+		{
+			return TEXT("RM_PosDelta");
+		}
+
+		if (Command.TurnBackPhase != ETurnBackPhase::None)
+		{
+			return Command.bTurnBackSecondSegment
+				? TEXT("TurnBackD1Fallback")
+				: TEXT("TurnBackD0Fallback");
+		}
+
+		if (!Command.DesiredWorldMoveDir.IsNearlyZero())
+		{
+			return TEXT("DesiredWorldMoveDirFallback");
+		}
+
+		return TEXT("None");
+	}
+}
+
+void FMotionDriver::EnsureRootMotionIgnored()
+{
+	if (!Mesh)
+	{
+		return;
+	}
+
+	if (UAnimInstance* AnimInst = Mesh->GetAnimInstance())
+	{
+		AnimInst->SetRootMotionMode(ERootMotionMode::IgnoreRootMotion);
+	}
+}
+
 void FMotionDriver::Init(ACharacter* InOwner)
 {
 	RootMotionScale = 1.f;
 	Owner = InOwner;
-	if (!Owner) return;
+	Movement = nullptr;
+	Mesh = nullptr;
+	bTurnBackDirectionActive = false;
+	bTurnBackRotationOverrideActive = false;
+	bSavedOrientRotationToMovement = false;
+	bSavedUseControllerDesiredRotation = false;
+	bSavedUseControllerRotationYaw = false;
+	TurnBackDirectionBasisForward = FVector(1.f, 0.f, 0.f);
+	TurnBackDirectionBasisRight = FVector(0.f, 1.f, 0.f);
+	TurnBackAnimationElapsed = 0.f;
+	TurnBackAnimationLength = 0.f;
+	bTurnBackAnimationActive = false;
+	bTurnBackAnimationComplete = false;
+	if (!Owner)
+	{
+		return;
+	}
 
 	Mesh = Owner->GetMesh();
 	Movement = Owner->GetCharacterMovement();
 
 	if (Mesh)
 	{
+		EnsureRootMotionIgnored();
+
 		if (UAnimInstance* AnimInst = Mesh->GetAnimInstance())
 		{
-			AnimInst->SetRootMotionMode(ERootMotionMode::IgnoreRootMotion);
+			if (const UZZZAnimInstance* ZZZAnim = Cast<UZZZAnimInstance>(AnimInst))
+			{
+				if (const UAnimSequence* TurnBackSequence =
+					ZZZAnim->GetSeqByKey(FName(TEXT("TurnBack"))))
+				{
+					TurnBackAnimationLength = FMath::Max(
+						TurnBackSequence->GetPlayLength(),
+						0.f);
+				}
+			}
 		}
 	}
 
-	// 仅读取 RootMotionScale；当前移动速度不从固定 Walk/Run 配置初始化。
+	// 读取 RootMotionScale；移动速度不从固定 Walk/Run 配置初始化。
 	if (const ABaseCharacter* BaseOwner = Cast<ABaseCharacter>(Owner))
 	{
 		const UCharConfigData* CharacterConfig = BaseOwner->GetCharacterConfig();
@@ -49,165 +125,393 @@ void FMotionDriver::Init(ACharacter* InOwner)
 	}
 }
 
+void FMotionDriver::UpdateTurnBackRotationMode(const FCharacterMovementCommand& Command)
+{
+	if (!Owner || !Movement)
+	{
+		return;
+	}
+
+	const bool bShouldOverrideAutomaticYaw =
+		Command.bShouldCommit
+		&& Command.TurnBackPhase != ETurnBackPhase::None
+		&& !Command.bTurnBackSecondSegment;
+
+	if (bShouldOverrideAutomaticYaw)
+	{
+		if (!bTurnBackRotationOverrideActive)
+		{
+			bSavedOrientRotationToMovement = Movement->bOrientRotationToMovement;
+			bSavedUseControllerDesiredRotation = Movement->bUseControllerDesiredRotation;
+			bSavedUseControllerRotationYaw = Owner->bUseControllerRotationYaw;
+			bTurnBackRotationOverrideActive = true;
+
+#if !UE_BUILD_SHIPPING
+			UE_LOG(LogZZZAnim, Log,
+				TEXT("[TurnBack][RotationMode] D0 automatic yaw disabled"));
+#endif
+		}
+
+		Movement->bOrientRotationToMovement = false;
+		Movement->bUseControllerDesiredRotation = false;
+		Owner->bUseControllerRotationYaw = false;
+		return;
+	}
+
+	if (!bTurnBackRotationOverrideActive)
+	{
+		return;
+	}
+
+	Movement->bOrientRotationToMovement = bSavedOrientRotationToMovement;
+	Movement->bUseControllerDesiredRotation = bSavedUseControllerDesiredRotation;
+	Owner->bUseControllerRotationYaw = bSavedUseControllerRotationYaw;
+	bTurnBackRotationOverrideActive = false;
+
+#if !UE_BUILD_SHIPPING
+	UE_LOG(LogZZZAnim, Log,
+		TEXT("[TurnBack][RotationMode] automatic yaw restored Orient=%d ControllerDesired=%d PawnYaw=%d"),
+		Movement->bOrientRotationToMovement ? 1 : 0,
+		Movement->bUseControllerDesiredRotation ? 1 : 0,
+		Owner->bUseControllerRotationYaw ? 1 : 0);
+#endif
+}
+
+void FMotionDriver::UpdateTurnBackDirectionIntent(
+	const FCharacterMovementCommand& Command)
+{
+	if (Command.TurnBackPhase == ETurnBackPhase::None)
+	{
+		ResetTurnBackDirection();
+		return;
+	}
+
+	if (!bTurnBackDirectionActive)
+	{
+		bTurnBackDirectionActive = true;
+
+		// 进入 TurnBack 首帧捕获 Bone_Root 当前的世界水平前向和右向，作为 d0 曲线的原始基准。
+		ResolveTurnBackBoneRootBasis(
+			TurnBackDirectionBasisForward,
+			TurnBackDirectionBasisRight);
+	}
+}
+
+void FMotionDriver::ResolveTurnBackBoneRootBasis(
+	FVector& OutForward,
+	FVector& OutRight) const
+{
+	OutForward = Owner
+		? Owner->GetActorForwardVector().GetSafeNormal2D()
+		: FVector(1.f, 0.f, 0.f);
+	OutRight = Owner
+		? Owner->GetActorRightVector().GetSafeNormal2D()
+		: FVector(0.f, 1.f, 0.f);
+
+	if (!Mesh)
+	{
+		return;
+	}
+
+	const FName BoneRootName(TEXT("Bone_Root"));
+	if (Mesh->GetBoneIndex(BoneRootName) == INDEX_NONE)
+	{
+		return;
+	}
+
+	const FQuat BoneRootWorldRotation = Mesh->GetComponentQuat()
+		* Mesh->GetBoneQuaternion(BoneRootName, EBoneSpaces::ComponentSpace);
+	const FVector BoneForward = BoneRootWorldRotation.GetForwardVector().GetSafeNormal2D();
+	const FVector BoneRight = BoneRootWorldRotation.GetRightVector().GetSafeNormal2D();
+	if (!BoneForward.IsNearlyZero() && !BoneRight.IsNearlyZero())
+	{
+		OutForward = BoneForward;
+		OutRight = BoneRight;
+	}
+}
+
+void FMotionDriver::ApplyTurnBackYaw(const FCharacterMovementCommand& Command)
+{
+	if (!Owner
+		|| Command.TurnBackPhase == ETurnBackPhase::None
+		|| Command.bTurnBackSecondSegment)
+	{
+		return;
+	}
+
+	const float YawDelta = FMath::IsFinite(Command.AnimCurveYawDelta)
+		? Command.AnimCurveYawDelta
+		: 0.f;
+	if (FMath::IsNearlyZero(YawDelta))
+	{
+		return;
+	}
+
+	Owner->AddActorWorldRotation(FRotator(0.f, YawDelta, 0.f));
+
+#if !UE_BUILD_SHIPPING
+	UE_LOG(LogZZZAnim, Log,
+		TEXT("[TurnBack][ActorYaw] Phase=%d D1=0 RMYawDelta=%.3f ActorYaw=%.3f"),
+		static_cast<uint8>(Command.TurnBackPhase),
+		YawDelta,
+		Owner->GetActorRotation().Yaw);
+#endif
+}
+
+void FMotionDriver::ResetTurnBackDirection()
+{
+	bTurnBackDirectionActive = false;
+	TurnBackDirectionBasisForward = FVector(1.f, 0.f, 0.f);
+	TurnBackDirectionBasisRight = FVector(0.f, 1.f, 0.f);
+}
+
+FVector FMotionDriver::ResolveTurnBackWorldMoveDirection(
+	const FCharacterMovementCommand& Command) const
+{
+	// d1（CanYaw 之后）：像 walkrun 一样直接朝玩家输入方向移动，方向被输入实时修正。
+	if (Command.bTurnBackSecondSegment)
+	{
+		FVector InputDir = Command.DesiredWorldMoveDir;
+		InputDir.Z = 0.f;
+		return InputDir.GetSafeNormal2D();
+	}
+
+	// d0（CanYaw 之前）：先读取固定动画起始基准下的 authored 方向。
+	FVector CurveDir = Command.AnimCurveVelocityDirection.GetSafeNormal2D();
+	if (CurveDir.IsNearlyZero() && Command.bHasRootMotion)
+	{
+		CurveDir = Command.RootMotionDelta.GetSafeNormal2D();
+	}
+
+	if (CurveDir.IsNearlyZero())
+	{
+		// 无曲线方向时退回入口 Bone_Root 前向，仍保持世界直线。
+		return TurnBackDirectionBasisForward;
+	}
+
+	FVector CurrentForward;
+	FVector CurrentRight;
+	ResolveTurnBackBoneRootBasis(CurrentForward, CurrentRight);
+	if (CurrentForward.IsNearlyZero() || CurrentRight.IsNearlyZero())
+	{
+		return TurnBackDirectionBasisForward;
+	}
+
+	// CurveDir 的 X/Y 是 Bone_Root 局部右/前分量；先转成 UE 局部 X=前、Y=右。
+	const FVector CurveLocalDirection(CurveDir.Y, CurveDir.X, 0.f);
+	const float EntryYaw = TurnBackDirectionBasisForward.Rotation().Yaw;
+	const float CurrentYaw = CurrentForward.Rotation().Yaw;
+	const float RelativeBoneRootYaw = FMath::FindDeltaAngleDegrees(
+		EntryYaw,
+		CurrentYaw);
+
+	// 当前 Bone_Root 已因 Actor 转身旋转了 RelativeBoneRootYaw；逆旋转 authored 方向，
+	// 再用当前 Bone_Root 基准映射回世界，保持入口时的世界位移直线。
+	const FVector CorrectedLocalDirection = FRotator(
+		0.f,
+		-RelativeBoneRootYaw,
+		0.f).RotateVector(CurveLocalDirection);
+	FVector WorldDirection = CurrentForward * CorrectedLocalDirection.X
+		+ CurrentRight * CorrectedLocalDirection.Y;
+	WorldDirection.Z = 0.f;
+	return WorldDirection.GetSafeNormal2D();
+}
+
 FVector FMotionDriver::ResolveWorldMoveDirection(
 	const FCharacterMovementCommand& Command) const
 {
-	FVector MoveDirection;
-	switch (Command.TurnBackPhase)
+	// TurnBack 是动画自带位移的特例：d0 用 dir 曲线×进入锁定基准，d1 用玩家输入方向。
+	if (Command.TurnBackPhase != ETurnBackPhase::None)
 	{
-	case ETurnBackPhase::Frozen:
-		// Frozen：保持进入转身前的方向，等待 sig_turnback 解冻。
-		MoveDirection = Command.TurnBackEntryDirection;
-		break;
-
-	case ETurnBackPhase::Released:
-		// Released 首帧优先使用刚由 RootMotion XY 与目标输入选择出的方向；后续帧跟随当前输入。
-		MoveDirection = !FrameTurnBackReleaseDirection.IsNearlyZero()
-			? FrameTurnBackReleaseDirection
-			: Command.DesiredWorldMoveDir;
-		break;
-
-	default:
-		// None：普通移动，直接使用当前输入方向。
-		MoveDirection = Command.DesiredWorldMoveDir;
-		break;
+		return ResolveTurnBackWorldMoveDirection(Command);
 	}
 
+	// 普通移动（无 dir/yaw 曲线）：移动方向就是玩家输入方向。
+	// DesiredWorldMoveDir 已由 LocomotionIntentProcessor 按摄像机水平 Yaw 把摇杆输入解析成世界方向。
+	FVector MoveDirection = Command.DesiredWorldMoveDir;
 	MoveDirection.Z = 0.f;
-	return MoveDirection.GetSafeNormal();
+	return MoveDirection.GetSafeNormal2D();
 }
 
-FVector FMotionDriver::ResolveTurnBackReleaseDirection(
-	const FCharacterMovementCommand& Command,
-	FMotionDriver::ETurnBackReleaseDirectionSource* OutSource) const
+void FMotionDriver::UpdateTurnBackReleaseState(
+	float DeltaTime,
+	const FCharacterMovementCommand& Command)
 {
-	if (OutSource)
-	{
-		*OutSource = ETurnBackReleaseDirectionSource::EntryDirectionFallback;
-	}
-
 	if (!Owner)
 	{
-		return FVector::ZeroVector;
+		return;
 	}
 
-	const FVector DesiredDirection = Command.DesiredWorldMoveDir.GetSafeNormal2D();
-	if (Command.bHasRootMotion)
+#if !UE_BUILD_SHIPPING
+	if (Command.TurnBackPhase != ETurnBackPhase::None)
 	{
-		// RootMotionDelta 是动画局部空间位移，先按旋转前 Actor 朝向转到世界。
-		// 动画的 Root/自定义位移可能已经包含 180° 转身：只有候选方向与目标输入相反时，
-		// 才取反向，避免把动画内置的转身再叠加一次。
-		const FVector LocalRootMotionDirection = Command.RootMotionDelta.GetSafeNormal2D();
-		if (!LocalRootMotionDirection.IsNearlyZero())
-		{
-			FVector WorldRootMotionDirection = Owner->GetActorTransform()
-				.TransformVectorNoScale(LocalRootMotionDirection);
-			WorldRootMotionDirection.Z = 0.f;
-			WorldRootMotionDirection = WorldRootMotionDirection.GetSafeNormal2D();
-			if (!WorldRootMotionDirection.IsNearlyZero())
-			{
-				if (!DesiredDirection.IsNearlyZero())
-				{
-					const float DirectionAlignment = FVector::DotProduct(
-						WorldRootMotionDirection,
-						DesiredDirection);
-					if (OutSource)
-					{
-						*OutSource = DirectionAlignment >= 0.f
-							? ETurnBackReleaseDirectionSource::RootMotionXY
-							: ETurnBackReleaseDirectionSource::RootMotionXYReversed;
-					}
-					return (DirectionAlignment >= 0.f
-						? WorldRootMotionDirection
-						: -WorldRootMotionDirection).GetSafeNormal2D();
-				}
+		const FRotator ActorRotation = Owner->GetActorRotation();
+		const FRotator ControlRotation = Owner->GetControlRotation();
+		const FVector Velocity = Owner->GetVelocity();
+		const FVector Acceleration = Movement
+			? Movement->GetCurrentAcceleration()
+			: FVector::ZeroVector;
+		const FRotator VelocityRotation = Velocity.IsNearlyZero()
+			? FRotator::ZeroRotator
+			: Velocity.GetSafeNormal2D().Rotation();
+		const FRotator AccelerationRotation = Acceleration.IsNearlyZero()
+			? FRotator::ZeroRotator
+			: Acceleration.GetSafeNormal2D().Rotation();
+		const FVector RequestedDirection = Command.bTurnBackSecondSegment
+			? Command.DesiredWorldMoveDir.GetSafeNormal2D()
+			: Command.AnimCurveVelocityDirection.GetSafeNormal2D();
+		const FVector RequestedVelocity = RequestedDirection
+			* FMath::Max(Command.AnimCurveSpeed, 0.f)
+			* RootMotionScale;
 
-				// 没有目标输入时保留旧契约：RootMotion 位移按反向方向作为安全回退。
-				if (OutSource)
+		const FName RootBoneName(TEXT("Root"));
+		const FName BoneRootName(TEXT("Bone_Root"));
+		const FName Bip001BoneName(TEXT("Bip001"));
+		const int32 RootBoneIndex = Mesh
+			? Mesh->GetBoneIndex(RootBoneName)
+			: INDEX_NONE;
+		const int32 BoneRootIndex = Mesh
+			? Mesh->GetBoneIndex(BoneRootName)
+			: INDEX_NONE;
+		const int32 Bip001BoneIndex = Mesh
+			? Mesh->GetBoneIndex(Bip001BoneName)
+			: INDEX_NONE;
+		const FRotator RootComponentRotation = RootBoneIndex != INDEX_NONE
+			? Mesh->GetBoneQuaternion(
+				RootBoneName,
+				EBoneSpaces::ComponentSpace).Rotator()
+			: FRotator::ZeroRotator;
+		const FRotator BoneRootComponentRotation = BoneRootIndex != INDEX_NONE
+			? Mesh->GetBoneQuaternion(
+				BoneRootName,
+				EBoneSpaces::ComponentSpace).Rotator()
+			: FRotator::ZeroRotator;
+		const FRotator Bip001ComponentRotation = Bip001BoneIndex != INDEX_NONE
+			? Mesh->GetBoneQuaternion(
+				Bip001BoneName,
+				EBoneSpaces::ComponentSpace).Rotator()
+			: FRotator::ZeroRotator;
+		const FRotator MeshRelativeRotation = Mesh
+			? Mesh->GetRelativeRotation()
+			: FRotator::ZeroRotator;
+		const FRotator MeshComponentRotation = Mesh
+			? Mesh->GetComponentRotation()
+			: FRotator::ZeroRotator;
+
+		UE_LOG(LogZZZAnim, Log,
+			TEXT("[TurnBack][RotationDiag] Frame=%llu Phase=%d D1=%d "
+				"Actor=(P%.2f Y%.2f R%.2f) Control=(P%.2f Y%.2f R%.2f) "
+				"VelocityYaw=%.2f AccelYaw=%.2f "
+				"Desired=(%.2f,%.2f,%.2f) CurveDir=(%.2f,%.2f,%.2f) "
+				"Requested=(%.2f,%.2f,%.2f) "
+				"Flags[Orient=%d ControllerDesired=%d PawnYaw=%d] "
+				"MeshRel=(P%.2f Y%.2f R%.2f) MeshComp=(P%.2f Y%.2f R%.2f) "
+				"BoneIndex[Root=%d Bone_Root=%d Bip001=%d] "
+				"BoneCSYaw[Root=%.2f Bone_Root=%.2f Bip001=%.2f]"),
+			GFrameCounter,
+			static_cast<uint8>(Command.TurnBackPhase),
+			Command.bTurnBackSecondSegment ? 1 : 0,
+			ActorRotation.Pitch,
+			ActorRotation.Yaw,
+			ActorRotation.Roll,
+			ControlRotation.Pitch,
+			ControlRotation.Yaw,
+			ControlRotation.Roll,
+			VelocityRotation.Yaw,
+			AccelerationRotation.Yaw,
+			Command.DesiredWorldMoveDir.X,
+			Command.DesiredWorldMoveDir.Y,
+			Command.DesiredWorldMoveDir.Z,
+			Command.AnimCurveVelocityDirection.X,
+			Command.AnimCurveVelocityDirection.Y,
+			Command.AnimCurveVelocityDirection.Z,
+			RequestedVelocity.X,
+			RequestedVelocity.Y,
+			RequestedVelocity.Z,
+			Movement ? (Movement->bOrientRotationToMovement ? 1 : 0) : -1,
+			Movement ? (Movement->bUseControllerDesiredRotation ? 1 : 0) : -1,
+			Owner->bUseControllerRotationYaw ? 1 : 0,
+			MeshRelativeRotation.Pitch,
+			MeshRelativeRotation.Yaw,
+			MeshRelativeRotation.Roll,
+			MeshComponentRotation.Pitch,
+			MeshComponentRotation.Yaw,
+			MeshComponentRotation.Roll,
+			RootBoneIndex,
+			BoneRootIndex,
+			Bip001BoneIndex,
+			RootComponentRotation.Yaw,
+			BoneRootComponentRotation.Yaw,
+			Bip001ComponentRotation.Yaw);
+	}
+#endif
+
+	const bool bTurnBackActive =
+		Command.TurnBackPhase == ETurnBackPhase::Frozen
+		|| Command.TurnBackPhase == ETurnBackPhase::Released;
+	if (!bTurnBackActive)
+	{
+		if (Command.TurnBackPhase == ETurnBackPhase::None)
+		{
+			bTurnBackAnimationActive = false;
+			bTurnBackAnimationComplete = false;
+			TurnBackAnimationElapsed = 0.f;
+		}
+		return;
+	}
+
+	// TurnBack 期间继续确保曲线驱动不会被引擎 Root Motion 叠加。
+	EnsureRootMotionIgnored();
+
+	if (!bTurnBackAnimationActive)
+	{
+		bTurnBackAnimationActive = true;
+		TurnBackAnimationElapsed = 0.f;
+
+		// Init 时 AnimBP 可能尚未完成实例化或配置；首次进入 TurnBack 时再尝试一次。
+		if (TurnBackAnimationLength <= KINDA_SMALL_NUMBER && Mesh)
+		{
+			if (const UZZZAnimInstance* ZZZAnim =
+				Cast<UZZZAnimInstance>(Mesh->GetAnimInstance()))
+			{
+				if (const UAnimSequence* TurnBackSequence =
+					ZZZAnim->GetSeqByKey(FName(TEXT("TurnBack"))))
 				{
-					*OutSource = ETurnBackReleaseDirectionSource::RootMotionXYReversed;
+					TurnBackAnimationLength = FMath::Max(
+						TurnBackSequence->GetPlayLength(),
+						0.f);
 				}
-				return (-WorldRootMotionDirection).GetSafeNormal2D();
 			}
 		}
 	}
 
-	// 没有可用位移曲线时，直接使用输入方向作为解冻目标。
-	if (!DesiredDirection.IsNearlyZero())
+	if (FMath::IsFinite(DeltaTime) && DeltaTime > 0.f)
 	{
-		if (OutSource)
-		{
-			*OutSource = ETurnBackReleaseDirectionSource::DesiredWorldMoveDir;
-		}
-		return DesiredDirection;
+		TurnBackAnimationElapsed += DeltaTime;
 	}
 
-	// 最后使用入口方向的严格反向，保证仍能完成固定 180° 的安全回退。
-	return (-Command.TurnBackEntryDirection).GetSafeNormal2D();
-}
-
-void FMotionDriver::ApplyTurnBackReleaseRotation(
-	const FCharacterMovementCommand& Command)
-{
-	FrameTurnBackReleaseDirection = FVector::ZeroVector;
-
-	if (!Owner)
-	{
-		return;
-	}
-
-	if (Command.TurnBackPhase == ETurnBackPhase::None)
-	{
-		// 一次转身结束后清除闩锁，下一段 TurnBack 可以再次触发。
-		bTurnBackReleaseRotationApplied = false;
-		return;
-	}
-
-	// 只有 sig_turnback 已经把相位推进到 Released 后才旋转 Actor；Frozen 期间保持旧方向。
 	if (Command.TurnBackPhase != ETurnBackPhase::Released
-		|| bTurnBackReleaseRotationApplied)
+		|| bTurnBackAnimationComplete)
 	{
 		return;
 	}
 
-	ETurnBackReleaseDirectionSource DirectionSource =
-		ETurnBackReleaseDirectionSource::EntryDirectionFallback;
-	const FVector CorrectedDirection = ResolveTurnBackReleaseDirection(Command, &DirectionSource);
-	if (CorrectedDirection.IsNearlyZero())
+	const bool bAnimationComplete = TurnBackAnimationLength <= KINDA_SMALL_NUMBER
+		|| TurnBackAnimationElapsed + KINDA_SMALL_NUMBER >= TurnBackAnimationLength;
+	if (!bAnimationComplete)
 	{
 		return;
 	}
 
-	const float CorrectedYaw = CorrectedDirection.Rotation().Yaw;
-	Owner->SetActorRotation(FRotator(0.f, CorrectedYaw, 0.f));
-	FrameTurnBackReleaseDirection = CorrectedDirection;
-	bTurnBackReleaseRotationApplied = true;
-
-	const TCHAR* SourceName = TEXT("EntryDirectionFallback");
-	switch (DirectionSource)
-	{
-	case ETurnBackReleaseDirectionSource::RootMotionXY:
-		SourceName = TEXT("RootMotionXY");
-		break;
-	case ETurnBackReleaseDirectionSource::RootMotionXYReversed:
-		SourceName = TEXT("RootMotionXY_Reversed");
-		break;
-	case ETurnBackReleaseDirectionSource::DesiredWorldMoveDir:
-		SourceName = TEXT("DesiredWorldMoveDir");
-		break;
-	default:
-		break;
-	}
-
+	bTurnBackAnimationComplete = true;
 	const FVector DesiredDirection = Command.DesiredWorldMoveDir.GetSafeNormal2D();
 	UE_LOG(LogZZZAnim, Log,
-		TEXT("[TurnBack][ReleaseRotation] ActorYaw=%.2f CorrectedYaw=%.2f Source=%s RootDelta=(%.3f,%.3f) DesiredYaw=%.2f"),
-		Owner->GetActorRotation().Yaw,
-		CorrectedYaw,
-		SourceName,
+		TEXT("[TurnBack][AnimationComplete] RootDelta=(%.3f,%.3f) DesiredYaw=%.2f AnimationTime=%.3f/%.3f"),
 		Command.RootMotionDelta.X,
 		Command.RootMotionDelta.Y,
-		DesiredDirection.IsNearlyZero() ? 0.0f : DesiredDirection.Rotation().Yaw);
+		DesiredDirection.IsNearlyZero() ? 0.0f : DesiredDirection.Rotation().Yaw,
+		TurnBackAnimationElapsed,
+		TurnBackAnimationLength);
 }
 
 void FMotionDriver::Process(
@@ -215,19 +519,41 @@ void FMotionDriver::Process(
 	const FCharacterMovementCommand& Command,
 	FRuntimeData& RuntimeData)
 {
-	if (!Owner || !Movement || !Command.bShouldCommit)
+	if (!Owner || !Movement)
 	{
 		return;
 	}
 
-	// sig_turnback 已将相位推进到 Released：首次 Commit 按 RootMotion/输入候选设置 Actor 朝向，
-	// 并用同一帧选出的方向提交移动。
-	ApplyTurnBackReleaseRotation(Command);
+	UpdateTurnBackRotationMode(Command);
+	if (!Command.bShouldCommit)
+	{
+		return;
+	}
+
+	// TurnBack Phase 和 CanYaw 第二段标记由参数处理器维护；D0 的 RM_Yaw 差分在 Motion Commit
+	// 阶段累加到 Actor，d0 位移方向随后按当前 Bone_Root yaw 做逆变换。
+	UpdateTurnBackDirectionIntent(Command);
+	ApplyTurnBackYaw(Command);
+	UpdateTurnBackReleaseState(DeltaTime, Command);
 
 	// 被仲裁阻止移动时，清零速度上限，只更新运行时数据，不驱动位移。
 	if (Command.bBlockMove)
 	{
 		Movement->MaxWalkSpeed = 0.f;
+		UpdateRuntimeData(RuntimeData);
+		return;
+	}
+
+	// 零输入时，普通移动必须立即停止；显式 TurnBack 或有效 RootMotion 曲线源允许
+	// 动画收尾继续提交，直到后续状态逻辑退出该状态。
+	const bool bAllowTurnBackRootMotion =
+		Command.TurnBackPhase != ETurnBackPhase::None;
+	if (!Command.bShouldMove
+		&& !bAllowTurnBackRootMotion
+		&& !Command.bHasRootMotionCurveSource)
+	{
+		Movement->MaxWalkSpeed = 0.f;
+		Movement->StopMovementImmediately();
 		UpdateRuntimeData(RuntimeData);
 		return;
 	}
@@ -251,13 +577,12 @@ void FMotionDriver::Process(
 		return;
 	}
 
-	// MaxWalkSpeed 仅承载当前 RM_Speed * RootMotionScale 的引擎速度上限，不是固定速度配置；
-	// 必须先于两条移动路径设置为有效曲线速度，随后移动请求才能立即采用该值。
+	// MaxWalkSpeed 仅承载当前 RM_Speed * RootMotionScale 的引擎速度上限，不是固定速度配置。
 	Movement->MaxWalkSpeed = ScaledCurveSpeed;
 
 	const FVector MoveDirection = ResolveWorldMoveDirection(Command);
 
-	// 路径 A：有有效 RM_PosX/RM_PosY 差分时走曲线位移分支；世界方向由当前相位方向提供。
+	// 路径 A：有有效 RM_PosX/RM_PosY 差分时走曲线位移分支；世界方向由上面的规则统一决定。
 	if (Command.bHasRootMotion)
 	{
 		ProcessRootMotionMovement(DeltaTime, Command);
@@ -268,7 +593,6 @@ void FMotionDriver::Process(
 		ProcessLocomotion(MoveDirection, Command);
 	}
 
-	// 回写实际速度、移动状态到 RuntimeData 供调试/UI 使用。
 	UpdateRuntimeData(RuntimeData);
 }
 
@@ -281,16 +605,14 @@ void FMotionDriver::ProcessRootMotionMovement(
 		return;
 	}
 
-	// TurnBack Frozen 期间使用进入转身前锁定的方向；Released 首帧使用解冻时选择出的方向，
-	// 其它相位使用当前摄像机相对输入方向。
 	FVector WorldMoveDir = ResolveWorldMoveDirection(Command);
 
-	// Stop/减速动画可能没有本帧输入；只回退到角色自身的水平前向，不使用摄像机方向。
+	// 只有曲线和输入方向都无效时，才回退到角色自身的水平前向。
 	if (WorldMoveDir.IsNearlyZero())
 	{
 		WorldMoveDir = Owner->GetActorForwardVector();
 		WorldMoveDir.Z = 0.f;
-		WorldMoveDir = WorldMoveDir.GetSafeNormal();
+		WorldMoveDir = WorldMoveDir.GetSafeNormal2D();
 	}
 
 	if (WorldMoveDir.IsNearlyZero())
@@ -305,7 +627,6 @@ void FMotionDriver::ProcessRootMotionMovement(
 		: 0.f;
 	if (AnimCurveSpeed <= KINDA_SMALL_NUMBER)
 	{
-		// RM_Speed 末尾为零时不再被 RM_Dist 推着移动。
 		return;
 	}
 
@@ -317,9 +638,33 @@ void FMotionDriver::ProcessRootMotionMovement(
 
 	const FVector WorldVelocity = WorldMoveDir * ScaledSpeed;
 
-	// RequestDirectMove 的第二个参数是 bForceMaxSpeed：true 走 Unreal 的
-	// 强制直接请求语义，不再依赖加速度/减速度逐步逼近；MaxWalkSpeed 已在
-	// 调用前设置为当前 ScaledSpeed，仅作为该帧曲线速度的引擎上限承载。
+#if !UE_BUILD_SHIPPING
+	// 只在 TurnBack 期间打印，避免普通移动每帧刷屏。
+	if (Command.TurnBackPhase != ETurnBackPhase::None)
+	{
+	UE_LOG(LogZZZAnim, Log,
+		TEXT("[MoveDiag][RequestDirectMove] Frame=%llu Path=RootMotion TurnBackPhase=%d SecondSegment=%d CurveDirectionSource=%s CurveDirectionLocal=(%.3f,%.3f) DesiredWorldMoveDir=(%.3f,%.3f,%.3f) RootMotionDelta=(%.3f,%.3f,%.3f) RequestDirectMoveDir=(%.3f,%.3f,%.3f) Speed=%.3f"),
+		GFrameCounter,
+		static_cast<uint8>(Command.TurnBackPhase),
+		Command.bTurnBackSecondSegment ? 1 : 0,
+		GetCurveDirectionSource(Command),
+		Command.AnimCurveVelocityDirection.X,
+		Command.AnimCurveVelocityDirection.Y,
+		Command.DesiredWorldMoveDir.X,
+		Command.DesiredWorldMoveDir.Y,
+		Command.DesiredWorldMoveDir.Z,
+		Command.RootMotionDelta.X,
+		Command.RootMotionDelta.Y,
+		Command.RootMotionDelta.Z,
+		WorldMoveDir.X,
+		WorldMoveDir.Y,
+		WorldMoveDir.Z,
+		ScaledSpeed);
+	}
+#endif
+
+	// RequestDirectMove 的第二个参数是 bForceMaxSpeed：true 走 Unreal 的强制直接请求语义，
+	// 不再依赖加速度/减速度逐步逼近；MaxWalkSpeed 已承载当前曲线速度。
 	Movement->RequestDirectMove(WorldVelocity, true);
 }
 
@@ -327,7 +672,7 @@ void FMotionDriver::ProcessLocomotion(
 	const FVector& WorldDir,
 	const FCharacterMovementCommand& Command)
 {
-	FVector Dir = WorldDir.GetSafeNormal();
+	FVector Dir = WorldDir.GetSafeNormal2D();
 	if (Dir.IsNearlyZero())
 	{
 		return;
@@ -344,25 +689,69 @@ void FMotionDriver::ProcessLocomotion(
 		return;
 	}
 
-	// 防滑步核心：输入方向 × RM_Speed × RootMotionScale → 直接速度请求。
-	// 与根曲线路径一致使用 bForceMaxSpeed=true，避免请求受加速度/减速度逼近影响。
+	// 防滑步核心：世界方向 × RM_Speed × RootMotionScale → 直接速度请求。
 	const FVector TargetVelocity = Dir * ScaledCurveSpeed;
+
+#if !UE_BUILD_SHIPPING
+	// 只在 TurnBack 期间打印，避免普通移动每帧刷屏。
+	if (Command.TurnBackPhase != ETurnBackPhase::None)
+	{
+	UE_LOG(LogZZZAnim, Log,
+		TEXT("[MoveDiag][RequestDirectMove] Frame=%llu Path=Locomotion TurnBackPhase=%d SecondSegment=%d CurveDirectionSource=%s CurveDirectionLocal=(%.3f,%.3f) DesiredWorldMoveDir=(%.3f,%.3f,%.3f) RootMotionDelta=(%.3f,%.3f,%.3f) RequestDirectMoveDir=(%.3f,%.3f,%.3f) Speed=%.3f"),
+		GFrameCounter,
+		static_cast<uint8>(Command.TurnBackPhase),
+		Command.bTurnBackSecondSegment ? 1 : 0,
+		GetCurveDirectionSource(Command),
+		Command.AnimCurveVelocityDirection.X,
+		Command.AnimCurveVelocityDirection.Y,
+		Command.DesiredWorldMoveDir.X,
+		Command.DesiredWorldMoveDir.Y,
+		Command.DesiredWorldMoveDir.Z,
+		Command.RootMotionDelta.X,
+		Command.RootMotionDelta.Y,
+		Command.RootMotionDelta.Z,
+		Dir.X,
+		Dir.Y,
+		Dir.Z,
+		ScaledCurveSpeed);
+	}
+#endif
+
 	Movement->RequestDirectMove(TargetVelocity, true);
 }
 
 void FMotionDriver::UpdateRuntimeData(FRuntimeData& RuntimeData)
 {
-	if (!Owner) return;
+	if (!Owner)
+	{
+		return;
+	}
 
 	FVector Velocity = Owner->GetVelocity();
-	RuntimeData.Movement.CurrentSpeed = Velocity.Size2D();
+	const FVector HorizontalVelocity(Velocity.X, Velocity.Y, 0.f);
+	RuntimeData.Movement.CurrentSpeed = HorizontalVelocity.Size2D();
 	RuntimeData.ZZZAnim.VelocityLength = RuntimeData.Movement.CurrentSpeed;
 	RuntimeData.Movement.bIsMoving = RuntimeData.Movement.CurrentSpeed > 10.f;
 
+	RuntimeData.ZZZAnim.ActualVelocityDirection = FVector::ZeroVector;
+	RuntimeData.ZZZAnim.ActualVelocityBlendX = 0.f;
+	RuntimeData.ZZZAnim.ActualVelocityBlendY = 0.f;
+	RuntimeData.ZZZAnim.ActualVelocityAngle = 0.f;
+
+	const FVector LocalVelocity = Owner->GetActorTransform()
+		.InverseTransformVector(HorizontalVelocity);
+	const float LocalVelocityLength = LocalVelocity.Size2D();
+	if (LocalVelocityLength > KINDA_SMALL_NUMBER)
+	{
+		RuntimeData.ZZZAnim.ActualVelocityDirection = HorizontalVelocity.GetSafeNormal2D();
+		RuntimeData.ZZZAnim.ActualVelocityBlendX = LocalVelocity.Y / LocalVelocityLength;
+		RuntimeData.ZZZAnim.ActualVelocityBlendY = LocalVelocity.X / LocalVelocityLength;
+		RuntimeData.ZZZAnim.ActualVelocityAngle = FMath::RadiansToDegrees(
+			FMath::Atan2(LocalVelocity.Y, LocalVelocity.X));
+	}
+
 	if (RuntimeData.Movement.bIsMoving)
 	{
-		FVector LocalVelocity = Owner->GetActorTransform()
-			.InverseTransformVector(Velocity);
 		RuntimeData.Movement.MoveAngle = FMath::RadiansToDegrees(
 			FMath::Atan2(LocalVelocity.Y, LocalVelocity.X));
 	}

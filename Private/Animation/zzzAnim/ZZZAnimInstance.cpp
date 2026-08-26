@@ -39,19 +39,34 @@ void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
 	bDrivenByPipeline = true;
 }
 
+void UZZZAnimInstance::AnimNotify_CanYaw()
+{
+	if (ABaseCharacter* Character = Owner.Get())
+	{
+		Character->NotifyCanYaw();
+	}
+}
+
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 {
 	// 固定顺序：抓取快照 → 注入上下文 → 由 C++ 同步 Moving 子状态 → 推进表现记忆。
 	SnapshotCapture.Capture(Snap, Owner.Get());
 	AnimBlendX = Snap.AnimBlendX;
 	AnimBlendY = Snap.AnimBlendY;
+	AnimCurveVelocity = Snap.AnimCurveVelocity;
+	AnimCurveVelocityDirection = Snap.AnimCurveVelocityDirection;
+	AnimCurveVelocityAngle = Snap.AnimCurveVelocityAngle;
+	ActualVelocityDirection = Snap.ActualVelocityDirection;
+	ActualVelocityBlendX = Snap.ActualVelocityBlendX;
+	ActualVelocityBlendY = Snap.ActualVelocityBlendY;
+	ActualVelocityAngle = Snap.ActualVelocityAngle;
+	bCanYaw = Snap.bCanYaw;
+	bTurnBackSecondSegment = Snap.bTurnBackSecondSegment;
 
 	const ABaseCharacter* Character = Owner.Get();
 	const FRuntimeData* RuntimeData = Character
 		? Character->GetRuntimeData()
 		: nullptr;
-	TurnBackSourceYaw = RuntimeData ? RuntimeData->RootMotion.AnimCurveYaw : 0.f;
-	TurnBackPoseYawCorrection = -TurnBackSourceYaw;
 
 	FZZZAnimWriteContext WriteContext;
 	WriteContext.Snap = &Snap;
@@ -76,25 +91,20 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 			&& !ActorForward.IsNearlyZero()
 			? FVector::DotProduct(ActorForward, DesiredMoveDir)
 			: 1.0f;
-		const float ActorYaw = Character ? Character->GetActorRotation().Yaw : 0.0f;
-		const float DesiredYaw = DesiredMoveDir.IsNearlyZero()
-			? 0.0f
-			: DesiredMoveDir.Rotation().Yaw;
 		const float CurrentVelocity = RuntimeData
 			? RuntimeData->Movement.CurrentSpeed
 			: 0.0f;
 
 		UE_LOG(LogZZZAnim, Log,
-			TEXT("[TurnBack][Snapshot] Phase=%d SubState=%d State=%d Gait=%d ShouldMove=%d InputForwardDot=%.3f ActorDesiredDot=%.3f ActorYaw=%.2f DesiredYaw=%.2f Velocity=%.2f"),
+			TEXT("[TurnBack][Snapshot] Phase=%d SecondSegment=%d SubState=%d State=%d Gait=%d ShouldMove=%d InputForwardDot=%.3f ActorDesiredDot=%.3f Velocity=%.2f"),
 			static_cast<uint8>(Snap.TurnBackPhase),
+			Snap.bTurnBackSecondSegment ? 1 : 0,
 			static_cast<uint8>(StateMemory.MovingSubState),
 			static_cast<uint8>(Snap.CurrentState),
 			static_cast<uint8>(Snap.Gait),
 			Snap.bShouldMove ? 1 : 0,
 			Snap.InputForwardDot,
 			ActorDesiredDot,
-			ActorYaw,
-			DesiredYaw,
 			CurrentVelocity);
 	}
 }

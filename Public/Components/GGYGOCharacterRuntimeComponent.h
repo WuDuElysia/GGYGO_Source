@@ -59,6 +59,9 @@ public:
 	void SetSprintHeld(bool bHeld);
 	void SetForceWalkHeld(bool bHeld);
 
+	/** 接收新版 ZZZAnim 的 CanYaw AnimNotify。 */
+	void NotifyCanYaw();
+
 	/** 返回控制 Pipeline 的初始化状态。 */
 	bool IsInitialized() const;
 

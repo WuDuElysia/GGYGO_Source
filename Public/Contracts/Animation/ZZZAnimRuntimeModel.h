@@ -8,6 +8,7 @@
  */
 #pragma once
 
+#include "CoreMinimal.h"
 #include "StateMachine/CharacterStateType.h"
 
 /**
@@ -32,6 +33,16 @@ struct FZZZAnimRuntimeModel
 
 	/** 当前速度标量（cm/s），MotionDriver 与逻辑速度同帧写入。 */
 	float VelocityLength = 0.f;
+
+	/** 角色实际水平速度的世界空间单位方向，MotionDriver 在移动提交后写入。 */
+	FVector ActualVelocityDirection = FVector::ZeroVector;
+
+	/** 角色实际速度相对 Actor 的 BlendSpace 分量：X=右，Y=前。 */
+	float ActualVelocityBlendX = 0.f;
+	float ActualVelocityBlendY = 0.f;
+
+	/** 角色实际速度相对 Actor 的方向角（度）：0=前，+90=右。 */
+	float ActualVelocityAngle = 0.f;
 
 	/** 2D 速度（cm/s），保留现有动画数据契约。 */
 	float Velocity2DLength = 0.f;

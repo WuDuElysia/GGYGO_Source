@@ -11,7 +11,6 @@
 #include "Pipeline/Intents/DodgeIntentProcessor.h"
 #include "Pipeline/Parameters/MovementParameterProcessor.h"
 #include "Pipeline/Parameters/RootMotionParameterProcessor.h"
-#include "Pipeline/Parameters/AnimSignalParameterProcessor.h"
 #include "Pipeline/Parameters/TurnBackPhaseProcessor.h"
 
 
@@ -38,14 +37,11 @@ void FIntentPipeline::Init(ACharacter* InOwner, USkeletalMeshComponent* InMesh)
 	RootMotionProc->Init(InMesh);
 	ParameterProcessors.Add(MoveTemp(RootMotionProc));
 
-	// 通用动画信号采样必须在 TurnBack 相位之前，保证相位读到本帧最新的 sig_turnback。
-	auto AnimSignalProc = MakeUnique<FAnimSignalParameterProcessor>();
-	AnimSignalProc->Init(InMesh);
-	ParameterProcessors.Add(MoveTemp(AnimSignalProc));
-
-	// TurnBack 相位机：读取本帧输入方向、步态和动画信号，写 RuntimeData.Movement.TurnBack.Phase。
+	// TurnBack 相位机：读取本帧输入方向、步态和 DeltaTime，
+	// 从角色 MovementConfig 的时间轴写 RuntimeData.Movement.TurnBack。
 	auto TurnBackPhaseProc = MakeUnique<FTurnBackPhaseProcessor>();
 	TurnBackPhaseProc->Init(InOwner);
+	TurnBackPhaseProcessor = TurnBackPhaseProc.Get();
 	ParameterProcessors.Add(MoveTemp(TurnBackPhaseProc));
 }
 
@@ -61,6 +57,14 @@ void FIntentPipeline::ProcessGait(const FInputData& InputData, FRuntimeData& Run
 {
 	GaitAuthority.Process(InputData, RuntimeData, DeltaTime);
 	LastGaitFrameCounter = GFrameCounter;
+}
+
+void FIntentPipeline::NotifyCanYaw()
+{
+	if (TurnBackPhaseProcessor)
+	{
+		TurnBackPhaseProcessor->NotifyCanYaw();
+	}
 }
 
 void FIntentPipeline::ProcessParameters(FRuntimeData& RuntimeData, float DeltaTime)

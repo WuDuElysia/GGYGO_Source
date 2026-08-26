@@ -72,7 +72,6 @@ Public/
 ├─ Components/GGYGOCharacterRuntimeComponent.h
 ├─ Contracts/
 │  ├─ Animation/
-│  │  ├─ AnimSignalFrame.h
 │  │  └─ ZZZAnimRuntimeModel.h
 │  ├─ Pipeline/CharacterFrameCommands.h
 │  └─ State/StateUpdateResult.h
@@ -113,7 +112,6 @@ Public/
 │  │  ├─ IIntentProcessor.h
 │  │  └─ IParameterProcessor.h
 │  └─ Parameters/
-│     ├─ AnimSignalParameterProcessor.h
 │     ├─ MovementParameterProcessor.h
 │     ├─ RootMotionParameterProcessor.h
 │     └─ TurnBackPhaseProcessor.h
@@ -169,7 +167,6 @@ Private/
 │  │  ├─ LocomotionIntentProcessor.cpp
 │  │  └─ ViewRotationProcessor.cpp
 │  └─ Parameters/
-│     ├─ AnimSignalParameterProcessor.cpp
 │     ├─ MovementParameterProcessor.cpp
 │     ├─ RootMotionParameterProcessor.cpp
 │     └─ TurnBackPhaseProcessor.cpp
@@ -349,11 +346,12 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 - `ProcessFrame(float)`：将唯一帧入口转发给 `FCharacterControlPipeline::ProcessFrame`，不在组件内展开阶段顺序。
 - `GetRuntimeData()`：转发 Pipeline 内部 RuntimeData 的非拥有指针。
 - `SetMoveInput`、`ClearMoveInput`、`SetLookInput`、`SetSprintHeld`、`SetForceWalkHeld`：转发给 Pipeline 的输入边界。
+- `NotifyCanYaw()`：接收 `UZZZAnimInstance::AnimNotify_CanYaw`，转发给 TurnBack 参数处理器；组件不直接修改 RuntimeData。
 - `IsInitialized()`：返回控制 Pipeline 的初始化状态。
 
 ### 5.6 `Public/Pipeline/CharacterControlPipeline.h` / `Private/Pipeline/CharacterControlPipeline.cpp`
 
-**`FCharacterFramePlan`**：由 `ResolveDecision` 生成的本帧统一结果和轻量提交包。除攻击/闪避意图、移动/攻击/闪避阻断、`ActionGranted`、主状态、步态、世界移动方向和 `bShouldMove` 外，还包含 `FStateUpdateResult` 以及 `FCharacterFrameCommandBuffer`。StateManager 结果只作已完成状态操作的报告；移动命令和动画发布命令由 Pipeline 在后续阶段消费。它不拥有 Unreal 对象，也不直接执行 GameplayAbility；当前项目没有 C++ Ability 激活链，因此 `ActionGranted` 只记录已有 Arbiter 结果。
+**`FCharacterFramePlan`**：由 `ResolveDecision` 生成的本帧统一结果和轻量提交包。除攻击/闪避意图、移动/攻击/闪避阻断、`ActionGranted`、主状态、步态、世界移动方向和 `bShouldMove` 外，还包含 `FStateUpdateResult` 以及 `FCharacterFrameCommandBuffer`。`bShouldMove` 同时桥接到 `FCharacterMovementCommand`，作为普通零输入帧停止曲线移动的门控；StateManager 结果只作已完成状态操作的报告，移动命令和动画发布命令由 Pipeline 在后续阶段消费。它不拥有 Unreal 对象，也不直接执行 GameplayAbility；当前项目没有 C++ Ability 激活链，因此 `ActionGranted` 只记录已有 Arbiter 结果。
 
 **`FCharacterControlPipeline`**：唯一纯 C++ 运行时所有权和时序中心。它拥有 InputData、RuntimeData、Input/Intent/Arbiter Pipeline、StateManager 和 MotionDriver；保存 Owner/ASC/Mesh 非拥有引用；自身不 Tick。
 
@@ -369,7 +367,8 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 - `CommitMovement(float)`：消费 `FCharacterMovementCommand`，调用 `FMotionDriver::Process` 提交角色移动并回写实际速度。
 - `PublishAnimation(float)`：消费动画发布命令，在已有 `UZZZAnimInstance` 存在时调用 `PipelineDrive`；不创建第二个动画实例。
 - `ResetFrame()`：调用 `FRuntimeData::ResetFrameIntents`，只清除帧级攻击/闪避意图，不清空最近一次计划。
-- `BuildFramePlan(const FStateUpdateResult&)`：从 RuntimeData 复制本帧结果，保存 StateManager 输出，并构造移动/动画发布命令。
+- `BuildFramePlan(const FStateUpdateResult&)`：从 RuntimeData 复制本帧结果，保存 StateManager 输出，并构造移动/动画发布命令；移动命令桥接 `bShouldMove`、`DesiredWorldMoveDir`、`TurnBackPhase`、`bTurnBackSecondSegment`、RM_Speed、`AnimCurveYawDelta`、`AnimCurveVelocity`、`AnimCurveVelocityDirection`、`RootMotionDelta` 和曲线源标记。`DesiredWorldMoveDir` 仍由 LocomotionIntentProcessor 按摄像机水平 Yaw 解析；TurnBack d0 在 CanYaw 前应用由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta 并按当前 Bone_Root 相对入口的逆 yaw 修正速度方向，保持世界位移直线，d1 在 CanYaw 后使用玩家输入方向。
+- `NotifyCanYaw()`：接收新版 ZZZAnim 的 CanYaw Notify，转发给 `FIntentPipeline`/`FTurnBackPhaseProcessor`；实际 d1 状态仍由 RuntimeData 和本帧命令统一产生。
 - `GetRuntimeData()`：返回内部 RuntimeData 的非拥有指针。
 - `SetMoveInput`、`ClearMoveInput`、`SetLookInput`、`SetSprintHeld`、`SetForceWalkHeld`：将外部输入写入 InputPipeline 的 Pending 区域。
 - `GetLastFramePlan()`：返回最近一次完成 Decision 阶段的只读计划和命令快照。
@@ -436,8 +435,8 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 ### 6.3 `Public/Movement/MovementConfig.h`
 
-- `FMovementConfig`：header-only USTRUCT。字段包括 SprintMultiplier、WalkToRunHoldSeconds、SprintSpeed、AirControlFactor、DodgeSpeed、DodgeDuration、KnockbackDecay、RotationInterpSpeed、RootMotionScale、bDebugMotion。
-- 当前实际消费：`FGaitAuthorityProcessor` 读取 `WalkToRunHoldSeconds`；`FMotionDriver::Init` 读取 `RootMotionScale`。其它配置字段当前没有 `Source/GGYGO` 运行时消费函数。
+- `FMovementConfig`：header-only USTRUCT。字段包括 SprintMultiplier、WalkToRunHoldSeconds、SprintSpeed、AirControlFactor、DodgeSpeed、DodgeDuration、KnockbackDecay、RootMotionScale、TurnBackReleaseTimeSeconds、TurnBackSecondSegmentTimeSeconds、TurnBackDurationSeconds、bDebugMotion。
+- 当前实际消费：`FGaitAuthorityProcessor` 读取 `WalkToRunHoldSeconds`；`FMotionDriver::Init` 读取 `RootMotionScale`；`FTurnBackPhaseProcessor::Init` 读取 TurnBack 释放时间和总时长，d1 不再由 `TurnBackSecondSegmentTimeSeconds` 时间点触发，而由动画 `CanYaw` Notify 触发。`TurnBackSecondSegmentTimeSeconds` 保留为配置兼容字段，当前运行时不消费。
 
 ### 6.4 `Public/Data/Input/InputData.h`
 
@@ -453,9 +452,8 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 ### 6.5 `Public/Data/Runtime/RuntimeData.h`
 
-`FRuntimeData` 聚合 `Intent`、`View`、`Gait`、`Movement`、`Arbiter`、`State`、`RootMotion`、`AnimSignals`、`ZZZAnim`。
+`FRuntimeData` 聚合 `Intent`、`View`、`Gait`、`Movement`、`Arbiter`、`State`、`RootMotion`、`ZZZAnim`。
 
-- `GetAnimSignal(FName)`：兼容旧调用入口，转发给 `AnimSignals.Get`。
 - `ResetFrameIntents()`：只调用 `Intent.ResetFrameIntents`，清理帧级攻击/闪避意图，不清理跨帧 Model 状态。
 
 ### 6.6 `Public/Data/Runtime/*.h`
@@ -465,15 +463,11 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 - `ArbiterRuntimeModel.h`：保存三个 Block bool 和 `ActionGranted`；无函数。
 - `GaitRuntimeModel.h`：保存 `bDodgeRunPending` 和 `ResolvedGait`；无函数。
 - `IntentRuntimeModel.h`：保存攻击/闪避意图和世界移动方向；`ResetFrameIntents()` 只清动作意图。
-- `MovementRuntimeModel.h`：`FTurnBackRuntimeModel` 保存 Phase 和 EntryDirection；`FMovementRuntimeModel` 保存 TurnBack、速度、角度、移动/接地状态；无显式函数。
-- `RootMotionRuntimeModel.h`：保存 RM_Speed、RM_Dist、RM_Pos、RM_Yaw、RM_Yaw 增量和 RootMotionDelta 等曲线/诊断字段；无显式函数。
-- `ZZZAnimRuntimeModel`（位于 `Contracts/Animation/ZZZAnimRuntimeModel.h`）：保存逻辑投影给新版动画层的步态、移动意图、Actor 局部平滑移动 `AnimBlendX/AnimBlendY` 和速度字段。
+- `MovementRuntimeModel.h`：`FTurnBackRuntimeModel` 保存逻辑 TurnBack Phase、`bCanYaw`、`bSecondSegment` 和从 Frozen 入口累计的 `ElapsedSeconds`；`bCanYaw` 由 CanYaw AnimNotify 经 Pipeline 转发后写入，`bSecondSegment` 随之进入 d1；`FMovementRuntimeModel` 保存 TurnBack、速度、角度、移动/接地状态；无显式函数。
+- `RootMotionRuntimeModel.h`：保存 RM_Speed、由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta、RM_Dist、RM_Pos、RootMotionDelta，以及由 RM_PosX/RM_PosY 差分得到的固定动画起始根轨迹速度 `AnimCurveVelocity`；`AnimCurveVelocityDirection` 是同一根轨迹坐标（X=前、Y=右）的最终有效方向，优先来自 authored `RM_VelocityDirX/Y`，并由 `bHasAuthoredVelocityDirection` 标记来源，缺失时回退位置差分；`bHasRootMotionCurveSource` 标记当前帧是否有速度、方向或距离曲线源；`AnimCurveAngle` 与 `bHasRootMotion` 保留方向角和位置轨迹数据；无显式函数。
+- `ZZZAnimRuntimeModel`（位于 `Contracts/Animation/ZZZAnimRuntimeModel.h`）：保存逻辑投影给新版动画层的步态、移动意图、Actor 局部平滑移动 `AnimBlendX/AnimBlendY`、速度字段和由 MotionDriver 提交后实际速度派生的 `ActualVelocityDirection`、`ActualVelocityBlendX/ActualVelocityBlendY`、`ActualVelocityAngle`。
 - `StateRuntimeModel.h`：保存 `CurrentState`，默认 Idle；无显式函数。
 - `ViewRuntimeModel.h`：保存 `ControlRotation`；无显式函数。
-
-### 6.7 `Public/Contracts/Animation/AnimSignalFrame.h`
-
-`FAnimSignalFrame` 是动画曲线到逻辑 TurnBack 处理器的反向运行时契约：`Reset()` 清空信号；`Add(FName,float)` 写入信号；`Get(FName)` 查值，缺失返回 0。它不属于逻辑 Model 或 ZZZAnim 内部表现记忆。
 
 ## 7. Pipeline 总体说明
 
@@ -481,7 +475,7 @@ Pipeline 不拥有独立 Tick。唯一控制根是 `FCharacterControlPipeline`�
 
 ### 7.1 `Public/Pipeline/CharacterControlPipeline.h` / `Private/Pipeline/CharacterControlPipeline.cpp`
 
-`Public/Contracts/Pipeline/CharacterFrameCommands.h` 定义 Pipeline 到 MotionDriver/ZZZAnimInstance 的本帧提交契约，只包含当前已经真实接线的移动和动画发布命令，不包含虚构的 GA/攻击/闪避命令。
+`Public/Contracts/Pipeline/CharacterFrameCommands.h` 定义 Pipeline 到 MotionDriver/ZZZAnimInstance 的本帧提交契约，只包含当前已经真实接线的移动和动画发布命令，不包含虚构的 GA/攻击/闪避命令。`FCharacterMovementCommand` 由 `BuildFramePlan` 写入 `bShouldMove`、`DesiredWorldMoveDir`、`TurnBackPhase`、`bTurnBackSecondSegment`、RM_Speed、`AnimCurveYawDelta`、根轨迹方向/位移和曲线源标记；MotionDriver 在 d0 应用由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta 并用 Bone_Root 当前相对入口的逆 yaw 修正速度方向，普通输入与 d1 继续使用摄像机修正的世界方向。
 
 **`FCharacterFramePlan`**：header-only 本帧结果和轻量提交包。`Reset()` 清空快照、`FStateUpdateResult` 和移动/动画命令；Pipeline 在 `BuildFramePlan(const FStateUpdateResult&)` 中从 RuntimeData 和 StateManager 输出构造它。StateManager 结果不会在 Commit 阶段重放，当前命令缓冲只包含真实接线的移动提交和 ZZZ 动画发布，不直接执行 GA。
 
@@ -497,7 +491,7 @@ Pipeline 不拥有独立 Tick。唯一控制根是 `FCharacterControlPipeline`�
 - `CommitMovement(float)`：消费 `FCharacterMovementCommand`，调用 `FMotionDriver::Process` 提交角色移动。
 - `PublishAnimation(float)`：消费动画发布命令，在所有逻辑生产者结束后获取已有 `UZZZAnimInstance` 并调用 `PipelineDrive`。
 - `ResetFrame()`：调用 `FRuntimeData::ResetFrameIntents`，只清理帧级动作意图。
-- `BuildFramePlan(const FStateUpdateResult&)`：复制当前 Intent、Arbiter、State、Gait 和 ZZZAnim 结果，保存状态更新结果，并构造移动/动画命令。
+- `BuildFramePlan(const FStateUpdateResult&)`：复制当前 Intent、Arbiter、State、Gait 和 ZZZAnim 结果，保存状态更新结果，并构造移动/动画命令；移动命令桥接 `bShouldMove`、`DesiredWorldMoveDir`、`TurnBackPhase`、`bTurnBackSecondSegment`、RM_Speed、`AnimCurveYawDelta`、`AnimCurveVelocity`、`AnimCurveVelocityDirection`、`RootMotionDelta` 和曲线源标记。`DesiredWorldMoveDir` 仍由 LocomotionIntentProcessor 按摄像机水平 Yaw 解析；TurnBack d0 在 CanYaw 前应用由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta 并按当前 Bone_Root 相对入口的逆 yaw 修正速度方向，保持世界位移直线，d1 在 CanYaw 后使用玩家输入方向；Actor yaw 的 d0 写入由 MotionDriver 完成。
 - `GetRuntimeData()`：返回内部 RuntimeData 的非拥有指针。
 - `SetMoveInput`、`ClearMoveInput`、`SetLookInput`、`SetSprintHeld`、`SetForceWalkHeld`：将外部输入写入 InputPipeline 的 Pending 区域。
 - `GetLastFramePlan()`：返回最近一次完成 Decision 阶段的只读计划、状态结果和命令快照。
@@ -544,14 +538,14 @@ Pipeline 不拥有独立 Tick。唯一控制根是 `FCharacterControlPipeline`�
 
 ### 7.4 `IntentPipeline.h/.cpp`
 
-**`FIntentPipeline`**：拥有四个 Intent Processor、四个 Parameter Processor，并单独拥有一个具名 Gait Authority。
+**`FIntentPipeline`**：拥有四个 Intent Processor、三个 Parameter Processor，并单独拥有一个具名 Gait Authority。
 
 **函数**：
 
-- `Init(ACharacter*, USkeletalMeshComponent*)`：按固定顺序初始化 ViewRotation、Locomotion、Attack、Dodge；再初始化 Movement、RootMotion、AnimSignal、TurnBack 参数处理器；初始化 GaitAuthority。
+- `Init(ACharacter*, USkeletalMeshComponent*)`：按固定顺序初始化 ViewRotation、Locomotion、Attack、Dodge；再初始化 Movement、RootMotion、TurnBack 参数处理器；初始化 GaitAuthority。
 - `ProcessIntents(const FInputData&, FRuntimeData&)`：按数组顺序运行四个 Intent Processor。
 - `ProcessGait(const FInputData&, FRuntimeData&, float)`：运行步态权威并记录当前 `GFrameCounter`。
-- `ProcessParameters(FRuntimeData&, float)`：检查本帧是否已经执行 Gait；缺失时只警告且不补写，然后按顺序运行四个参数处理器。
+- `ProcessParameters(FRuntimeData&, float)`：检查本帧是否已经执行 Gait；缺失时只警告且不补写，然后按 Movement → RootMotion → TurnBack 顺序运行三个参数处理器。
 
 ### 7.5 `ArbiterPipeline.h/.cpp`
 
@@ -633,21 +627,16 @@ Pipeline 不拥有独立 Tick。唯一控制根是 `FCharacterControlPipeline`�
 #### `Parameters/RootMotionParameterProcessor.h/.cpp`
 
 - `Init(USkeletalMeshComponent*)`：缓存 Mesh，并清理曲线采样基线。
-- `Process(RuntimeData, DeltaTime)`：清零当前 RootMotion 输出；从 AnimInstance 采样 RM_PosX、RM_PosY、RM_Dist、RM_Speed、RM_Yaw；处理有限值、首次采样、曲线回退和差分；写 AnimCurveSpeed/AnimSpeed、RootMotionDelta、bHasRootMotion、Yaw/距离诊断字段。`RootMotionDelta` 由 `CharacterControlPipeline::BuildFramePlan` 复制到 `FCharacterMovementCommand`，在 sig_turnback 解冻后的 Released 首帧作为方向候选：转到世界空间后与 `DesiredWorldMoveDir` 同向时直接使用，相反时取 180°反向；无有效候选时回退输入或入口方向；`AnimCurveYawDelta` 仅保留为 RootMotion 诊断字段。
-- `ResetSampleState()`：清空上帧采样值并关闭基线标志。
+- `Process(RuntimeData, DeltaTime)`：清零当前 RootMotion 输出；从 AnimInstance 采样 RM_PosX、RM_PosY、RM_Dist、RM_Speed、RM_Yaw、RM_VelocityDirX 和 RM_VelocityDirY；RM_Yaw 使用当前采样值减上一帧采样值做差分，首帧或重置基线输出 0，曲线值保持不变时不重复累加；处理有限值、首次采样、曲线回退和位置差分；写 AnimCurveSpeed/AnimSpeed、`AnimCurveYawDelta`、RootMotionDelta、bHasRootMotion、`bHasRootMotionCurveSource` 和距离字段，并用 `DeltaPos / DeltaTime` 写入固定动画起始根轨迹坐标中的 `AnimCurveVelocity`。有效 authored 方向曲线写入最终 `AnimCurveVelocityDirection` 并设置 `bHasAuthoredVelocityDirection`，缺失或无有效非零样本时使用 RM_PosX/RM_PosY 差分；`AnimCurveAngle` 使用最终有效方向。上述字段由 `CharacterControlPipeline::BuildFramePlan` 复制到 `FCharacterMovementCommand`。MotionDriver 普通 walkrun 无 dir 曲线，移动方向就是摄像机修正后的 `DesiredWorldMoveDir`，RM_Speed 只决定速度；TurnBack d0 在 CanYaw 前应用差分得到的 AnimCurveYawDelta，并用当前 Bone_Root 相对入口的逆 yaw 修正 RM_VelocityDirX/Y，使世界位移保持入口直线；CanYaw 后进入 d1，像 walkrun 一样朝输入方向移动。
+- `ResetSampleState()`：清空上帧位置、距离和 RM_Yaw 累计曲线采样值，并关闭基线标志。
 
 RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移额外叠加。
 
-#### `Parameters/AnimSignalParameterProcessor.h/.cpp`
-
-- `GGYGOAnimSignals::TurnBack()`：返回静态 `FName("sig_turnback")`。
-- `Init(USkeletalMeshComponent*)`：缓存 Mesh，重建需要采样的曲线名列表。
-- `Process(RuntimeData, DeltaTime)`：清空 AnimSignals；有有效 AnimInstance 时采样登记的曲线；有限值写入，不有限值写 0。
-
 #### `Parameters/TurnBackPhaseProcessor.h/.cpp`
 
-- `Init(ACharacter*)`：缓存 Owner。
-- `Process(RuntimeData, DeltaTime)`：读取 State、输入方向、Gait、ZZZAnim bShouldMove 和 sig_turnback；维护 TurnBack Phase 与 EntryDirection。非 Moving 复位 None；Run 且输入反向时进入 Frozen；信号达到阈值进入 Released；释放后输入停止或接近角色前向时回到 None。
+- `Init(ACharacter*)`：缓存 Owner；从 `ABaseCharacter::GetCharacterConfig()->MovementConfig` 读取 TurnBack 释放时间和总时长，缺失或非法值使用默认值；d1 不再读取 `TurnBackSecondSegmentTimeSeconds`。
+- `NotifyCanYaw()`：接收 `UZZZAnimInstance::AnimNotify_CanYaw` 转发来的事件，等待下一次参数阶段消费。
+- `Process(RuntimeData, DeltaTime)`：只读取 State、输入方向、Gait 和 `ZZZAnim.bShouldMove`，按逻辑时间轴维护 TurnBack Phase、`bCanYaw`、`bSecondSegment` 和累计时间；Run 且输入反向时进入 Frozen；到达释放时间进入 Released；CanYaw 到达后立即设置 d1；第一段不可被无输入打断，d1 开始后无输入可以退出，总时长到达时自然退出；不读取动画旋转曲线推进生命周期。自然完成后保留反向输入边沿锁存，必须先离开反向阈值才能再次触发，避免持续反向输入在结束帧立即开启新的 TurnBack。
 
 当前该处理器使用规则层默认反向阈值，没有读取 `FZZZAnimTuning::TurnBackReverseInputDotThreshold`。
 
@@ -661,7 +650,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 - `EStateGroup`：Locomotion、Action、Overlay、System、MAX。
 - `EStateRelationType`：Independent、Interrupted、Blocked。
 - `EMovementGait`：None、Walk、Run。
-- `ETurnBackPhase`：None、Frozen、Released。
+- `ETurnBackPhase`：None（不在转身）、Frozen（已触发转身，逻辑时间轴第一段且不可被输入打断）、Released（到达释放时间点，等待第二段或总时长；第二段开始后可被无输入打断）。
 
 注释中提到的 InAir、Attacking、Dodging、HitStun、Stunned、Dead、Interacting 当前没有出现在实际枚举中。
 
@@ -751,18 +740,31 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 
 ### `Public/Drivers/MotionDriver.h` / `Private/Drivers/MotionDriver.cpp`
 
-**`FMotionDriver`**：纯 C++ 最终运动驱动器。缓存 Owner、CharacterMovement、Mesh 和 RootMotionScale。
+**`FMotionDriver`**：纯 C++ 最终运动驱动器。缓存 Owner、CharacterMovement、Mesh 和 RootMotionScale；RM_Speed 是唯一速度主值，AnimCurveYawDelta 是由累计 RM_Yaw 相邻采样差分得到的 D0 当前帧角度增量。分两类移动：
 
-- `Init(ACharacter*)`：缓存 Owner/Mesh/Movement；将 AnimInstance RootMotionMode 设为 IgnoreRootMotion；从 BaseCharacter 的 CharacterConfig 读取 RootMotionScale。
-- `Process(float, const FCharacterMovementCommand&, FRuntimeData&)`：消费 Pipeline 构造的本帧移动命令；sig_turnback 使 Phase 进入 Released 后，首次 Commit 将 RootMotionDelta 的局部 XY 转到世界空间，与 `DesiredWorldMoveDir` 同向时直接选择该方向、相反时选择其 180°反向，并设置 Actor 旋转，再用同一修正方向提交本帧移动；无有效位移候选时回退到 `DesiredWorldMoveDir`，最终回退到 `TurnBackEntryDirection` 的反向；BlockMove 时停止移动并更新黑板；读取命令中的 RM_Speed×RootMotionScale 设置 MaxWalkSpeed；最后更新 RuntimeData。
-- `ResolveWorldMoveDirection(const FCharacterMovementCommand&)`：Frozen 使用命令中的 EntryDirection；Released 首帧优先使用解冻旋转得到的修正方向，后续使用 DesiredWorldMoveDir；去 Z 并归一化。
-- `ResolveTurnBackReleaseDirection(const FCharacterMovementCommand&, ETurnBackReleaseDirectionSource*)`：将 RootMotionDelta 局部 XY 按翻转前 Actor Transform 转到世界空间，与目标输入同向时直接使用，相反时取 180°反向，并将方向来源返回给诊断日志；没有有效位移候选时回退到输入方向，再回退到入口方向的反向。
-- `ApplyTurnBackReleaseRotation(const FCharacterMovementCommand&)`：仅在 Frozen→Released 的首个 Commit 阶段设置 Actor Yaw 并锁存本帧修正方向；Phase 回到 None 后清除闩锁。
-- `ProcessRootMotionMovement(DeltaTime, const FCharacterMovementCommand&)`：使用命令中的有效 RM_Speed 和当前相位方向构造世界速度，调用 `RequestDirectMove`；RM_Dist 不参与额外位移。
-- `ProcessLocomotion(WorldDir, const FCharacterMovementCommand&)`：使用命令方向×有效曲线速度调用 `RequestDirectMove`。
-- `UpdateRuntimeData(RuntimeData)`：从 Actor Velocity 写 CurrentSpeed、ZZZAnim.VelocityLength、bIsMoving，并将实际速度转换为角色局部 MoveAngle。
+- **普通 walkrun**（无 dir 曲线）：移动方向 = 玩家输入方向 `DesiredWorldMoveDir`（摄像机相对解析的世界方向）；Actor 朝向由 CharacterMovement/Controller 的现有配置处理。
+- **TurnBack**（有固定方向曲线，dir 约定 X=左右、Y=前后）：分 d0/d1 两段，由命令中的 `bTurnBackSecondSegment` 区分。
+  - d0（CanYaw 之前）：TurnBack 进入时捕获 `Bone_Root` 世界水平前向/右向；先把差分得到的 AnimCurveYawDelta 累加到 Actor yaw，再把 RM_VelocityDirX/Y 按当前 Bone_Root 相对入口的逆 yaw 修正后映射回世界，保持入口世界位移直线。
+  - d1（CanYaw 之后）：像 walkrun 一样朝摄像机修正后的玩家输入方向移动，并交给现有 CharacterMovement/Controller 旋转配置接管朝向；无输入时由 `FTurnBackPhaseProcessor` 退出 TurnBack。
 
-`FMotionDriver` 不再直接决定本帧移动输入、TurnBack 相位或 RootMotion 路径；这些决策字段由 `FCharacterControlPipeline::BuildFramePlan` 写入 `FCharacterMovementCommand`。
+TurnBack Phase 和 CanYaw/d1 标记由逻辑层维护，AnimBP 只消费快照；AnimInstance 通过 `AnimNotify_CanYaw` 把信号转发给 Pipeline，MotionDriver 是 D0 Actor yaw 的唯一写入方。
+
+- `Init(ACharacter*)`：缓存 Owner/Mesh/Movement；若 AnimInstance 已存在则将 RootMotionMode 设为 IgnoreRootMotion；从当前 `UZZZAnimInstance` 查询 TurnBack AnimSequence 时长，并从 BaseCharacter 的 CharacterConfig 读取 RootMotionScale。AnimInstance 可能晚于初始化，因此活动中的 TurnBack 还会重复确保 IgnoreRootMotion。
+- `Process(float, const FCharacterMovementCommand&, FRuntimeData&)`：消费本帧移动命令；依次更新 D0 自动朝向覆盖、捕获 TurnBack 入口 Bone_Root 基准、在 D0 应用差分后的 `AnimCurveYawDelta`、更新动画计时，再按 `bShouldMove`、解析出的世界方向和 RM_Speed 提交位移。TurnBack 或有效曲线源允许动画收尾继续提交，普通零输入且无曲线源时将 MaxWalkSpeed 置零、调用 `StopMovementImmediately` 并更新黑板；BlockMove 时停止移动；最后更新 RuntimeData。
+- `ResolveWorldMoveDirection(const FCharacterMovementCommand&)`：TurnBack 时委托 `ResolveTurnBackWorldMoveDirection`；普通移动直接返回玩家输入方向 `DesiredWorldMoveDir`（无 dir 曲线映射）。
+- `ResolveTurnBackWorldMoveDirection(const FCharacterMovementCommand&)`：d1（`bTurnBackSecondSegment`）返回玩家输入方向 `DesiredWorldMoveDir`；d0 使用 `AnimCurveVelocityDirection`（缺失用 `RootMotionDelta`），先按当前 Bone_Root 相对入口的逆 yaw 将 X=左右/Y=前后方向转回原基准，再用当前 Bone_Root 世界前向/右向映射，保持入口世界方向；无曲线时退回入口 Bone_Root 前向。
+- `UpdateTurnBackReleaseState(float, const FCharacterMovementCommand&)`：TurnBack 进入时开始累计配置动画播放时间；Phase 由 `FTurnBackPhaseProcessor` 推进后，动画完成时仅输出一次完成诊断；Phase 回到 None 后清理动画计时。
+- `UpdateTurnBackDirectionIntent(const FCharacterMovementCommand&)`：进入 TurnBack 首帧捕获当前 `Bone_Root` 世界水平前向/右向，作为 d0 原始方向基准；Phase 回到 None 时清理。
+- `ApplyTurnBackYaw(const FCharacterMovementCommand&)`：CanYaw 前读取命令中的 `AnimCurveYawDelta`，直接以水平增量累加 Actor yaw；CanYaw/d1 后不再应用 `AnimCurveYawDelta`。
+- `UpdateTurnBackRotationMode(const FCharacterMovementCommand&)`：D0 活动期间暂时关闭 `CharacterMovement` 的 `bOrientRotationToMovement`、`bUseControllerDesiredRotation` 和 Pawn 的 `bUseControllerRotationYaw`，进入 d1 或 TurnBack 结束时恢复进入前配置。
+- `ResolveTurnBackBoneRootBasis(FVector&, FVector&)`：读取当前 `Bone_Root` 的世界水平基准，缺失时回退 Actor 前向/右向。
+- `EnsureRootMotionIgnored()`：在 Init 和 TurnBack 活动帧对当前 AnimInstance 设置 `ERootMotionMode::IgnoreRootMotion`，覆盖 AnimInstance 晚于 BeginPlay 实例化的情况。
+- `ProcessRootMotionMovement(DeltaTime, const FCharacterMovementCommand&)`：使用 `ResolveWorldMoveDirection` 解析出的世界方向，结合有效 RM_Speed 和 RootMotionScale 构造世界速度并调用 `RequestDirectMove`；RM_Dist 不参与额外位移。
+- `ProcessLocomotion(WorldDir, const FCharacterMovementCommand&)`：使用已解析的世界方向 × 有效曲线速度调用 `RequestDirectMove`。
+- `UpdateRuntimeData(RuntimeData)`：在移动提交后从 Actor 水平 `Velocity` 写 `CurrentSpeed`、`ZZZAnim.VelocityLength`、`bIsMoving` 和局部 `MoveAngle`；同时将水平实际速度归一化写入 `ZZZAnim.ActualVelocityDirection`，并按 Actor 局部坐标写入 `ActualVelocityBlendX/ActualVelocityBlendY`（X=右、Y=前）和 `ActualVelocityAngle`（0=前、+90=右）。速度为零时清零这些方向字段。
+- TurnBack 诊断：非 Shipping 构建在 TurnBack 活动帧读取并输出 `[TurnBack][RotationDiag]`，记录 Actor/Controller/Velocity/Acceleration 旋转、输入与曲线方向、CharacterMovement 自动朝向开关、Mesh 相对/组件旋转和 `Root`/`Bone_Root`/`Bip001` 的 Component Space Yaw；另输出 `[TurnBack][ActorYaw]` 记录每帧差分后的 AnimCurveYawDelta 和应用后的 Actor yaw；D0 同时关闭 CharacterMovement/Controller 自动朝向，d1 或 TurnBack 结束后恢复原配置。诊断日志只读，但 D0 的 Actor yaw 由 `ApplyTurnBackYaw` 唯一写入。
+
+`FMotionDriver` 不直接决定本帧移动输入或 TurnBack Phase；这些决策字段由 `FCharacterControlPipeline::BuildFramePlan` 写入 `FCharacterMovementCommand`。普通移动方向来自摄像机相对解析后的玩家输入；TurnBack d0 用当前 Bone_Root 相对入口基准的逆 yaw 修正固定方向曲线并应用差分后的 AnimCurveYawDelta，D0 临时关闭自动朝向，d1 用玩家输入方向并恢复原有旋转配置。只有 D0 的 `ApplyTurnBackYaw` 写入 Actor yaw；`AnimCurveAngle` 和实际速度角仍分别用于曲线方向诊断与动画方向反馈。
 
 当前没有写 `ZZZAnim.Velocity2DLength` 或 `LastInputDirectionAngle`。
 
@@ -787,7 +789,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 
 ### 10.3 `Contracts/Animation/ZZZAnimRuntimeModel.h`
 
-`FZZZAnimRuntimeModel` 是逻辑到新版 ZZZ 动画层的跨层游戏线程投影：逻辑 Pipeline 写入，`FZZZAnimSnapshotCapture` 读取。它位于 `Contracts/Animation`，不属于 ZZZAnim 内部表现记忆，也不拥有逻辑决策；字段包括 `Gait`、`bShouldMove`、`CurrentState`、`VelocityLength`、`Velocity2DLength`、`LastInputDirectionAngle`。当前有写入链的是前四类字段，后两个字段目前没有有效写入方。
+`FZZZAnimRuntimeModel` 是逻辑到新版 ZZZ 动画层的跨层游戏线程投影：逻辑 Pipeline 写入，`FZZZAnimSnapshotCapture` 读取。它位于 `Contracts/Animation`，不属于 ZZZAnim 内部表现记忆，也不拥有逻辑决策；字段包括 `Gait`、`bShouldMove`、`CurrentState`、`VelocityLength`、`Velocity2DLength`、`LastInputDirectionAngle`、Actor 局部平滑输入方向 `AnimBlendX/AnimBlendY`，以及 MotionDriver 提交后实际速度派生的 `ActualVelocityDirection`、`ActualVelocityBlendX/ActualVelocityBlendY`、`ActualVelocityAngle`。当前有写入链的是前四类字段、AnimBlendX/Y 和 ActualVelocity 方向字段，后两个旧速度兼容字段目前没有有效写入方。
 
 ### 10.4 `Animation/zzzAnim/Data/ZZZAnimSet.h`
 
@@ -795,7 +797,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 
 ### 10.5 `Animation/zzzAnim/Data/ZZZAnimSnapshot.h`
 
-`FZZZAnimSnapshot` 是动画侧只读快照，保存 Gait、ShouldMove、相对 Actor 的 `AnimBlendX/AnimBlendY`、InputForwardDot、TurnBackPhase、CurrentState、VelocityLength、Grounded 和 BlockMove；当前没有显式成员函数。Capture 当前将 `bBlockMove` 写为 false。
+`FZZZAnimSnapshot` 是动画侧只读快照，保存 Gait、ShouldMove、相对 Actor 的 `AnimBlendX/AnimBlendY`、由 RootMotionParameterProcessor 生成的最终有效固定动画曲线坐标 `AnimCurveVelocity`、`AnimCurveVelocityDirection`、`AnimCurveVelocityAngle`（优先 authored RM_VelocityDirX/Y，缺失时由 RM_PosX/RM_PosY 差分回退）、InputForwardDot、逻辑侧 `TurnBackPhase` 和 `bTurnBackSecondSegment`、CurrentState、VelocityLength、由 MotionDriver 写入的 `ActualVelocityDirection`、`ActualVelocityBlendX/ActualVelocityBlendY`、`ActualVelocityAngle`、Grounded 和 BlockMove；当前没有显式成员函数。Capture 当前将 `bBlockMove` 写为 false。
 
 ### 10.6 `Animation/zzzAnim/Data/ZZZAnimStateMemory.h`
 
@@ -809,7 +811,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 
 **`FZZZAnimSnapshotCapture`**：从逻辑黑板生成动画快照，不拥有 Owner 或 RuntimeData。
 
-- `Capture(FZZZAnimSnapshot&, ABaseCharacter*)`：先重置快照；Owner/RuntimeData 缺失则返回；复制 `RuntimeData.ZZZAnim` 中的 Gait、ShouldMove、`AnimBlendX/AnimBlendY`、CurrentState 和 VelocityLength，并复制 TurnBack Phase；用角色前向与期望移动方向计算并钳制 InputForwardDot；读取 Grounded；当前把 BlockMove 写为 false。
+- `Capture(FZZZAnimSnapshot&, ABaseCharacter*)`：先重置快照；Owner/RuntimeData 缺失则返回；复制 `RuntimeData.ZZZAnim` 中的 Gait、ShouldMove、`AnimBlendX/AnimBlendY`、ActualVelocity 方向字段、CurrentState 和 VelocityLength；从 `RuntimeData.RootMotion` 复制 `AnimCurveVelocity`、最终有效 `AnimCurveVelocityDirection` 和 `AnimCurveAngle` 到快照；复制 TurnBack Phase、`bCanYaw` 和 `bSecondSegment`；用角色前向与期望移动方向计算并钳制 InputForwardDot；读取 Grounded；当前把 BlockMove 写为 false。
 
 ### 10.9 `Animation/zzzAnim/Locomotion/ZZZLocomotionDecisions.h/.cpp`
 
@@ -821,8 +823,8 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 - `Conduit_To_EnterMove()`：快照缺失或 Gait 不是 Run 时返回 true。
 - `Conduit_To_Moving_Direct()`：快照存在且 Gait 是 Run 时返回 true。
 - `ShouldStopMoving()`：有快照且当前没有移动意图时返回 true。
-- `ShouldExitMoving()`：同样检查无移动意图，但 TurnBack Frozen 时强制 false。
-- `WalkRun_To_TurnBack()`：快照状态为 Moving 且 TurnBackPhase 为 Frozen 时返回 true。
+- `ShouldExitMoving()`：同样检查无移动意图，但 TurnBack Phase 为任一非 None 时强制 false，保证逻辑时间轴完成前不会因中途松开输入而退出顶层 Moving。
+- `WalkRun_To_TurnBack()`：快照状态为 Moving 且 TurnBackPhase 不为 None 时返回 true；不要求 AnimBP 恰好在 Frozen 的短窗口内求值。
 
 ### 10.10 `Animation/zzzAnim/Locomotion/ZZZLocomotionEvents.h/.cpp`
 
@@ -850,7 +852,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 
 **`UZZZAnimInstance`**：新版 ZZZ AnimInstance，负责管线主动驱动、快照上下文刷新、AnimBP 过渡条件和动画资产查询。
 
-**字段**：`AnimSet`、`Tuning`、`StateMemory`、`AnimBlendX`、`AnimBlendY`、`TurnBackSourceYaw`、`TurnBackPoseYawCorrection`、保护快照 `Snap`；私有 Owner 弱指针、管线驱动标志、SnapshotCapture、Decisions、Events。AnimBlendX/Y 由 Snapshot 在 `RefreshDecisionContext` 中同步，供 AnimBP 直接读取。
+**字段**：`AnimSet`、`Tuning`、`StateMemory`、`AnimBlendX`、`AnimBlendY`、`AnimCurveVelocity`、`AnimCurveVelocityDirection`、`AnimCurveVelocityAngle`、`ActualVelocityDirection`、`ActualVelocityBlendX`、`ActualVelocityBlendY`、`ActualVelocityAngle`、`bCanYaw`、`bTurnBackSecondSegment`、保护快照 `Snap`；私有 Owner 弱指针、管线驱动标志、SnapshotCapture、Decisions、Events。AnimBlendX/Y、曲线速度方向、实际速度方向和逻辑 TurnBack CanYaw/第二段字段都由 Snapshot 在 `RefreshDecisionContext` 中同步，供 AnimBP 只读。
 
 **函数**：
 
@@ -858,7 +860,8 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 - `NativeUpdateAnimation(float)`：调用父类；上一帧由 PipelineDrive 驱动时清标记并跳过重复刷新，否则走降级刷新路径。
 - `NativeThreadSafeUpdateAnimation(float)`：当前只调用父类，没有额外线程安全计算。
 - `PipelineDrive(float)`：立即刷新快照/上下文/表现记忆，再设置 bDrivenByPipeline，供角色 Tick 末尾主动调用。
-- `RefreshDecisionContext(float)`：执行 Capture → 同步 `AnimBlendX/AnimBlendY` → 读取 AnimCurveYaw → 构造读写 Context → 设置 Decisions/Events Context → 同步 MovingSubState → 推进 Stop/Gait 表现；TurnBack 时输出方向/角度/速度诊断。
+- `AnimNotify_CanYaw()`：接收动画中名为 `CanYaw` 的 AnimNotify，通过 `ABaseCharacter::NotifyCanYaw` 转发到运行时 Pipeline；不直接写动画快照或 RuntimeData。
+- `RefreshDecisionContext(float)`：执行 Capture → 同步 `AnimBlendX/AnimBlendY`、`AnimCurveVelocity`/`AnimCurveVelocityDirection`/`AnimCurveVelocityAngle`、`ActualVelocityDirection`/`ActualVelocityBlendX`/`ActualVelocityBlendY`/`ActualVelocityAngle`、`bCanYaw` 和 `bTurnBackSecondSegment` → 构造读写 Context → 设置 Decisions/Events Context → 同步 MovingSubState → 推进 Stop/Gait 表现；TurnBack 时仅输出 Phase、CanYaw、第二段、输入点积和速度诊断。
 - `Locomotion_NotMoving_To_Conduit()`：转发 Decisions 的 NotMoving 判定。
 - `Locomotion_Stop_To_Conduit()`：转发 Stop 入口判定。
 - `Locomotion_Conduit_To_EnterMove()`：转发非 Run 分支判定。
@@ -880,6 +883,8 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 **`UAnimSyncMarkerTools`**：编辑器用 `UBlueprintFunctionLibrary`，不参与运行时 Pipeline。
 
 - `SetAuthoredSyncMarkers(UAnimSequence*, MarkerNames, Times)`：在 `WITH_EDITOR` 下按两个数组的较小长度清空并写入 AuthoredSyncMarkers，按时间排序，刷新同步标记缓存并标脏，返回实际写入数量；非编辑器返回 0。
+- `BakeVelocityDirectionCurves(UAnimSequence*)`：通过 UE 5.8 Animation Data Model 读取 RM_PosX/RM_PosY，在 `GetNumberOfSampledKeys()`/`GetTimeAtFrame()` 采样帧上计算每帧水平位置增量的归一化方向；首帧为零，使用 `IAnimationDataController::AddCurve`/`SetCurveKeys` 覆盖真实 `RM_VelocityDirX`、`RM_VelocityDirY` FloatCurve，成功后标脏但不保存包。若静止序列缺少 RM_PosX/RM_PosY，则按其采样帧数写入全零方向曲线。
+- 控制台命令 `ZZZBakeVelocityDirectionCurves <AnimSequenceObjectPath> [...]`：批量调用上述 Bake 入口；命令只标脏资产，执行后需通过编辑器保存资产。
 
 ### 11.2 `Public/SyncMarkerImporter.h` / `Private/SyncMarkerImporter.cpp`
 
@@ -902,21 +907,21 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 | `RuntimeData.ZZZAnim.bShouldMove` | `FLocomotionIntentProcessor::Process` | SnapshotCapture/ZZZAnim locomotion |
 | `RuntimeData.Gait.ResolvedGait` | `FGaitAuthorityProcessor` | Motion/ZZZAnim |
 | `RuntimeData.ZZZAnim.AnimBlendX/AnimBlendY` | `FMovementParameterProcessor` | SnapshotCapture/UZZZAnimInstance/AnimBP 的方向 BlendSpace |
-| `RuntimeData.RootMotion` | `FRootMotionParameterProcessor` | Motion/diagnostics；`RootMotionDelta` 经 FramePlan 命令传给 MotionDriver，在 Released 首帧转到世界空间并与目标输入比较，选择 Actor 方向候选或回退方向 | 
-| `RuntimeData.AnimSignals` | `FAnimSignalParameterProcessor` | TurnBackPhase |
-| `RuntimeData.Movement.TurnBack` | `FTurnBackPhaseProcessor` | Motion/ZZZAnim |
+| `RuntimeData.RootMotion` | `FRootMotionParameterProcessor` | Motion/ZZZAnim diagnostics；`RootMotionDelta`、`AnimCurveVelocity`、最终 `AnimCurveVelocityDirection`、`AnimCurveYawDelta` 和 `bHasAuthoredVelocityDirection` 经 `BuildFramePlan` 桥接到 `FCharacterMovementCommand`；RM_VelocityDirX/Y authored 方向有效时优先，缺失时回退 RM_PosX/RM_PosY 差分；RootMotionDelta 与 `AnimCurveVelocity` 是动画曲线局部方向（X=前/Y=右）；普通 walkrun 无曲线时移动方向 = 玩家输入 `DesiredWorldMoveDir`，RM_Speed 只决定速度；TurnBack d0 在 CanYaw 前应用由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta，并按当前 Bone_Root 相对入口的逆 yaw 修正方向保持世界直线，d1 段用玩家输入方向。`AnimCurveAngle` 保留为曲线方向角诊断。
+| `RuntimeData.Movement.TurnBack` | `FTurnBackPhaseProcessor` 写入 Phase、`bCanYaw`、`bSecondSegment` 和 `ElapsedSeconds`；CanYaw 由 `UZZZAnimInstance::AnimNotify_CanYaw` 经 `ABaseCharacter`、RuntimeComponent、Pipeline 转发 | MotionDriver、ZZZAnim Snapshot；动画层只读 Phase/CanYaw/第二段，不反向写入 |
 | `RuntimeData.State.CurrentState` | `FGYGOStateManager` | Animation/State consumers |
 | `RuntimeData.ZZZAnim.CurrentState` | `FGYGOStateManager`，与最终主状态同步写入 | SnapshotCapture/ZZZAnim Decisions |
 | `RuntimeData.Movement.CurrentSpeed` | `FMotionDriver::UpdateRuntimeData` | Base getter/ZZZAnim |
 | `RuntimeData.Movement.bIsGrounded` | 当前无运行时写入方；模型默认值为 true | SnapshotCapture/基础角色查询 |
 | `RuntimeData.ZZZAnim.VelocityLength` | `FMotionDriver::UpdateRuntimeData` | SnapshotCapture |
+| `RuntimeData.ZZZAnim.ActualVelocityDirection`、`ActualVelocityBlendX/ActualVelocityBlendY`、`ActualVelocityAngle` | `FMotionDriver::UpdateRuntimeData` 在 Motion Commit 后从 Actor 水平 `Velocity` 派生；速度为零时清零 | `FZZZAnimSnapshotCapture` → `FZZZAnimSnapshot` → `UZZZAnimInstance`/AnimBP；ActualVelocityDirection 是世界单位方向，BlendX/Y 是相对 Actor 的 X=右/Y=前分量，Angle 为相对 Actor 角度 |
 | `RuntimeData.ZZZAnim.Gait` | `FGaitAuthorityProcessor` | SnapshotCapture |
 | `FZZZAnimSnapshot` | `FZZZAnimSnapshotCapture` | Decisions/Events |
 | `FZZZAnimStateMemory` | `FZZZLocomotionEvents` | AnimInstance/AnimBP |
 | `FStateUpdateResult` / `FStateTransitionEvent` | `FGYGOStateManager::Update` / `RecordTransitionEvent` | `FCharacterFramePlan::StateUpdate`、Pipeline 的状态结果消费；不重新提交状态 |
 | `FCharacterFramePlan` | `FCharacterControlPipeline::BuildFramePlan` | 当前帧结果、状态报告和命令缓冲；不取代 RuntimeData canonical 写入 |
 | `FCharacterFrameCommandBuffer` | `FCharacterControlPipeline::BuildFramePlan` | `CommitMovement` / `PublishAnimation` 的本帧真实提交命令 |
-| `FCharacterMovementCommand` | `FCharacterControlPipeline::BuildFramePlan` | `FMotionDriver::Process`；驱动移动并回写实际速度 |
+| `FCharacterMovementCommand` | `FCharacterControlPipeline::BuildFramePlan` | `FMotionDriver::Process`；消费 `bShouldMove`、`TurnBackPhase`、`bTurnBackSecondSegment`、`DesiredWorldMoveDir`、`AnimCurveYawDelta`、`AnimCurveVelocityDirection`、`RootMotionDelta` 和 RM_Speed；普通移动方向 = 玩家输入 `DesiredWorldMoveDir`、RM_Speed 决定速度；TurnBack d0 在 CanYaw 前用当前 Bone_Root 相对入口的逆 yaw 修正 dir，并应用由累计 RM_Yaw 差分得到的 `AnimCurveYawDelta`，同时关闭自动朝向；d1 段用玩家输入方向并恢复原有旋转配置；携带 `AnimCurveVelocity`、`bHasAuthoredVelocityDirection` 和来源标记供移动/诊断；普通零输入且非曲线收尾时由 MotionDriver 停速并不提交 `RequestDirectMove`；MotionDriver 回写实际速度，D0 写入 Actor yaw |
 | `FCharacterAnimationPublishCommand` | `FCharacterControlPipeline::BuildFramePlan` | `FCharacterControlPipeline::PublishAnimation`；调用已有 `UZZZAnimInstance::PipelineDrive` |
 
 ## 13. 当前未实现、未接线和兼容项
@@ -933,7 +938,7 @@ RM_Speed 是 MotionDriver 的速度主值；RM_Dist 只做诊断，不与位移�
 - `FRuntimeData.Movement.bIsGrounded` 当前没有运行时写入方，保持模型默认值 true；SnapshotCapture 只读取该字段。
 - `FZZZAnimSnapshot.bBlockMove` 当前由 Capture 固定写 false。
 - `FZZZAnimTuning` 的 TurnBack 阈值、LoopBlendIn、OneShotBlendOut 当前没有完整消费链。
-- `FRootMotionRuntimeModel.RootMotionDelta`、`AnimCurveDistanceDelta`、`AnimCurveAngle` 当前由参数处理器采样，其中 `RootMotionDelta` 已通过移动命令在 TurnBack Released 首帧参与 Actor 方向候选选择；`AnimCurveYawDelta` 仍仅作诊断。
+- `FRootMotionRuntimeModel.RootMotionDelta`、`AnimCurveDistanceDelta`、`AnimCurveYawDelta` 和 `AnimCurveAngle` 当前由参数处理器采样，其中 `RootMotionDelta`/`AnimCurveVelocityDirection` 通过移动命令作为固定根轨迹的方向和位移路径；TurnBack d0 的 `AnimCurveYawDelta` 由累计 RM_Yaw 相邻采样差分得到并由 MotionDriver 直接累加到 Actor，D0 同时关闭自动朝向，d1 恢复原有旋转配置并按输入方向移动；方向按当前 Bone_Root 相对入口的逆 yaw 修正；MotionDriver 使用 RM_Speed 驱动速度。RM_Dist 仍只作距离诊断。
 - `FGYGOStateManager::DeactivateState` 注释描述了 GE 移除，但函数体当前没有真正移除状态施加的 GE。
 - `FStateUpdateResult` 和 `FCharacterFrameCommandBuffer` 已接入 Pipeline，但命令缓冲当前只包含移动和 ZZZ 动画发布；状态结果是已完成操作报告，不会被 Pipeline 重放。
 - `FCharacterFramePlan::ActionGranted` 仍只是 Arbiter 结果；没有 C++ GameplayAbility、攻击/闪避状态或 GA 命令执行链。

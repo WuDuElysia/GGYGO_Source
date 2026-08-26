@@ -1,14 +1,15 @@
 /**
  * @file TurnBackPhaseProcessor.h
- * @brief TurnBack 相位处理器（急停转身的唯一真相）
+ * @brief TurnBack 逻辑时间轴处理器（急停转身的唯一真相）
  *
- * 逻辑层单点维护 RuntimeData.Movement.TurnBack.Phase：
- *   None → Frozen    Run 且当前输入接近角色前向的反方向时触发；记录进入前的移动方向
- *   Frozen → Released sig_turnback 曲线越过阈值（动画告知"可解冻"）
- *   Released → None  角色朝向已对齐当前输入，或已无移动输入
+ * 逻辑层单点维护 RuntimeData.Movement.TurnBack：
+ *   None → Frozen    Run 且当前输入接近角色前向的反方向时触发
+ *   Frozen → Released 到达配置的释放时间点；第一段不可被输入打断
+ *   CanYaw AnimNotify 到达后立即设置 bSecondSegment，进入 d1 输入接管
+ *   Released → None  到达总时长，或 d1 开始后没有移动输入
  *
- * 反向输入判定只在此处进行一次；MotionDriver 与动画快照都只读该相位，
- * 不再各自重复检测，消除双探测器不一致。
+ * 第二段开始由逻辑时间轴标记，不读取动画旋转曲线推进生命周期。
+ * 反向输入在一次 TurnBack 完成后需要先离开反向阈值，避免持续按住反向输入立即重触发。
  */
 #pragma once
 
@@ -20,15 +21,31 @@ class ACharacter;
 class FTurnBackPhaseProcessor : public IParameterProcessor
 {
 public:
-	/** @param InOwner 角色指针（读取当前 Actor 前向用于反向判定与进入方向记录） */
+	/** @param InOwner 角色指针（读取当前 Actor 前向和 MovementConfig） */
 	void Init(ACharacter* InOwner);
 
 	/**
-	 * 前置条件：本帧 LocomotionIntentProcessor 已写 DesiredWorldMoveDir、
-	 * 步态阶段已写 ResolvedGait、FAnimSignalParameterProcessor 已采样 sig_turnback。
+	 * 接收新版 ZZZAnim 的 CanYaw AnimNotify；信号状态在下一次 Pipeline Decision 阶段转为 d1。
+	 */
+	void NotifyCanYaw();
+
+	/**
+	 * 前置条件：本帧 LocomotionIntentProcessor 已写 DesiredWorldMoveDir，
+	 * 步态阶段已写 ResolvedGait；本函数使用 DeltaTime 推进 TurnBack 逻辑时间轴。
 	 */
 	virtual void Process(FRuntimeData& RuntimeData, float DeltaTime) override;
 
-private:
 	ACharacter* Owner = nullptr;
+
+	/** Frozen → Released 的时间点（秒）。 */
+	float ReleaseTimeSeconds = 0.17f;
+
+	/** CanYaw Notify 已到达；由 Process 在 TurnBack 活动帧转为 RuntimeData 的 d1 标记。 */
+	bool bCanYawNotified = false;
+
+	/** TurnBack 自然结束的总时长（秒）。 */
+	float DurationSeconds = 2.40f;
+
+	/** 一次反向输入触发已经消费；离开反向阈值后才允许再次触发。 */
+	bool bTurnBackInputLatched = false;
 };

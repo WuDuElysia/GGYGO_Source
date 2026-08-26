@@ -127,6 +127,14 @@ void ABaseCharacter::ClearMoveInput()
 	}
 }
 
+void ABaseCharacter::NotifyCanYaw()
+{
+	if (RuntimeComponent)
+	{
+		RuntimeComponent->NotifyCanYaw();
+	}
+}
+
 void ABaseCharacter::SetLookInput(const FVector2D& Value)
 {
 	if (RuntimeComponent)

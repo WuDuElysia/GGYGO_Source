@@ -84,6 +84,9 @@ public:
 	/** 获取运行时黑板（供 AnimInstance 等外部系统只读访问） */
 	FRuntimeData* GetRuntimeData() const { return RuntimeComponent ? RuntimeComponent->GetRuntimeData() : nullptr; }
 
+	/** 接收新版 ZZZAnim 的 CanYaw AnimNotify，不直接让动画层写 RuntimeData。 */
+	void NotifyCanYaw();
+
 protected:
 	// ============================================================
 	// 输入处理门面

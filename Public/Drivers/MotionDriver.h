@@ -2,9 +2,13 @@
  * @file MotionDriver.h
  * @brief 运动驱动器
  *
- * 负责将意图管线产生的世界移动方向转化为实际位移，并在 TurnBack 解冻信号到达时
- * 根据 RootMotion 位移 XY 与目标输入方向的一致性选择直接方向或反向方向，一次性提交 Actor 转身。
- * 移动方向和 Actor 旋转都由本类作为唯一运行时写入方。
+ * 负责把动画烘焙曲线转换为 Actor 的实际位移和 D0 朝向。RM_Speed 是速度主值，RM_Yaw 是累计角度曲线，
+ * 参数处理器将其相邻采样值差分为 D0 每帧角度增量。普通 walkrun 无 dir 曲线，移动方向 = 玩家输入方向 DesiredWorldMoveDir。
+ * TurnBack D0 使用进入时捕获的 Bone_Root 世界前/右基准，并按当前 Bone_Root 相对入口的 yaw
+ * 逆变换 RM_VelocityDirX/Y，保证 Actor 转身后世界位移仍沿原直线；D0 临时关闭 CharacterMovement/Controller 自动朝向，
+ * CanYaw 后进入 d1，像 walkrun 一样由输入接管并恢复原有旋转配置。
+ * 动画实例不提取 Root Motion，AnimBP 只消费快照，不承担 Actor 移动或朝向。
+ * dir 曲线约定 X=左右、Y=前后。
  */
 #pragma once
 
@@ -19,68 +23,67 @@ class USkeletalMeshComponent;
 /**
  * 运动驱动器
  *
- * 负责将意图管线产生的世界移动方向转化为实际位移。
- * DesiredWorldMoveDir 是摄像机相对输入生成的世界主方向；TurnBack Frozen 期间优先使用进入转身前锁定的方向，
- * Released 首帧根据 RootMotion 位移 XY 与目标输入方向的一致性选择直接或 180° 反向方向，随后使用修正后的方向提交移动；None 使用当前输入方向。
- * RM_Speed 是曲线速度主值（cm/s），决定移动最终速度；RootMotionScale 只缩放该曲线速度。
- * RM_Dist 仅保留为距离差分诊断，RM_PosX/RM_PosY 通过 RootMotionDelta 提供 TurnBack 解冻方向依据。
- *
- * 两条移动路径：
- *   - ProcessLocomotion：常规移动，使用有效 RM_Speed × RootMotionScale 后 RequestDirectMove(..., true)
- *   - ProcessRootMotionMovement：解析后的世界方向 × RM_Speed × RootMotionScale → RequestDirectMove(..., true)
+ * RM_Speed 是曲线速度主值（cm/s），AnimCurveYawDelta 是由累计 RM_Yaw 相邻采样差分得到的 D0 当前帧角度增量（度）。
+ * 普通 walkrun 无 dir 曲线，移动方向 = 玩家输入方向 DesiredWorldMoveDir。
+ * TurnBack D0：按 CanYaw 之前将 AnimCurveYawDelta（由累计 RM_Yaw 相邻采样差分得到）给 Actor 累加 yaw；位移方向使用进入时捕获的
+ * Bone_Root 世界前/右基准，并用当前 Bone_Root 相对入口的逆 yaw 修正 dir 曲线，保持世界直线。
+ * TurnBack d1：CanYaw 到达后像 walkrun 一样朝玩家输入方向移动并允许现有旋转链接管朝向。
  */
 class FMotionDriver
 {
 public:
 	void Init(ACharacter* InOwner);
 
-	/** 每帧由 Pipeline 消费移动命令并提交角色位移或 TurnBack Actor 旋转。 */
+	/** 每帧由 Pipeline 消费移动命令并提交角色位移或 TurnBack 状态更新。 */
 	void Process(
 		float DeltaTime,
 		const FCharacterMovementCommand& Command,
 		FRuntimeData& RuntimeData);
 
 private:
-	/**
-	 * 返回当前帧实际用于位移的世界方向。
-	 * TurnBackPhase==Frozen 时使用进入转身前锁定的方向；Released 首帧优先使用刚修正的方向，之后使用当前输入方向。
-	 */
+	/** 返回当前帧实际用于位移的世界方向；有效根轨迹曲线优先于输入和 TurnBack 兼容方向。 */
 	FVector ResolveWorldMoveDirection(const FCharacterMovementCommand& Command) const;
 
-	enum class ETurnBackReleaseDirectionSource : uint8
-	{
-		RootMotionXY,
-		RootMotionXYReversed,
-		DesiredWorldMoveDir,
-		EntryDirectionFallback
-	};
+	/** 进入 TurnBack 首帧捕获 d0 使用的 Bone_Root 世界前向和右向基准。 */
+	void UpdateTurnBackDirectionIntent(const FCharacterMovementCommand& Command);
 
-	/**
-	 * 解析解冻瞬间的正确方向：RootMotion 局部 XY 转世界后与目标输入比较；仅在相反时取 180°反向，
-	 * 无位移时回退到输入/入口方向，并可返回本次选择的来源供诊断日志使用。
-	 */
-	FVector ResolveTurnBackReleaseDirection(
-		const FCharacterMovementCommand& Command,
-		ETurnBackReleaseDirectionSource* OutSource = nullptr) const;
+	/** 在 CanYaw 之前把由累计 RM_Yaw 相邻采样差分得到的 AnimCurveYawDelta 累加到 Actor 的水平 yaw。 */
+	void ApplyTurnBackYaw(const FCharacterMovementCommand& Command);
 
-	/** 仅在 Frozen→Released 的首个 Commit 阶段设置 Actor 朝向并锁存本帧修正方向。 */
-	void ApplyTurnBackReleaseRotation(const FCharacterMovementCommand& Command);
+	/** D0 期间关闭 CharacterMovement/Controller 自动朝向，进入 d1 或退出时恢复原配置。 */
+	void UpdateTurnBackRotationMode(const FCharacterMovementCommand& Command);
 
-	/**
-	 * 曲线驱动移动：解析后的世界方向（普通输入或 TurnBack 锁定方向）决定水平世界方向，
-	 * RM_Speed × RootMotionScale 决定最终速度；RM_Dist 仅用于距离诊断。
-	 * 无输入时仅回退到 Actor 的水平前向，不旋转曲线局部轴。
-	 */
+	/** 读取当前 Bone_Root 的世界水平前向/右向；缺失时回退 Actor 基准。 */
+	void ResolveTurnBackBoneRootBasis(
+		FVector& OutForward,
+		FVector& OutRight) const;
+
+	/** 解析 TurnBack 世界移动方向：d0 用 Bone_Root 逆 yaw 修正 dir，d1 用玩家输入方向。 */
+	FVector ResolveTurnBackWorldMoveDirection(
+		const FCharacterMovementCommand& Command) const;
+
+	/** 更新 TurnBack 动画计时和完成诊断。 */
+	void UpdateTurnBackReleaseState(
+		float DeltaTime,
+		const FCharacterMovementCommand& Command);
+
+	/** 在 Init 和 TurnBack 活动期间确保曲线驱动不会被引擎 Root Motion 叠加。 */
+	void EnsureRootMotionIgnored();
+
+	/** 退出 TurnBack 时清理进入锁定状态。 */
+	void ResetTurnBackDirection();
+
+	/** 曲线驱动移动：方向由 ResolveWorldMoveDirection 决定，RM_Speed × RootMotionScale 决定速度。 */
 	void ProcessRootMotionMovement(
 		float DeltaTime,
 		const FCharacterMovementCommand& Command);
 
-	/** 常规移动路径：输入方向 × RM_Speed × RootMotionScale → RequestDirectMove(..., true)（防滑步核心） */
+	/** 常规移动路径：世界方向 × RM_Speed × RootMotionScale。 */
 	void ProcessLocomotion(
 		const FVector& WorldDir,
 		const FCharacterMovementCommand& Command);
 
-	/** 回写 RuntimeData 中的 CurrentSpeed/bIsMoving/MoveAngle */
+	/** 回写 RuntimeData 中的 CurrentSpeed/bIsMoving/MoveAngle。 */
 	void UpdateRuntimeData(FRuntimeData& RuntimeData);
 
 	/** 所属角色 */
@@ -89,15 +92,34 @@ private:
 	/** 角色移动组件（缓存，避免每帧 GetCharacterMovement） */
 	UCharacterMovementComponent* Movement = nullptr;
 
-	/** 骨骼网格组件（缓存，Init 时设置 RootMotionMode） */
+	/** 骨骼网格组件（缓存，Init 时设置 RootMotionMode 并读取 TurnBack 序列） */
 	USkeletalMeshComponent* Mesh = nullptr;
 
-	/** 曲线速度缩放（Init 时从 MovementConfig.RootMotionScale 读取）；仅缩放 RM_Speed，不是固定速度来源。 */
+	/** 曲线速度缩放（Init 时从 MovementConfig.RootMotionScale 读取）。 */
 	float RootMotionScale = 1.f;
 
-	/** 防止同一段 TurnBack Released 阶段重复设置 Actor 朝向。 */
-	bool bTurnBackReleaseRotationApplied = false;
+	/** 是否已锁定本次 TurnBack 的进入方向基准。 */
+	bool bTurnBackDirectionActive = false;
 
-	/** 解冻首帧由 RootMotion XY 与目标输入选择出的移动方向，仅存活到当前 Process 调用。 */
-	FVector FrameTurnBackReleaseDirection = FVector::ZeroVector;
+	/** D0 是否暂时接管了 CharacterMovement/Controller 的自动朝向配置。 */
+	bool bTurnBackRotationOverrideActive = false;
+	bool bSavedOrientRotationToMovement = false;
+	bool bSavedUseControllerDesiredRotation = false;
+	bool bSavedUseControllerRotationYaw = false;
+
+	/** TurnBack D0 使用的进入时 Bone_Root 世界水平前向和右向基准。 */
+	FVector TurnBackDirectionBasisForward = FVector(1.f, 0.f, 0.f);
+	FVector TurnBackDirectionBasisRight = FVector(0.f, 1.f, 0.f);
+
+	/** TurnBack 动画是否已完成；只用于避免重复输出完成诊断。 */
+	bool bTurnBackAnimationComplete = false;
+
+	/** TurnBack 动画从 Frozen 入口开始累计的播放时间。 */
+	float TurnBackAnimationElapsed = 0.f;
+
+	/** 从 UZZZAnimInstance 的 TurnBack AnimSequence 读取的播放时长。 */
+	float TurnBackAnimationLength = 0.f;
+
+	/** 是否已经进入一段需要等待动画完成诊断的 TurnBack。 */
+	bool bTurnBackAnimationActive = false;
 };
