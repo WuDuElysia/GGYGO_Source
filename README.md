@@ -1,8 +1,13 @@
 # GGYGO Source 代码手册与运行时架构
 
-> 本文是 `Source/GGYGO/**` 的源码级索引和运行时架构说明。内容以当前工作区源码为准，不以文件名、旧 NTE 逆向资料或未落地设计作为实现依据。
+> **本文已停止维护，不再保证与源码一致。**
 >
-> 本文只保留稳定的项目架构、文件/目录职责、class/struct/字段/函数说明、数据权威、运行时顺序和当前源码已确认的未接线边界。
+> 自动同步该文档的 hook 与 skill 已移除。它记录的是 Lyra 风格重构开始前那一版自研 Pipeline 架构，
+> 对理解旧的 `Pipeline/`、`StateMachine/`、`Drivers/` 与 ZZZ 动画层仍有参考价值，
+> 但**新增的 `AbilitySystem/` GAS 核心层只被部分收录，且按重构计划上述旧模块将整体退役**。
+>
+> 需要当前架构与实施计划时，看 Obsidian 笔记 `lyra学习笔记/计划蓝图.md` 与 `GGYGO_整体架构.canvas`；
+> 需要确认代码事实时，直接读源码。
 
 ## 0. 阅读约定
 
@@ -53,6 +58,24 @@ Source/GGYGO/
 ├─ GGYGOPlayerController.h / GGYGOPlayerController.cpp
 ├─ GGYGOTags.h
 ├─ SyncMarkerImporter.h / SyncMarkerImporter.cpp
+├─ AbilitySystem/                                    ← 新版 GAS 核心层，见第 14 章
+│  ├─ GGYGOAbilitySystemComponent.h / .cpp
+│  ├─ GGYGOAbilitySet.h / .cpp
+│  ├─ GGYGOAbilitySystemGlobals.h / .cpp
+│  ├─ GGYGOGameplayEffectContext.h / .cpp
+│  ├─ GGYGOAbilitySourceInterface.h / .cpp
+│  ├─ GGYGOAbilityTagRelationshipMapping.h / .cpp
+│  ├─ GGYGOAbilitySystemLog.h / .cpp
+│  ├─ Abilities/
+│  │  ├─ GGYGOGameplayAbility.h / .cpp
+│  │  ├─ GGYGOAbilityCost.h
+│  │  └─ GGYGOAbilityFailureMessages.h
+│  ├─ Attributes/
+│  │  ├─ GGYGOAttributeSetBase.h / .cpp
+│  │  ├─ GGYGOHealthSet.h / .cpp
+│  │  └─ GGYGOCombatSet.h / .cpp
+│  └─ Groups/
+│     └─ GGYGOAbilityGroupTypes.h
 ├─ Animation/
 │  ├─ AnimSyncMarkerTools.h / AnimSyncMarkerTools.cpp
 │  └─ zzzAnim/
@@ -121,17 +144,27 @@ Source/GGYGO/
 │     ├─ MovementParameterProcessor.h / MovementParameterProcessor.cpp
 │     ├─ RootMotionParameterProcessor.h / RootMotionParameterProcessor.cpp
 │     └─ TurnBackPhaseProcessor.h / TurnBackPhaseProcessor.cpp
-└─ StateMachine/
-   ├─ CharacterState.h / CharacterState.cpp
-   ├─ CharacterStateType.h
-   ├─ GGYGOStateManager.h / GGYGOStateManager.cpp
-   ├─ Data/FStateRelationRow.h
-   └─ State/
-      ├─ IdleState.h / IdleState.cpp
-      └─ MovingState.h / MovingState.cpp
+├─ Messages/
+│  └─ GGYGOVerbMessage.h
+├─ Physics/
+│  └─ GGYGOPhysicalMaterialWithTags.h / .cpp
+├─ StateMachine/
+│  ├─ CharacterState.h / CharacterState.cpp
+│  ├─ CharacterStateType.h
+│  ├─ GGYGOStateManager.h / GGYGOStateManager.cpp
+│  ├─ Data/FStateRelationRow.h
+│  └─ State/
+│     ├─ IdleState.h / IdleState.cpp
+│     └─ MovingState.h / MovingState.cpp
+└─ System/
+   └─ GGYGOGameplayTags.h / .cpp
 ```
 
-上面的清单只包含**已有源码文件**的目录。当前没有 C++ GameplayAbility 类、独立 Movement 类或 Tests；这些能力尚未实现。`Data/Runtime`、`Contracts`、多数 ZZZ 动画内部数据文件、枚举和接口是 header-only，这是设计上的纯数据/接口形式，不是漏掉的 `.cpp`。
+上面的清单只包含**已有源码文件**的目录。`Data/Runtime`、`Contracts`、多数 ZZZ 动画内部数据文件、枚举和接口是 header-only，这是设计上的纯数据/接口形式，不是漏掉的 `.cpp`。
+
+`AbilitySystem/` 下已有 GAS 核心层的基类与数据资产（见第 14 章），但**还没有任何具体的 GameplayAbility 派生类**：
+`UGGYGOGameplayAbility` 是抽象基类，项目里没有可直接激活的攻击、闪避或技能能力。
+独立 Movement 类与 Tests 同样尚未实现。
 
 除以上目录外，模块内还存在一批**只有 `.gitkeep`、没有任何源码文件**的目录，见 2.3。它们是按 Lyra `LyraGame` 布局建立的职责分区，读到目录名时不能推断对应能力已经实现。
 
@@ -139,14 +172,14 @@ Source/GGYGO/
 
 这些目录当前不含任何源码文件，叶子目录只放一个 `.gitkeep` 占位以便纳入版本控制。它们定义"某类文件应该放在哪里"，不代表任何已实现能力。模块唯一 include root 仍是 `ModuleDirectory`，因此这些目录内的头文件将以 `AbilitySystem/...`、`Character/...` 等相对模块根的路径被包含。
 
-#### GAS 分区
+`AbilitySystem/`、`AbilitySystem/Abilities/`、`AbilitySystem/Attributes/`、`AbilitySystem/Groups/`、
+`Messages/`、`Physics/`、`System/` 已经有实际源码，不再属于本节范围，改由 2.2 的文件树与第 14 章描述。
+
+#### GAS 分区（尚空）
 
 | 目录 | 预定收纳内容 |
 |---|---|
-| `AbilitySystem/` | GAS 核心宿主层：ASC 派生类、AbilitySet、AbilitySystemGlobals、GameplayEffectContext、AbilitySourceInterface、AbilityTagRelationshipMapping、GlobalAbilitySystem 等直接放在本目录，不再下沉子目录。 |
-| `AbilitySystem/Abilities/` | `GameplayAbility` 基类及其派生（死亡、复位、跳跃、攻击、闪避、受击等）。 |
-| `AbilitySystem/Abilities/Costs/` | 可插拔的 Ability 消耗策略对象（对应 Lyra `LyraAbilityCost` 系列）。 |
-| `AbilitySystem/Attributes/` | 按职责拆分的 `UAttributeSet`（生命、战斗、耐力、韧性等）。当前生效的 `Attributes/GGYGOAttributeSet.*` 仍在模块根级 `Attributes/`，两处并存。 |
+| `AbilitySystem/Abilities/Costs/` | `UGGYGOAbilityCost` 的具体派生（耐力、能量、连段计数）。基类已在 `Abilities/GGYGOAbilityCost.h`。 |
 | `AbilitySystem/Executions/` | `UGameplayEffectExecutionCalculation` 派生（伤害、治疗、削韧等结算）。 |
 | `AbilitySystem/Calculations/` | `UGameplayModMagnitudeCalculation` 派生（按属性/Tag 计算 Modifier 数值）。 |
 | `AbilitySystem/Effects/` | C++ 侧 `UGameplayEffect` 派生与 GE 引用集中点。当前全局 GE 软引用仍在模块根 `GGYGOGameplayEffects.h/.cpp`。 |
@@ -181,11 +214,8 @@ Source/GGYGO/
 | `Feedback/` | 打击感反馈总目录：CameraShake、手柄震动、HitStop、时停。 |
 | `Feedback/ContextEffects/` | 按表面/材质/情境派发的音效与特效（脚步、命中、拔刀），对应 Lyra `Feedback/ContextEffects`。 |
 | `Feedback/NumberPops/` | 伤害数字与飘字，对应 Lyra `Feedback/NumberPops`。 |
-| `Physics/` | 碰撞通道定义、带 GameplayTag 的物理材质。命中判定通道与材质驱动的命中反馈依赖此处。 |
-| `System/` | 全局系统：AssetManager、GameInstance、GameplayTagStack、通用静态工具。当前 Tag 常量仍集中在模块根 `GGYGOTags.h`。 |
 | `Development/` | 调试与开发期工具：CheatManager、可视化、开发期设置。当前诊断散布在各 Processor 的 `!UE_BUILD_SHIPPING` 分支中。 |
 | `Teams/` | 阵营/敌我关系与查询。 |
-| `Messages/` | 解耦的 Gameplay 消息广播，基于 `UGameplayMessageSubsystem`。 |
 
 Lyra 顶层还有 `Audio/`、`Cosmetics/`、`Equipment/`、`GameFeatures/`、`Hotfix/`、`Interaction/`、`Inventory/`、`Performance/`、`Replays/`、`Settings/`、`Tests/`、`UI/`、`Weapons/`。这些分区在 GGYGO 中没有建立目录，也没有对应源码。
 
@@ -280,9 +310,19 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 **函数**：
 
-- `GGYGO(ReadOnlyTargetRules Target)`：设置显式/共享 PCH；添加 Public 依赖 `Core`、`CoreUObject`、`Engine`、`InputCore`、`EnhancedInput`、`GameplayAbilities`、`GameplayTags`、`GameplayTasks`、`ModularGameplay`、`GameFeatures`；添加 Private 依赖 `Json`、`GameplayMessageRuntime`；注册 `ModuleDirectory` 作为唯一 include root；当目标是 Editor 时增加 `AutomationController`。没有运行时初始化逻辑。
+- `GGYGO(ReadOnlyTargetRules Target)`：设置显式/共享 PCH；添加 Public 依赖 `Core`、`CoreUObject`、`Engine`、`InputCore`、`EnhancedInput`、`GameplayAbilities`、`GameplayTags`、`GameplayTasks`、`ModularGameplay`、`GameFeatures`、`PhysicsCore`；添加 Private 依赖 `Json`、`GameplayMessageRuntime`；注册 `ModuleDirectory` 作为唯一 include root；当目标是 Editor 时增加 `AutomationController`；最后调用 `SetupIrisSupport(Target)`。没有运行时初始化逻辑。
 
-`ModularGameplay` 提供 `UGameFrameworkComponentManager`、`UPawnComponent` 和 InitState 组件初始化状态机；`GameFeatures` 提供 GameFeature/Experience 插件化能力；`GameplayMessageRuntime` 提供 `UGameplayMessageSubsystem`，模块由工程插件 `Plugins/GameplayMessageRouter` 提供，不是引擎自带模块。三者均已在 `GGYGO.uproject` 启用对应插件（`ModularGameplay`、`GameFeatures`、`GameplayMessageRouter`）。当前模块源码尚未引用这三个模块的任何符号，它们是为组件化重构预先声明的依赖。
+各依赖的实际用途：
+
+| 依赖 | 用途 | 是否已被引用 |
+|---|---|---|
+| `ModularGameplay` | `UGameFrameworkComponentManager`、`UPawnComponent`、InitState 状态机 | 尚未引用，为阶段 4 组件化预留 |
+| `GameFeatures` | GameFeature / Experience 插件化 | 尚未引用，为后续数据装配预留 |
+| `PhysicsCore` | `UPhysicalMaterial`，`UGGYGOPhysicalMaterialWithTags` 派生它 | 已引用 |
+| `GameplayMessageRuntime` | `UGameplayMessageSubsystem`，来自工程插件 `Plugins/GameplayMessageRouter`，不是引擎模块 | 已引用（HealthSet 与 GameplayAbility 广播消息） |
+| `SetupIrisSupport(Target)` | `FGGYGOGameplayEffectContext` 用 `UE_NET_IMPLEMENT_FORWARDING_NETSERIALIZER_AND_REGISTRY_DELEGATES` 转发 Iris 序列化，该宏引用 `UE::Net::FNetSerializerRegistryDelegates` 与 `FPropertyNetSerializerInfoRegistry`，不调用此 helper 会链接失败 | 已必需 |
+
+前三个插件（`ModularGameplay`、`GameFeatures`、`GameplayMessageRouter`）均已在 `GGYGO.uproject` 启用。
 
 ### 5.2 `GGYGO.h` / `GGYGO.cpp`
 
@@ -940,9 +980,9 @@ TurnBack Phase 和 CanYaw/d1 标记由逻辑层维护，AnimBP 只消费快照�
 
 ## 13. 当前未实现、未接线和兼容项
 
-以下是源码事实，不是待办承诺：
+以下是源码事实，不是待办承诺。新版 GAS 核心层（`AbilitySystem/`）自身的未接线边界集中列在 14.8，本节只列旧有链路。
 
-- 没有 C++ GameplayAbility 实现；移动由 `FMotionDriver` 完成，没有独立移动类；当前没有 Private 测试实现。以上能力对应的空脚手架目录已从源码树移除，需要时再新建。
+- 没有具体的 GameplayAbility 派生类（`UGGYGOGameplayAbility` 只是抽象基类，不能直接激活）；移动由 `FMotionDriver` 完成，没有独立移动类；当前没有测试实现。
 - 当前玩家没有攻击/闪避 Enhanced Input 回调。
 - `FActionArbiter`、`FHealthArbiter`、`FStaminaArbiter` 的核心业务仍有 TODO/空实现。
 - AttributeSet 没有 Stamina 属性，`ClampStamina` 是空钩子。
