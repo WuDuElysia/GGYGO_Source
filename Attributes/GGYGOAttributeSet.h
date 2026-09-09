@@ -12,11 +12,17 @@
 
 // 宏：自动生成 GetXXX()、SetXXX()、InitXXX() 访问器函数
 // GAS 框架要求每个属性都必须有这些访问器
+//
+// ifndef 保护是必需的：新版 AbilitySystem/Attributes/GGYGOAttributeSetBase.h 定义了
+// 同名同内容的宏。unity build 会把多个 .cpp 合并进同一编译单元，两个头文件因此可能
+// 先后被包含，没有保护就是宏重定义。两处定义内容完全一致，谁先生效都一样。
+#ifndef ATTRIBUTE_ACCESSORS
 #define ATTRIBUTE_ACCESSORS(ClassName, PropertyName) \
 	GAMEPLAYATTRIBUTE_PROPERTY_GETTER(ClassName, PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_GETTER(PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_SETTER(PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_INITTER(PropertyName)
+#endif
 
 UCLASS()
 class GGYGO_API UGGYGOAttributeSet : public UAttributeSet

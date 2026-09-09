@@ -205,7 +205,15 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_HitStun);
 	/** 眩晕。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Stunned);
-	/** 已死亡。 */
+	/**
+	 * 正在死亡：生命归零、死亡演出进行中。
+	 *
+	 * 与 `State_Dead` 分开是因为这段区间的规则不同 ——
+	 * 此时角色仍在场、仍需要播动画、仍可能被追打，但不该再响应输入或被再次击杀。
+	 * 只有一个 Tag 的话就无法表达"演出中"与"已收尾"的差别。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Dying);
+	/** 已死亡，演出已收尾。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Dead);
 	/** 韧性被击破，处于破韧硬直中。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_PoiseBreak);
@@ -254,6 +262,14 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Gameplay_Damage_Immunity);
 	/** 自毁 / 处死类伤害，绕过免疫与开发期保命规则。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Gameplay_Damage_SelfDestruct);
+
+	/**
+	 * 死因标记：掉出世界。
+	 *
+	 * 只标记死法，不影响伤害计算（免疫穿透由 `Gameplay_Damage_SelfDestruct` 负责）。
+	 * 用途是让死亡 Cue 与死亡消息能区分表现 —— 掉出世界不该播倒地动画。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Gameplay_Damage_FellOutOfWorld);
 	/** 削韧来源标记。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Gameplay_PoiseDamage);
 

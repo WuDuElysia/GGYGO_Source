@@ -77,6 +77,7 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(State_Dodging, "State.Dodging");
 	UE_DEFINE_GAMEPLAY_TAG(State_HitStun, "State.HitStun");
 	UE_DEFINE_GAMEPLAY_TAG(State_Stunned, "State.Stunned");
+	UE_DEFINE_GAMEPLAY_TAG(State_Dying, "State.Dying");
 	UE_DEFINE_GAMEPLAY_TAG(State_Dead, "State.Dead");
 	UE_DEFINE_GAMEPLAY_TAG(State_PoiseBreak, "State.PoiseBreak");
 	UE_DEFINE_GAMEPLAY_TAG(State_Interacting, "State.Interacting");
@@ -95,6 +96,7 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage, "Gameplay.Damage");
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage_Immunity, "Gameplay.Damage.Immunity");
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage_SelfDestruct, "Gameplay.Damage.SelfDestruct");
+	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage_FellOutOfWorld, "Gameplay.Damage.FellOutOfWorld");
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_PoiseDamage, "Gameplay.PoiseDamage");
 
 	// ===== 八、Cooldown =====
