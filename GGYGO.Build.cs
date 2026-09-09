@@ -1,6 +1,5 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
 
-using System.IO;
 using UnrealBuildTool;
 
 public class GGYGO : ModuleRules
@@ -9,18 +8,33 @@ public class GGYGO : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "EnhancedInput", "GameplayAbilities", "GameplayTags", "GameplayTasks" });
+		PublicDependencyModuleNames.AddRange(new string[]
+		{
+			"Core",
+			"CoreUObject",
+			"Engine",
+			"InputCore",
+			"EnhancedInput",
+			"GameplayAbilities",
+			"GameplayTags",
+			"GameplayTasks",
+			// Lyra 风格组件化基础：UGameFrameworkComponentManager、UPawnComponent、InitState 状态机。
+			"ModularGameplay",
+			// Experience / GameFeature 插件化数据驱动。
+			"GameFeatures",
+		});
 
-		PrivateDependencyModuleNames.AddRange(new string[] { "Json" });
+		PrivateDependencyModuleNames.AddRange(new string[]
+		{
+			"Json",
+			// 解耦的 Gameplay 消息广播；模块来自 Plugins/GameplayMessageRouter。
+			"GameplayMessageRuntime",
+		});
 
-		PublicIncludePaths.AddRange(new string[] {
-			Path.Combine(ModuleDirectory, "Public"),
-			Path.Combine(ModuleDirectory, "Public/Attributes"),
-			Path.Combine(ModuleDirectory, "Public/Movement"),
-			Path.Combine(ModuleDirectory, "Public/StateMachine")
-});
+		// 头文件与实现文件按职责子目录并列，模块根是唯一 include 根。
+		PublicIncludePaths.Add(ModuleDirectory);
 
-		// 测试脚手架：让 Private/Tests 下的测试与生成器工具头可被相对解析。
+		// 测试脚手架：模块根下的 Tests 与生成器工具头可被相对解析。
 		// Automation 框架（IMPLEMENT_SIMPLE_AUTOMATION_TEST / FAutomationTestBase）与
 		// FRandomStream 均位于 Core/Engine，已在上方依赖中，无需额外运行时模块。
 
