@@ -1,0 +1,77 @@
+# 默认不做自动文本探测，避免 UE 二进制资产被误当文本处理。
+* -text
+
+# ------------------------------------------------------------
+# 文本文件：仓库内统一 LF 存储，检出时按平台转换
+# ------------------------------------------------------------
+*.h         text eol=lf diff=cpp
+*.hpp       text eol=lf diff=cpp
+*.cpp       text eol=lf diff=cpp
+*.inl       text eol=lf diff=cpp
+*.cs        text eol=lf diff=csharp
+*.py        text eol=lf diff=python
+*.md        text eol=lf
+*.txt       text eol=lf
+*.ini       text eol=lf
+*.json      text eol=lf
+*.xml       text eol=lf
+*.yml       text eol=lf
+*.yaml      text eol=lf
+*.csv       text eol=lf
+*.usf       text eol=lf
+*.ush       text eol=lf
+*.hlsl      text eol=lf
+*.uproject  text eol=lf
+*.uplugin   text eol=lf
+.gitignore      text eol=lf
+.gitattributes  text eol=lf
+.editorconfig   text eol=lf
+
+# Windows 批处理必须保留 CRLF
+*.bat       text eol=crlf
+*.cmd       text eol=crlf
+*.ps1       text eol=crlf
+
+# ------------------------------------------------------------
+# Unreal 资产与其它二进制：禁止换行转换和文本 diff
+# ------------------------------------------------------------
+*.uasset    binary
+*.umap      binary
+*.upk       binary
+*.udk       binary
+*.ubulk     binary
+*.uexp      binary
+*.uptnl     binary
+
+*.fbx       binary
+*.obj       binary
+*.blend     binary
+*.psd       binary
+*.png       binary
+*.jpg       binary
+*.jpeg      binary
+*.tga       binary
+*.bmp       binary
+*.exr       binary
+*.hdr       binary
+*.dds       binary
+*.tif       binary
+*.tiff      binary
+
+*.wav       binary
+*.mp3       binary
+*.ogg       binary
+*.flac      binary
+*.mp4       binary
+*.avi       binary
+
+*.dll       binary
+*.lib       binary
+*.pdb       binary
+*.exe       binary
+*.so        binary
+*.dylib     binary
+*.a         binary
+*.zip       binary
+*.7z        binary
+*.pak       binary
