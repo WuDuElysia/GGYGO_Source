@@ -22,6 +22,8 @@ public class GGYGO : ModuleRules
 			"ModularGameplay",
 			// Experience / GameFeature 插件化数据驱动。
 			"GameFeatures",
+			// UPhysicalMaterial：GGYGOPhysicalMaterialWithTags 派生它，用于命中材质分流与减伤。
+			"PhysicsCore",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
@@ -43,6 +45,13 @@ public class GGYGO : ModuleRules
 		{
 			PrivateDependencyModuleNames.Add("AutomationController");
 		}
+
+		// Iris 网络序列化支持。
+		// FGGYGOGameplayEffectContext 用 UE_NET_IMPLEMENT_FORWARDING_NETSERIALIZER_AND_REGISTRY_DELEGATES
+		// 把自身的序列化转发给引擎的 EffectContext 序列化器，该宏会引用
+		// UE::Net::FNetSerializerRegistryDelegates 与 FPropertyNetSerializerInfoRegistry，
+		// 必须调用这个 helper 才能正确链接（Lyra 的 Build.cs 同样调用它）。
+		SetupIrisSupport(Target);
 
 
 		// Uncomment if you are using Slate UI

@@ -13,10 +13,14 @@
 namespace
 {
 #if WITH_EDITOR
-	const FName CurveNamePosX(TEXT("RM_PosX"));
-	const FName CurveNamePosY(TEXT("RM_PosY"));
-	const FName CurveNameVelocityDirectionX(TEXT("RM_VelocityDirX"));
-	const FName CurveNameVelocityDirectionY(TEXT("RM_VelocityDirY"));
+	// 加 BakeTool 前缀避免与 Pipeline/Parameters/RootMotionParameterProcessor.cpp 里的同名常量冲突。
+	// 两者都在匿名命名空间里定义同样的曲线名，一旦被 UE 的 unity build 合进同一个编译单元就会重定义。
+	// 这两处引用的是同一套 ZZZ 曲线，本应共享一份定义；等 RootMotionParameterProcessor
+	// 随移动层重建退役后，再把曲线名收敛到一处。
+	const FName BakeToolCurveNamePosX(TEXT("RM_PosX"));
+	const FName BakeToolCurveNamePosY(TEXT("RM_PosY"));
+	const FName BakeToolCurveNameVelocityDirectionX(TEXT("RM_VelocityDirX"));
+	const FName BakeToolCurveNameVelocityDirectionY(TEXT("RM_VelocityDirY"));
 
 	float SanitizeCurveSample(const float Value)
 	{
@@ -113,16 +117,16 @@ int32 UAnimSyncMarkerTools::BakeVelocityDirectionCurves(UAnimSequence* Anim)
 	}
 
 	const FAnimationCurveIdentifier PosXIdentifier(
-		CurveNamePosX,
+		BakeToolCurveNamePosX,
 		ERawCurveTrackTypes::RCT_Float);
 	const FAnimationCurveIdentifier PosYIdentifier(
-		CurveNamePosY,
+		BakeToolCurveNamePosY,
 		ERawCurveTrackTypes::RCT_Float);
 	const FAnimationCurveIdentifier DirectionXIdentifier(
-		CurveNameVelocityDirectionX,
+		BakeToolCurveNameVelocityDirectionX,
 		ERawCurveTrackTypes::RCT_Float);
 	const FAnimationCurveIdentifier DirectionYIdentifier(
-		CurveNameVelocityDirectionY,
+		BakeToolCurveNameVelocityDirectionY,
 		ERawCurveTrackTypes::RCT_Float);
 
 	const FFloatCurve* PosXCurve = DataModel->FindFloatCurve(PosXIdentifier);
