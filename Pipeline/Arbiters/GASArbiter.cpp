@@ -1,85 +1,91 @@
 /**
  * @file GASArbiter.cpp
- * @brief GAS 状态仲裁器实现（Phase 7 扩展版）
+ * @brief GAS 状态仲裁器实现
  *
- * 仲裁逻辑（每帧执行，在 ArbiterPipeline::Process 的 reset 之后）：
- *   1. 检查 State.Dead → 全封锁
- *   2. 检查 State.Stunned → 封锁动作
- *   3. 检查 Restriction.* Tag → 逐位设置 bBlock*
+ * 仲裁顺序（每帧执行，在 `FArbiterPipeline::Process` 清零 bBlock* 之后）：
+ *   1. 死亡 → 全封锁并提前返回
+ *   2. 眩晕 → 封锁全部动作
+ *   3. 逐个 Restriction.* Tag → 设置对应 bBlock 标记
  *
- * 注意：ArbiterPipeline 在此函数之前已将所有 bBlock* 重置为 false。
- * 此处只负责将 Tag 翻译为 true。
+ * 本函数只把 false 改成 true，不负责清零 —— 那是 ArbiterPipeline 的职责。
  */
 #include "Pipeline/Arbiters/GASArbiter.h"
-#include "Data/Runtime/RuntimeData.h"
+
 #include "AbilitySystemComponent.h"
+#include "Data/Runtime/RuntimeData.h"
 #include "GameplayTagContainer.h"
+#include "System/GGYGOGameplayTags.h"
 
 void FGASArbiter::Init(UAbilitySystemComponent* InASC)
 {
 	ASC = InASC;
 
-	// 缓存所有 Tag，避免每帧字符串查找开销
-	Tag_Dead     = FGameplayTag::RequestGameplayTag(GGYGOTags::State::Dead);
-	Tag_Stunned  = FGameplayTag::RequestGameplayTag(GGYGOTags::State::Stunned);
-	Tag_CantMove    = FGameplayTag::RequestGameplayTag(GGYGOTags::Restriction::CantMove);
-	Tag_CantAttack  = FGameplayTag::RequestGameplayTag(GGYGOTags::Restriction::CantAttack);
-	Tag_CantDodge   = FGameplayTag::RequestGameplayTag(GGYGOTags::Restriction::CantDodge);
-	Tag_CantJump    = FGameplayTag::RequestGameplayTag(GGYGOTags::Restriction::CantJump);
-	Tag_CantInput   = FGameplayTag::RequestGameplayTag(GGYGOTags::Restriction::CantInput);
+	// 这里曾经用 FGameplayTag::RequestGameplayTag 预解析七个 Tag 并缓存成员，
+	// 目的是避免每帧字符串查找。改用原生 Tag 后这层缓存没有意义了：
+	// 原生 Tag 是模块加载时注册的全局变量，直接读即可。
 }
 
 void FGASArbiter::Arbitrate(FRuntimeData& RuntimeData, float DeltaTime)
 {
-	if (!ASC) return;
-
-	// ============================================================
-	// 优先级 1：死亡状态 → 全封锁
-	// ============================================================
-	if (ASC->HasMatchingGameplayTag(Tag_Dead))
+	if (!ASC)
 	{
-		RuntimeData.Arbiter.bBlockMove   = true;
-		RuntimeData.Arbiter.bBlockAttack = true;
-		RuntimeData.Arbiter.bBlockDodge  = true;
-		return; // 死亡是最高优先级，不再检查其他
+		return;
 	}
 
 	// ============================================================
-	// 优先级 2：眩晕状态 → 封锁动作（保留输入处理）
+	// 优先级 1：死亡 —— 最高优先级，直接返回不再检查其它
 	// ============================================================
-	if (ASC->HasMatchingGameplayTag(Tag_Stunned))
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Dead))
 	{
-		RuntimeData.Arbiter.bBlockMove   = true;
-		RuntimeData.Arbiter.bBlockAttack = true;
-		RuntimeData.Arbiter.bBlockDodge  = true;
-		// 眩晕不阻断输入处理，只是禁止动作执行
-		// （与 GE_BlockAll 的 LimitFlags 不同，这里只设动作标记）
-	}
-
-	// ============================================================
-	// 优先级 3：Restriction.* Tag → 逐位设置（通用限制层）
-	//    这些 Tag 由 GE 施加（如 HitStun 的 GE_BlockCombat 带 CantMove/CantAttack）
-	//    与状态 Tag 叠加生效：Stunned + CantMove = 还是 true（无冲突）
-	// ============================================================
-
-	if (ASC->HasMatchingGameplayTag(Tag_CantMove))
 		RuntimeData.Arbiter.bBlockMove = true;
-
-	if (ASC->HasMatchingGameplayTag(Tag_CantAttack))
 		RuntimeData.Arbiter.bBlockAttack = true;
-
-	if (ASC->HasMatchingGameplayTag(Tag_CantDodge))
 		RuntimeData.Arbiter.bBlockDodge = true;
+		return;
+	}
 
-	if (ASC->HasMatchingGameplayTag(Tag_CantJump))
+	// ============================================================
+	// 优先级 2：眩晕 —— 封锁动作但不阻断输入采集
+	// ============================================================
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Stunned))
 	{
-		// CantJump 目前没有独立的 RuntimeData 字段，
-		// 通过 bBlockMove 间接禁止跳跃（MotionDriver 层判断）
+		RuntimeData.Arbiter.bBlockMove = true;
+		RuntimeData.Arbiter.bBlockAttack = true;
+		RuntimeData.Arbiter.bBlockDodge = true;
+	}
+
+	// ============================================================
+	// 优先级 3：Restriction.* 逐项翻译
+	// 这些 Tag 由 GE 施加（受击硬直、无敌帧、演出锁定等），
+	// 与上面的状态 Tag 叠加生效，不互相覆盖。
+	// ============================================================
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantMove))
+	{
 		RuntimeData.Arbiter.bBlockMove = true;
 	}
 
-	if (ASC->HasMatchingGameplayTag(Tag_CantInput))
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantAttack))
 	{
-		// bBlockInput 已移除；如果未来需要，在此处设置具体 block 标记
+		RuntimeData.Arbiter.bBlockAttack = true;
+	}
+
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantDodge))
+	{
+		RuntimeData.Arbiter.bBlockDodge = true;
+	}
+
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantJump))
+	{
+		// RuntimeData 没有独立的跳跃阻断字段，暂时借用 bBlockMove。
+		// 这是个已知的不精确之处：它会连带禁掉地面移动。
+		// 移动层重建后由 CMC 直接查 Restriction.CantJump，不再有这个问题。
+		RuntimeData.Arbiter.bBlockMove = true;
+	}
+
+	if (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantInput))
+	{
+		// RuntimeData 没有 bBlockInput 字段，因此这个 Tag 当前**没有任何实际效果**。
+		// 输入屏蔽的正确落点是 ASC 的 TAG_GGYGO_Gameplay_AbilityInputBlocked
+		// （见 UGGYGOAbilitySystemComponent::ProcessAbilityInput），
+		// 以及移动层重建后 CMC 对移动输入的拒收。
 	}
 }
