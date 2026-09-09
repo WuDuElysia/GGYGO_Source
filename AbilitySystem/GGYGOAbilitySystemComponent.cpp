@@ -6,6 +6,7 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOAbilityTagRelationshipMapping.h"
+#include "AbilitySystem/Groups/GGYGOAbilityGroupConfig.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
 
@@ -296,8 +297,57 @@ void UGGYGOAbilitySystemComponent::AbilitySpecInputReleased(FGameplayAbilitySpec
 	}
 }
 
+const FGGYGOAbilityGroupRule& UGGYGOAbilitySystemComponent::ResolveGroupRule(FGameplayTag GroupTag) const
+{
+	// 未注入配置表时的兜底规则。static 保证能安全返回引用。
+	// 取值与阶段 1 的硬编码一致（SingleInstance + 平手后来者胜），
+	// 于是"还没配表"和"已配表但没配这个组"两种情况下行为都不变。
+	static const FGGYGOAbilityGroupRule FallbackRule;
+
+	if (AbilityGroupConfig)
+	{
+		return AbilityGroupConfig->GetRuleForGroup(GroupTag);
+	}
+
+	return FallbackRule;
+}
+
+void UGGYGOAbilitySystemComponent::SetAbilityGroupConfig(const UGGYGOAbilityGroupConfig* InConfig)
+{
+	AbilityGroupConfig = InConfig;
+}
+
+int32 UGGYGOAbilitySystemComponent::GetActiveAbilityCountInGroup(FGameplayTag GroupTag) const
+{
+	const TArray<TWeakObjectPtr<UGGYGOGameplayAbility>>* Group = ActiveAbilitiesByGroup.Find(GroupTag);
+	if (!Group)
+	{
+		return 0;
+	}
+
+	// 不能直接用 Num()：表里可能残留已被 GC 的弱引用（清理只在 Remove 时做）。
+	int32 Count = 0;
+	for (const TWeakObjectPtr<UGGYGOGameplayAbility>& Weak : *Group)
+	{
+		if (Weak.IsValid())
+		{
+			++Count;
+		}
+	}
+
+	return Count;
+}
+
 bool UGGYGOAbilitySystemComponent::IsActivationBlockedByGroup(const UGGYGOGameplayAbility* Ability) const
 {
+	EGGYGOAbilityGroupBlockReason UnusedReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
+	return IsActivationBlockedByGroup(Ability, UnusedReason);
+}
+
+bool UGGYGOAbilitySystemComponent::IsActivationBlockedByGroup(const UGGYGOGameplayAbility* Ability, EGGYGOAbilityGroupBlockReason& OutReason) const
+{
+	OutReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
+
 	if (!Ability)
 	{
 		return false;
@@ -318,6 +368,7 @@ bool UGGYGOAbilitySystemComponent::IsActivationBlockedByGroup(const UGGYGOGamepl
 
 			if (Active->GetSelfPolicy() == EGGYGOAbilitySelfPolicy::Exclusive && Active->GetActivationPriority() > RequestPriority)
 			{
+				OutReason = EGGYGOAbilityGroupBlockReason::ExclusiveActive;
 				return true;
 			}
 		}
@@ -330,24 +381,49 @@ bool UGGYGOAbilitySystemComponent::IsActivationBlockedByGroup(const UGGYGOGamepl
 		return false;
 	}
 
-	// 第二步：同组冲突。
-	// 阶段 1 硬编码按 SingleInstance 处理；阶段 3 改为查 UGGYGOAbilityGroupConfig，
-	// 届时 Coexist 组会直接放过，SingleInstanceQueued 组会转为入队而不是拒绝。
-	if (const TArray<TWeakObjectPtr<UGGYGOGameplayAbility>>* Group = ActiveAbilitiesByGroup.Find(GroupTag))
+	// 第二步：同组冲突，按该组配置的规则判定。
+	const FGGYGOAbilityGroupRule& Rule = ResolveGroupRule(GroupTag);
+	if (Rule.Rule == EGGYGOAbilityGroupRule::Coexist)
 	{
-		for (const TWeakObjectPtr<UGGYGOGameplayAbility>& WeakActive : *Group)
-		{
-			const UGGYGOGameplayAbility* Active = WeakActive.Get();
-			if (!Active || Active == Ability)
-			{
-				continue;
-			}
+		// 组内无并发限制，连遍历都不必做。
+		return false;
+	}
 
-			// 用 > 而非 >=：同优先级不阻断，让后来者能激活并在下一步取消旧实例（D4）。
-			if (Active->GetActivationPriority() > RequestPriority)
-			{
-				return true;
-			}
+	const TArray<TWeakObjectPtr<UGGYGOGameplayAbility>>* Group = ActiveAbilitiesByGroup.Find(GroupTag);
+	if (!Group)
+	{
+		return false;
+	}
+
+	for (const TWeakObjectPtr<UGGYGOGameplayAbility>& WeakActive : *Group)
+	{
+		const UGGYGOGameplayAbility* Active = WeakActive.Get();
+		if (!Active || Active == Ability)
+		{
+			continue;
+		}
+
+		if (Rule.Rule == EGGYGOAbilityGroupRule::SingleInstanceQueued)
+		{
+			// 严格先来后到：不比优先级，组里有人在跑就一律拒绝。
+			// 配合 AddAbilityToActivationGroup 里"Queued 组不取消同组实例"，
+			// 已激活的那一个必然能播完 —— 这是连段不被自己打断的保证。
+			OutReason = EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued;
+			return true;
+		}
+
+		// SingleInstance：比较优先级。
+		// bNewcomerWinsOnTie 为 true 时用 >（平手不阻断，放新的进来顶掉旧的，D4）；
+		// 为 false 时用 >=（平手也阻断，先激活者守住位置，受击组要的是这个）。
+		const int32 ActivePriority = Active->GetActivationPriority();
+		const bool bBlocked = Rule.bNewcomerWinsOnTie
+			? (ActivePriority > RequestPriority)
+			: (ActivePriority >= RequestPriority);
+
+		if (bBlocked)
+		{
+			OutReason = EGGYGOAbilityGroupBlockReason::LowerPriority;
+			return true;
 		}
 	}
 
@@ -381,19 +457,34 @@ void UGGYGOAbilitySystemComponent::AddAbilityToActivationGroup(UGGYGOGameplayAbi
 		CancelAbilitiesByFunc(ShouldCancelFunc, /*bReplicateCancelAbility=*/true);
 	}
 
-	// 同组顶替：取消同组里优先级**小于等于**自己的其他实例。
-	// 这里用 <= 而 IsActivationBlockedByGroup 用 >，两者拼起来正好是 D4：
-	// 同优先级时新的能激活（不被阻断），旧的被取消。
+	// 同组顶替：只有 SingleInstance 规则会取消同组实例。
+	//
+	// Coexist 不取消是显然的。SingleInstanceQueued 不取消是本规则的**定义**：
+	// 能走到这里说明组里原本是空的（否则会被 IsActivationBlockedByGroup 拦掉），
+	// 所以没有该取消的对象；写成显式 early-out 是为了防止将来有人
+	// 绕过仲裁直接激活时，Queued 组的"绝不打断"承诺被这段代码破坏。
 	if (GroupTag.IsValid())
 	{
-		auto ShouldCancelFunc = [Ability, NewPriority, GroupTag](const UGGYGOGameplayAbility* Other, FGameplayAbilitySpecHandle Handle)
+		const FGGYGOAbilityGroupRule& Rule = ResolveGroupRule(GroupTag);
+		if (Rule.Rule == EGGYGOAbilityGroupRule::SingleInstance)
 		{
-			return (Other != Ability)
-				&& (Other->GetGroupTag() == GroupTag)
-				&& (Other->GetActivationPriority() <= NewPriority);
-		};
+			// 取消阈值与 IsActivationBlockedByGroup 的阻断条件严格互补：
+			//   平手后来者胜：阻断 >  → 取消 <=（平手的旧实例被顶掉）
+			//   平手先到者胜：阻断 >= → 取消 <（能激活说明组里全都更低）
+			const bool bCancelTies = Rule.bNewcomerWinsOnTie;
+			auto ShouldCancelFunc = [Ability, NewPriority, GroupTag, bCancelTies](const UGGYGOGameplayAbility* Other, FGameplayAbilitySpecHandle Handle)
+			{
+				if (Other == Ability || Other->GetGroupTag() != GroupTag)
+				{
+					return false;
+				}
 
-		CancelAbilitiesByFunc(ShouldCancelFunc, /*bReplicateCancelAbility=*/true);
+				const int32 OtherPriority = Other->GetActivationPriority();
+				return bCancelTies ? (OtherPriority <= NewPriority) : (OtherPriority < NewPriority);
+			};
+
+			CancelAbilitiesByFunc(ShouldCancelFunc, /*bReplicateCancelAbility=*/true);
+		}
 	}
 }
 
@@ -410,6 +501,8 @@ void UGGYGOAbilitySystemComponent::RemoveAbilityFromActivationGroup(UGGYGOGamepl
 		return;
 	}
 
+	bool bGroupBecameEmpty = false;
+
 	if (TArray<TWeakObjectPtr<UGGYGOGameplayAbility>>* Group = ActiveAbilitiesByGroup.Find(GroupTag))
 	{
 		Group->Remove(Ability);
@@ -420,11 +513,19 @@ void UGGYGOAbilitySystemComponent::RemoveAbilityFromActivationGroup(UGGYGOGamepl
 		if (Group->Num() == 0)
 		{
 			ActiveAbilitiesByGroup.Remove(GroupTag);
+			bGroupBecameEmpty = true;
 		}
 	}
 
-	// 阶段 3 补充：如果该组规则是 SingleInstanceQueued，
-	// 这里要通知输入缓冲队列尝试出队下一个请求（连段的下一段）。
+	// 组空出来了，通知等待方。SingleInstanceQueued 组的连段靠它衔接：
+	// 意图层收到通知后立刻重试缓冲中的下一段，不必等到下一帧轮询。
+	//
+	// 放在容器更新**之后**广播：订阅者大概率会在回调里立刻尝试激活，
+	// 那次激活会走 IsActivationBlockedByGroup，必须看到已经清空的组状态。
+	if (bGroupBecameEmpty)
+	{
+		OnAbilityGroupFreed.Broadcast(GroupTag);
+	}
 }
 
 void UGGYGOAbilitySystemComponent::NotifyAbilityActivated(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability)

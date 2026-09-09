@@ -155,11 +155,16 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 	// （例如测试用的裸 ASC），那种情况下跳过组检查而不是崩掉。
 	if (const UGGYGOAbilitySystemComponent* GGYGOASC = Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()))
 	{
-		if (GGYGOASC->IsActivationBlockedByGroup(this))
+		EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
+		if (GGYGOASC->IsActivationBlockedByGroup(this, BlockReason))
 		{
 			if (OptionalRelevantTags)
 			{
-				OptionalRelevantTags->AddTag(GGYGOGameplayTags::Ability_ActivateFail_ActivationGroup);
+				// 把"该不该重试"编码进失败 Tag，意图层不必反查配置表就能决定
+				// 把请求留在缓冲里还是丢弃。
+				OptionalRelevantTags->AddTag(BlockReason == EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued
+					? GGYGOGameplayTags::Ability_ActivateFail_ActivationGroupQueued
+					: GGYGOGameplayTags::Ability_ActivateFail_ActivationGroup);
 			}
 			return false;
 		}

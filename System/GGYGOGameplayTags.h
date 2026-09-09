@@ -161,8 +161,17 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_TagsMissing);
 	/** 网络角色不满足条件。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_Networking);
-	/** 被组仲裁拒绝。 */
+	/** 被组仲裁拒绝（优先级不足或跨组 Exclusive 压制），重试没有意义。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_ActivationGroup);
+
+	/**
+	 * 被组仲裁拒绝，但**值得重试** —— 组规则是 `SingleInstanceQueued` 且组内正有实例在跑。
+	 *
+	 * 与上一个分开是为了让意图层能只凭失败原因决定去留：
+	 * 收到这个 Tag 就把请求留在输入缓冲里等组空出，收到上一个就直接丢弃。
+	 * 否则意图层得反查 GA 的 GroupTag 再查配置表，等于把仲裁逻辑抄第二遍。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_ActivationGroupQueued);
 
 	// ============================================================
 	// 五、State —— 状态身份

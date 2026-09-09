@@ -62,6 +62,7 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_TagsMissing, "Ability.ActivateFail.TagsMissing");
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_Networking, "Ability.ActivateFail.Networking");
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_ActivationGroup, "Ability.ActivateFail.ActivationGroup");
+	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_ActivationGroupQueued, "Ability.ActivateFail.ActivationGroupQueued");
 
 	// ===== 五、State =====
 	UE_DEFINE_GAMEPLAY_TAG(State_Idle, "State.Idle");

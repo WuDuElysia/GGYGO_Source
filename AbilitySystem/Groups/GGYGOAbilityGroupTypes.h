@@ -16,10 +16,10 @@
  * | 组规则 `GroupRule`  | 独立 DataAsset | 该组内部的并发规则，改规则只改一处 |
  * | 自身策略 + 优先级    | GA 资产      | 个体行为与冲突时的强弱 |
  *
- * ## 当前实现范围
- * 阶段 1 只落地类型定义和 GA 上的字段，ASC 里是**最小仲裁**：
- * 全局 Exclusive 排斥 + 同组默认按 `SingleInstance` 处理。
- * 阶段 3 才接入 `UGGYGOAbilityGroupConfig` DataAsset，让每个组能配自己的规则。
+ * ## 判定入口
+ * 三个维度最终在 `UGGYGOAbilitySystemComponent::IsActivationBlockedByGroup` 汇合：
+ * 先算跨组的 `SelfPolicy` 排斥，再查 `UGGYGOAbilityGroupConfig` 得到本组规则。
+ * 未注入配置表时所有组走 `FGGYGOAbilityGroupRule` 的字段默认值。
  */
 #pragma once
 
@@ -43,9 +43,17 @@ enum class EGGYGOAbilityGroupRule : uint8
 	SingleInstance,
 
 	/**
-	 * 组内同时只能一个，但新请求**进输入缓冲队列**而不是取消旧的。
-	 * 这是普攻连段的正确机制：第二段等第一段结束再出，而不是打断它重头播。
-	 * 队列由意图层的 `InputBufferQueue` 持有（阶段 7 实现）。
+	 * 组内同时只能一个，且**从不取消已有实例** —— 新请求直接被拒，等旧的自然结束。
+	 * 这是普攻连段的正确机制：第二段等第一段播完再出，而不是打断它重头播。
+	 *
+	 * 与 `SingleInstance` 的区别就在"取不取消"：
+	 * `SingleInstance` 会按优先级顶掉旧的，本规则不比较优先级、只看有没有人在跑。
+	 *
+	 * "排队"本身不在 ASC 里实现。ASC 只负责拒绝并给出
+	 * `EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued`；
+	 * 真正的重试由意图层的输入缓冲在有效窗内完成（阶段 7），
+	 * 也可以订阅 ASC 的 `OnAbilityGroupFreed` 在组空出的瞬间立即重试。
+	 * 这样避免了 ASC 与意图层各持一个队列。
 	 */
 	SingleInstanceQueued
 };
@@ -66,7 +74,34 @@ enum class EGGYGOAbilitySelfPolicy : uint8
 	Exclusive
 };
 
-/** 一个组的并发规则配置。由 `UGGYGOAbilityGroupConfig`（阶段 3）按 GroupTag 索引。 */
+/**
+ * 组仲裁拒绝激活的原因。
+ *
+ * 区分原因的用途：`GroupOccupiedQueued` 表示"这次不行但请求值得保留"，
+ * 调用方（意图层的输入缓冲）可以在有效窗内继续重试；
+ * 其余原因表示"条件不满足"，重试也没意义。
+ */
+UENUM(BlueprintType)
+enum class EGGYGOAbilityGroupBlockReason : uint8
+{
+	/** 未被组规则阻断。 */
+	NotBlocked,
+
+	/** 存在跨组的 `Exclusive` 高优先级能力（死亡、被击倒、大招演出中）。 */
+	ExclusiveActive,
+
+	/** 同组内有优先级更高的能力正在运行。 */
+	LowerPriority,
+
+	/**
+	 * 同组规则是 `SingleInstanceQueued` 且组内已有实例。
+	 * 与 `LowerPriority` 的区别：这里**不比较优先级**，也**不取消**已有实例，
+	 * 是严格的先来后到。连段就靠它实现。
+	 */
+	GroupOccupiedQueued
+};
+
+/** 一个组的并发规则配置。由 `UGGYGOAbilityGroupConfig` 按 GroupTag 索引。 */
 USTRUCT(BlueprintType)
 struct FGGYGOAbilityGroupRule
 {

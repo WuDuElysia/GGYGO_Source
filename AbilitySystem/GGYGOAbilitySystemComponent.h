@@ -13,13 +13,22 @@
  * 当成输入事件发给刚创建的实例，能力会收到一次它不该收到的 InputPressed。
  * 所以 held 和 pressed 只收集句柄，第三阶段才统一 `TryActivateAbility`。
  *
- * ## 2. 组仲裁（当前是最小实现）
+ * ## 2. 组仲裁（表驱动）
  * 用 `ActiveAbilitiesByGroup` 按组 Tag 索引正在运行的能力，替代 Lyra 的三元素计数数组。
- * 阶段 1 的规则是硬编码的：全局 Exclusive 排斥 + 同组按 `SingleInstance` 处理。
- * 阶段 3 接入 `UGGYGOAbilityGroupConfig` 后，每个组才能配自己的规则
- * （`Coexist` / `SingleInstance` / `SingleInstanceQueued`）。
  *
- * 优先级比较一律用 `>`（决策 D4）：同优先级时后来者胜出并打断先激活者。
+ * 规则分两层，互不干扰：
+ * - **跨组**：`SelfPolicy == Exclusive` 的能力压制所有组里优先级更低的能力。
+ *   死亡、被击倒、大招演出用它做到"世界静止"。
+ * - **同组**：查 `UGGYGOAbilityGroupConfig` 得到该组的 `EGGYGOAbilityGroupRule`，
+ *   三种语义分别是放过、按优先级顶替、严格先来后到。
+ *
+ * `SingleInstance` 的平手归属由 `bNewcomerWinsOnTie` 决定，默认 true（决策 D4：
+ * 同优先级后来者打断先激活者），受击组通常要配成 false 以免受击动画反复重播。
+ * 未注入配置表时全部走内置默认规则，等价于阶段 1 的硬编码行为。
+ *
+ * 仲裁只做"拒绝"，不做"排队"。`SingleInstanceQueued` 被拒时返回
+ * `GroupOccupiedQueued` 原因，重试交给意图层的输入缓冲（阶段 7），
+ * 或订阅 `OnAbilityGroupFreed` 在组空出瞬间重试。ASC 内不再造第二个队列。
  *
  * ## 3. Tag 关系扩展
  * 把 `UGGYGOAbilityTagRelationshipMapping` 的查询结果接进 GAS 的阻断/取消判定。
@@ -33,22 +42,34 @@
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
+#include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
 #include "NativeGameplayTags.h"
 
 #include "GGYGOAbilitySystemComponent.generated.h"
 
 class AActor;
 class UGameplayAbility;
+class UGGYGOAbilityGroupConfig;
 class UGGYGOAbilityTagRelationshipMapping;
 class UObject;
 struct FFrame;
 struct FGameplayAbilityTargetDataHandle;
+struct FGGYGOAbilityGroupRule;
 
 /**
  * 持有此 Tag 时整帧 Ability 输入被屏蔽。
  * 屏蔽会连 held 一起清掉，避免解除屏蔽后旧按键突然自动激活。
  */
 GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_GGYGO_Gameplay_AbilityInputBlocked);
+
+/**
+ * 某个能力组的最后一个实例结束时广播。
+ * @param GroupTag 空出来的组。
+ *
+ * 主要给 `SingleInstanceQueued` 组用：意图层订阅它就能在组空出的瞬间立即重试
+ * 被缓冲的请求，不必每帧轮询。连段的衔接感依赖这个即时性。
+ */
+DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityGroupFreed, FGameplayTag /*GroupTag*/);
 
 UCLASS()
 class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
@@ -94,17 +115,22 @@ public:
 
 	/**
 	 * 判断请求激活的能力是否被组规则阻断。
-	 *
-	 * 判定两步：
-	 *   1. 全局排斥：任何组里存在 `SelfPolicy == Exclusive` 且优先级**更高**的能力 → 阻断
-	 *   2. 同组冲突：同组内存在优先级**更高**的能力 → 阻断
-	 *
-	 * 两步都用 `>`，所以同优先级不阻断——配合 `AddAbilityToActivationGroup` 里取消旧实例，
-	 * 共同实现 D4 的"后来者打断先激活者"。
-	 *
 	 * @return true 表示应拒绝激活。
 	 */
 	bool IsActivationBlockedByGroup(const UGGYGOGameplayAbility* Ability) const;
+
+	/**
+	 * 带原因的重载。原因用于区分"重试有意义"（`GroupOccupiedQueued`）
+	 * 与"条件不满足"（其余），供意图层决定是否把请求留在缓冲里。
+	 *
+	 * 判定顺序：
+	 *   1. **跨组排斥**：任何组里存在 `SelfPolicy == Exclusive` 且优先级更高的能力 → 阻断
+	 *   2. **同组规则**（查 `UGGYGOAbilityGroupConfig`）：
+	 *      - `Coexist` → 放过
+	 *      - `SingleInstance` → 按优先级比较，`bNewcomerWinsOnTie` 决定平手归属
+	 *      - `SingleInstanceQueued` → 组内有人就阻断，不比优先级
+	 */
+	bool IsActivationBlockedByGroup(const UGGYGOGameplayAbility* Ability, EGGYGOAbilityGroupBlockReason& OutReason) const;
 
 	/**
 	 * 能力激活成功后登记到组，并取消被它顶掉的能力。
@@ -112,8 +138,23 @@ public:
 	 */
 	void AddAbilityToActivationGroup(UGGYGOGameplayAbility* Ability);
 
-	/** 能力结束后从组中摘除。由 `NotifyAbilityEnded` 调用。 */
+	/** 能力结束后从组中摘除；组变空时广播 `OnAbilityGroupFreed`。由 `NotifyAbilityEnded` 调用。 */
 	void RemoveAbilityFromActivationGroup(UGGYGOGameplayAbility* Ability);
+
+	/**
+	 * 注入组规则配置表。传 nullptr 清除，之后降级为内置默认规则。
+	 * 阶段 4 之后应由 `UGGYGOPawnData` 在初始化时设置。
+	 */
+	void SetAbilityGroupConfig(const UGGYGOAbilityGroupConfig* InConfig);
+
+	/** 当前的组规则配置表，可能为 nullptr。 */
+	const UGGYGOAbilityGroupConfig* GetAbilityGroupConfig() const { return AbilityGroupConfig; }
+
+	/** 某个组当前正在运行的能力数量。诊断与 UI 用。 */
+	int32 GetActiveAbilityCountInGroup(FGameplayTag GroupTag) const;
+
+	/** 组的最后一个实例结束时广播。见 `FGGYGOAbilityGroupFreed` 说明。 */
+	FGGYGOAbilityGroupFreed OnAbilityGroupFreed;
 
 	// ===== Tag 关系 =====
 
@@ -165,10 +206,27 @@ protected:
 	/** 本地处理失败：转发给能力自己的失败反馈。 */
 	void HandleAbilityFailed(const UGameplayAbility* Ability, const FGameplayTagContainer& FailureReason);
 
+	/**
+	 * 取某个组的生效规则。
+	 *
+	 * 未注入配置表时返回内置默认规则（`SingleInstance` + `bNewcomerWinsOnTie = true`），
+	 * 与阶段 1 的硬编码行为一致 —— 保证接入配置表这件事本身不改变既有表现。
+	 */
+	const FGGYGOAbilityGroupRule& ResolveGroupRule(FGameplayTag GroupTag) const;
+
 protected:
 	/** Tag 关系表。为空时不做任何关系扩展。 */
 	UPROPERTY()
 	TObjectPtr<UGGYGOAbilityTagRelationshipMapping> TagRelationshipMapping;
+
+	/**
+	 * 组并发规则表。为空时所有组走内置默认规则。
+	 *
+	 * `const` 是有意的：规则是只读数据，运行时改一个组的并发语义会让
+	 * 已在运行的能力处于按旧规则登记、按新规则退出的不一致状态。
+	 */
+	UPROPERTY()
+	TObjectPtr<const UGGYGOAbilityGroupConfig> AbilityGroupConfig;
 
 	/** 本帧按下的句柄。`ProcessAbilityInput` 处理后清空。 */
 	TArray<FGameplayAbilitySpecHandle> InputPressedSpecHandles;
