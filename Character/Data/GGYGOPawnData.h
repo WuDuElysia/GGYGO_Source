@@ -29,6 +29,7 @@ class APawn;
 class UGGYGOAbilityGroupConfig;
 class UGGYGOAbilitySet;
 class UGGYGOAbilityTagRelationshipMapping;
+class UGGYGOInputConfig;
 class UGGYGOMovementSet;
 class UObject;
 
@@ -91,4 +92,14 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Movement")
 	TObjectPtr<const UGGYGOMovementSet> MovementSet;
+
+	/**
+	 * 输入映射。由 `UGGYGOHeroComponent` 消费，AI 控制的单位不读它。
+	 *
+	 * 放在 PawnData 而不是 HeroComponent 上，是因为"这个键放哪个技能"
+	 * 属于角色定义的一部分：不同角色的技能键位含义不同，
+	 * 而输入映射上下文（IMC）那种"怎么被操控"的配置才留在组件上。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
+	TObjectPtr<const UGGYGOInputConfig> InputConfig;
 };

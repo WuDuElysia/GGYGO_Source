@@ -7,6 +7,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOHealthComponent.h"
+#include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -140,11 +141,18 @@ void AGGYGOCharacterBase::SetupPlayerInputComponent(UInputComponent* PlayerInput
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
-	// 本类只通知协调者"输入组件已就绪"，让依赖它的 feature 能推进。
-	// 具体的输入绑定属于 HeroComponent 的职责，不在角色基类里硬编码。
+	// 通知协调者"输入组件已就绪"，让依赖它的 feature 能推进。
 	if (PawnExtComponent)
 	{
 		PawnExtComponent->SetupPlayerInputComponent();
+	}
+
+	// HeroComponent 只在被玩家操控的单位上存在，所以要判空而不是断言。
+	// 这里必须再调一次绑定：InitState 推进到 DataInitialized 的时机可能早于
+	// 输入组件创建，那一次会因为 InputComponent 为空而跳过。
+	if (UGGYGOHeroComponent* HeroComponent = UGGYGOHeroComponent::FindHeroComponent(this))
+	{
+		HeroComponent->InitializePlayerInput(PlayerInputComponent);
 	}
 }
 
