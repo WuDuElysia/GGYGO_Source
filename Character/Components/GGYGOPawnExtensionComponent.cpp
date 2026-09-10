@@ -4,6 +4,7 @@
  */
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 
+#include "AbilitySystem/Cues/GGYGOGameplayCueManager.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
@@ -269,6 +270,13 @@ void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 		{
 			MoveComp->SetMovementSet(PawnData->MovementSet);
 		}
+	}
+
+	// 预热该角色的特效。Cue 是按需异步加载的，不预热则第一次触发时
+	// 资产还没就位，表现为"第一刀没有火花"。
+	if (UGGYGOGameplayCueManager* CueManager = UGGYGOGameplayCueManager::Get())
+	{
+		CueManager->PreloadCuesForTags(PawnData->CuesToPreload);
 	}
 }
 

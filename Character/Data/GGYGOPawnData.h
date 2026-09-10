@@ -21,6 +21,7 @@
 #pragma once
 
 #include "Engine/DataAsset.h"
+#include "GameplayTagContainer.h"
 #include "Templates/SubclassOf.h"
 
 #include "GGYGOPawnData.generated.h"
@@ -113,4 +114,16 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Camera")
 	TSubclassOf<UGGYGOCameraMode> DefaultCameraMode;
+
+	/**
+	 * 该角色会用到的 GameplayCue，在初始化时预加载。
+	 *
+	 * Cue 资产是按需异步加载的，不预热则第一次触发时特效还没就位 ——
+	 * 表现为"第一刀没有火花"。把角色的命中、闪避、技能特效列在这里，
+	 * 战斗开始前它们就已经加载完毕。
+	 *
+	 * 留空是合法的，只是失去了提前量。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Cues", meta = (Categories = "GameplayCue"))
+	FGameplayTagContainer CuesToPreload;
 };
