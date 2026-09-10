@@ -189,8 +189,18 @@ UGGYGOCharacterMovementComponent::UGGYGOCharacterMovementComponent(const FObject
 	bUseControllerDesiredRotation = false;
 	RotationRate = FRotator(0.0f, 720.0f, 0.0f);
 
-	// 关掉 CMC 默认的"根据速度自动进退 Crouch"之类的状态推断留给后续阶段处理，
-	// 当前不改动引擎默认值以免引入未验证的行为差异。
+	// CMC 默认不复制自己的属性（移动状态走专门的 RPC 通道）。
+	// 这里需要属性复制，因为转身状态要发给模拟代理，而那条信息
+	// 不属于移动预测数据。
+	SetIsReplicatedByDefault(true);
+}
+
+void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+
+	// SkipOwner：拥有者自己是权威解算方，收到服务器的回传只会与本地预测打架。
+	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, bReplicatedTurnBackFirstSegment, COND_SkipOwner);
 }
 
 void UGGYGOCharacterMovementComponent::BeginPlay()
@@ -529,6 +539,14 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 	// 只恢复"是否处于第一段"这一个事实。相位的精确取值（Frozen / Released）
 	// 只影响动画表现，而表现由本地动画层自己驱动，不需要从这里取。
 	const bool bFirstSegment = (Flags & GGYGOMovementConstants::TurnBackFirstSegmentFlag) != 0;
+
+	// 服务器把它转成复制属性，模拟代理才能知道转身正在发生 ——
+	// 压缩标志位只走客户端→服务器一个方向，不会转发给其它客户端。
+	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_Authority)
+	{
+		bReplicatedTurnBackFirstSegment = bFirstSegment;
+	}
+
 	if (bFirstSegment)
 	{
 		if (TurnBackPhase == EGGYGOTurnBackPhase::None)
@@ -583,8 +601,25 @@ void UGGYGOCharacterMovementComponent::NotifyCanYaw()
 	bTurnBackCanYawPending = true;
 }
 
+EGGYGOTurnBackPhase UGGYGOCharacterMovementComponent::GetTurnBackPhase() const
+{
+	// 模拟代理没有本地解算的相位，只有复制来的一个 bool。
+	// 映射成 Frozen 是因为动画层只判断 `!= None`，具体是哪一段它不关心。
+	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
+	{
+		return bReplicatedTurnBackFirstSegment ? EGGYGOTurnBackPhase::Frozen : EGGYGOTurnBackPhase::None;
+	}
+
+	return TurnBackPhase;
+}
+
 bool UGGYGOCharacterMovementComponent::IsTurnBackFirstSegment() const
 {
+	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
+	{
+		return bReplicatedTurnBackFirstSegment;
+	}
+
 	return TurnBackPhase != EGGYGOTurnBackPhase::None && !bTurnBackSecondSegment;
 }
 

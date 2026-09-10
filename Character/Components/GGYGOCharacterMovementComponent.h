@@ -161,6 +161,8 @@ public:
 
 	/** 提供我们自己的预测数据类型。 */
 	virtual FNetworkPredictionData_Client* GetPredictionData_Client() const override;
+
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 	//~End of UCharacterMovementComponent interface
 
 	/**
@@ -190,14 +192,12 @@ public:
 	/**
 	 * 当前转身相位。
 	 *
-	 * **模拟代理上恒为 `None`**：相位在本地控制端解算，经压缩标志位传给服务器，
-	 * 而压缩标志位不会转发给其它客户端。因此别人客户端上看到的角色不会播转身动画。
-	 *
-	 * 修正它需要一条独立的状态复制通道，而攻击、受击等表现状态有同样的需求，
-	 * 应当一次性设计而不是为转身单独加一个复制属性。
+	 * 模拟代理上只区分"是否处于第一段"：相位的精确取值在本地控制端解算，
+	 * 复制给其它客户端的只有一个 bool。第一段之外一律返回 `None`，
+	 * 因为动画只需要知道要不要播转身。
 	 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
-	EGGYGOTurnBackPhase GetTurnBackPhase() const { return TurnBackPhase; }
+	EGGYGOTurnBackPhase GetTurnBackPhase() const;
 
 	/** 是否已交还输入控制权（`CanYaw` 已消费）。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
@@ -374,6 +374,19 @@ protected:
 
 	/** 进入转身时的 Actor yaw（度）。曲线局部方向转世界方向的基准。 */
 	float TurnBackEntryYaw = 0.0f;
+
+	/**
+	 * 转身第一段的复制标志。
+	 *
+	 * 压缩标志位只在"客户端→服务器"方向传递，不会转发给其它客户端，
+	 * 所以模拟代理无法从那条路径得知转身状态。这个属性补上那一段：
+	 * 服务器从压缩标志位得知后写入它，再由属性复制发给所有客户端。
+	 *
+	 * 只复制"是否第一段"这一个 bool 而不是完整相位，理由与压缩标志位一致：
+	 * 只有第一段会改变移动行为与动画分支。
+	 */
+	UPROPERTY(Replicated)
+	bool bReplicatedTurnBackFirstSegment = false;
 
 	/** 曲线采样器。持有跨帧基线，只在 `TickComponent` 里推进。 */
 	FGGYGOAnimCurveSampler CurveSampler;
