@@ -5,8 +5,10 @@
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Animation/AnimInstance.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOMovementSet.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 #include "System/GGYGOGameplayTags.h"
 
@@ -37,6 +39,14 @@ namespace GGYGOMovementConstants
 	 */
 	constexpr uint8 GaitFlagShift = 0;
 	constexpr uint8 GaitFlagMask = FSavedMove_Character::FLAG_Custom_0 | FSavedMove_Character::FLAG_Custom_1;
+
+	/**
+	 * 转身第一段标志位。
+	 *
+	 * 只同步这一个 bit 而不是完整相位：只有第一段会改变移动行为
+	 * （方向与朝向由动画接管），第二段与普通移动无异，接收端不需要区分。
+	 */
+	constexpr uint8 TurnBackFirstSegmentFlag = FSavedMove_Character::FLAG_Custom_2;
 }
 
 // ============================================================================
@@ -50,6 +60,13 @@ void FSavedMove_GGYGO::Clear()
 	SavedGait = EGGYGOGait::None;
 	SavedWalkHoldTimer = 0.0f;
 	bSavedWantsRunOnNextMove = false;
+	SavedCurveMotion.Reset();
+
+	SavedTurnBackPhase = EGGYGOTurnBackPhase::None;
+	SavedTurnBackElapsed = 0.0f;
+	bSavedTurnBackSecondSegment = false;
+	SavedTurnBackEntryYaw = 0.0f;
+	bSavedTurnBackInputLatched = false;
 }
 
 void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, FNetworkPredictionData_Client_Character& ClientData)
@@ -61,6 +78,13 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 		SavedGait = MoveComp->ResolvedGait;
 		SavedWalkHoldTimer = MoveComp->WalkHoldTimer;
 		bSavedWantsRunOnNextMove = MoveComp->bWantsRunOnNextMove;
+		SavedCurveMotion = MoveComp->CurveMotion;
+
+		SavedTurnBackPhase = MoveComp->TurnBackPhase;
+		SavedTurnBackElapsed = MoveComp->TurnBackElapsed;
+		bSavedTurnBackSecondSegment = MoveComp->bTurnBackSecondSegment;
+		SavedTurnBackEntryYaw = MoveComp->TurnBackEntryYaw;
+		bSavedTurnBackInputLatched = MoveComp->bTurnBackInputLatched;
 	}
 }
 
@@ -76,6 +100,17 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 		MoveComp->ResolvedGait = SavedGait;
 		MoveComp->WalkHoldTimer = SavedWalkHoldTimer;
 		MoveComp->bWantsRunOnNextMove = bSavedWantsRunOnNextMove;
+
+		// 恢复曲线量而不是重新采样：回放时动画已经走到别的时间点了。
+		// 采样器自身的基线不动 —— 它只在 TickComponent 里推进，
+		// 回放污染基线会让回放结束后的第一帧位移出错。
+		MoveComp->CurveMotion = SavedCurveMotion;
+
+		MoveComp->TurnBackPhase = SavedTurnBackPhase;
+		MoveComp->TurnBackElapsed = SavedTurnBackElapsed;
+		MoveComp->bTurnBackSecondSegment = bSavedTurnBackSecondSegment;
+		MoveComp->TurnBackEntryYaw = SavedTurnBackEntryYaw;
+		MoveComp->bTurnBackInputLatched = bSavedTurnBackInputLatched;
 	}
 }
 
@@ -96,6 +131,19 @@ bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 		return false;
 	}
 
+	// 转身期间不合并。这段的位移方向由曲线逐帧给出，合并会丢掉中间帧的方向变化，
+	// 服务器重演出的轨迹与客户端不同。
+	if (NewGGYGOMove && (NewGGYGOMove->SavedTurnBackPhase != SavedTurnBackPhase
+		|| NewGGYGOMove->bSavedTurnBackSecondSegment != bSavedTurnBackSecondSegment))
+	{
+		return false;
+	}
+
+	if (SavedTurnBackPhase != EGGYGOTurnBackPhase::None)
+	{
+		return false;
+	}
+
 	return Super::CanCombineWith(NewMove, InCharacter, MaxDelta);
 }
 
@@ -105,6 +153,11 @@ uint8 FSavedMove_GGYGO::GetCompressedFlags() const
 
 	// 步态占两位。static_cast 是安全的：EGGYGOGait 只有 0/1/2 三个值。
 	Result |= (static_cast<uint8>(SavedGait) << GGYGOMovementConstants::GaitFlagShift) & GGYGOMovementConstants::GaitFlagMask;
+
+	if (SavedTurnBackPhase != EGGYGOTurnBackPhase::None && !bSavedTurnBackSecondSegment)
+	{
+		Result |= GGYGOMovementConstants::TurnBackFirstSegmentFlag;
+	}
 
 	return Result;
 }
@@ -145,6 +198,51 @@ void UGGYGOCharacterMovementComponent::BeginPlay()
 	Super::BeginPlay();
 
 	CacheAbilitySystemComponent();
+}
+
+void UGGYGOCharacterMovementComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
+{
+	// 必须在 Super 之前采样：Super 会推进移动，而移动要用本帧的曲线速度。
+	//
+	// 采样放在这里而不是 UpdateCharacterStateBeforeMovement，因为后者在
+	// sub-stepping 时一帧内会被调用多次，而采样器持有跨帧基线，
+	// 多次调用会让第二次之后的差分全为零。
+	SampleAnimCurves(DeltaTime);
+
+	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+}
+
+void UGGYGOCharacterMovementComponent::SampleAnimCurves(float DeltaTime)
+{
+	const USkeletalMeshComponent* Mesh = CharacterOwner ? CharacterOwner->GetMesh() : nullptr;
+	const UAnimInstance* AnimInstance = Mesh ? Mesh->GetAnimInstance() : nullptr;
+
+	if (!AnimInstance)
+	{
+		// 没有动画就没有曲线。丢弃基线，避免 Mesh 恢复后拿旧基线算出一个大位移。
+		CurveMotion.Reset();
+		CurveSampler.ResetBaseline();
+		return;
+	}
+
+	CurveSampler.Sample(*AnimInstance, DeltaTime, CurveMotion);
+}
+
+float UGGYGOCharacterMovementComponent::GetScaledCurveSpeed() const
+{
+	if (!MovementSet || !MovementSet->bUseCurveDrivenSpeed || !CurveMotion.HasUsableSpeed())
+	{
+		return 0.0f;
+	}
+
+	const float Scaled = CurveMotion.Speed * FMath::Max(MovementSet->RootMotionScale, 0.0f);
+
+	return FMath::IsFinite(Scaled) ? FMath::Max(Scaled, 0.0f) : 0.0f;
+}
+
+bool UGGYGOCharacterMovementComponent::IsCurveDrivingSpeed() const
+{
+	return GetScaledCurveSpeed() > KINDA_SMALL_NUMBER;
 }
 
 void UGGYGOCharacterMovementComponent::CacheAbilitySystemComponent()
@@ -218,7 +316,7 @@ float UGGYGOCharacterMovementComponent::GetMaxSpeed() const
 	}
 
 	// 非地面移动交回基类：游泳、飞行、下落各有自己的速度体系，
-	// 步态只对地面移动有意义。
+	// 步态与动画曲线只对地面移动有意义。
 	if (MovementMode != MOVE_Walking && MovementMode != MOVE_NavWalking)
 	{
 		return Super::GetMaxSpeed();
@@ -229,7 +327,30 @@ float UGGYGOCharacterMovementComponent::GetMaxSpeed() const
 		return Super::GetMaxSpeed();
 	}
 
-	return MovementSet->GetSpeedForGait(ResolvedGait);
+	// 曲线速度优先。它逐帧给出动画本身的位移速率，脚步与位移因此严格对齐。
+	const float CurveSpeed = GetScaledCurveSpeed();
+	if (CurveSpeed > KINDA_SMALL_NUMBER)
+	{
+		return CurveSpeed;
+	}
+
+	const float GaitSpeed = MovementSet->GetSpeedForGait(ResolvedGait);
+
+	// 曲线不可用时的非本地控制端要放宽上界。
+	//
+	// 曲线值是本地动画状态，服务器若没有评估动画就采不到。此时服务器按步态的
+	// 固定速度重演客户端的 move，而客户端跑的是曲线速度 —— 两者不等就会
+	// 持续触发位置校正，表现为角色被反复拉回。放宽到覆盖曲线峰值的上界后，
+	// 服务器不再因为这个差异而校正。
+	//
+	// 只在"曲线不可用"时放宽：服务器能采到曲线时走上面那条分支，精确一致。
+	const bool bIsLocallyControlled = CharacterOwner && CharacterOwner->IsLocallyControlled();
+	if (!bIsLocallyControlled && MovementSet->bUseCurveDrivenSpeed && ResolvedGait != EGGYGOGait::None)
+	{
+		return FMath::Max(GaitSpeed, FMath::Max(MovementSet->MaxCurveDrivenSpeed, 0.0f));
+	}
+
+	return GaitSpeed;
 }
 
 bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const
@@ -263,6 +384,23 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 	if (CharacterOwner && CharacterOwner->IsLocallyControlled())
 	{
 		ResolveGait(DeltaSeconds);
+		UpdateTurnBack(DeltaSeconds);
+	}
+
+	// 转身第一段接管位移方向：把加速度改成曲线给出的世界方向。
+	//
+	// 改 Acceleration 而不是直接改 Velocity，是为了让加减速、摩擦、坡度
+	// 仍然由 CMC 处理 —— 直接设速度会让角色撞墙时失去正常的滑动行为。
+	//
+	// 非本地控制端也要执行：`UpdateFromCompressedFlags` 已经恢复了相位，
+	// 不覆盖方向会让它按玩家输入的方向移动，与本地端分歧。
+	if (IsTurnBackFirstSegment())
+	{
+		const FVector TurnBackDirection = ResolveTurnBackWorldDirection();
+		if (!TurnBackDirection.IsNearlyZero())
+		{
+			Acceleration = TurnBackDirection * GetMaxAcceleration();
+		}
 	}
 
 	Super::UpdateCharacterStateBeforeMovement(DeltaSeconds);
@@ -387,6 +525,206 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 	ResolvedGait = (GaitBits <= static_cast<uint8>(EGGYGOGait::Run))
 		? static_cast<EGGYGOGait>(GaitBits)
 		: EGGYGOGait::None;
+
+	// 只恢复"是否处于第一段"这一个事实。相位的精确取值（Frozen / Released）
+	// 只影响动画表现，而表现由本地动画层自己驱动，不需要从这里取。
+	const bool bFirstSegment = (Flags & GGYGOMovementConstants::TurnBackFirstSegmentFlag) != 0;
+	if (bFirstSegment)
+	{
+		if (TurnBackPhase == EGGYGOTurnBackPhase::None)
+		{
+			// 接收端首次得知转身开始。入口朝向取当前朝向 —— 这是能拿到的最好近似，
+			// 与发送端的入口朝向可能有偏差，偏差大小取决于网络延迟。
+			TurnBackEntryYaw = UpdatedComponent
+				? UpdatedComponent->GetComponentRotation().Yaw
+				: 0.0f;
+			TurnBackPhase = EGGYGOTurnBackPhase::Frozen;
+		}
+		bTurnBackSecondSegment = false;
+	}
+	else if (TurnBackPhase != EGGYGOTurnBackPhase::None)
+	{
+		// 第一段已结束。第二段的移动与普通移动一致，直接复位即可。
+		ResetTurnBack();
+	}
+}
+
+void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
+{
+	// 转身第一段的朝向由 `RM_Yaw` 曲线驱动。
+	//
+	// 在这里接管而不是在外部调 AddActorWorldRotation，是为了不与 CMC 的
+	// 自动朝向对齐（bOrientRotationToMovement）互相争夺 Yaw ——
+	// 绕过 Super 就等于这一帧只有曲线在转角色，不需要临时关掉那些开关再恢复。
+	if (IsTurnBackFirstSegment() && UpdatedComponent)
+	{
+		const float YawDelta = FMath::IsFinite(CurveMotion.YawDeltaDegrees)
+			? CurveMotion.YawDeltaDegrees
+			: 0.0f;
+
+		if (!FMath::IsNearlyZero(YawDelta))
+		{
+			FRotator NewRotation = UpdatedComponent->GetComponentRotation();
+			NewRotation.Yaw += YawDelta;
+
+			// 走 MoveUpdatedComponent 而不是直接设置变换：它会处理碰撞扫掠，
+			// 也让这次旋转进入 CMC 的移动更新记录，回放时结果一致。
+			MoveUpdatedComponent(FVector::ZeroVector, NewRotation.Quaternion(), /*bSweep=*/true);
+		}
+
+		return;
+	}
+
+	Super::PhysicsRotation(DeltaTime);
+}
+
+void UGGYGOCharacterMovementComponent::NotifyCanYaw()
+{
+	bTurnBackCanYawPending = true;
+}
+
+bool UGGYGOCharacterMovementComponent::IsTurnBackFirstSegment() const
+{
+	return TurnBackPhase != EGGYGOTurnBackPhase::None && !bTurnBackSecondSegment;
+}
+
+void UGGYGOCharacterMovementComponent::ResetTurnBack()
+{
+	TurnBackPhase = EGGYGOTurnBackPhase::None;
+	TurnBackElapsed = 0.0f;
+	bTurnBackCanYaw = false;
+	bTurnBackSecondSegment = false;
+	bTurnBackCanYawPending = false;
+	TurnBackEntryYaw = 0.0f;
+}
+
+bool UGGYGOCharacterMovementComponent::IsReverseRunInput() const
+{
+	// 只有跑动中才触发。走路时的反向输入应当直接转身走回去，
+	// 那个速度下不需要刹车动作。
+	if (ResolvedGait != EGGYGOGait::Run || !MovementSet)
+	{
+		return false;
+	}
+
+	const FVector InputDirection = GetCurrentAcceleration().GetSafeNormal2D();
+	if (InputDirection.IsNearlyZero() || !UpdatedComponent)
+	{
+		return false;
+	}
+
+	const FVector Forward = UpdatedComponent->GetForwardVector().GetSafeNormal2D();
+	if (Forward.IsNearlyZero())
+	{
+		return false;
+	}
+
+	return FVector::DotProduct(Forward, InputDirection) <= MovementSet->TurnBackReverseInputDotThreshold;
+}
+
+void UGGYGOCharacterMovementComponent::UpdateTurnBack(float DeltaSeconds)
+{
+	if (!MovementSet || !IsMovingOnGround())
+	{
+		// 离地时转身没有意义，且落地后的朝向应由落地动画决定。
+		ResetTurnBack();
+		return;
+	}
+
+	const bool bReverseInput = IsReverseRunInput();
+
+	// 消费 CanYaw：控制权交还输入，进入第二段。
+	// 只在转身进行中消费 —— 其它动画里的同名通知不该启动一次转身。
+	if (bTurnBackCanYawPending)
+	{
+		bTurnBackCanYawPending = false;
+
+		if (TurnBackPhase != EGGYGOTurnBackPhase::None)
+		{
+			bTurnBackCanYaw = true;
+			bTurnBackSecondSegment = true;
+		}
+	}
+
+	const float ClampedDelta = (FMath::IsFinite(DeltaSeconds) && DeltaSeconds > 0.0f)
+		? DeltaSeconds
+		: 0.0f;
+
+	switch (TurnBackPhase)
+	{
+	case EGGYGOTurnBackPhase::None:
+	{
+		if (!bReverseInput)
+		{
+			// 输入离开反向阈值，解除闩，允许下一次触发。
+			bTurnBackInputLatched = false;
+			break;
+		}
+
+		if (bTurnBackInputLatched)
+		{
+			break;
+		}
+
+		TurnBackPhase = EGGYGOTurnBackPhase::Frozen;
+		TurnBackElapsed = 0.0f;
+		bTurnBackCanYaw = false;
+		bTurnBackSecondSegment = false;
+		bTurnBackInputLatched = true;
+
+		// 记下入口朝向，整段转身的世界位移方向都以它为基准。
+		TurnBackEntryYaw = UpdatedComponent
+			? UpdatedComponent->GetComponentRotation().Yaw
+			: 0.0f;
+		break;
+	}
+
+	case EGGYGOTurnBackPhase::Frozen:
+	{
+		// 第一段不可打断，即使玩家已经松手也要推进到可释放阶段 ——
+		// 中途放弃会让刹车动作停在一半，角色姿态与速度对不上。
+		TurnBackElapsed += ClampedDelta;
+
+		if (TurnBackElapsed >= MovementSet->TurnBackReleaseTimeSeconds)
+		{
+			TurnBackPhase = EGGYGOTurnBackPhase::Released;
+		}
+		break;
+	}
+
+	case EGGYGOTurnBackPhase::Released:
+	{
+		TurnBackElapsed += ClampedDelta;
+
+		const bool bTimedOut = TurnBackElapsed >= MovementSet->TurnBackDurationSeconds;
+
+		// 已交还控制权后松手即可结束：那之后的移动已经由输入主导，
+		// 继续占着转身状态只会阻止下一次转身触发。
+		const bool bReleasedByInput = bTurnBackSecondSegment && !HasMoveInput();
+
+		if (bTimedOut || bReleasedByInput)
+		{
+			ResetTurnBack();
+		}
+		break;
+	}
+	}
+}
+
+FVector UGGYGOCharacterMovementComponent::ResolveTurnBackWorldDirection() const
+{
+	// 曲线分量系是 X 左右、Y 前后，UE 局部空间是 X 前、Y 右，所以交换两轴。
+	const FVector CurveDirection = CurveMotion.Direction;
+	FVector LocalDirection(CurveDirection.Y, CurveDirection.X, 0.0f);
+
+	if (LocalDirection.IsNearlyZero())
+	{
+		// 没有曲线方向时沿入口朝向直行。返回零向量会让角色在刹车段原地不动，
+		// 那比方向略有偏差更糟。
+		LocalDirection = FVector::ForwardVector;
+	}
+
+	return FRotator(0.0f, TurnBackEntryYaw, 0.0f).RotateVector(LocalDirection.GetSafeNormal2D());
 }
 
 FNetworkPredictionData_Client* UGGYGOCharacterMovementComponent::GetPredictionData_Client() const

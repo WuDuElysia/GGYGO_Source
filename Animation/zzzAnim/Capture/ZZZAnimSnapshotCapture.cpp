@@ -57,9 +57,16 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 			1.0f);
 	}
 
-	// ===== 曲线与 TurnBack =====
-	// AnimCurveVelocity / AnimCurveVelocityDirection / AnimCurveVelocityAngle /
-	// TurnBackPhase / bCanYaw / bTurnBackSecondSegment 保持构造默认值：
-	// 它们的生产者依赖动画曲线采样，而曲线采样尚未接入 CMC。
-	// 后果是转身状态不会被进入。
+	// ===== 曲线运动量 =====
+	// 保持动画侧分量系（X 左右、Y 前后），不转成 UE 局部空间 ——
+	// AnimBP 里对照曲线编辑器调参时看到的应当是同一组数值。
+	const FGGYGOAnimCurveMotion& CurveMotion = MoveComp->GetCurveMotion();
+	OutSnap.AnimCurveVelocity = CurveMotion.Velocity;
+	OutSnap.AnimCurveVelocityDirection = CurveMotion.Direction;
+	OutSnap.AnimCurveVelocityAngle = CurveMotion.DirectionAngle;
+
+	// ===== 转身 =====
+	OutSnap.TurnBackPhase = MoveComp->GetTurnBackPhase();
+	OutSnap.bCanYaw = MoveComp->IsTurnBackCanYaw();
+	OutSnap.bTurnBackSecondSegment = MoveComp->IsTurnBackSecondSegment();
 }

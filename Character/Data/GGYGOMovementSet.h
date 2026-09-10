@@ -81,12 +81,33 @@ public:
 	// ===== 曲线驱动 =====
 
 	/**
-	 * 动画曲线速度的缩放系数。只缩放速度，不缩放位移量。
+	 * 是否让动画曲线接管速度。
 	 *
-	 * 曲线驱动尚未接入 CMC，本字段目前没有读取方。
+	 * 开启后速度由 `RM_Speed` 曲线逐帧给出，脚步与位移严格对齐（不打滑）。
+	 * 关闭则一直用上面的 `WalkSpeed` / `RunSpeed`。
+	 *
+	 * 动画没有烘焙曲线时会自动回退到固定速度，所以开启它对未处理的动画无害。
 	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven")
+	bool bUseCurveDrivenSpeed = true;
+
+	/** 动画曲线速度的缩放系数。只缩放速度，不缩放位移量。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float RootMotionScale = 1.0f;
+
+	/**
+	 * 曲线速度的上界（cm/s），用于非本地控制端的速度校验。
+	 *
+	 * 曲线值是本地动画状态，服务器若没有评估动画就采不到曲线。
+	 * 那种情况下服务器用固定速度会低于客户端的曲线速度，
+	 * 导致位置校正持续触发（角色被反复拉回）。本字段给服务器一个足够宽松的
+	 * 上界，代价是这个上界内客户端的速度不受精确约束。
+	 *
+	 * 应当设为大于所有移动动画 `RM_Speed` 峰值的值。设得过小会拉回角色，
+	 * 过大则放宽了作弊空间 —— 但位置本身仍受服务器校验，收益上限有限。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0", ForceUnits = "cm/s"))
+	float MaxCurveDrivenSpeed = 1500.0f;
 
 	// ===== TurnBack =====
 	// 相位机尚未在 CMC 内实现，以下三项目前没有读取方。

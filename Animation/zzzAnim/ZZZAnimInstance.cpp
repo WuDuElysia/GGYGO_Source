@@ -5,6 +5,7 @@
 
 #include "Animation/zzzAnim/ZZZAnimInstance.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 
@@ -40,10 +41,16 @@ void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
 
 void UZZZAnimInstance::AnimNotify_CanYaw()
 {
-	// 有意为空。转身相位机尚未在 CMC 内实现，本通知目前无人消费。
-	//
-	// 函数体保留而不删除：动画资产里的 `CanYaw` Notify 仍然存在，
-	// 没有对应处理函数会在运行时持续刷警告。
+	// 把控制权交还玩家输入的时机由动画决定，而不是由代码里的固定秒数决定 ——
+	// 换一版转身动画时不必回来改配置。
+	if (const ACharacter* Character = Owner.Get())
+	{
+		if (UGGYGOCharacterMovementComponent* MoveComp =
+			Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()))
+		{
+			MoveComp->NotifyCanYaw();
+		}
+	}
 }
 
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)

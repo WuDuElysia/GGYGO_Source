@@ -28,9 +28,22 @@
  * 代价是客户端理论上可以谎报 Run。这里接受该风险 —— 步态只影响速度上限，
  * 而位置本身仍受服务器的 `ServerMoveHandleClientError` 校验约束，
  * 谎报能得到的收益上限就是走速与跑速之差。
+ *
+ * ## 曲线速度与预测的边界
+ * 曲线值来自动画的当前评估结果，属于本地状态。三处处理让它尽量可预测：
+ * - 采样只在 `TickComponent` 里做一次，结果存进 `FSavedMove_GGYGO`，
+ *   回放时还原而不重新采样（那时动画已走到别的时间点）
+ * - 转身期间的 move 不允许合并，否则中间帧的方向变化会丢失
+ * - 服务器采不到曲线时把速度上界放宽到 `MaxCurveDrivenSpeed`，
+ *   避免因两端速度不同而持续校正
+ *
+ * 仍未解决的是：服务器若不评估动画，它重演出的**位移方向**在转身第一段
+ * 会与客户端不同（那段方向由曲线给出）。彻底解决需要把曲线量放进
+ * `FCharacterNetworkMoveData` 随 ServerMove 一起发送。
  */
 #pragma once
 
+#include "Character/Components/GGYGOAnimCurveSampler.h"
 #include "Character/Data/GGYGOMovementTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 
@@ -84,6 +97,29 @@ public:
 
 	/** 本次 move 开始时是否持有"下次移动直接进 Run"的契约。 */
 	bool bSavedWantsRunOnNextMove = false;
+
+	/**
+	 * 本次 move 生效的曲线运动量。
+	 *
+	 * 必须保存：曲线值来自动画的当前评估结果，回放时动画已经走到别的时间点，
+	 * 重新采样会得到不同的值，移动结果就与首次执行不一致。
+	 */
+	FGGYGOAnimCurveMotion SavedCurveMotion;
+
+	/** 本次 move 的转身相位。 */
+	EGGYGOTurnBackPhase SavedTurnBackPhase = EGGYGOTurnBackPhase::None;
+
+	/** 本次 move 的转身计时。 */
+	float SavedTurnBackElapsed = 0.0f;
+
+	/** 本次 move 是否已进入转身第二段。 */
+	bool bSavedTurnBackSecondSegment = false;
+
+	/** 本次 move 的转身入口朝向（度）。位移方向的基准，必须还原。 */
+	float SavedTurnBackEntryYaw = 0.0f;
+
+	/** 本次 move 的反向输入闩状态。影响能否触发下一次转身。 */
+	bool bSavedTurnBackInputLatched = false;
 };
 
 /** 客户端预测数据。唯一职责是让 CMC 分配出我们自己的 SavedMove 类型。 */
@@ -108,14 +144,20 @@ public:
 	//~UCharacterMovementComponent interface
 	virtual void BeginPlay() override;
 
+	/** 每帧采样动画曲线，然后交给基类推进移动。 */
+	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+
 	/** 按当前步态返回速度上限。被 `Restriction.CantMove` 阻断时返回 0。 */
 	virtual float GetMaxSpeed() const override;
 
 	/** 每次 move（含回放）前解算步态。 */
 	virtual void UpdateCharacterStateBeforeMovement(float DeltaSeconds) override;
 
-	/** 服务器与回放路径从压缩标志位取回步态。 */
+	/** 服务器与回放路径从压缩标志位取回步态与转身段。 */
 	virtual void UpdateFromCompressedFlags(uint8 Flags) override;
+
+	/** 转身第一段的朝向由动画曲线驱动，其余情况交回基类。 */
+	virtual void PhysicsRotation(float DeltaTime) override;
 
 	/** 提供我们自己的预测数据类型。 */
 	virtual FNetworkPredictionData_Client* GetPredictionData_Client() const override;
@@ -135,6 +177,46 @@ public:
 	/** 本帧解算出的步态。动画层读它决定走跑混合。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	EGGYGOGait GetResolvedGait() const { return ResolvedGait; }
+
+	/** 本帧的曲线运动量。处于动画侧分量系（X 左右、Y 前后）。 */
+	const FGGYGOAnimCurveMotion& GetCurveMotion() const { return CurveMotion; }
+
+	/** 曲线速度是否正在接管移动。为 false 时速度来自配置的固定值。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
+	bool IsCurveDrivingSpeed() const;
+
+	// ===== 急停转身 =====
+
+	/**
+	 * 当前转身相位。
+	 *
+	 * **模拟代理上恒为 `None`**：相位在本地控制端解算，经压缩标志位传给服务器，
+	 * 而压缩标志位不会转发给其它客户端。因此别人客户端上看到的角色不会播转身动画。
+	 *
+	 * 修正它需要一条独立的状态复制通道，而攻击、受击等表现状态有同样的需求，
+	 * 应当一次性设计而不是为转身单独加一个复制属性。
+	 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
+	EGGYGOTurnBackPhase GetTurnBackPhase() const { return TurnBackPhase; }
+
+	/** 是否已交还输入控制权（`CanYaw` 已消费）。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
+	bool IsTurnBackCanYaw() const { return bTurnBackCanYaw; }
+
+	/** 是否已进入转身的第二段。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
+	bool IsTurnBackSecondSegment() const { return bTurnBackSecondSegment; }
+
+	/**
+	 * 接收转身动画里的 `CanYaw` 通知，把控制权交还给玩家输入。
+	 *
+	 * 由 `UZZZAnimInstance::AnimNotify_CanYaw` 调用。只置一个待处理标记，
+	 * 实际生效在下一次移动更新时 —— AnimNotify 的到达时机在帧内不确定，
+	 * 直接改状态会让同一帧内的移动计算读到不一致的值。
+	 *
+	 * 重复通知无额外语义，只会被消费一次。
+	 */
+	void NotifyCanYaw();
 
 	/**
 	 * 请求下一次移动直接进入 Run，跳过走跑计时。
@@ -214,6 +296,33 @@ protected:
 	/** 把移动参数写进 CMC 的对应字段。 */
 	void ApplyMovementSetToComponent();
 
+	/** 从 Mesh 的 AnimInstance 采样曲线。每帧恰好一次。 */
+	void SampleAnimCurves(float DeltaTime);
+
+	/** 取曲线速度经 `RootMotionScale` 缩放后的值。曲线不可用时返回 0。 */
+	float GetScaledCurveSpeed() const;
+
+	/** 推进转身相位机。 */
+	void UpdateTurnBack(float DeltaSeconds);
+
+	/** 当前输入是否构成"要转身"（跑动中输入接近反向）。 */
+	bool IsReverseRunInput() const;
+
+	/** 转身状态整体复位。 */
+	void ResetTurnBack();
+
+	/** 是否处于转身第一段 —— 该段的位移方向与朝向都由动画决定，不跟随输入。 */
+	bool IsTurnBackFirstSegment() const;
+
+	/**
+	 * 把曲线的局部方向转成世界方向。
+	 *
+	 * 基准是进入转身时保存的 Actor 朝向，而不是当前朝向。用当前朝向会让
+	 * 世界方向随角色转身一起旋转，位移轨迹变成弧线；而急停转身要的是
+	 * 角色一边转身一边沿原方向滑行刹车，世界方向必须保持不变。
+	 */
+	FVector ResolveTurnBackWorldDirection() const;
+
 protected:
 	/** 移动参数资产。 */
 	UPROPERTY(Transient)
@@ -237,6 +346,45 @@ protected:
 
 	/** 上一帧是否被禁止移动。用于识别解禁沿。 */
 	bool bPreviousMovementBlocked = false;
+
+	// ===== 转身状态 =====
+
+	/** 当前相位。 */
+	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;
+
+	/** 本次转身已进行的时长（秒）。 */
+	float TurnBackElapsed = 0.0f;
+
+	/** 已消费 `CanYaw`，控制权已交还输入。 */
+	bool bTurnBackCanYaw = false;
+
+	/** 已进入第二段。 */
+	bool bTurnBackSecondSegment = false;
+
+	/**
+	 * 反向输入已被本次转身消费。
+	 *
+	 * 转身结束后玩家往往还按着同一个方向键，而那个方向此时已经是角色的正前方，
+	 * 不该再触发一次转身。必须等输入离开反向阈值才允许下一次触发。
+	 */
+	bool bTurnBackInputLatched = false;
+
+	/** `CanYaw` 通知待处理。由 `NotifyCanYaw` 置位，在移动更新时消费。 */
+	bool bTurnBackCanYawPending = false;
+
+	/** 进入转身时的 Actor yaw（度）。曲线局部方向转世界方向的基准。 */
+	float TurnBackEntryYaw = 0.0f;
+
+	/** 曲线采样器。持有跨帧基线，只在 `TickComponent` 里推进。 */
+	FGGYGOAnimCurveSampler CurveSampler;
+
+	/**
+	 * 本帧的曲线运动量。
+	 *
+	 * 在 `TickComponent` 里更新一次，之后整帧的移动计算都读它。
+	 * 移动回放时由 `FSavedMove_GGYGO::PrepMoveFor` 覆盖为当时的值。
+	 */
+	FGGYGOAnimCurveMotion CurveMotion;
 
 	friend class FSavedMove_GGYGO;
 };
