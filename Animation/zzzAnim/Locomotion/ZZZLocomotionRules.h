@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file ZZZLocomotionRules.h
  * @brief ZZZ 动画 Locomotion 的无状态纯规则
  *
@@ -8,7 +8,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "StateMachine/CharacterStateType.h" // EMovementGait
+#include "Character/Data/GGYGOMovementTypes.h"
 
 struct FZZZAnimTuning;
 
@@ -48,5 +48,5 @@ namespace ZZZLocomotionRules
 	 * 由 Snapshot_Gait 推导 GaitBlendY 目标值：仅 Run 为 1，其余取值为 0。
 	 * 正向判定同时为非法 Snapshot_Gait 提供按 Walk 处理的容错，不改写源值。
 	 */
-	float ResolveGaitBlendTarget(EMovementGait InSnapshotGait);
+	float ResolveGaitBlendTarget(EGGYGOGait InSnapshotGait);
 }

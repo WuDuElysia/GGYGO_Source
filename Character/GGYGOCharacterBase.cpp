@@ -5,6 +5,7 @@
 #include "Character/GGYGOCharacterBase.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOHealthComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Components/CapsuleComponent.h"
@@ -14,7 +15,13 @@
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterBase)
 
 AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitializer)
-	: Super(ObjectInitializer)
+	// 把 ACharacter 自带的 CMC 换成项目 CMC。
+	//
+	// 必须用 SetDefaultSubobjectClass 而不是 CreateDefaultSubobject 再挂一个：
+	// ACharacter 内部有大量代码直接引用 CharacterMovement 成员（跳跃、蹲伏、
+	// RootMotion、网络同步），额外挂一个组件不会被那些代码使用，
+	// 结果是两个 CMC 同时存在而只有引擎那个真正生效。
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UGGYGOCharacterMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
 	// 本类自己不 Tick。每帧逻辑属于各组件与 CMC，
 	// 由 Actor 统一 Tick 再分发会让执行顺序变成隐式约定。
@@ -51,6 +58,13 @@ AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitial
 UAbilitySystemComponent* AGGYGOCharacterBase::GetAbilitySystemComponent() const
 {
 	return AbilitySystemComponent;
+}
+
+UGGYGOCharacterMovementComponent* AGGYGOCharacterBase::GetGGYGOMovementComponent() const
+{
+	// CastChecked 是安全的：构造函数已经用 SetDefaultSubobjectClass 保证了类型。
+	// 若这里真的失败，说明有子类又把 CMC 类型换回去了，那是应当立刻暴露的配置错误。
+	return CastChecked<UGGYGOCharacterMovementComponent>(GetCharacterMovement());
 }
 
 void AGGYGOCharacterBase::PostInitializeComponents()

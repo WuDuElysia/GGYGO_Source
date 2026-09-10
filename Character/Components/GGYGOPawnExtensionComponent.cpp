@@ -6,6 +6,7 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "GameFramework/Controller.h"
@@ -161,14 +162,12 @@ void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemCo
 	AbilitySystemComponent = InASC;
 	AbilitySystemComponent->InitAbilityActorInfo(InOwnerActor, Pawn);
 
-	// 注入 PawnData 里的两张配置表。
-	// 必须在 InitAbilityActorInfo 之后：那之前 ASC 还不知道自己属于谁，
-	// 而两张表的消费方（仲裁、Tag 关系扩展）都需要 ActorInfo 有效。
-	if (PawnData)
-	{
-		AbilitySystemComponent->SetAbilityGroupConfig(PawnData->AbilityGroupConfig);
-		AbilitySystemComponent->SetTagRelationshipMapping(PawnData->TagRelationshipMapping);
-	}
+	// PawnData 的配置分发**不在这里做**，见 ApplyPawnDataToConsumers 的说明。
+	// 这里只建立 ASC 与 Avatar 的关系，让订阅方（HealthComponent、CMC）能拿到 ASC。
+	//
+	// 但如果 PawnData 已经就绪（关卡里放置的实例在 PostInitializeComponents 前就有值），
+	// 顺手分发一次没有坏处，而且能覆盖"InitState 因故没走完"的退化情况。
+	ApplyPawnDataToConsumers();
 
 	OnAbilitySystemInitialized.Broadcast();
 }
@@ -246,6 +245,31 @@ void UGGYGOPawnExtensionComponent::HandlePlayerStateReplicated()
 void UGGYGOPawnExtensionComponent::SetupPlayerInputComponent()
 {
 	CheckDefaultInitialization();
+}
+
+void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
+{
+	if (!PawnData)
+	{
+		return;
+	}
+
+	// ASC 侧的两张表。
+	if (AbilitySystemComponent)
+	{
+		AbilitySystemComponent->SetAbilityGroupConfig(PawnData->AbilityGroupConfig);
+		AbilitySystemComponent->SetTagRelationshipMapping(PawnData->TagRelationshipMapping);
+	}
+
+	// 移动层。用 FindComponentByClass 而不是要求 Owner 是 ACharacter ——
+	// 载具、飞行单位将来可能不是 Character，那时它们没有这个组件，跳过即可。
+	if (AActor* Owner = GetOwner())
+	{
+		if (UGGYGOCharacterMovementComponent* MoveComp = Owner->FindComponentByClass<UGGYGOCharacterMovementComponent>())
+		{
+			MoveComp->SetMovementSet(PawnData->MovementSet);
+		}
+	}
 }
 
 void UGGYGOPawnExtensionComponent::GrantAbilitySets()
@@ -348,10 +372,17 @@ void UGGYGOPawnExtensionComponent::HandleChangeInitState(UGameFrameworkComponent
 {
 	if (DesiredState == GGYGOGameplayTags::InitState_DataInitialized)
 	{
-		// 在这一步授予能力，而不是在 InitializeAbilitySystem 里，原因有两个：
-		// 1. 语义上"授予能力"正是数据初始化这件事本身
-		// 2. 到这一步所有 feature 都已 DataAvailable，能力激活时依赖的其它组件
-		//    （HealthComponent 等）都已就绪，OnSpawn 策略的能力可以安全激活
+		// 配置分发放在这一步，而不是 InitializeAbilitySystem 里。
+		//
+		// 原因是时序：InitializeAbilitySystem 由 Pawn 在 PostInitializeComponents 调用，
+		// 那时 PawnData 可能还没设置（运行时生成的角色是先 SpawnActor 再 SetPawnData）。
+		// 而 DataInitialized 的前置条件里包含 DataAvailable，后者要求 PawnData 非空，
+		// 所以走到这里 PawnData 一定有值。
+		ApplyPawnDataToConsumers();
+
+		// 授予能力同样放这里，还多一层理由：此刻所有 feature 都已 DataAvailable，
+		// 能力激活时依赖的其它组件（HealthComponent 等）都已就绪，
+		// OnSpawn 策略的能力可以安全激活。
 		GrantAbilitySets();
 	}
 }

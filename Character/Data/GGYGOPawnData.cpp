@@ -14,4 +14,5 @@ UGGYGOPawnData::UGGYGOPawnData(const FObjectInitializer& ObjectInitializer)
 	PawnClass = nullptr;
 	AbilityGroupConfig = nullptr;
 	TagRelationshipMapping = nullptr;
+	MovementSet = nullptr;
 }

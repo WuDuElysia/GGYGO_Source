@@ -1,13 +1,12 @@
-/**
+﻿/**
  * @file ZZZAnimInstance.cpp
  * @brief ZZZ 动画决策层实现
  */
 
 #include "Animation/zzzAnim/ZZZAnimInstance.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
-#include "BaseCharacter.h"
 #include "Components/SkeletalMeshComponent.h"
-#include "Data/Runtime/RuntimeData.h"
+#include "GameFramework/Character.h"
 
 // ============================================================================
 // AnimInstance 生命周期
@@ -16,7 +15,7 @@
 void UZZZAnimInstance::NativeInitializeAnimation()
 {
 	Super::NativeInitializeAnimation();
-	Owner = Cast<ABaseCharacter>(TryGetPawnOwner());
+	Owner = Cast<ACharacter>(TryGetPawnOwner());
 }
 
 void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
@@ -41,10 +40,14 @@ void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
 
 void UZZZAnimInstance::AnimNotify_CanYaw()
 {
-	if (ABaseCharacter* Character = Owner.Get())
-	{
-		Character->NotifyCanYaw();
-	}
+	// 阶段 5：接收方已随移动 Pipeline 退役，本通知暂时无人消费。
+	//
+	// 保留这个函数体（而不是删掉）有两个理由：动画资产里的 `CanYaw` Notify
+	// 仍然存在，删掉会在运行时刷"找不到处理函数"的警告；
+	// 而阶段 6 在 CMC 里重建 TurnBack 相位机时，这里就是转发点。
+	//
+	// 原链路有六层转发（AnimInstance → Character → RuntimeComponent → Pipeline
+	// → IntentPipeline → TurnBackPhaseProcessor），重建时应当直接转给 CMC。
 }
 
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
@@ -63,11 +66,6 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 	bCanYaw = Snap.bCanYaw;
 	bTurnBackSecondSegment = Snap.bTurnBackSecondSegment;
 
-	const ABaseCharacter* Character = Owner.Get();
-	const FRuntimeData* RuntimeData = Character
-		? Character->GetRuntimeData()
-		: nullptr;
-
 	FZZZAnimWriteContext WriteContext;
 	WriteContext.Snap = &Snap;
 	WriteContext.Tuning = &Tuning;
@@ -78,35 +76,25 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 	LocomotionEvents.SynchronizeMovingSubState();
 	LocomotionEvents.AdvanceGaitBlend(DeltaSeconds);
 
-	if (Snap.TurnBackPhase != ETurnBackPhase::None
+#if !UE_BUILD_SHIPPING
+	// TurnBack 诊断。全部字段取自快照，不再回头读移动层 ——
+	// 快照之外再取一次值，两者可能来自不同时刻，日志就会自相矛盾。
+	if (Snap.TurnBackPhase != EGGYGOTurnBackPhase::None
 		|| StateMemory.MovingSubState == EZZZAnimMovingSubState::TurnBack)
 	{
-		const FVector DesiredMoveDir = RuntimeData
-			? RuntimeData->Intent.DesiredWorldMoveDir.GetSafeNormal2D()
-			: FVector::ZeroVector;
-		const FVector ActorForward = Character
-			? Character->GetActorForwardVector().GetSafeNormal2D()
-			: FVector::ZeroVector;
-		const float ActorDesiredDot = !DesiredMoveDir.IsNearlyZero()
-			&& !ActorForward.IsNearlyZero()
-			? FVector::DotProduct(ActorForward, DesiredMoveDir)
-			: 1.0f;
-		const float CurrentVelocity = RuntimeData
-			? RuntimeData->Movement.CurrentSpeed
-			: 0.0f;
-
 		UE_LOG(LogZZZAnim, Log,
-			TEXT("[TurnBack][Snapshot] Phase=%d SecondSegment=%d SubState=%d State=%d Gait=%d ShouldMove=%d InputForwardDot=%.3f ActorDesiredDot=%.3f Velocity=%.2f"),
+			TEXT("[TurnBack][Snapshot] Phase=%d SecondSegment=%d SubState=%d Gait=%d ShouldMove=%d Grounded=%d BlockMove=%d InputForwardDot=%.3f Velocity=%.2f"),
 			static_cast<uint8>(Snap.TurnBackPhase),
 			Snap.bTurnBackSecondSegment ? 1 : 0,
 			static_cast<uint8>(StateMemory.MovingSubState),
-			static_cast<uint8>(Snap.CurrentState),
 			static_cast<uint8>(Snap.Gait),
 			Snap.bShouldMove ? 1 : 0,
+			Snap.bGrounded ? 1 : 0,
+			Snap.bBlockMove ? 1 : 0,
 			Snap.InputForwardDot,
-			ActorDesiredDot,
-			CurrentVelocity);
+			Snap.VelocityLength);
 	}
+#endif
 }
 
 void UZZZAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)

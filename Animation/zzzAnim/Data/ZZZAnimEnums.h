@@ -10,8 +10,8 @@
 /**
  * Locomotion 动画状态（AnimBP 拓扑中的状态，不是角色逻辑状态）
  *
- * 与 ECharacterStateType 严格区分：
- *   ECharacterStateType      逻辑状态（Idle / Moving），由 StateManager 决定
+ * 与移动层的状态严格区分：
+ *   FZZZAnimSnapshot::bShouldMove / Gait   移动层状态，由 CMC 决定
  *   EZZZAnimLocomotionState  动画状态（Conduit / EnterMove / ...），由 AnimBP 决定
  */
 UENUM(BlueprintType)

@@ -29,6 +29,7 @@ class APawn;
 class UGGYGOAbilityGroupConfig;
 class UGGYGOAbilitySet;
 class UGGYGOAbilityTagRelationshipMapping;
+class UGGYGOMovementSet;
 class UObject;
 
 UCLASS(BlueprintType, Const, meta = (DisplayName = "GGYGO Pawn Data", ShortTooltip = "一个可操控单位的静态配置"))
@@ -79,4 +80,15 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Abilities")
 	TObjectPtr<UGGYGOAbilityTagRelationshipMapping> TagRelationshipMapping;
+
+	/**
+	 * 移动参数。注入给 `UGGYGOCharacterMovementComponent`。
+	 *
+	 * 放在 PawnData 而不是 Pawn 蓝图上，是为了让"同一角色的不同移动手感"
+	 * （轻甲/重甲、负伤状态）能靠换资产实现，而不是复制整个角色蓝图。
+	 *
+	 * 留空则 CMC 全部走引擎默认值，角色仍能移动（速度是 CMC 的默认 600）。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Movement")
+	TObjectPtr<const UGGYGOMovementSet> MovementSet;
 };

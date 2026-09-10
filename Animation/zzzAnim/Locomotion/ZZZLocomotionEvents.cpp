@@ -1,11 +1,11 @@
-/**
+﻿/**
  * @file ZZZLocomotionEvents.cpp
  * @brief ZZZ 动画 Locomotion 状态事件模块实现
  */
 
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionEvents.h"
 #include "Animation/zzzAnim/Data/ZZZAnimSnapshot.h"
-#include "StateMachine/CharacterStateType.h"
+#include "Character/Data/GGYGOMovementTypes.h"
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionRules.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
 
@@ -21,7 +21,7 @@ void FZZZLocomotionEvents::SynchronizeMovingSubState()
 		return;
 	}
 
-	if (Context.Snap->CurrentState != ECharacterStateType::Moving)
+	if (!Context.Snap->bShouldMove)
 	{
 		Context.Memory->MovingSubState = EZZZAnimMovingSubState::None;
 		return;
@@ -32,7 +32,7 @@ void FZZZLocomotionEvents::SynchronizeMovingSubState()
 	// Frozen/Released 都算“转身中”；Back → WalkRun 是否离开由 AnimBP 的动画播放完成条件决定，
 	// 不把相位结束单独当作完整 TurnBack 播放完成信号。
 	Context.Memory->MovingSubState =
-		Context.Snap->TurnBackPhase == ETurnBackPhase::None
+		Context.Snap->TurnBackPhase == EGGYGOTurnBackPhase::None
 			? EZZZAnimMovingSubState::WalkRun
 			: EZZZAnimMovingSubState::TurnBack;
 }
@@ -40,15 +40,15 @@ void FZZZLocomotionEvents::SynchronizeMovingSubState()
 void FZZZLocomotionEvents::AdvanceStopSelection(float DeltaSeconds)
 {
 	const bool bIsMoving =
-		Context.Snap->CurrentState == ECharacterStateType::Moving;
+		Context.Snap->bShouldMove;
 
 	// 早停窗口只由逻辑状态首次进入 Moving 且入口步态为 Walk/None 时启动；
 	// 直接 Run 入口不启动，避免把直接跑步误判为 EnterMove。
 	if (bIsMoving && !bWasMoving)
 	{
 		const bool bWalkStartEntry =
-			Context.Snap->Gait == EMovementGait::Walk
-			|| Context.Snap->Gait == EMovementGait::None;
+			Context.Snap->Gait == EGGYGOGait::Walk
+			|| Context.Snap->Gait == EGGYGOGait::None;
 		bEnterMoveWindowActive = bWalkStartEntry;
 		EnterMoveElapsedSeconds = 0.0f;
 	}
@@ -102,13 +102,13 @@ void FZZZLocomotionEvents::AdvanceStopSelection(float DeltaSeconds)
 	// 只有有效 Moving 步态更新 StopValue；None 或非法值保留已经规范化的最近一次值。
 	switch (Context.Snap->Gait)
 	{
-	case EMovementGait::Walk:
+	case EGGYGOGait::Walk:
 		Context.Memory->StopValue = 1;
 		break;
-	case EMovementGait::Run:
+	case EGGYGOGait::Run:
 		Context.Memory->StopValue = 2;
 		break;
-	case EMovementGait::None:
+	case EGGYGOGait::None:
 	default:
 		break;
 	}
@@ -134,7 +134,7 @@ void FZZZLocomotionEvents::AdvanceGaitBlend(float DeltaSeconds)
 	AdvanceStopSelection(DeltaSeconds);
 
 	const bool bIsMoving =
-		Context.Snap->CurrentState == ECharacterStateType::Moving;
+		Context.Snap->bShouldMove;
 
 	// GaitValue 只保存最近一次有效 Moving 步态的离散选择值。
 	// 外部若写入非法值，先规范为 None，确保后续不会把越域值带入步态选择。
@@ -158,13 +158,13 @@ void FZZZLocomotionEvents::AdvanceGaitBlend(float DeltaSeconds)
 	// 保留已经规范化的最近一次有效值。
 	switch (Context.Snap->Gait)
 	{
-	case EMovementGait::Walk:
+	case EGGYGOGait::Walk:
 		Context.Memory->GaitValue = 1;
 		break;
-	case EMovementGait::Run:
+	case EGGYGOGait::Run:
 		Context.Memory->GaitValue = 2;
 		break;
-	case EMovementGait::None:
+	case EGGYGOGait::None:
 	default:
 		break;
 	}
@@ -211,7 +211,7 @@ void FZZZLocomotionEvents::AdvanceGaitBlend(float DeltaSeconds)
 
 float FZZZLocomotionEvents::ResolveTargetFromSnapshot() const
 {
-	if (Context.Snap->Gait == EMovementGait::None)
+	if (Context.Snap->Gait == EGGYGOGait::None)
 	{
 		return LastGaitBlendTarget;
 	}
@@ -221,10 +221,10 @@ float FZZZLocomotionEvents::ResolveTargetFromSnapshot() const
 
 void FZZZLocomotionEvents::ReportInvalidSnapshotGaitIfNeeded()
 {
-	const EMovementGait SnapshotGait = Context.Snap->Gait;
-	const bool bIsValid = SnapshotGait == EMovementGait::None
-		|| SnapshotGait == EMovementGait::Walk
-		|| SnapshotGait == EMovementGait::Run;
+	const EGGYGOGait SnapshotGait = Context.Snap->Gait;
+	const bool bIsValid = SnapshotGait == EGGYGOGait::None
+		|| SnapshotGait == EGGYGOGait::Walk
+		|| SnapshotGait == EGGYGOGait::Run;
 
 	if (bIsValid)
 	{

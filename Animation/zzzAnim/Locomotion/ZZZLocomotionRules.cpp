@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file ZZZLocomotionRules.cpp
  * @brief ZZZ 动画 Locomotion 无状态纯规则实现
  */
@@ -40,8 +40,8 @@ namespace ZZZLocomotionRules
 		return FMath::Clamp(ConfiguredThreshold, -1.0f, 0.0f);
 	}
 
-	float ResolveGaitBlendTarget(EMovementGait InSnapshotGait)
+	float ResolveGaitBlendTarget(EGGYGOGait InSnapshotGait)
 	{
-		return InSnapshotGait == EMovementGait::Run ? 1.0f : 0.0f;
+		return InSnapshotGait == EGGYGOGait::Run ? 1.0f : 0.0f;
 	}
 }

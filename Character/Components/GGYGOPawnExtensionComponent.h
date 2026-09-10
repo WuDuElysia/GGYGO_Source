@@ -152,6 +152,14 @@ protected:
 	UFUNCTION()
 	void OnRep_PawnData();
 
+	/**
+	 * 把 PawnData 里的配置分发给各消费者（ASC 的两张表、CMC 的移动参数）。
+	 *
+	 * 幂等，可以重复调用 —— 各 Setter 都是单纯赋值。
+	 * 主调用点在 `HandleChangeInitState(DataInitialized)`，那里能保证 PawnData 非空。
+	 */
+	void ApplyPawnDataToConsumers();
+
 	/** 授予 PawnData 里配置的所有 AbilitySet。仅服务器，且只执行一次。 */
 	void GrantAbilitySets();
 

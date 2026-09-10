@@ -37,6 +37,7 @@ class AActor;
 class AController;
 class UAbilitySystemComponent;
 class UGGYGOAbilitySystemComponent;
+class UGGYGOCharacterMovementComponent;
 class UGGYGOHealthComponent;
 class UGGYGOPawnExtensionComponent;
 class UInputComponent;
@@ -67,6 +68,15 @@ public:
 	/** 生命与韧性门面。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOHealthComponent* GetHealthComponent() const { return HealthComponent; }
+
+	/**
+	 * 类型化的 CMC 访问器。
+	 *
+	 * 不用成员变量缓存，因为 CMC 是 `ACharacter` 的既有子对象（由
+	 * `SetDefaultSubobjectClass` 换掉了类型），再存一份指针就有两个真源。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
+	UGGYGOCharacterMovementComponent* GetGGYGOMovementComponent() const;
 
 protected:
 	//~AActor / APawn 生命周期

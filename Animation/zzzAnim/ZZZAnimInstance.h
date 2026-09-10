@@ -33,7 +33,7 @@
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionEvents.h"
 #include "ZZZAnimInstance.generated.h"
 
-class ABaseCharacter;
+class ACharacter;
 class UBlendSpace;
 
 UCLASS()
@@ -76,9 +76,9 @@ public:
 	// ============================================================
 
 	/**
-	 * NotMoving → Conduit：有移动输入且逻辑状态已经是 Moving。
+	 * NotMoving → Conduit：本帧有移动意图。
 	 *
-	 * 该函数只读取 ZZZAnim 快照，不读取 Actor 或逻辑 RuntimeData。
+	 * 该函数只读取快照，不访问 Actor 或移动层。
 	 */
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_NotMoving_To_Conduit() const;
@@ -205,7 +205,26 @@ private:
 	/** 抓取快照 → 注入上下文（判定层只读视图、事件层可写上下文）→ 推进。 */
 	void RefreshDecisionContext(float DeltaSeconds);
 
-	TWeakObjectPtr<ABaseCharacter> Owner;
+	/**
+	 * 拥有者。
+	 *
+	 * 类型是 `ACharacter` 而不是具体角色类，因为动画层需要的一切都通过
+	 * `UGGYGOCharacterMovementComponent` 取得，而 CMC 是 `ACharacter` 的既有子对象。
+	 * 不绑定具体角色类的好处是新旧角色基类（迁移期间共存）都能用同一个 AnimBP，
+	 * 没有项目 CMC 的角色只会得到全默认的快照，不会崩。
+	 */
+	TWeakObjectPtr<ACharacter> Owner;
+
+	/**
+	 * 本帧是否已由外部驱动过。
+	 *
+	 * 阶段 5 起**不再有外部驱动方** —— 旧 `FCharacterControlPipeline::PublishAnimation`
+	 * 会在逻辑全部算完后显式调 `PipelineDrive`，那条链路随 Pipeline 退役。
+	 * 现在统一走引擎的 `NativeUpdateAnimation`。
+	 *
+	 * 保留这个标记与 `PipelineDrive` 是为了给阶段 6 留出手动驱动的入口：
+	 * 曲线采样必须在动画求值之后、移动提交之前发生，届时可能需要显式控制时机。
+	 */
 	bool bDrivenByPipeline = false;
 
 	FZZZAnimSnapshotCapture SnapshotCapture;
