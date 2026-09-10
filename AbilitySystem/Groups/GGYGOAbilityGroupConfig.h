@@ -15,7 +15,7 @@
  * ## 注入方式
  * 由 `UGGYGOAbilitySystemComponent::SetAbilityGroupConfig` 注入，
  * 未注入时 ASC 降级为内置默认规则（见该函数注释）。
- * 阶段 4 之后应由 `UGGYGOPawnData` 携带并在初始化时设置。
+ * 正常由 `UGGYGOPawnData` 携带，在角色初始化时注入。
  */
 #pragma once
 

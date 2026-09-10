@@ -75,7 +75,7 @@ void AGGYGOCharacterBase::PostInitializeComponents()
 	// 而 BeginPlay 时 InitState 已经开始推进，ASC 还没就位会让 DataAvailable 卡住。
 	//
 	// OwnerActor 和 AvatarActor 都传 this —— ASC 归角色自己（决策 D1）。
-	// 队伍级 ASC 走的是另一条路（挂 PlayerState，阶段 10）。
+	// 队伍共享资源（队伍能量之类）需要的是另一个挂 PlayerState 的 ASC，不走这里。
 	if (AbilitySystemComponent && PawnExtComponent)
 	{
 		PawnExtComponent->InitializeAbilitySystem(AbilitySystemComponent, this);
@@ -140,8 +140,8 @@ void AGGYGOCharacterBase::SetupPlayerInputComponent(UInputComponent* PlayerInput
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
 
-	// 实际的输入绑定不在这里做，将由 HeroComponent 承担（阶段 7）。
 	// 本类只通知协调者"输入组件已就绪"，让依赖它的 feature 能推进。
+	// 具体的输入绑定属于 HeroComponent 的职责，不在角色基类里硬编码。
 	if (PawnExtComponent)
 	{
 		PawnExtComponent->SetupPlayerInputComponent();

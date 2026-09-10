@@ -2,21 +2,18 @@
  * @file PlayerCharacter.h
  * @brief 旧玩家角色 —— 过渡壳，只为兼容已有蓝图而存在
  *
- * 与 `ABaseCharacter` 同理：保留它是因为 `BP_Player` 之类的蓝图以它为父类，
- * 而 `Content/` 不在版本控制内，删掉无法回退。
+ * 与 `ABaseCharacter` 同理：本类存在的唯一理由是 `BP_Player` 之类的蓝图
+ * 以它为父类，而 `Content/` 不在版本控制内，删掉无法回退。
  *
- * ## 与旧实现的区别
- * 输入不再经过 `ABaseCharacter` 的输入门面转发给纯 C++ `FInputPipeline`
- * （那条链路随移动 Pipeline 退役），改为直接调用 `APawn` 的标准输入接口：
- * `AddMovementInput` 与 `AddControllerYawInput` / `AddControllerPitchInput`。
+ * ## 输入走 APawn 的标准接口
+ * 回调直接调用 `AddMovementInput` 与 `AddControllerYawInput` /
+ * `AddControllerPitchInput`，输入因此进入 CMC 的 `Acceleration`，
+ * 被 `FSavedMove_Character` 保存并获得网络预测。
+ * 自建输入缓冲则做不到这一点，CMC 看不见的输入无法参与预测。
  *
- * 这样输入就进入了 CMC 的 `Acceleration`，从而被 `FSavedMove_Character` 保存，
- * 具备网络预测能力 —— 旧链路把输入存在自己的双缓冲里，CMC 完全看不到。
- *
- * ## 正式方案
- * 输入绑定最终应由 `UGGYGOHeroComponent` 承担（阶段 7），
- * 用 InputTag 把输入与 GA 解耦，而不是在角色类里硬编码回调。
- * 本类只是让现有蓝图在过渡期仍能操作角色。
+ * ## 不要在这里扩展输入
+ * 输入绑定的正式归属是 `UGGYGOHeroComponent`，用 InputTag 把输入与 GA 解耦。
+ * 本类只让现有蓝图仍能操作角色，硬编码的回调不应继续增加。
  */
 #pragma once
 
@@ -31,7 +28,7 @@ class UInputComponent;
 class UObject;
 struct FFrame;
 
-UCLASS(meta = (DeprecatedNode, DeprecationMessage = "输入绑定将由 UGGYGOHeroComponent 接管（阶段 7），本类仅为兼容已有蓝图保留。"))
+UCLASS(meta = (DeprecatedNode, DeprecationMessage = "输入绑定将由 UGGYGOHeroComponent 接管，本类仅为兼容已有蓝图保留。"))
 class GGYGO_API APlayerCharacter : public ABaseCharacter
 {
 	GENERATED_BODY()
@@ -68,14 +65,13 @@ protected:
 	/**
 	 * 冲刺（Shift），Digital。
 	 *
-	 * **当前无效果**。新步态体系只有 Walk / Run 两档，升档靠持续行走时长，
-	 * 没有"按住冲刺"这一档 —— 旧配置里的 `SprintSpeed` / `SprintMultiplier`
-	 * 也从未被任何代码读取过。保留绑定入口，语义待阶段 7 输入层重建时确定。
+	 * **当前无效果**。步态只有 Walk / Run 两档、靠持续行走时长升档，
+	 * 没有"按住冲刺"这一档。绑定入口保留，语义待定。
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	TObjectPtr<UInputAction> IA_Sprint;
 
-	/** 强制步行（Ctrl），Digital。**当前无效果**，同上。 */
+	/** 强制步行（Ctrl），Digital。**当前无效果**，理由同 `IA_Sprint`。 */
 	UPROPERTY(EditDefaultsOnly, Category = "Input")
 	TObjectPtr<UInputAction> IA_ForceWalk;
 

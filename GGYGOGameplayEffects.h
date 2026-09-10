@@ -1,14 +1,13 @@
 /**
  * @file GGYGOGameplayEffects.h
- * @brief GameplayEffect 类引用注册表（Phase 7）
+ * @brief GameplayEffect 类引用注册表
  *
- * 定义项目中所有 GE 的 TSoftClassPtr 引用。
- * 具体的 GE 蓝图类在 Content/ 目录下创建，
- * 此文件提供统一的引用入口，避免硬编码字符串。
+ * 集中存放所有 GE 的 `TSoftClassPtr`。GE 蓝图类本身在 `Content/` 下创建，
+ * 这里提供统一的引用入口，让 C++ 侧不必硬编码资产路径字符串。
  *
- * 使用方式：
- *   StateManager::ActivateState → GetEnterGameplayEffects() 返回此处的引用
- *   ASC->ApplyGameplayEffectToSelf(GEGlobals::GE_BlockCombat.Get())
+ * `InitGEGlobals()` 必须在任何 GE 被应用之前调用一次。
+ * 目前没有调用方 —— 原先由角色 BeginPlay 触发，那条链路已不存在，
+ * 归属应当是游戏或世界级的初始化点。在补上之前这里的引用全部为空。
  */
 #pragma once
 

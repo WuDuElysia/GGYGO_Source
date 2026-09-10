@@ -14,7 +14,7 @@
 
 namespace GGYGOMovementConstants
 {
-	/** 判定"正在移动"的水平速度阈值（cm/s）。沿用旧 MotionDriver 的取值。 */
+	/** 判定"正在移动"的水平速度阈值（cm/s）。用于过滤碰撞挤压等微小残余速度。 */
 	constexpr float MovingSpeedThreshold = 10.0f;
 
 	/**

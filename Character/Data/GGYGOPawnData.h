@@ -15,8 +15,8 @@
  *
  * ## 与 Lyra 的差异
  * Lyra 的 `ULyraPawnData` 还带 `InputConfig` 与 `DefaultCameraMode`，
- * 分别由 `HeroComponent` 与相机系统消费。本项目那两块在阶段 7 / 8 才建，
- * 字段等到有消费方时再加 —— 现在加只会得到一个谁都不读的配置项。
+ * 由 HeroComponent 与相机系统消费。本项目那两个系统尚未建立，
+ * 相应字段等到有消费方时再加 —— 提前加只会得到谁都不读的配置项。
  */
 #pragma once
 

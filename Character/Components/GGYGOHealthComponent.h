@@ -30,8 +30,8 @@
  * 2. **不重置属性**。Lyra 在初始化时有一段 `SetNumericAttributeBase(Health, MaxHealth)`
  *    并自标为 TEMP。属性初值应由 PawnData 里的初始化 GE 给，写在这里会覆盖掉
  *    "残血复活""继承上一场血量"这类合理需求。
- * 3. **自毁 GE 可配置**。Lyra 从 `ULyraGameData` 全局资产取伤害 GE，
- *    本项目还没有那层资产管理，改为组件上的 `EditDefaultsOnly` 字段。
+ * 3. **自毁 GE 配在组件上**。Lyra 从 `ULyraGameData` 全局资产取伤害 GE，
+ *    本项目没有那层全局资产管理，所以做成组件的 `EditDefaultsOnly` 字段。
  */
 #pragma once
 

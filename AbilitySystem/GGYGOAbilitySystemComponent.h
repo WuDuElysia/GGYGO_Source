@@ -24,19 +24,20 @@
  *
  * `SingleInstance` 的平手归属由 `bNewcomerWinsOnTie` 决定，默认 true（决策 D4：
  * 同优先级后来者打断先激活者），受击组通常要配成 false 以免受击动画反复重播。
- * 未注入配置表时全部走内置默认规则，等价于阶段 1 的硬编码行为。
+ * 未注入配置表时全部走内置默认规则。
  *
  * 仲裁只做"拒绝"，不做"排队"。`SingleInstanceQueued` 被拒时返回
- * `GroupOccupiedQueued` 原因，重试交给意图层的输入缓冲（阶段 7），
- * 或订阅 `OnAbilityGroupFreed` 在组空出瞬间重试。ASC 内不再造第二个队列。
+ * `GroupOccupiedQueued` 原因，重试由意图层的输入缓冲负责，
+ * 或订阅 `OnAbilityGroupFreed` 在组空出瞬间重试。
+ * ASC 内不设第二个队列 —— 两个队列会在"哪个才是真实待激活列表"上产生歧义。
  *
  * ## 3. Tag 关系扩展
  * 把 `UGGYGOAbilityTagRelationshipMapping` 的查询结果接进 GAS 的阻断/取消判定。
  *
  * ## 谁来调用 ProcessAbilityInput
- * 目前**没有调用方**。它需要每帧被驱动，正常应由 `UGGYGOHeroComponent`
- * 或 PlayerController 在 Tick 里调用，那两个都还不存在（阶段 4 / 7）。
- * 在此之前输入链路是断的，这是已知边界，不是漏实现。
+ * 目前**没有调用方**，输入链路因此是断的。
+ * 它需要每帧被驱动，归属是 `UGGYGOHeroComponent` 或 PlayerController 的 Tick，
+ * 而那两处都还没有建立。这是已知边界，不是漏实现。
  */
 #pragma once
 
@@ -143,7 +144,7 @@ public:
 
 	/**
 	 * 注入组规则配置表。传 nullptr 清除，之后降级为内置默认规则。
-	 * 阶段 4 之后应由 `UGGYGOPawnData` 在初始化时设置。
+	 * 正常由 `UGGYGOPawnData` 在角色初始化时设置。
 	 */
 	void SetAbilityGroupConfig(const UGGYGOAbilityGroupConfig* InConfig);
 
@@ -210,7 +211,7 @@ protected:
 	 * 取某个组的生效规则。
 	 *
 	 * 未注入配置表时返回内置默认规则（`SingleInstance` + `bNewcomerWinsOnTie = true`），
-	 * 与阶段 1 的硬编码行为一致 —— 保证接入配置表这件事本身不改变既有表现。
+	 * 使"没配表"与"配了表但没配这个组"两种情况行为一致。
 	 */
 	const FGGYGOAbilityGroupRule& ResolveGroupRule(FGameplayTag GroupTag) const;
 

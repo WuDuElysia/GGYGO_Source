@@ -52,11 +52,9 @@ void UGGYGOAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AA
 			}
 		}
 
-		// Lyra 在这里还会注册 GlobalAbilitySystem 并把 AnimInstance 与 ASC 关联。
-		// 两者在 GGYGO 都还不存在：
-		//   - UGGYGOGlobalAbilitySystem 尚未实现（队伍 Buff 广播，阶段 10 需要）
-		//   - UZZZAnimInstance 目前从 Pipeline 接收推送，阶段 5b 改为自拉时再接 ASC
-		// 等它们就位后在此处补上注册。
+		// Lyra 在这里还会注册 GlobalAbilitySystem（队伍范围的 Buff 广播）
+		// 并把 AnimInstance 与 ASC 关联，让动画层能直接查询 Tag。
+		// 两者在本项目都尚未实现，等它们就位后在此处补上注册。
 
 		// 放在最后：确保 ActorInfo 已完整、能力实例已收到 Avatar 通知。
 		TryActivateAbilitiesOnSpawn();
@@ -300,8 +298,8 @@ void UGGYGOAbilitySystemComponent::AbilitySpecInputReleased(FGameplayAbilitySpec
 const FGGYGOAbilityGroupRule& UGGYGOAbilitySystemComponent::ResolveGroupRule(FGameplayTag GroupTag) const
 {
 	// 未注入配置表时的兜底规则。static 保证能安全返回引用。
-	// 取值与阶段 1 的硬编码一致（SingleInstance + 平手后来者胜），
-	// 于是"还没配表"和"已配表但没配这个组"两种情况下行为都不变。
+	// 取字段默认值（SingleInstance + 平手后来者胜），使"没配表"与
+	// "配了表但没配这个组"两种情况行为一致。
 	static const FGGYGOAbilityGroupRule FallbackRule;
 
 	if (AbilityGroupConfig)
@@ -460,7 +458,7 @@ void UGGYGOAbilitySystemComponent::AddAbilityToActivationGroup(UGGYGOGameplayAbi
 	// 同组顶替：只有 SingleInstance 规则会取消同组实例。
 	//
 	// Coexist 不取消是显然的。SingleInstanceQueued 不取消是本规则的**定义**：
-	// 能走到这里说明组里原本是空的（否则会被 IsActivationBlockedByGroup 拦掉），
+	// 能走到这里说明组里是空的（否则会被 IsActivationBlockedByGroup 拦掉），
 	// 所以没有该取消的对象；写成显式 early-out 是为了防止将来有人
 	// 绕过仲裁直接激活时，Queued 组的"绝不打断"承诺被这段代码破坏。
 	if (GroupTag.IsValid())

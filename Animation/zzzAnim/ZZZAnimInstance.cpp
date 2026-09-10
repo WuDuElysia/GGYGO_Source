@@ -40,14 +40,10 @@ void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
 
 void UZZZAnimInstance::AnimNotify_CanYaw()
 {
-	// 阶段 5：接收方已随移动 Pipeline 退役，本通知暂时无人消费。
+	// 有意为空。转身相位机尚未在 CMC 内实现，本通知目前无人消费。
 	//
-	// 保留这个函数体（而不是删掉）有两个理由：动画资产里的 `CanYaw` Notify
-	// 仍然存在，删掉会在运行时刷"找不到处理函数"的警告；
-	// 而阶段 6 在 CMC 里重建 TurnBack 相位机时，这里就是转发点。
-	//
-	// 原链路有六层转发（AnimInstance → Character → RuntimeComponent → Pipeline
-	// → IntentPipeline → TurnBackPhaseProcessor），重建时应当直接转给 CMC。
+	// 函数体保留而不删除：动画资产里的 `CanYaw` Notify 仍然存在，
+	// 没有对应处理函数会在运行时持续刷警告。
 }
 
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
@@ -77,7 +73,7 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 	LocomotionEvents.AdvanceGaitBlend(DeltaSeconds);
 
 #if !UE_BUILD_SHIPPING
-	// TurnBack 诊断。全部字段取自快照，不再回头读移动层 ——
+	// TurnBack 诊断。全部字段取自快照，不回头读移动层 ——
 	// 快照之外再取一次值，两者可能来自不同时刻，日志就会自相矛盾。
 	if (Snap.TurnBackPhase != EGGYGOTurnBackPhase::None
 		|| StateMemory.MovingSubState == EZZZAnimMovingSubState::TurnBack)

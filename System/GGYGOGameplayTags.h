@@ -3,9 +3,9 @@
  * @brief 项目 GameplayTag 的统一原生声明
  *
  * ## 为什么用原生 Tag
- * 取代了旧的 `GGYGOTags.h`。旧文件用 `namespace + static const FName` 存字符串，
- * 运行时靠 `FGameplayTag::RequestGameplayTag` 解析，再用 `FGGYGOTagCache` 手工缓存一份。
- * 这条链路有三个问题：每次解析都是字符串查找；Tag 拼错只能在运行时发现；
+ * 另一种常见做法是用 `namespace + static const FName` 存字符串，
+ * 运行时靠 `FGameplayTag::RequestGameplayTag` 解析，再手工缓存一份。
+ * 那条链路有三个问题：每次解析都是字符串查找；Tag 拼错只能在运行时发现；
  * 缓存结构需要人工维护，加一个 Tag 要改三处（FName 常量、缓存字段、Init 里的赋值）。
  *
  * 原生 Tag 在模块加载时注册，编译期就能引用符号，写错编译不过，也不需要缓存。
@@ -223,9 +223,9 @@ namespace GGYGOGameplayTags
 	// ============================================================
 	// 六、Restriction —— 功能限制
 	//
-	// 由 GE 施加。移动层重建后 `CantMove` 由 CMC 直接查询，
-	// 攻击/闪避的限制则由 GA 的 `ActivationBlockedTags` 表达，
-	// 不再经过 Arbiter 翻译成 bool 标记。
+	// 由 GE 施加，消费方直接查 Tag，不经过中间的 bool 标记翻译层。
+	// `CantMove` 由 CMC 在 `GetMaxSpeed()` 里查询；
+	// 攻击/闪避的限制由 GA 的 `ActivationBlockedTags` 表达。
 	// ============================================================
 
 	/** 不能移动。攻击类 GA 激活期间施加，防止 locomotion 位移与动作位移叠加。 */
@@ -243,12 +243,12 @@ namespace GGYGOGameplayTags
 	/** 禁止交互。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Restriction_CantInteract);
 	/**
-	 * 免疫伤害（旧 Tag）。
+	/**
+	 * 免疫伤害。**不要在新代码里用这个**，用 `Gameplay_Damage_Immunity`。
 	 *
-	 * **注意语义重复**：`UGGYGOHealthSet` 的免疫判定只认下面的
-	 * `Gameplay.Damage.Immunity`，不认这个。保留它是因为可能被现有蓝图
-	 * GE 资产（如 GE_Invincible）引用，删掉会断引用。
-	 * 新代码请一律用 `Gameplay_Damage_Immunity`。
+	 * 两个 Tag 语义重复，而 `UGGYGOHealthSet` 的免疫判定只认那一个。
+	 * 本 Tag 仅因被现有蓝图 GE 资产（如 GE_Invincible）引用而存在，
+	 * 删除会断引用；它对伤害计算没有任何实际效果。
 	 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Restriction_ImmuneDamage);
 

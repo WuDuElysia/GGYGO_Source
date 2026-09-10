@@ -76,8 +76,8 @@ bool FZZZLocomotionDecisions::WalkRun_To_TurnBack() const
 	// 反向输入检测的唯一真相在移动层；此处只读相位：整个 TurnBack 生命周期都允许进入。
 	// 用 Phase != None 而不是只等 Frozen，避免蓝图求值晚于释放时间点时错过进入窗口。
 	//
-	// 注意：TurnBackPhase 在阶段 6 之前恒为 None，所以本函数当前恒返回 false，
-	// AnimBP 不会进入转身状态。这是移动层重建期间的已知功能缺口，不是判定写错。
+	// 注意：相位机尚未在 CMC 内实现，TurnBackPhase 恒为 None，
+	// 所以本函数目前恒返回 false，AnimBP 不会进入转身状态 —— 判定本身没写错。
 	return Context.Snap
 		&& Context.Snap->TurnBackPhase != EGGYGOTurnBackPhase::None;
 }

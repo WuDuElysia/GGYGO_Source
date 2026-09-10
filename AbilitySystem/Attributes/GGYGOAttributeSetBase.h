@@ -7,9 +7,8 @@
  *
  * ## 关于类名
  * 对应 Lyra 的 `ULyraAttributeSet`，按命名习惯本应叫 `UGGYGOAttributeSet`，
- * 但那个名字被旧的单体 Set（`Attributes/GGYGOAttributeSet.h`）占用，
- * 而旧 Set 仍被 `ABaseCharacter` 与若干蓝图 GE 资产引用，本阶段不动它。
- * 等阶段 4 角色组件化完成、旧 Set 删除后，再把本类改名为 `UGGYGOAttributeSet`。
+ * 但那个名字被 `Attributes/GGYGOAttributeSet.h` 里的单体 Set 占用。
+ * 那个 Set 仍被若干蓝图 GE 资产引用，删除会断引用，因此本类暂用 Base 后缀。
  *
  * ## 拆分依据（按 Lyra 的分法）
  *   - `UGGYGOHealthSet`：目标侧的**承受**属性。生命、韧性，以及一次性的 Damage / Healing / PoiseDamage 元属性。

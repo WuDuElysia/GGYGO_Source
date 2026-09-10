@@ -39,12 +39,8 @@ void APlayerCharacter::SetupPlayerInputComponent(UInputComponent* PlayerInputCom
 
 	if (IA_Move)
 	{
-		// 只绑 Triggered，不再绑 Completed。
-		//
-		// 旧实现需要 Completed 去调 ClearMoveInput()，因为输入被存在
-		// FInputPipeline 自己的双缓冲里，不清就会一直保持上一次的方向。
-		// AddMovementInput 没有这个问题：CMC 每帧消费完 Acceleration 就自动归零，
-		// 松手后不再调用 AddMovementInput 即等于零输入。
+		// 只需绑 Triggered。CMC 每帧消费完 Acceleration 就自动归零，
+		// 松手后不再调用 AddMovementInput 即等于零输入，不需要额外的清零事件。
 		EIC->BindAction(IA_Move, ETriggerEvent::Triggered, this, &APlayerCharacter::OnMoveInput);
 	}
 
@@ -83,8 +79,8 @@ void APlayerCharacter::OnMoveInput(const FInputActionValue& Value)
 	const FVector Forward = RotationBasis.GetUnitAxis(EAxis::X);
 	const FVector Right = RotationBasis.GetUnitAxis(EAxis::Y);
 
-	// AddMovementInput 会累加进 CMC 的 Acceleration，于是自动获得
-	// SavedMove 保存与网络预测。旧链路把输入存在 Pipeline 私有缓冲里，CMC 看不到。
+	// 走 AddMovementInput 而不是自己存一份输入：它会累加进 CMC 的 Acceleration，
+	// 从而被 SavedMove 保存并获得网络预测。CMC 看不到的输入无法参与预测。
 	AddMovementInput(Forward * Input.Y + Right * Input.X);
 }
 

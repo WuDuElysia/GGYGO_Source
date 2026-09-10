@@ -2,34 +2,22 @@
  * @file GGYGOCharacterMovementComponent.h
  * @brief 项目 CMC —— 步态权威 + Tag 驱动的移动禁用
  *
- * 取代旧的 `FMotionDriver` + `FGaitAuthorityProcessor` + `FArbiterPipeline` 三件套。
+ * ## 为什么这些逻辑必须写在 CMC 内部
+ * 在 CMC 外面驱动移动（每帧覆写 `MaxWalkSpeed`、调 `RequestDirectMove`、
+ * 直接改 Actor 朝向）在单机下能跑，但联机下必然出错：那些写入发生在
+ * `SavedMove` / `NetworkPrediction` 体系之外，服务器重放客户端的 move 时
+ * 拿不到它们，位置校正会持续触发，表现为角色抖动或被拉回。
  *
- * ## 为什么必须回到 CMC 内部
- * 旧实现在 CMC **外面**驱动移动：每帧覆写 `MaxWalkSpeed`，再调 `RequestDirectMove`，
- * TurnBack 期间还直接 `AddActorWorldRotation`。这些写入全部发生在 CMC 的
- * `SavedMove` / `NetworkPrediction` 体系之外，后果是联机下客户端与服务器
- * 必然不一致：服务器重放客户端的 move 时拿不到那些外部写入，
- * 位置校正会持续触发，表现为角色抖动或被拉回。
- *
- * 旧代码里连一处 `FSavedMove_Character` 派生都没有（六个相关目录零匹配），
- * 所以它不是"预测做得不好"，而是完全没有进入预测体系。
- *
- * 本类改为使用 CMC 的正规扩展点：
+ * 所以速度与状态一律走 CMC 的正规扩展点：
  * - `GetMaxSpeed()` 决定速度上限 —— CMC 自己会在 `CalcVelocity` 里用它，
  *   于是加减速、摩擦、坡度、碰撞全部沿用引擎已验证的实现
  * - `UpdateCharacterStateBeforeMovement()` 做步态解算 —— 这个函数在
  *   正常 tick 与 move 回放时都会被调用，是有状态逻辑的正确位置
  * - `FSavedMove_GGYGO` 保存步态与计时器 —— 回放时能还原，预测才成立
  *
- * ## 步态判定的化简
- * 旧逻辑依赖 `RuntimeData.State.CurrentState == Moving`，而那个状态机
- * （`FGYGOStateManager` 只注册了 Idle / Moving 两个状态）本身就是
- * "有没有移动输入"的投影：`FIdleState` 见到有方向就转 Moving，
- * `FMovingState` 见到方向归零就转回 Idle。
- *
- * 所以本类直接用移动输入判定，去掉中间那层状态机。这不是行为改变，
- * 是去掉一层等价的间接。用 `GetCurrentAcceleration()` 而不是原始摇杆值，
- * 因为它已被 `SavedMove` 保存，回放时取值一致。
+ * ## 步态的判定依据
+ * 用 `GetCurrentAcceleration()` 判断有无移动意图，而不是读原始摇杆值：
+ * 前者已被 `SavedMove` 保存，move 回放时取值与首次执行一致，后者没有这个保证。
  *
  * ## 关于步态的网络权威
  * 步态由客户端解算，经 `CompressedFlags` 的两个自定义位发给服务器，
@@ -166,19 +154,16 @@ public:
 	/**
 	 * 本帧是否有移动意图。
 	 *
-	 * 取代旧 `FZZZAnimRuntimeModel::bShouldMove`。动画层用它决定进出移动状态 ——
-	 * 用意图而不是实际速度，是因为起步第一帧速度还是 0，
-	 * 按速度判定会让起步动画晚一帧，玩家能感觉到输入迟滞。
+	 * 动画层用它决定进出移动状态。用意图而不是实际速度，是因为起步第一帧
+	 * 速度还是 0，按速度判定会让起步动画晚一帧，玩家能感觉到输入迟滞。
 	 *
-	 * 已知差异：旧 `FInputPipeline` 在松手后有一个短窗口维持上一次有效方向
-	 * （`MoveFlickerBuffer`），用于快速点按时不抖动。那属于输入层职责，
-	 * 随输入层在阶段 7 重建，当前本函数在松手当帧即返回 false。
+	 * 松手当帧即返回 false，没有防抖窗口。快速点按方向键会让动画在
+	 * 起步与停止之间抖动，抑制它需要输入层持有一个短的方向保持窗口。
 	 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	bool HasMoveInput() const;
 
 	// ===== 供动画层读取的派生量 =====
-	// 这些取代旧 MotionDriver::UpdateRuntimeData 写进 FRuntimeData 的那批字段。
 	// 做成即时计算的 getter 而不是每帧缓存，是因为它们全都是 Velocity 的纯函数，
 	// 缓存只会多出一份可能与 Velocity 不同步的状态。
 
@@ -186,7 +171,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	float GetHorizontalSpeed() const;
 
-	/** 是否正在移动。阈值 10 cm/s，与旧实现一致。 */
+	/** 是否正在移动。阈值 10 cm/s，用于过滤碰撞挤压等微小残余速度。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	bool IsMovingHorizontally() const;
 
@@ -206,8 +191,8 @@ public:
 	/**
 	 * 水平速度相对角色朝向的 BlendSpace 分量。X 为右、Y 为前，均已归一化。
 	 *
-	 * 轴序是给 BlendSpace 用的约定，与 UE 的局部空间（X 前、Y 右）**相反**，
-	 * 这是旧实现留下的既有约定，动画资产按它配好了，不改。
+	 * 轴序与 UE 的局部空间（X 前、Y 右）**相反**，这是动画资产侧的约定，
+	 * BlendSpace 的两个轴就是按这个顺序配的，改这里会让所有移动混合错位。
 	 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	void GetLocalVelocityBlend(float& OutBlendX, float& OutBlendY) const;

@@ -14,8 +14,7 @@
  *
  * ## 本阶段未实现的部分
  * - 相机模式（`SetCameraMode` / `ClearCameraMode`）：依赖 HeroComponent 与 CameraMode，都还不存在
- * - 完整的组规则仲裁：现在是最小实现（全局 Exclusive 排斥 + 同组默认 SingleInstance），
- *   阶段 3 接入 `UGGYGOAbilityGroupConfig` DataAsset 后才支持每组独立配规则
+ * - 相机模式相关的接口，依赖尚未建立的 HeroComponent
  *
  * ## 默认策略
  * 构造函数里设的四个 GAS 策略值得留意：
@@ -93,8 +92,9 @@ public:
 
 	/**
 	 * 取 Avatar 角色。
-	 * 返回 `ACharacter*` 而不是具体项目角色类，是因为阶段 4 会把 `ABaseCharacter`
-	 * 换成 `AGGYGOCharacter`，现在绑定具体类型会造成返工。
+	 *
+	 * 返回 `ACharacter*` 而不是具体项目角色类：能力应当能作用于任意角色类型，
+	 * 绑定具体类会让同一个能力无法复用到载具或非玩家单位上。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Ability")
 	ACharacter* GetCharacterFromActorInfo() const;

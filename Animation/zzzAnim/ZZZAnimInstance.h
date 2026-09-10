@@ -210,20 +210,17 @@ private:
 	 *
 	 * 类型是 `ACharacter` 而不是具体角色类，因为动画层需要的一切都通过
 	 * `UGGYGOCharacterMovementComponent` 取得，而 CMC 是 `ACharacter` 的既有子对象。
-	 * 不绑定具体角色类的好处是新旧角色基类（迁移期间共存）都能用同一个 AnimBP，
+	 * 不绑定具体角色类，同一个 AnimBP 就能挂在任意角色类上；
 	 * 没有项目 CMC 的角色只会得到全默认的快照，不会崩。
 	 */
 	TWeakObjectPtr<ACharacter> Owner;
 
 	/**
-	 * 本帧是否已由外部驱动过。
+	 * 本帧是否已由外部调用 `PipelineDrive` 驱动过。
 	 *
-	 * 阶段 5 起**不再有外部驱动方** —— 旧 `FCharacterControlPipeline::PublishAnimation`
-	 * 会在逻辑全部算完后显式调 `PipelineDrive`，那条链路随 Pipeline 退役。
-	 * 现在统一走引擎的 `NativeUpdateAnimation`。
-	 *
-	 * 保留这个标记与 `PipelineDrive` 是为了给阶段 6 留出手动驱动的入口：
-	 * 曲线采样必须在动画求值之后、移动提交之前发生，届时可能需要显式控制时机。
+	 * 目前没有外部驱动方，快照统一在引擎的 `NativeUpdateAnimation` 里刷新。
+	 * 保留这个入口是因为曲线采样必须在动画求值之后、移动提交之前发生，
+	 * 那种时序要求无法靠引擎回调的默认顺序满足，需要由外部显式驱动。
 	 */
 	bool bDrivenByPipeline = false;
 

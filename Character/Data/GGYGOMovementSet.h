@@ -2,26 +2,15 @@
  * @file GGYGOMovementSet.h
  * @brief 一个角色的移动参数
  *
- * 取代旧的 `FMovementConfig`（内联在 `UCharConfigData` 里的 USTRUCT）。
- * 改成独立 DataAsset 的理由与 `UGGYGOPawnData` 相同：移动手感需要能跨角色复用，
- * 也需要能给同一角色换一套（受伤状态、水下、载具），内联结构做不到。
+ * 做成独立 DataAsset 而不是内联在角色配置里，理由与 `UGGYGOPawnData` 相同：
+ * 移动手感需要能跨角色复用，也需要能给同一角色换一套（受伤状态、水下、载具）。
  *
- * ## 迁移时丢弃的字段
- * 旧 `FMovementConfig` 有 11 个字段，其中 7 个在整个 `Source/GGYGO` 里
- * **没有任何读取方**：`SprintMultiplier`、`SprintSpeed`、`AirControlFactor`、
- * `DodgeSpeed`、`DodgeDuration`、`KnockbackDecay`、`TurnBackSecondSegmentTimeSeconds`、
- * `bDebugMotion`。它们不是"预留"，是配了没人用 —— 闪避速度实际由动画曲线决定，
- * 空中控制从未被写进 CMC。这次不迁移，需要时再按真实需求加。
- *
- * ## 新增的两个字段
- * `WalkSpeed` / `RunSpeed` 是**新增的**，旧实现里不存在。
- * 旧移动完全由 `RM_Speed` 动画曲线驱动速度（`MaxWalkSpeed` 每帧被覆写成曲线值），
- * 所以根本没有固定速度配置。曲线驱动会在阶段 6 重新接上，
- * 这两个值届时降为"曲线缺失时的兜底速度"，现在则是唯一速度来源。
- *
- * 保留兜底而不是照搬旧行为（无曲线就 `StopMovementImmediately`）是有意的：
- * 那个行为让"动画没配曲线"表现为角色完全不动，极难排查。有兜底速度时
- * 表现为"能动但没有防滑步"，问题明显但不阻塞。
+ * ## 速度来源
+ * `WalkSpeed` / `RunSpeed` 是当前唯一的速度来源。
+ * 动画曲线驱动（`RM_Speed` 决定每帧速度，用于消除脚滑）接入后，
+ * 这两个值会降为曲线缺失时的兜底速度 —— 保留兜底而不是让角色停住，
+ * 是因为"动画没配曲线"若表现为角色完全不动，极难定位；
+ * 表现为"能动但有脚滑"则问题明显且不阻塞。
  */
 #pragma once
 
@@ -68,7 +57,7 @@ public:
 	 * 是否让角色朝向自动对齐移动方向。
 	 *
 	 * 动作游戏通常要 true（角色面向跑动方向），锁定目标时由能力临时关掉。
-	 * TurnBack 期间也会被临时关掉，因为那段的朝向由动画曲线驱动（阶段 6）。
+	 * 转身第一段期间也会被临时关掉，因为那段的朝向由动画曲线驱动。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation")
 	bool bOrientRotationToMovement = true;
@@ -89,27 +78,25 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Acceleration", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float GroundFriction = 8.0f;
 
-	// ===== 曲线驱动（阶段 6 消费） =====
+	// ===== 曲线驱动 =====
 
 	/**
-	 * 动画曲线速度的缩放系数。
+	 * 动画曲线速度的缩放系数。只缩放速度，不缩放位移量。
 	 *
-	 * 从旧 `FMovementConfig::RootMotionScale` 迁移而来。只缩放速度，不缩放位移量。
-	 * 阶段 6 曲线驱动接入后生效，当前无读取方 —— 保留是因为它是既有配置，
-	 * 删掉会让阶段 6 重建时丢失已调好的数值。
+	 * 曲线驱动尚未接入 CMC，本字段目前没有读取方。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float RootMotionScale = 1.0f;
 
-	// ===== TurnBack（阶段 6 消费） =====
+	// ===== TurnBack =====
+	// 相位机尚未在 CMC 内实现，以下三项目前没有读取方。
 
 	/**
 	 * 反向输入判定阈值：移动输入与角色前向的点积小于等于此值才算"要转身"。
 	 *
 	 * 默认 -0.95 约等于 162 度以上的反向。
-	 * 这个值原本是动画层的常量 `ZZZLocomotionRules::DefaultTurnBackReverseInputDotThreshold`，
-	 * 却被逻辑层的 `FTurnBackPhaseProcessor` 直接引用 —— 那是逻辑层反向依赖表现层的唯一处。
-	 * 提到配置资产上一并解决了依赖方向和可调性两件事。
+	 * 阈值放在移动层的配置资产上而不是动画层的常量里，是为了保持依赖方向 ——
+	 * 转身的触发判定属于移动层，动画层只读相位结果。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "TurnBack", meta = (ClampMin = "-1.0", ClampMax = "1.0", UIMin = "-1.0", UIMax = "1.0"))
 	float TurnBackReverseInputDotThreshold = -0.95f;

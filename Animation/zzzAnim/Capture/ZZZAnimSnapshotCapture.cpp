@@ -22,7 +22,7 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 		Cast<UGGYGOCharacterMovementComponent>(InOwner->GetCharacterMovement());
 	if (!MoveComp)
 	{
-		// 不是项目 CMC（旧 ABaseCharacter，或编辑器预览用的裸 Character）。
+		// 不是项目 CMC（例如编辑器预览用的裸 Character）。
 		// 保持全默认值，动画停在待机，不崩。
 		return;
 	}
@@ -39,12 +39,10 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 	OutSnap.ActualVelocityAngle = MoveComp->GetLocalVelocityAngle();
 	MoveComp->GetLocalVelocityBlend(OutSnap.ActualVelocityBlendX, OutSnap.ActualVelocityBlendY);
 
-	// BlendSpace 主输入暂时直接用实际速度的分量。
+	// BlendSpace 主输入用实际速度的分量。
 	//
-	// 旧实现里 AnimBlendX/Y 是**输入方向**经 FInterpTo 平滑后的值，与实际速度不同：
-	// 输入方向在起步第一帧就是满值，而实际速度要加速几帧才到位。
-	// 那个平滑属于输入层职责（阶段 7 重建），在此之前用实际速度是最接近的替代 ——
-	// CMC 的加减速本身就提供了平滑，只是响应比原来慢一点。
+	// 平滑由 CMC 的加减速提供，这里不再额外插值 —— 两级平滑串联会让
+	// 混合响应明显滞后于角色实际转向。
 	OutSnap.AnimBlendX = OutSnap.ActualVelocityBlendX;
 	OutSnap.AnimBlendY = OutSnap.ActualVelocityBlendY;
 
@@ -60,7 +58,8 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 	}
 
 	// ===== 曲线与 TurnBack =====
-	// 阶段 6 在此填入 AnimCurveVelocity / AnimCurveVelocityDirection /
-	// AnimCurveVelocityAngle / TurnBackPhase / bCanYaw / bTurnBackSecondSegment。
-	// 现在保持构造默认值，转身状态因此不会被进入。
+	// AnimCurveVelocity / AnimCurveVelocityDirection / AnimCurveVelocityAngle /
+	// TurnBackPhase / bCanYaw / bTurnBackSecondSegment 保持构造默认值：
+	// 它们的生产者依赖动画曲线采样，而曲线采样尚未接入 CMC。
+	// 后果是转身状态不会被进入。
 }

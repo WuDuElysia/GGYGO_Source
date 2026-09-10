@@ -13,18 +13,12 @@
  * Character 的生命周期，于是"敌人不需要输入""载具不需要 Health"这类差异
  * 只能用运行时判断绕开，而不是干脆不挂那个组件。
  *
- * ## 与旧 ABaseCharacter 的关系
- * 两者**并行存在**，本类不是它的父类也不是子类。
- * 旧类被移动 Pipeline 的 4 个文件反向依赖，那套 Pipeline 在阶段 5 整体退役；
- * 现在就去改它等于把阶段 5 的风险提前到阶段 4。
- * 旧角色蓝图继续用 `ABaseCharacter`，新角色用本类，阶段 5 收敛为一个。
- *
  * ## ASC 挂在这里而不是 PlayerState
  * 决策 D1。Lyra 一个 PlayerState 一个 ASC，但一个 ASC 只能挂一套同类 AttributeSet，
  * 而本项目一名玩家带三个角色（D2），共用 ASC 会让三角色共享生命值与技能冷却。
  *
- * 代价是队伍级的共享资源（如队伍能量）需要另一个挂 PlayerState 的 ASC，
- * 那部分在阶段 10 处理。本类的 `GetAbilitySystemComponent` 返回的始终是角色自己的。
+ * 代价是队伍级的共享资源（如队伍能量）需要另一个挂 PlayerState 的 ASC。
+ * 本类的 `GetAbilitySystemComponent` 返回的始终是角色自己的那个。
  */
 #pragma once
 

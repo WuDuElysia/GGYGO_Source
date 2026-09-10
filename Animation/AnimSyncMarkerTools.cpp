@@ -14,9 +14,8 @@ namespace
 {
 #if WITH_EDITOR
 	// 加 BakeTool 前缀避免与 Pipeline/Parameters/RootMotionParameterProcessor.cpp 里的同名常量冲突。
-	// 两者都在匿名命名空间里定义同样的曲线名，一旦被 UE 的 unity build 合进同一个编译单元就会重定义。
-	// 这两处引用的是同一套 ZZZ 曲线，本应共享一份定义；等 RootMotionParameterProcessor
-	// 随移动层重建退役后，再把曲线名收敛到一处。
+	// 曲线名加 BakeTool 前缀，避免与其它文件匿名命名空间里的同名常量在
+	// unity build 合并编译单元时重定义。曲线名理应收敛到一处共享定义。
 	const FName BakeToolCurveNamePosX(TEXT("RM_PosX"));
 	const FName BakeToolCurveNamePosY(TEXT("RM_PosY"));
 	const FName BakeToolCurveNameVelocityDirectionX(TEXT("RM_VelocityDirX"));

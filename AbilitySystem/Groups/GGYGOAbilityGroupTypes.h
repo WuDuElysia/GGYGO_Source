@@ -51,9 +51,9 @@ enum class EGGYGOAbilityGroupRule : uint8
 	 *
 	 * "排队"本身不在 ASC 里实现。ASC 只负责拒绝并给出
 	 * `EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued`；
-	 * 真正的重试由意图层的输入缓冲在有效窗内完成（阶段 7），
+	 * 真正的重试由意图层的输入缓冲在有效窗内完成，
 	 * 也可以订阅 ASC 的 `OnAbilityGroupFreed` 在组空出的瞬间立即重试。
-	 * 这样避免了 ASC 与意图层各持一个队列。
+	 * 这样 ASC 与意图层不会各持一个队列，避免"哪个才是真实待激活列表"的歧义。
 	 */
 	SingleInstanceQueued
 };
