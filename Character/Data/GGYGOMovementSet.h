@@ -5,12 +5,13 @@
  * 做成独立 DataAsset 而不是内联在角色配置里，理由与 `UGGYGOPawnData` 相同：
  * 移动手感需要能跨角色复用，也需要能给同一角色换一套（受伤状态、水下、载具）。
  *
- * ## 速度来源
- * `WalkSpeed` / `RunSpeed` 是当前唯一的速度来源。
- * 动画曲线驱动（`RM_Speed` 决定每帧速度，用于消除脚滑）接入后，
- * 这两个值会降为曲线缺失时的兜底速度 —— 保留兜底而不是让角色停住，
- * 是因为"动画没配曲线"若表现为角色完全不动，极难定位；
- * 表现为"能动但有脚滑"则问题明显且不阻塞。
+ * ## 速度来源的优先级
+ * 曲线速度（`RM_Speed`，逐帧给出，用于消除脚滑）优先；
+ * 动画没有烘焙曲线时回落到 `WalkSpeed` / `RunSpeed`。
+ *
+ * 保留固定速度作为兜底而不是让角色停住：若"动画没配曲线"表现为角色完全不动，
+ * 排查方向会指向输入或移动组件，离真正的原因很远；
+ * 表现为"能动但有脚滑"则问题明显且不阻塞其它验证。
  */
 #pragma once
 
@@ -109,8 +110,8 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0", ForceUnits = "cm/s"))
 	float MaxCurveDrivenSpeed = 1500.0f;
 
-	// ===== TurnBack =====
-	// 相位机尚未在 CMC 内实现，以下三项目前没有读取方。
+	// ===== TurnBack（急停转身）=====
+	// 由 UGGYGOCharacterMovementComponent 的相位机读取。
 
 	/**
 	 * 反向输入判定阈值：移动输入与角色前向的点积小于等于此值才算"要转身"。

@@ -13,10 +13,11 @@
  * 抽成独立资产后，`UGGYGOPawnExtensionComponent` 只认 PawnData 这一个输入，
  * 换角色就是换一份 PawnData。这对多角色队伍（决策 D2）是必需的。
  *
- * ## 与 Lyra 的差异
- * Lyra 的 `ULyraPawnData` 还带 `InputConfig` 与 `DefaultCameraMode`，
- * 由 HeroComponent 与相机系统消费。本项目那两个系统尚未建立，
- * 相应字段等到有消费方时再加 —— 提前加只会得到谁都不读的配置项。
+ * ## 消费方
+ * `UGGYGOPawnExtensionComponent` 在 InitState 到达 `DataInitialized` 时
+ * 把各字段分发给对应的消费者（ASC、CMC、HeroComponent、CameraComponent）。
+ * 分发时机不能提前到 `InitializeAbilitySystem` —— 那个函数由 Pawn 在
+ * `PostInitializeComponents` 调用，运行时生成的角色那时还没被 `SetPawnData`。
  */
 #pragma once
 
