@@ -22,21 +22,7 @@ void UZZZAnimInstance::NativeInitializeAnimation()
 void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
 	Super::NativeUpdateAnimation(DeltaSeconds);
-
-	if (bDrivenByPipeline)
-	{
-		bDrivenByPipeline = false;
-		return;
-	}
-
-	// 降级路径：管线未驱动（编辑器预览等场景）
 	RefreshDecisionContext(DeltaSeconds);
-}
-
-void UZZZAnimInstance::PipelineDrive(float DeltaSeconds)
-{
-	RefreshDecisionContext(DeltaSeconds);
-	bDrivenByPipeline = true;
 }
 
 void UZZZAnimInstance::AnimNotify_CanYaw()

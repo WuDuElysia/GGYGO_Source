@@ -10,7 +10,7 @@
  *      LocomotionDecisions.ShouldStopMoving() 的停止移动输入判定；Direct Conduit
  *      仅依据本帧 Snapshot_Gait == Run。EnterMove → Moving 的动画播放完成条件由
  *      AnimBP 直接使用 Time Remaining (ratio) <= 0 处理，不需要 C++ 函数
- *   2. 表现参数维护：Moving 子状态、StopValue、GaitValue 与 GaitBlendY 的维护由 C++ pipeline 完成；
+ *   2. 表现参数维护：Moving 子状态、StopValue、GaitValue 与 GaitBlendY 的维护由 C++ 每帧刷新完成；
  *      Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
  *   3. 配表查询（UFUNCTION → UAnimSequence*）：被 AnimGraph 节点 Bind
  *
@@ -49,15 +49,6 @@ public:
 	virtual void NativeInitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
 	virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
-
-	/**
-	 * 管线主动驱动（BaseCharacter::Tick 末尾调用）
-	 *
-	 * 在逻辑管线全部完成之后显式抓取快照。
-	 * 此后引擎调 NativeUpdateAnimation 时检测到标记，跳过重复工作。
-	 * 保证 AnimBP 读到的 Snap 一定是本帧管线刚写完的最新值。
-	 */
-	void PipelineDrive(float DeltaSeconds);
 
 	/** TurnBack 动画中名为 CanYaw 的 AnimNotify 回调。 */
 	UFUNCTION()
@@ -214,15 +205,6 @@ private:
 	 * 没有项目 CMC 的角色只会得到全默认的快照，不会崩。
 	 */
 	TWeakObjectPtr<ACharacter> Owner;
-
-	/**
-	 * 本帧是否已由外部调用 `PipelineDrive` 驱动过。
-	 *
-	 * 目前没有外部驱动方，快照统一在引擎的 `NativeUpdateAnimation` 里刷新。
-	 * 保留这个入口是因为曲线采样必须在动画求值之后、移动提交之前发生，
-	 * 那种时序要求无法靠引擎回调的默认顺序满足，需要由外部显式驱动。
-	 */
-	bool bDrivenByPipeline = false;
 
 	FZZZAnimSnapshotCapture SnapshotCapture;
 	FZZZLocomotionDecisions LocomotionDecisions;
