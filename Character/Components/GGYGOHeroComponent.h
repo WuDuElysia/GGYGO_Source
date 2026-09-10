@@ -64,6 +64,16 @@ public:
 	/** 由拥有者 Pawn 在 `SetupPlayerInputComponent` 里调用。 */
 	void InitializePlayerInput(UInputComponent* PlayerInputComponent);
 
+	/**
+	 * 输入缓冲的有效时长（秒）。
+	 *
+	 * 请求被"组内已有实例"拒绝后会被缓冲这么久，期间一旦该组空出就立刻重试。
+	 * 这是连段手感的核心参数：太短会让玩家必须精确卡在动画末尾按键，
+	 * 太长会让早按的键在很久之后突然生效，玩家已经不预期它了。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input", meta = (ClampMin = "0.0", ForceUnits = "s"))
+	float InputBufferWindow = 0.35f;
+
 protected:
 	virtual void OnRegister() override;
 	virtual void BeginPlay() override;
@@ -102,7 +112,36 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	int32 InputMappingPriority = 0;
 
+	/** 订阅 ASC 的重试通知与组空出通知。ASC 就绪后调用。 */
+	void BindAbilityRetryDelegates();
+
+	/** 缓冲一个被拒的请求。同一个 InputTag 重复缓冲只刷新时间戳。 */
+	void BufferAbilityInput(FGameplayTag InputTag);
+
+	/** 某个能力组空出，重试缓冲中的请求。 */
+	void HandleAbilityGroupFreed(FGameplayTag GroupTag);
+
 private:
 	/** 本组件产生的 Ability 输入绑定句柄，用于整批解绑。 */
 	TArray<uint32> AbilityInputBindHandles;
+
+	/** 一条被缓冲的输入请求。 */
+	struct FBufferedInput
+	{
+		FGameplayTag InputTag;
+
+		/** 缓冲开始的世界时间。用绝对时间而非倒计时，避免每帧递减。 */
+		float BufferedAtTime = 0.0f;
+	};
+
+	/**
+	 * 被缓冲的输入请求。
+	 *
+	 * 用数组而不是单个槽位：玩家可能在一段攻击播放期间先按普攻再按闪避，
+	 * 两者属于不同的能力组，各自的空出时机也不同。只留一个槽位会丢掉其中一个。
+	 */
+	TArray<FBufferedInput> BufferedInputs;
+
+	/** 委托是否已订阅。ASC 可能多次就绪（换 Avatar），避免重复订阅。 */
+	bool bAbilityRetryDelegatesBound = false;
 };

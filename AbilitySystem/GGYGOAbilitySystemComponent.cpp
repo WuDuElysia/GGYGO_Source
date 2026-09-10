@@ -540,6 +540,26 @@ void UGGYGOAbilitySystemComponent::NotifyAbilityFailed(const FGameplayAbilitySpe
 {
 	Super::NotifyAbilityFailed(Handle, Ability, FailureReason);
 
+	// 值得重试的失败要通知意图层。
+	//
+	// 在这里判断而不是让意图层自己查配置表，是因为"该不该重试"取决于
+	// 组规则，而组规则只有 ASC 知道。让意图层反查等于把仲裁逻辑抄第二遍。
+	if (FailureReason.HasTagExact(GGYGOGameplayTags::Ability_ActivateFail_ActivationGroupQueued))
+	{
+		if (const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle))
+		{
+			// InputTag 由 UGGYGOAbilitySet 在授予时写进动态源标签。
+			for (const FGameplayTag& SpecTag : Spec->GetDynamicSpecSourceTags())
+			{
+				if (SpecTag.MatchesTag(GGYGOGameplayTags::InputTag))
+				{
+					OnAbilityInputRetryable.Broadcast(SpecTag);
+					break;
+				}
+			}
+		}
+	}
+
 	// 服务器上非本地控制的能力失败时，反馈要在玩家自己的客户端播，所以发 RPC 过去。
 	if (APawn* Avatar = Cast<APawn>(GetAvatarActor()))
 	{

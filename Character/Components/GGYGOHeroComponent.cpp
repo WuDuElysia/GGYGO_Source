@@ -227,6 +227,10 @@ void UGGYGOHeroComponent::InitializePlayerInput(UInputComponent* PlayerInputComp
 	GGYGOIC->BindNativeAction(InputConfig, GGYGOGameplayTags::InputTag_Look_Stick, ETriggerEvent::Triggered, this, &ThisClass::Input_LookStick, /*bLogIfNotFound=*/false);
 
 	GGYGOIC->BindAbilityActions(InputConfig, this, &ThisClass::Input_AbilityInputTagPressed, &ThisClass::Input_AbilityInputTagReleased, AbilityInputBindHandles);
+
+	// 输入缓冲依赖 ASC 的通知。放在这里而不是 BeginPlay：
+	// ASC 就绪的时机晚于 BeginPlay，而走到这里 PawnData 已经就位，ASC 必然也在。
+	BindAbilityRetryDelegates();
 }
 
 void UGGYGOHeroComponent::Input_Move(const FInputActionValue& InputActionValue)
@@ -305,5 +309,92 @@ void UGGYGOHeroComponent::Input_AbilityInputTagReleased(FGameplayTag InputTag)
 	if (UGGYGOAbilitySystemComponent* GGYGOASC = PawnExtComp ? PawnExtComp->GetGGYGOAbilitySystemComponent() : nullptr)
 	{
 		GGYGOASC->AbilityInputTagReleased(InputTag);
+	}
+}
+
+void UGGYGOHeroComponent::BindAbilityRetryDelegates()
+{
+	if (bAbilityRetryDelegatesBound)
+	{
+		return;
+	}
+
+	const UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(GetPawn<APawn>());
+	UGGYGOAbilitySystemComponent* GGYGOASC = PawnExtComp ? PawnExtComp->GetGGYGOAbilitySystemComponent() : nullptr;
+	if (!GGYGOASC)
+	{
+		return;
+	}
+
+	GGYGOASC->OnAbilityInputRetryable.AddUObject(this, &ThisClass::BufferAbilityInput);
+	GGYGOASC->OnAbilityGroupFreed.AddUObject(this, &ThisClass::HandleAbilityGroupFreed);
+
+	bAbilityRetryDelegatesBound = true;
+}
+
+void UGGYGOHeroComponent::BufferAbilityInput(FGameplayTag InputTag)
+{
+	const UWorld* World = GetWorld();
+	if (!World || !InputTag.IsValid())
+	{
+		return;
+	}
+
+	const float Now = World->GetTimeSeconds();
+
+	// 同一个 InputTag 已在缓冲里就只刷新时间戳。
+	// 追加一条会让玩家连按三次时产生三次重试，一次组空出就连出三段。
+	for (FBufferedInput& Buffered : BufferedInputs)
+	{
+		if (Buffered.InputTag.MatchesTagExact(InputTag))
+		{
+			Buffered.BufferedAtTime = Now;
+			return;
+		}
+	}
+
+	BufferedInputs.Add(FBufferedInput{ InputTag, Now });
+}
+
+void UGGYGOHeroComponent::HandleAbilityGroupFreed(FGameplayTag GroupTag)
+{
+	const UWorld* World = GetWorld();
+	if (!World || BufferedInputs.Num() == 0)
+	{
+		return;
+	}
+
+	const UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(GetPawn<APawn>());
+	UGGYGOAbilitySystemComponent* GGYGOASC = PawnExtComp ? PawnExtComp->GetGGYGOAbilitySystemComponent() : nullptr;
+	if (!GGYGOASC)
+	{
+		return;
+	}
+
+	const float Now = World->GetTimeSeconds();
+
+	// 先剔除过期项。
+	//
+	// 过期清理放在组空出这个时机而不是每帧 Tick：缓冲项很少，
+	// 而组空出本身就是唯一需要读取缓冲的时刻，为它单独开一个 Tick 不划算。
+	BufferedInputs.RemoveAll([this, Now](const FBufferedInput& Buffered)
+	{
+		return (Now - Buffered.BufferedAtTime) > InputBufferWindow;
+	});
+
+	// 重试时不按 GroupTag 筛选缓冲项。
+	//
+	// 缓冲的是 InputTag，而一个 InputTag 可能对应多个能力、分属不同组，
+	// 意图层无从判断它该等哪个组。直接全部重试一遍，由 ASC 的仲裁决定
+	// 哪些能通过 —— 那本来就是它的职责，重复判断只会引入不一致。
+	//
+	// 复制一份再遍历：重试会激活能力，能力可能同帧结束并再次触发本函数，
+	// 直接遍历原数组会在迭代中被修改。
+	TArray<FBufferedInput> Pending = BufferedInputs;
+	BufferedInputs.Reset();
+
+	for (const FBufferedInput& Buffered : Pending)
+	{
+		GGYGOASC->AbilityInputTagPressed(Buffered.InputTag);
 	}
 }

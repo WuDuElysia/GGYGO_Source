@@ -47,6 +47,14 @@ namespace GGYGOGameplayTags
 	// Move / Look 走 `BindNativeAction` 直连，不进 GAS（与 Lyra 一致）。
 	// ============================================================
 
+	/**
+	 * InputTag 的根标签。
+	 *
+	 * 本身不作为具体输入使用，存在的意义是让"这个 Tag 是不是一个输入标签"
+	 * 可以用一次层级匹配回答，而不必比较字符串前缀。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag);
+
 	/** 移动轴。直连 `AddMovementInput`，不激活任何能力。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Move);
 	/** 鼠标视角。直连 Controller。 */

@@ -72,6 +72,18 @@ GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_GGYGO_Gameplay_AbilityInputBlocked)
  */
 DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityGroupFreed, FGameplayTag /*GroupTag*/);
 
+/**
+ * 某个 InputTag 的激活请求被拒但值得重试。
+ *
+ * 只在失败原因是"组内已有实例且该组严格先来后到"时广播 ——
+ * 冷却、资源不足这类原因重试也不会成功。
+ *
+ * 参数是 InputTag 而不是能力句柄：意图层缓冲的是"玩家按了什么键"，
+ * 重试时应当重新走一遍完整的输入处理（那期间可能有更高优先级的能力
+ * 变得可用），而不是死盯着当初那一个句柄。
+ */
+DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityInputRetryable, FGameplayTag /*InputTag*/);
+
 UCLASS()
 class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
 {
@@ -156,6 +168,9 @@ public:
 
 	/** 组的最后一个实例结束时广播。见 `FGGYGOAbilityGroupFreed` 说明。 */
 	FGGYGOAbilityGroupFreed OnAbilityGroupFreed;
+
+	/** 请求被拒但值得重试时广播。见 `FGGYGOAbilityInputRetryable` 说明。 */
+	FGGYGOAbilityInputRetryable OnAbilityInputRetryable;
 
 	// ===== Tag 关系 =====
 
