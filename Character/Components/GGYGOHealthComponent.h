@@ -203,13 +203,14 @@ protected:
 	virtual void OnRep_DeathState(EGGYGODeathState OldDeathState);
 
 	/**
-	 * 自毁用的伤害 GE。需要一个带 `SetByCaller.Damage` 幅度的即时 GE。
+	 * 自毁用的伤害 GE，覆盖项目默认值。
 	 *
-	 * 留空则 `DamageSelfDestruct` 只记录错误并返回，不会退化成直接改属性 ——
-	 * 静默降级会掩盖配置缺失，等到线上出现"掉出世界不死"才被发现。
+	 * 留空则用 `UGGYGOGameData::SelfDestructGameplayEffect` —— 自毁对所有角色
+	 * 是同一件事，通常不需要逐个配。这个字段留给特例（例如爆炸型敌人
+	 * 死亡时要连带范围伤害）。
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Health")
-	TSubclassOf<UGameplayEffect> SelfDestructEffect;
+	TSubclassOf<UGameplayEffect> SelfDestructEffectOverride;
 
 	/** 本组件绑定的 ASC。 */
 	UPROPERTY()

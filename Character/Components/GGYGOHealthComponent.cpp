@@ -11,6 +11,7 @@
 #include "GameplayEffectExtension.h"
 #include "GameplayEffectTypes.h"
 #include "Net/UnrealNetwork.h"
+#include "System/GGYGOGameData.h"
 #include "System/GGYGOGameplayTags.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOHealthComponent)
@@ -352,11 +353,22 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 		return;
 	}
 
-	if (!SelfDestructEffect)
+	// 组件上的覆盖值优先，没配则用项目默认。
+	TSubclassOf<UGameplayEffect> EffectToApply = SelfDestructEffectOverride;
+	if (!EffectToApply)
 	{
-		// 显式报错而不是退化为直接改属性。见头文件对该字段的说明。
+		if (const UGGYGOGameData* GameData = UGGYGOGameData::Get())
+		{
+			EffectToApply = GameData->SelfDestructGameplayEffect.LoadSynchronous();
+		}
+	}
+
+	if (!EffectToApply)
+	{
+		// 显式报错而不是退化为直接改属性。直接改会绕过免疫判定与元属性消费，
+		// 让"无敌帧内掉出世界"的行为与正常受伤不一致。
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("DamageSelfDestruct: [%s] 的 HealthComponent 未配置 SelfDestructEffect，无法自毁。"),
+			TEXT("DamageSelfDestruct: [%s] 既没有 SelfDestructEffectOverride，GameData 里也没配 SelfDestructGameplayEffect。"),
 			*GetNameSafe(GetOwner()));
 		return;
 	}
@@ -364,12 +376,12 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 	FGameplayEffectContextHandle Context = AbilitySystemComponent->MakeEffectContext();
 	Context.AddSourceObject(this);
 
-	const FGameplayEffectSpecHandle SpecHandle = AbilitySystemComponent->MakeOutgoingSpec(SelfDestructEffect, 1.0f, Context);
+	const FGameplayEffectSpecHandle SpecHandle = AbilitySystemComponent->MakeOutgoingSpec(EffectToApply, 1.0f, Context);
 	if (!SpecHandle.IsValid() || !SpecHandle.Data.IsValid())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
 			TEXT("DamageSelfDestruct: [%s] 无法为 [%s] 创建 GE Spec。"),
-			*GetNameSafe(GetOwner()), *GetNameSafe(SelfDestructEffect));
+			*GetNameSafe(GetOwner()), *GetNameSafe(EffectToApply));
 		return;
 	}
 
