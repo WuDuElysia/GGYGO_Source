@@ -12,6 +12,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
+#include "Camera/GGYGOCameraComponent.h"
 #include "Engine/HitResult.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/Controller.h"
@@ -477,4 +478,36 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 			}
 		}
 	}
+}
+
+void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode)
+{
+	if (!CameraMode)
+	{
+		return;
+	}
+
+	// 只有被玩家操控的角色有相机组件。AI 角色走到这里是正常的，不报错。
+	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
+	{
+		CameraComponent->PushCameraMode(CameraMode);
+		ActiveCameraMode = CameraMode;
+	}
+}
+
+void UGGYGOGameplayAbility::ClearCameraMode()
+{
+	// 只清标记，不弹栈。
+	//
+	// 相机模式栈没有"弹出"操作，恢复靠的是默认模式重新被推到栈顶后
+	// 权重平滑升回 1。显式弹出反而会造成一次跳变。
+	ActiveCameraMode = nullptr;
+}
+
+void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
+{
+	// 先清相机再交给父类：父类会清理 ActorInfo，之后就拿不到 Avatar 了。
+	ClearCameraMode();
+
+	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }

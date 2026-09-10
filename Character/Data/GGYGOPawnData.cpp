@@ -16,4 +16,5 @@ UGGYGOPawnData::UGGYGOPawnData(const FObjectInitializer& ObjectInitializer)
 	TagRelationshipMapping = nullptr;
 	MovementSet = nullptr;
 	InputConfig = nullptr;
+	DefaultCameraMode = nullptr;
 }

@@ -23,6 +23,8 @@
 
 #include "GGYGOHeroCharacter.generated.h"
 
+class UGGYGOCameraComponent;
+class UGGYGOCameraMode;
 class UGGYGOHeroComponent;
 class UObject;
 
@@ -38,8 +40,32 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOHeroComponent* GetHeroComponent() const { return HeroComponent; }
 
+	/** 相机组件。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
+	UGGYGOCameraComponent* GetCameraComponent() const { return CameraComponent; }
+
+protected:
+	virtual void PostInitializeComponents() override;
+
+	/**
+	 * 决定默认相机模式。绑到相机组件的委托上。
+	 *
+	 * 取自 PawnData，这样每个角色可以有不同的默认视角
+	 * （大剑角色需要更远的镜头，双刀角色可以更近）。
+	 */
+	TSubclassOf<UGGYGOCameraMode> DetermineCameraMode() const;
+
 private:
 	/** 输入处理。IMC 与优先级在这个组件的细节面板里配。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOHeroComponent> HeroComponent;
+
+	/**
+	 * 相机。
+	 *
+	 * 挂在角色而不是 Controller 上：队伍换人时镜头参数应当跟着角色走，
+	 * 而 Controller 是跨角色复用的。
+	 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UGGYGOCameraComponent> CameraComponent;
 };

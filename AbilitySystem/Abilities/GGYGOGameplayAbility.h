@@ -12,9 +12,7 @@
  * Lyra 用三值枚举 `ELyraAbilityActivationGroup` 做并发控制。本项目**不照抄那个枚举**，
  * 直接用组 Tag + 优先级模型，避免先引入一套马上要被替换的类型。
  *
- * ## 本阶段未实现的部分
- * - 相机模式（`SetCameraMode` / `ClearCameraMode`）：依赖 HeroComponent 与 CameraMode，都还不存在
- * - 相机模式相关的接口，依赖尚未建立的 HeroComponent
+ * ## 尚未实现的部分
  *
  * ## 默认策略
  * 构造函数里设的四个 GAS 策略值得留意：
@@ -42,6 +40,7 @@ class IGGYGOAbilitySourceInterface;
 class UAnimMontage;
 class UGGYGOAbilityCost;
 class UGGYGOAbilitySystemComponent;
+class UGGYGOCameraMode;
 class UObject;
 struct FFrame;
 struct FGameplayAbilityActorInfo;
@@ -168,6 +167,38 @@ protected:
 
 	/** Avatar 绑定完成。转发给蓝图。 */
 	virtual void OnPawnAvatarSet();
+
+	// ===== 相机模式 =====
+
+	/**
+	 * 激活期间接管相机。
+	 *
+	 * 只对被玩家操控的角色有效（AI 角色没有相机组件）。
+	 * 不需要显式恢复 —— 停止推入后默认模式会在下一帧混合回来，
+	 * 但仍应在能力结束时调 `ClearCameraMode` 以停止每帧推入。
+	 */
+	void SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode);
+
+	/** 停止接管相机。能力被打断时也会经 `EndAbility` 自动调用。 */
+	void ClearCameraMode();
+
+	/**
+	 * 能力结束时清理相机接管。
+	 *
+	 * 必须重写它而不是只在正常结束路径里清理：能力可能被组仲裁取消、
+	 * 被死亡取消、或因 Avatar 销毁而结束，那些路径都不会走能力自己的收尾逻辑，
+	 * 相机会永久停在演出视角。
+	 */
+	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
+
+	/**
+	 * 激活期间使用的相机模式。留空表示不接管相机。
+	 *
+	 * 配在能力上而非由代码指定，是为了让同一个能力类在不同角色上
+	 * 能有不同的演出镜头。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Camera")
+	TSubclassOf<UGGYGOCameraMode> ActiveCameraMode;
 
 	/**
 	 * 解析能力来源，用于构造 EffectContext。

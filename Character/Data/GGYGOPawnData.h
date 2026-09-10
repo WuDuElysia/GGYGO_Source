@@ -29,6 +29,7 @@ class APawn;
 class UGGYGOAbilityGroupConfig;
 class UGGYGOAbilitySet;
 class UGGYGOAbilityTagRelationshipMapping;
+class UGGYGOCameraMode;
 class UGGYGOInputConfig;
 class UGGYGOMovementSet;
 class UObject;
@@ -102,4 +103,14 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input")
 	TObjectPtr<const UGGYGOInputConfig> InputConfig;
+
+	/**
+	 * 默认相机模式，作为相机模式栈的栈底。
+	 *
+	 * 每个角色可以不同：武器长度与体型决定了合适的镜头距离。
+	 * 留空则相机保持上一次的模式，不会强行塞一个兜底模式 ——
+	 * 那会在初始化完成的瞬间产生可见的视角跳变。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Camera")
+	TSubclassOf<UGGYGOCameraMode> DefaultCameraMode;
 };

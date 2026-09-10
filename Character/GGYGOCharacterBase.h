@@ -59,6 +59,8 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOPawnExtensionComponent* GetPawnExtensionComponent() const { return PawnExtComponent; }
 
+
+
 	/** 生命与韧性门面。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOHealthComponent* GetHealthComponent() const { return HealthComponent; }
