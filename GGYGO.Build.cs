@@ -24,6 +24,8 @@ public class GGYGO : ModuleRules
 			"GameFeatures",
 			// UPhysicalMaterial：GGYGOPhysicalMaterialWithTags 派生它，用于命中材质分流与减伤。
 			"PhysicsCore",
+			// 命中特效：GameplayCue 里生成 Niagara 系统。
+			"Niagara",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
