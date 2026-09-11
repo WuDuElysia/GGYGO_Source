@@ -77,12 +77,16 @@ void UGGYGOHealthComponent::InitializeWithAbilitySystem(UGGYGOAbilitySystemCompo
 	HealthSet = AbilitySystemComponent->GetSet<UGGYGOHealthSet>();
 	if (!HealthSet)
 	{
-		// 常见原因：PawnData 的 AbilitySets 里没有配 GGYGOHealthSet。
-		// 这里只报错不崩，让角色仍能生成（便于排查），但生命相关功能全部失效。
+		// 属性集是队伍位置的默认子对象，随 ASC 一同到达，正常不可能缺失。
+		// 走到这里说明传进来的 ASC 不是位置上的那个（例如某处自己建了一个 ASC）。
+		//
+		// 这里**不**把 AbilitySystemComponent 置空：那样本组件会退回"未绑定"状态，
+		// 下一次广播时再走一遍同样的失败，把一次配置错误变成反复出现的噪声，
+		// 反而掩盖了首次失败的位置。保留绑定，让错误只报一次。
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("InitializeWithAbilitySystem: [%s] 的 ASC 上找不到 UGGYGOHealthSet，请检查 PawnData 的 AbilitySets 配置。"),
+			TEXT("InitializeWithAbilitySystem: [%s] 的 ASC 上找不到 UGGYGOHealthSet，生命功能失效。"
+				 "该属性集应由 AGGYGOCharacterSlot 以默认子对象持有。"),
 			*GetNameSafe(Owner));
-		AbilitySystemComponent = nullptr;
 		return;
 	}
 

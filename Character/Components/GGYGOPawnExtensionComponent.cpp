@@ -185,10 +185,9 @@ void UGGYGOPawnExtensionComponent::UninitializeAbilitySystem()
 	// 这里再清一遍会把新 Avatar 的能力误取消。
 	if (AbilitySystemComponent->GetAvatarActor() == GetOwner())
 	{
-		// 回收本组件授予的能力。必须在 CancelAbilities 之前 ——
-		// ClearAbility 内部会结束正在激活的实例，反过来就会留下已取消但未移除的 spec。
-		GrantedHandles.TakeFromAbilitySystem(AbilitySystemComponent);
-		bAbilitySetsGranted = false;
+		// 这里**不**回收 AbilitySet：能力由队伍位置授予，与位置同生命周期。
+		// 本 Pawn 只是 Avatar，它下场或销毁不该带走位置上的能力 ——
+		// 那正是"待命角色冷却继续走"依赖的前提。
 
 		// 死亡相关能力要能跨过 Avatar 更替继续跑（死亡演出、掉落物结算）。
 		FGameplayTagContainer AbilityTypesToIgnore;
@@ -255,12 +254,9 @@ void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 		return;
 	}
 
-	// ASC 侧的两张表。
-	if (AbilitySystemComponent)
-	{
-		AbilitySystemComponent->SetAbilityGroupConfig(PawnData->AbilityGroupConfig);
-		AbilitySystemComponent->SetTagRelationshipMapping(PawnData->TagRelationshipMapping);
-	}
+	// ASC 侧的配置（组规则表、Tag 关系表）不在这里做：它们属于 ASC，
+	// 而 ASC 归队伍位置持有，由 `AGGYGOCharacterSlot::InitializeForPawnData` 注入。
+	// 在两处都写会让"当前生效的是哪一份配置"取决于两个初始化流程的先后。
 
 	// 移动层。用 FindComponentByClass 而不是要求 Owner 是 ACharacter ——
 	// 载具、飞行单位将来可能不是 Character，那时它们没有这个组件，跳过即可。
@@ -278,32 +274,6 @@ void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 	{
 		CueManager->PreloadCuesForTags(PawnData->CuesToPreload);
 	}
-}
-
-void UGGYGOPawnExtensionComponent::GrantAbilitySets()
-{
-	// 授予是服务器权威操作，客户端靠 AbilitySpec 的复制拿到能力。
-	if (!AbilitySystemComponent || !PawnData || bAbilitySetsGranted)
-	{
-		return;
-	}
-
-	if (GetOwner()->GetLocalRole() != ROLE_Authority)
-	{
-		return;
-	}
-
-	for (const TObjectPtr<UGGYGOAbilitySet>& AbilitySet : PawnData->AbilitySets)
-	{
-		if (AbilitySet)
-		{
-			// SourceObject 传 PawnData：能力里可以由此回溯自己的配置来源，
-			// 比传 Pawn 更有用（Pawn 用 ActorInfo 就能拿到）。
-			AbilitySet->GiveToAbilitySystem(AbilitySystemComponent, &GrantedHandles, const_cast<UGGYGOPawnData*>(PawnData.Get()));
-		}
-	}
-
-	bAbilitySetsGranted = true;
 }
 
 void UGGYGOPawnExtensionComponent::CheckDefaultInitialization()
@@ -387,11 +357,6 @@ void UGGYGOPawnExtensionComponent::HandleChangeInitState(UGameFrameworkComponent
 		// 而 DataInitialized 的前置条件里包含 DataAvailable，后者要求 PawnData 非空，
 		// 所以走到这里 PawnData 一定有值。
 		ApplyPawnDataToConsumers();
-
-		// 授予能力同样放这里，还多一层理由：此刻所有 feature 都已 DataAvailable，
-		// 能力激活时依赖的其它组件（HealthComponent 等）都已就绪，
-		// OnSpawn 策略的能力可以安全激活。
-		GrantAbilitySets();
 	}
 }
 

@@ -29,17 +29,6 @@ AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitial
 	PrimaryActorTick.bCanEverTick = false;
 	PrimaryActorTick.bStartWithTickEnabled = false;
 
-	// ===== ASC =====
-	// 用 CreateDefaultSubobject 而非运行时 NewObject：
-	// ASC 的 InitAbilityActorInfo 会扫描 Actor 子对象自动发现 AttributeSet，
-	// 运行时创建的对象扫不到。
-	AbilitySystemComponent = CreateDefaultSubobject<UGGYGOAbilitySystemComponent>(TEXT("AbilitySystemComponent"));
-
-	// Mixed：队伍角色是玩家自己的单位，需要完整的 GE 与属性信息给 UI，
-	// 但对其他玩家只需要最小集。敌人 AI 在各自子类里改为 Minimal。
-	AbilitySystemComponent->SetIsReplicated(true);
-	AbilitySystemComponent->SetReplicationMode(EGameplayEffectReplicationMode::Mixed);
-
 	// ===== 协调者 =====
 	PawnExtComponent = CreateDefaultSubobject<UGGYGOPawnExtensionComponent>(TEXT("PawnExtensionComponent"));
 
@@ -58,7 +47,17 @@ AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitial
 
 UAbilitySystemComponent* AGGYGOCharacterBase::GetAbilitySystemComponent() const
 {
-	return AbilitySystemComponent;
+	return GetGGYGOAbilitySystemComponent();
+}
+
+UGGYGOAbilitySystemComponent* AGGYGOCharacterBase::GetGGYGOAbilitySystemComponent() const
+{
+	// ASC 不属于本角色，而属于它所在的队伍位置（决策 D1）。
+	// 本角色只是那个 ASC 的 Avatar，通过协调者拿到被注入的那一个。
+	//
+	// **可能返回 nullptr**：从 Pawn 生成到队伍位置注入 ASC 之间存在一个窗口。
+	// 调用方必须判空，不能沿用"角色一定有 ASC"的旧假设。
+	return PawnExtComponent ? PawnExtComponent->GetGGYGOAbilitySystemComponent() : nullptr;
 }
 
 UGGYGOCharacterMovementComponent* AGGYGOCharacterBase::GetGGYGOMovementComponent() const
@@ -72,15 +71,12 @@ void AGGYGOCharacterBase::PostInitializeComponents()
 {
 	Super::PostInitializeComponents();
 
-	// 在这里初始化而不是 BeginPlay：所有组件此时都已注册，
-	// 而 BeginPlay 时 InitState 已经开始推进，ASC 还没就位会让 DataAvailable 卡住。
+	// 这里**不再**绑定 ASC。ASC 归队伍位置（`AGGYGOCharacterSlot`）持有，
+	// 由装配方在生成本角色后调用 `PawnExtComponent->InitializeAbilitySystem(SlotASC, Slot)` 注入。
 	//
-	// OwnerActor 和 AvatarActor 都传 this —— ASC 归角色自己（决策 D1）。
-	// 队伍共享资源（队伍能量之类）需要的是另一个挂 PlayerState 的 ASC，不走这里。
-	if (AbilitySystemComponent && PawnExtComponent)
-	{
-		PawnExtComponent->InitializeAbilitySystem(AbilitySystemComponent, this);
-	}
+	// 之所以不能在这里自己建一个再绑：那样属性集只能跟着 Pawn 的初始化流程走，
+	// 而本角色的 HealthComponent 也在同一段流程里初始化，两者先后无法保证。
+	// 属性集现在是 Slot 的默认子对象，Slot 一存在就绪，早于本角色。
 }
 
 void AGGYGOCharacterBase::BeginPlay()
@@ -174,11 +170,17 @@ void AGGYGOCharacterBase::FellOutOfWorld(const UDamageType& DmgType)
 void AGGYGOCharacterBase::OnAbilitySystemInitialized()
 {
 	UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
-	check(GGYGOASC);
+	if (!GGYGOASC)
+	{
+		// 本回调由协调者在 ASC 注入完成后触发，正常不会为空。
+		// 但 RegisterAndCall 会补发一次已发生的广播，注册方若在注入之前订阅就会走到这里。
+		return;
+	}
 
 	// HealthComponent 在这里而不是自己的 BeginPlay 里初始化：
-	// 它需要从 ASC 上取 HealthSet，而 AttributeSet 由 AbilitySet 在
-	// InitState 的 DataInitialized 阶段授予，时机不由 HealthComponent 自己决定。
+	// 它要从 ASC 上取 HealthSet，而 ASC 何时被注入不由 HealthComponent 决定。
+	//
+	// 属性集本身不存在就绪问题 —— 它是队伍位置的默认子对象，随 ASC 一同到达。
 	if (HealthComponent)
 	{
 		HealthComponent->InitializeWithAbilitySystem(GGYGOASC);

@@ -14,6 +14,7 @@
 #include "GameModes/GGYGOExperienceDefinition.h"
 #include "Player/GGYGOPlayerController.h"
 #include "Player/GGYGOPlayerState.h"
+#include "Teams/GGYGOCharacterSlot.h"
 #include "Teams/GGYGOSquadComponent.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOGameMode)
@@ -116,6 +117,14 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 		? StartSpot->GetActorTransform()
 		: FTransform::Identity;
 
+	// 两阶段装配。
+	//
+	// 阶段一只建位置，不建实体：位置持有 ASC 与属性集，走完这一阶段
+	// 全队的属性、冷却、组规则就都已就绪。阶段二生成的 Pawn 无论以什么顺序
+	// 初始化，都不会遇到"属性集还没到"的情况 —— 这是 ASC 放在位置上的目的。
+	TArray<AGGYGOCharacterSlot*> SpawnedSlots;
+	SpawnedSlots.Reserve(Experience->SquadMembers.Num());
+
 	for (const TObjectPtr<const UGGYGOPawnData>& PawnData : Experience->SquadMembers)
 	{
 		if (!PawnData)
@@ -123,12 +132,88 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 			continue;
 		}
 
-		if (AGGYGOCharacterBase* Member = SpawnSquadMember(NewPlayer, PawnData, SpawnTransform))
+		if (AGGYGOCharacterSlot* Slot = SpawnSquadSlot(NewPlayer, PawnData))
 		{
-			// 第一个登记的成员会由 SquadComponent 自动设为出战并被附身。
-			SquadComponent->RegisterMember(Member);
+			SpawnedSlots.Add(Slot);
 		}
 	}
+
+	// 阶段二：为每个位置生成实体并互相绑定。
+	//
+	// 登记放在这里而不是阶段一：`RegisterSlot` 会把第一个位置设为出战并附身它的 Pawn，
+	// 那要求 Pawn 已经存在。
+	for (AGGYGOCharacterSlot* Slot : SpawnedSlots)
+	{
+		const UGGYGOPawnData* PawnData = Slot->GetPawnData();
+		if (!PawnData)
+		{
+			continue;
+		}
+
+		AGGYGOCharacterBase* Member = SpawnSquadMember(NewPlayer, PawnData, SpawnTransform);
+		if (!Member)
+		{
+			continue;
+		}
+
+		// 把位置的 ASC 注入 Pawn 的协调者：Owner 是位置，Avatar 是 Pawn。
+		if (UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Member))
+		{
+			PawnExtComp->InitializeAbilitySystem(Slot->GetGGYGOAbilitySystemComponent(), Slot);
+		}
+
+		// 反向绑定：让位置的 ASC 知道自己的 Avatar 是谁。
+		Slot->SetAvatar(Member);
+
+		// 第一个登记的位置会由 SquadComponent 自动设为出战并被附身。
+		SquadComponent->RegisterSlot(Slot);
+	}
+
+	// 装配结果留一条记录：这条链路跨 GameMode、位置、Pawn、SquadComponent 四方，
+	// 出问题时"到底装了几个位置、谁在出战"是第一个要回答的问题，
+	// 没有它就只能靠断点或逐个 Actor 翻查。
+	const AGGYGOCharacterBase* ActiveCharacter = SquadComponent->GetActiveCharacter();
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("SpawnSquadForPlayer: 装配完成，位置 %d 个，出战 [%s]。"),
+		SquadComponent->GetSlotCount(), *GetNameSafe(ActiveCharacter));
+}
+
+AGGYGOCharacterSlot* AGGYGOGameMode::SpawnSquadSlot(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData)
+{
+	UWorld* World = GetWorld();
+	if (!World || !PawnData)
+	{
+		return nullptr;
+	}
+
+	FActorSpawnParameters SpawnParams;
+
+	// Owner 必须是 PlayerController。
+	//
+	// GAS 的客户端预测靠 `ASC->GetOwnerActor()->GetNetOwningPlayer()` 找到玩家连接，
+	// 而位置本身不是 Pawn 也不是 PlayerState，这条链只能靠 Owner 建立。
+	// 设错的症状是 PredictionKey 生成不出来、所有 LocalPredicted 能力退化成
+	// 纯服务器执行（输入延迟一个 RTT），而且**不会报任何错**。
+	SpawnParams.Owner = OwningPlayer;
+
+	// 位置没有空间存在感，出生变换取单位变换即可。
+	AGGYGOCharacterSlot* Slot = World->SpawnActor<AGGYGOCharacterSlot>(
+		AGGYGOCharacterSlot::StaticClass(),
+		FTransform::Identity,
+		SpawnParams);
+
+	if (!Slot)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("SpawnSquadSlot: 为 [%s] 生成队伍位置失败。"), *GetNameSafe(PawnData));
+		return nullptr;
+	}
+
+	// 装载角色定义：注入组规则与 Tag 关系表，并授予该角色的 AbilitySet。
+	// 这一步完成后本位置的属性与能力就已可用，与实体是否存在无关。
+	Slot->InitializeForPawnData(PawnData);
+
+	return Slot;
 }
 
 AGGYGOCharacterBase* AGGYGOGameMode::SpawnSquadMember(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData, const FTransform& SpawnTransform)

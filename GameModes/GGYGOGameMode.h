@@ -19,6 +19,7 @@
 
 class APlayerController;
 class AGGYGOCharacterBase;
+class AGGYGOCharacterSlot;
 class UGGYGOExperienceDefinition;
 class UGGYGOPawnData;
 class UObject;
@@ -51,8 +52,16 @@ protected:
 	 */
 	void ActivateGameFeatures();
 
-	/** 按 Experience 为该玩家生成队伍并登记。 */
+	/** 按 Experience 为该玩家生成队伍并登记。分两阶段：先建位置，再建实体。 */
 	void SpawnSquadForPlayer(APlayerController* NewPlayer);
+
+	/**
+	 * 生成一个队伍位置并装载角色定义。
+	 *
+	 * 位置持有 ASC 与属性集，必须先于实体存在。
+	 * `OwningPlayer` 会被设为位置的 Owner —— GAS 的预测链依赖它，不能省。
+	 */
+	AGGYGOCharacterSlot* SpawnSquadSlot(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData);
 
 	/** 生成单个成员并完成 PawnData 注入。 */
 	AGGYGOCharacterBase* SpawnSquadMember(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData, const FTransform& SpawnTransform);

@@ -12,6 +12,8 @@
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
 #include "Net/UnrealNetwork.h"
+#include "Teams/GGYGOCharacterSlot.h"
+#include "Teams/GGYGOSquadTypes.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOSquadComponent)
 
@@ -30,24 +32,43 @@ void UGGYGOSquadComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
-	DOREPLIFETIME(UGGYGOSquadComponent, Members);
-	DOREPLIFETIME(UGGYGOSquadComponent, ActiveMemberIndex);
+	DOREPLIFETIME(UGGYGOSquadComponent, Slots);
+	DOREPLIFETIME(UGGYGOSquadComponent, ActiveSlotIndex);
+}
+
+AGGYGOCharacterSlot* UGGYGOSquadComponent::GetActiveSlot() const
+{
+	return Slots.IsValidIndex(ActiveSlotIndex) ? Slots[ActiveSlotIndex] : nullptr;
+}
+
+AGGYGOCharacterSlot* UGGYGOSquadComponent::GetSlot(int32 SlotIndex) const
+{
+	return Slots.IsValidIndex(SlotIndex) ? Slots[SlotIndex] : nullptr;
 }
 
 AGGYGOCharacterBase* UGGYGOSquadComponent::GetActiveCharacter() const
 {
-	return Members.IsValidIndex(ActiveMemberIndex) ? Members[ActiveMemberIndex] : nullptr;
+	const AGGYGOCharacterSlot* ActiveSlot = GetActiveSlot();
+	return ActiveSlot ? Cast<AGGYGOCharacterBase>(ActiveSlot->GetAvatarPawn()) : nullptr;
 }
 
-bool UGGYGOSquadComponent::CanMemberBeActive(const AGGYGOCharacterBase* Member) const
+bool UGGYGOSquadComponent::CanSlotBeActive(const AGGYGOCharacterSlot* Slot) const
 {
-	if (!Member)
+	if (!Slot)
 	{
 		return false;
 	}
 
-	// 已死亡的成员不能出战。切人到尸体上会让玩家失去控制且无法切回。
-	if (const UGGYGOHealthComponent* HealthComponent = Member->GetHealthComponent())
+	// 没有实体的位置不能出战。Pawn 可能尚未生成或已销毁，
+	// 此时位置的属性与冷却仍在，但没有可附身的目标。
+	AGGYGOCharacterBase* Character = Cast<AGGYGOCharacterBase>(Slot->GetAvatarPawn());
+	if (!Character)
+	{
+		return false;
+	}
+
+	// 已死亡的位置不能出战。切人到尸体上会让玩家失去控制且无法切回。
+	if (const UGGYGOHealthComponent* HealthComponent = Character->GetHealthComponent())
 	{
 		if (HealthComponent->IsDeadOrDying())
 		{
@@ -58,9 +79,9 @@ bool UGGYGOSquadComponent::CanMemberBeActive(const AGGYGOCharacterBase* Member) 
 	return true;
 }
 
-void UGGYGOSquadComponent::RegisterMember(AGGYGOCharacterBase* Member)
+void UGGYGOSquadComponent::RegisterSlot(AGGYGOCharacterSlot* Slot)
 {
-	if (!Member)
+	if (!Slot)
 	{
 		return;
 	}
@@ -72,23 +93,33 @@ void UGGYGOSquadComponent::RegisterMember(AGGYGOCharacterBase* Member)
 		return;
 	}
 
-	if (Members.Contains(Member))
+	if (Slots.Contains(Slot))
 	{
 		return;
 	}
 
-	Members.Add(Member);
-
-	// 新登记的成员默认待命。第一个成员随后被激活。
-	DeactivateMember(Member);
-
-	if (ActiveMemberIndex == INDEX_NONE)
+	if (Slots.Num() >= GGYGO_MAX_SQUAD_SIZE)
 	{
-		SwitchToMember(0);
+		// 在装配阶段拒绝而不是接受后再承担复制开销：每个位置带一个 ASC，
+		// 配置越界的代价是成倍的网络流量，而那要到压测时才会被发现。
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("RegisterSlot: 队伍已满（上限 %d），拒绝登记 [%s]。请检查玩法配置的队伍规模。"),
+			GGYGO_MAX_SQUAD_SIZE, *GetNameSafe(Slot));
+		return;
+	}
+
+	Slots.Add(Slot);
+
+	// 新登记的位置默认待命。第一个位置随后被激活。
+	DeactivateSlot(Slot);
+
+	if (ActiveSlotIndex == INDEX_NONE)
+	{
+		SwitchToSlot(0);
 	}
 }
 
-bool UGGYGOSquadComponent::SwitchToMember(int32 MemberIndex)
+bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex)
 {
 	AActor* Owner = GetOwner();
 	if (!Owner || Owner->GetLocalRole() != ROLE_Authority)
@@ -96,13 +127,13 @@ bool UGGYGOSquadComponent::SwitchToMember(int32 MemberIndex)
 		return false;
 	}
 
-	if (!Members.IsValidIndex(MemberIndex) || MemberIndex == ActiveMemberIndex)
+	if (!Slots.IsValidIndex(SlotIndex) || SlotIndex == ActiveSlotIndex)
 	{
 		return false;
 	}
 
-	AGGYGOCharacterBase* NewActive = Members[MemberIndex];
-	if (!CanMemberBeActive(NewActive))
+	AGGYGOCharacterSlot* NewSlot = Slots[SlotIndex];
+	if (!CanSlotBeActive(NewSlot))
 	{
 		return false;
 	}
@@ -112,46 +143,48 @@ bool UGGYGOSquadComponent::SwitchToMember(int32 MemberIndex)
 	if (!PC)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SwitchToMember: [%s] 找不到 PlayerController，无法转移控制权。"), *GetNameSafe(Owner));
+			TEXT("SwitchToSlot: [%s] 找不到 PlayerController，无法转移控制权。"), *GetNameSafe(Owner));
 		return false;
 	}
 
-	AGGYGOCharacterBase* OldActive = GetActiveCharacter();
+	AGGYGOCharacterSlot* OldSlot = GetActiveSlot();
 
 	// 顺序很重要：先解除旧的再附身新的。
 	//
 	// 反过来做会让 UnPossess 在新 Pawn 已被附身之后执行，
 	// 而 UnPossess 会清掉 Controller 的 Pawn 引用 —— 刚建立的附身关系被清掉。
-	if (OldActive)
+	if (OldSlot)
 	{
 		PC->UnPossess();
-		DeactivateMember(OldActive);
+		DeactivateSlot(OldSlot);
 	}
 
-	ActiveMemberIndex = MemberIndex;
+	ActiveSlotIndex = SlotIndex;
 
-	ActivateMember(NewActive);
-	PC->Possess(NewActive);
+	ActivateSlot(NewSlot);
 
-	OnActiveCharacterChanged.Broadcast(NewActive);
+	AGGYGOCharacterBase* NewCharacter = Cast<AGGYGOCharacterBase>(NewSlot->GetAvatarPawn());
+	PC->Possess(NewCharacter);
+
+	OnActiveCharacterChanged.Broadcast(NewCharacter);
 
 	return true;
 }
 
-bool UGGYGOSquadComponent::SwitchToNextMember()
+bool UGGYGOSquadComponent::SwitchToNextSlot()
 {
-	const int32 Count = Members.Num();
+	const int32 Count = Slots.Num();
 	if (Count <= 1)
 	{
 		return false;
 	}
 
-	// 从下一个开始逐个试，跳过死亡成员。
-	// 最多试 Count - 1 次：试满一圈还没成功说明只有自己活着。
+	// 从下一个开始逐个试，跳过死亡或无实体的位置。
+	// 最多试 Count - 1 次：试满一圈还没成功说明只有自己可出战。
 	for (int32 Offset = 1; Offset < Count; ++Offset)
 	{
-		const int32 Candidate = (ActiveMemberIndex + Offset) % Count;
-		if (SwitchToMember(Candidate))
+		const int32 Candidate = (ActiveSlotIndex + Offset) % Count;
+		if (SwitchToSlot(Candidate))
 		{
 			return true;
 		}
@@ -160,9 +193,9 @@ bool UGGYGOSquadComponent::SwitchToNextMember()
 	return false;
 }
 
-bool UGGYGOSquadComponent::SwitchToPreviousMember()
+bool UGGYGOSquadComponent::SwitchToPreviousSlot()
 {
-	const int32 Count = Members.Num();
+	const int32 Count = Slots.Num();
 	if (Count <= 1)
 	{
 		return false;
@@ -171,8 +204,8 @@ bool UGGYGOSquadComponent::SwitchToPreviousMember()
 	for (int32 Offset = 1; Offset < Count; ++Offset)
 	{
 		// 加 Count 再取模，避免负数下标。
-		const int32 Candidate = ((ActiveMemberIndex - Offset) % Count + Count) % Count;
-		if (SwitchToMember(Candidate))
+		const int32 Candidate = ((ActiveSlotIndex - Offset) % Count + Count) % Count;
+		if (SwitchToSlot(Candidate))
 		{
 			return true;
 		}
@@ -181,34 +214,36 @@ bool UGGYGOSquadComponent::SwitchToPreviousMember()
 	return false;
 }
 
-void UGGYGOSquadComponent::ActivateMember(AGGYGOCharacterBase* Member)
+void UGGYGOSquadComponent::ActivateSlot(AGGYGOCharacterSlot* Slot)
 {
-	if (!Member)
+	AGGYGOCharacterBase* Character = Slot ? Cast<AGGYGOCharacterBase>(Slot->GetAvatarPawn()) : nullptr;
+	if (!Character)
 	{
 		return;
 	}
 
-	Member->SetActorHiddenInGame(false);
-	Member->SetActorEnableCollision(true);
+	Character->SetActorHiddenInGame(false);
+	Character->SetActorEnableCollision(true);
 
-	if (UCharacterMovementComponent* MoveComp = Member->GetCharacterMovement())
+	if (UCharacterMovementComponent* MoveComp = Character->GetCharacterMovement())
 	{
 		// 恢复到行走模式。待命期间移动模式被设为 None，不恢复的话角色不会动。
 		MoveComp->SetMovementMode(MOVE_Walking);
 	}
 }
 
-void UGGYGOSquadComponent::DeactivateMember(AGGYGOCharacterBase* Member)
+void UGGYGOSquadComponent::DeactivateSlot(AGGYGOCharacterSlot* Slot)
 {
-	if (!Member)
+	AGGYGOCharacterBase* Character = Slot ? Cast<AGGYGOCharacterBase>(Slot->GetAvatarPawn()) : nullptr;
+	if (!Character)
 	{
 		return;
 	}
 
-	Member->SetActorHiddenInGame(true);
-	Member->SetActorEnableCollision(false);
+	Character->SetActorHiddenInGame(true);
+	Character->SetActorEnableCollision(false);
 
-	if (UCharacterMovementComponent* MoveComp = Member->GetCharacterMovement())
+	if (UCharacterMovementComponent* MoveComp = Character->GetCharacterMovement())
 	{
 		// 停住并禁用移动。只隐藏不停移动会让待命角色带着上一刻的速度
 		// 继续滑行，切回来时位置已经偏离。
@@ -216,12 +251,12 @@ void UGGYGOSquadComponent::DeactivateMember(AGGYGOCharacterBase* Member)
 		MoveComp->DisableMovement();
 	}
 
-	// 待命角色的 ASC **不做任何处理**：冷却要继续走、Buff 要继续计时、
-	// 血量要保留。这是队伍制玩法的核心，也是选择换 Avatar 而不是
-	// 销毁重建的理由。
+	// 待命位置的 ASC **不做任何处理**：冷却要继续走、Buff 要继续计时、
+	// 血量要保留。这些状态都在位置上而不在 Pawn 上，所以即便将来改成
+	// 待命时销毁 Pawn，它们同样不受影响。
 }
 
-void UGGYGOSquadComponent::OnRep_ActiveMemberIndex()
+void UGGYGOSquadComponent::OnRep_ActiveSlotIndex()
 {
 	// 客户端只更新表现。隐藏与碰撞由 Actor 自身的复制属性同步，
 	// 这里只需要广播事件让 UI 与相机跟上。

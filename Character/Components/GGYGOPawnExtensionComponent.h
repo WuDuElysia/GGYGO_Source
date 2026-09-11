@@ -29,14 +29,15 @@
  * `DataInitialized` 那一条是整个机制的核心：它把"等别人就绪"从各组件的手工判断
  * 变成向 Manager 的一次查询（`HaveAllFeaturesReachedInitState`）。
  *
- * ## 与 Lyra 的三处差异
- * 1. **ASC 挂在 Pawn 自己身上**（决策 D1），不是 PlayerState。Lyra 一个 PlayerState
- *    一个 ASC，而本项目一名玩家带三个角色，共用 ASC 会让三角色共享 HP 与冷却。
- *    `InitializeAbilitySystem` 仍保留 `InOwnerActor` 参数，因为队伍级 ASC
- *    （挂 PlayerState、管队伍共享资源）将来仍走这条路。
- * 2. **额外注入 `AbilityGroupConfig`**，这是本项目的组并发规则表，Lyra 没有对应物。
- * 3. **AbilitySets 在这里授予**。Lyra 在 `ALyraPlayerState::SetPawnData` 里授予，
- *    因为 ASC 归 PlayerState；我们的 ASC 归 Pawn，授予方自然也跟着下来。
+ * ## 与 Lyra 的差异
+ * 1. **ASC 既不挂 Pawn 也不挂 PlayerState，而挂队伍位置 `AGGYGOCharacterSlot`**（决策 D1）。
+ *    一名玩家带多个角色，共用 PlayerState 上的一个 ASC 会让各角色共享 HP 与冷却；
+ *    而挂 Pawn 会让属性集的就绪时机被 Pawn 初始化流程牵制。
+ *    本组件因此只**接收**外部注入的 ASC：`InitializeAbilitySystem(SlotASC, Slot)`，
+ *    `InOwnerActor` 传的就是那个位置。
+ * 2. **本组件不授予 AbilitySet**。Lyra 在 `ALyraPlayerState::SetPawnData` 里授予，
+ *    因为 ASC 归 PlayerState；本项目归位置，所以授予方也在位置上。
+ *    本组件只分发 PawnData 里属于 Pawn 的部分：移动参数与 Cue 预热。
  */
 #pragma once
 
@@ -160,8 +161,9 @@ protected:
 	 */
 	void ApplyPawnDataToConsumers();
 
-	/** 授予 PawnData 里配置的所有 AbilitySet。仅服务器，且只执行一次。 */
-	void GrantAbilitySets();
+	// 能力授予不在本组件：AbilitySet 由队伍位置 `AGGYGOCharacterSlot` 在装配时授予，
+	// 因为 ASC 与属性集都归它持有。本组件只负责把 PawnData 里**属于 Pawn 的**部分
+	// （移动参数、Cue 预热）分发下去。
 
 	/** ASC 就绪（本 Pawn 成为 Avatar）后广播。 */
 	FSimpleMulticastDelegate OnAbilitySystemInitialized;
@@ -182,15 +184,4 @@ protected:
 	UPROPERTY(Transient)
 	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;
 
-	/**
-	 * 授予记录，用于反初始化时回收。
-	 *
-	 * 不回收的后果不是内存泄漏（ASC 销毁时一起走），而是**换 Avatar 时能力重复授予**：
-	 * 同一个 ASC 换到新 Pawn 后再授予一遍，两套句柄同时存在。
-	 */
-	UPROPERTY(Transient)
-	FGGYGOAbilitySet_GrantedHandles GrantedHandles;
-
-	/** AbilitySets 是否已授予。防止 `DataInitialized` 被重复进入时授予两遍。 */
-	bool bAbilitySetsGranted = false;
 };

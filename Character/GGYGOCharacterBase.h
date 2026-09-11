@@ -13,12 +13,16 @@
  * Character 的生命周期，于是"敌人不需要输入""载具不需要 Health"这类差异
  * 只能用运行时判断绕开，而不是干脆不挂那个组件。
  *
- * ## ASC 挂在这里而不是 PlayerState
- * 决策 D1。Lyra 一个 PlayerState 一个 ASC，但一个 ASC 只能挂一套同类 AttributeSet，
- * 而本项目一名玩家带三个角色（D2），共用 ASC 会让三角色共享生命值与技能冷却。
+ * ## ASC 不由本类持有
+ * 决策 D1：ASC 挂在队伍位置 `AGGYGOCharacterSlot` 上，本角色只是它的 Avatar。
  *
- * 代价是队伍级的共享资源（如队伍能量）需要另一个挂 PlayerState 的 ASC。
- * 本类的 `GetAbilitySystemComponent` 返回的始终是角色自己的那个。
+ * 一个 ASC 只能挂一套同类 AttributeSet，而一名玩家带多个角色（D2），
+ * 所以不能像 Lyra 那样共用 PlayerState 上的一个 ASC。但也不放在本类身上 ——
+ * 那会让属性集的就绪时机被 Pawn 的初始化流程牵制，而本类的
+ * `UGGYGOHealthComponent` 正是在同一段流程里读属性集的。
+ * 放在位置上，属性集随位置构造即就绪，早于任何 Pawn 存在。
+ *
+ * `GetAbilitySystemComponent` 返回被注入的那个 ASC，**在注入完成前为 nullptr**。
  */
 #pragma once
 
@@ -47,13 +51,17 @@ public:
 	AGGYGOCharacterBase(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
 	//~IAbilitySystemInterface
-	/** 返回本角色自己的 ASC。GAS 全部对外交互都经由它。 */
+	/** 返回本角色作为 Avatar 所属的那个 ASC。注入完成前为 nullptr。 */
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
 	//~End of IAbilitySystemInterface
 
-	/** 类型化的 ASC 访问器，省掉调用方的 Cast。 */
+	/**
+	 * 类型化的 ASC 访问器，省掉调用方的 Cast。
+	 *
+	 * 返回队伍位置注入的 ASC，**注入完成前为 nullptr**，调用方必须判空。
+	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
-	UGGYGOAbilitySystemComponent* GetGGYGOAbilitySystemComponent() const { return AbilitySystemComponent; }
+	UGGYGOAbilitySystemComponent* GetGGYGOAbilitySystemComponent() const;
 
 	/** 初始化协调者。其它组件通过它拿 PawnData 与 ASC。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
@@ -125,15 +133,6 @@ protected:
 	void UninitAndDestroy();
 
 private:
-	/**
-	 * GAS 中枢。挂在角色自己身上（决策 D1，理由见文件头）。
-	 *
-	 * `VisibleAnywhere` 而非 `EditDefaultsOnly`：组件实例由构造函数创建，
-	 * 不该在编辑器里被替换。
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;
-
 	/** 初始化协调者。必须存在，否则 InitState 链条断裂。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOPawnExtensionComponent> PawnExtComponent;
