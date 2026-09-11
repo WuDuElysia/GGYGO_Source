@@ -16,8 +16,38 @@
 #include "Player/GGYGOPlayerState.h"
 #include "Teams/GGYGOCharacterSlot.h"
 #include "Teams/GGYGOSquadComponent.h"
+#include "Teams/GGYGOSquadPresets.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOGameMode)
+
+namespace
+{
+	/**
+	 * 用本地玩家存档里的出战编队填充名单。
+	 *
+	 * 服务器上的远程玩家取不到 LocalPlayer，直接返回 false —— 别人的编队存在
+	 * 他自己的磁盘上，服务器读不到，只能由客户端上报（尚未实现）。
+	 * 所以联机时远程玩家目前走默认编队，这不是错误路径。
+	 *
+	 * @return 是否填充成功。没有编队、出战编队为空、成员全都解析不出来都算失败。
+	 */
+	bool TryApplySavedRoster(const APlayerController* PlayerController, UGGYGOSquadComponent* SquadComponent)
+	{
+		UGGYGOSquadPresets* Presets = UGGYGOSquadPresets::GetForPlayerController(PlayerController);
+		if (!Presets)
+		{
+			return false;
+		}
+
+		TArray<UGGYGOPawnData*> ResolvedRoster;
+		if (Presets->ResolveActivePresetRoster(ResolvedRoster) == 0)
+		{
+			return false;
+		}
+
+		return SquadComponent->SetRoster(ResolvedRoster);
+	}
+}
 
 AGGYGOGameMode::AGGYGOGameMode(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -108,15 +138,26 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 		return;
 	}
 
-	// 名单来源：玩家的编成结果优先，没有则用玩法配置里的默认编队。
+	// 名单来源按优先级三级回落：
 	//
-	// 这个优先级是编成功能的接入点：局外流程只要在装配前调用
-	// `SquadComponent->SetRoster()`，这里就会用玩家选的阵容；
-	// 什么都没设置时（新档、调试关卡、自动化测试）回落到 Experience 的默认编队，
-	// 于是"没有编成界面"也不会导致空场景。
-	const bool bUsedPlayerRoster = !SquadComponent->GetRoster().IsEmpty();
+	// 1. 已经设好的名单 —— 有别的流程（将来的客户端上报、自动化测试）
+	//    在装配前调过 SetRoster，那就以它为准，不要用存档覆盖。
+	// 2. 本地玩家存档里的出战编队 —— 单机与主机端的正常路径。
+	// 3. Experience 的默认编队 —— 新档、调试关卡、自动化测试的兜底，
+	//    否则"没有编成界面"就等于空场景。
+	const TCHAR* RosterSource = TEXT("Experience 默认编队");
+	if (!SquadComponent->GetRoster().IsEmpty())
+	{
+		RosterSource = TEXT("玩家编队（已设置）");
+	}
+	else if (TryApplySavedRoster(NewPlayer, SquadComponent))
+	{
+		RosterSource = TEXT("玩家编队（本地存档）");
+	}
+
+	// 上面两级都没结果时 GetRoster() 仍为空，此时用默认编队。
 	const TArray<TObjectPtr<const UGGYGOPawnData>>& SquadRoster =
-		bUsedPlayerRoster ? SquadComponent->GetRoster() : Experience->SquadMembers;
+		SquadComponent->GetRoster().IsEmpty() ? Experience->SquadMembers : SquadComponent->GetRoster();
 
 	if (SquadRoster.IsEmpty())
 	{
@@ -193,7 +234,7 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 	const AGGYGOCharacterBase* ActiveCharacter = SquadComponent->GetActiveCharacter();
 	UE_LOG(LogGGYGOAbilitySystem, Display,
 		TEXT("SpawnSquadForPlayer: 装配完成，名单来源 [%s]，位置 %d 个，出战 [%s]。"),
-		bUsedPlayerRoster ? TEXT("玩家编队") : TEXT("Experience 默认编队"),
+		RosterSource,
 		SquadComponent->GetSlotCount(), *GetNameSafe(ActiveCharacter));
 }
 
