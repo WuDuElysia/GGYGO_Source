@@ -5,6 +5,7 @@
 #include "GameModes/GGYGOExperienceDefinition.h"
 
 #include "Character/Data/GGYGOPawnData.h"
+#include "Teams/GGYGOSquadTypes.h"
 
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
@@ -23,6 +24,17 @@ UGGYGOExperienceDefinition::UGGYGOExperienceDefinition(const FObjectInitializer&
 EDataValidationResult UGGYGOExperienceDefinition::IsDataValid(FDataValidationContext& Context) const
 {
 	EDataValidationResult Result = CombineDataValidationResults(Super::IsDataValid(Context), EDataValidationResult::Valid);
+
+	if (SquadMembers.Num() > GGYGO_MAX_SQUAD_SIZE)
+	{
+		// 运行时也会截断并报错，但那要等到实际进关才发现。
+		// 每个成员带一个 ASC，超配的代价是成倍的复制开销，值得在编辑期就拦住。
+		Context.AddError(FText::Format(
+			LOCTEXT("SquadTooLarge", "默认编队有 {0} 个成员，超过上限 {1}。多余的成员在装配时会被丢弃。"),
+			FText::AsNumber(SquadMembers.Num()),
+			FText::AsNumber(GGYGO_MAX_SQUAD_SIZE)));
+		Result = EDataValidationResult::Invalid;
+	}
 
 	int32 MemberIndex = 0;
 	for (const TObjectPtr<const UGGYGOPawnData>& Member : SquadMembers)

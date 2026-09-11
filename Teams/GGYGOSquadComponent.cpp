@@ -6,6 +6,7 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Components/GGYGOHealthComponent.h"
+#include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
@@ -32,8 +33,59 @@ void UGGYGOSquadComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>&
 {
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
+	DOREPLIFETIME(UGGYGOSquadComponent, Roster);
 	DOREPLIFETIME(UGGYGOSquadComponent, Slots);
 	DOREPLIFETIME(UGGYGOSquadComponent, ActiveSlotIndex);
+}
+
+bool UGGYGOSquadComponent::SetRoster(const TArray<UGGYGOPawnData*>& InRoster)
+{
+	AActor* Owner = GetOwner();
+	if (!Owner || Owner->GetLocalRole() != ROLE_Authority)
+	{
+		return false;
+	}
+
+	if (IsSquadAssembled())
+	{
+		// 装配之后改名单没有正确语义：位置上的属性集是默认子对象，
+		// 换角色时数值会残留；已授予的能力也无法干净地对应到另一份 PawnData。
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("SetRoster: 队伍已装配（%d 个位置），拒绝修改编队。换编队请在下一局开始前进行。"),
+			Slots.Num());
+		return false;
+	}
+
+	if (InRoster.IsEmpty())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("SetRoster: 收到空名单，忽略。"));
+		return false;
+	}
+
+	Roster.Reset();
+	Roster.Reserve(FMath::Min(InRoster.Num(), GGYGO_MAX_SQUAD_SIZE));
+
+	for (UGGYGOPawnData* PawnData : InRoster)
+	{
+		if (!PawnData)
+		{
+			// 空项跳过而不是整体拒绝：编成界面允许留空位，
+			// 那时名单里会出现 null，把它当成"这个位置不带人"更合理。
+			continue;
+		}
+
+		if (Roster.Num() >= GGYGO_MAX_SQUAD_SIZE)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("SetRoster: 名单超过上限 %d，多余的成员被丢弃。请检查编成界面的数量限制。"),
+				GGYGO_MAX_SQUAD_SIZE);
+			break;
+		}
+
+		Roster.Add(PawnData);
+	}
+
+	return !Roster.IsEmpty();
 }
 
 AGGYGOCharacterSlot* UGGYGOSquadComponent::GetActiveSlot() const

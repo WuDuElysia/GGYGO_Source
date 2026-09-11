@@ -2,7 +2,15 @@
  * @file GGYGOExperienceDefinition.h
  * @brief 一局游戏的玩法定义
  *
- * 回答"这一局怎么玩"：玩家带哪支队伍、启用哪些 GameFeature 插件。
+ * 回答"这一局怎么玩"：默认带哪支队伍、启用哪些 GameFeature 插件。
+ *
+ * ## 与编队的分工
+ * 本资产里的队伍配置是**默认编队**，不是本局的最终阵容。
+ * 玩家的编成结果放在 `UGGYGOSquadComponent` 的编队名单上，装配时它优先。
+ *
+ * 这样分是因为两者的变化频率与归属完全不同：玩法配置属于关卡与模式，
+ * 由策划改；编队属于玩家，每局都可能不一样。写在同一处会导致
+ * "改玩家阵容要改玩法资产"。
  *
  * ## 为什么需要它
  * 没有这层抽象时，"玩家生成什么角色"只能写在 GameMode 里。于是每加一个模式
@@ -48,10 +56,18 @@ public:
 	TArray<FString> GameFeaturesToEnable;
 
 	/**
-	 * 玩家队伍的成员配置，按出场顺序排列。
+	 * **默认编队**：玩家没有做过编成时用的成员配置，按出场顺序排列。
 	 *
-	 * 数组长度决定队伍规模。空数组是合法的（观战、纯剧情场景），
-	 * 此时不生成任何角色。
+	 * 这不是"本局一定会用的阵容"。实际阵容由
+	 * `UGGYGOSquadComponent::SetRoster` 设置的编队名单决定，
+	 * 只有名单为空时才回落到这里（新档、调试关卡、自动化测试）。
+	 *
+	 * 之所以保留这份默认值而不是要求必须先编成：没有编成界面的场景
+	 * （单元测试、直接从编辑器起某个关卡）也应当能跑出可操作的角色，
+	 * 否则每次调试都要先走一遍编成流程。
+	 *
+	 * 数组长度决定默认队伍规模，上限见 `GGYGO_MAX_SQUAD_SIZE`。
+	 * 空数组是合法的（观战、纯剧情场景），此时若玩家也没有编队则不生成任何角色。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Squad", meta = (TitleProperty = "PawnClass"))
 	TArray<TObjectPtr<const UGGYGOPawnData>> SquadMembers;

@@ -34,6 +34,7 @@ class APawn;
 class APlayerController;
 class AGGYGOCharacterBase;
 class AGGYGOCharacterSlot;
+class UGGYGOPawnData;
 class UObject;
 
 /** 出战角色变更。@param NewCharacter 新出战角色的 Pawn，可能为 nullptr。 */
@@ -55,9 +56,37 @@ public:
 	}
 
 	/**
+	 * 设置本局的编队名单。仅服务器有效，且**必须在装配之前**调用。
+	 *
+	 * 名单决定这一局有哪几个角色、按什么顺序排列。装配（生成位置与实体）
+	 * 之后不再接受修改 —— 那属于"局内换人"，与本项目的编成语义不同：
+	 * 已授予的能力与已生效的 Buff 无法干净地对应到另一份 PawnData，
+	 * 而位置上的属性集是默认子对象，换角色时数值会残留。
+	 * 要换编队就在下一局开始前换。
+	 *
+	 * 超出 `GGYGO_MAX_SQUAD_SIZE` 的部分会被截断并报错。名单里的空项被跳过。
+	 *
+	 * @return 是否被接受。已装配、非服务器、名单为空都返回 false。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
+	bool SetRoster(const TArray<UGGYGOPawnData*>& InRoster);
+
+	/** 本局的编队名单。未设置时为空，此时装配方应回落到玩法配置里的默认编队。 */
+	const TArray<TObjectPtr<const UGGYGOPawnData>>& GetRoster() const { return Roster; }
+
+	/**
+	 * 是否已经装配过。
+	 *
+	 * 判据是"有没有位置"而不是单独的标记位：位置数组是复制属性，
+	 * 客户端据此也能得到一致答案，多一个标记位就多一处可能与它不同步的状态。
+	 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
+	bool IsSquadAssembled() const { return Slots.Num() > 0; }
+
+	/**
 	 * 登记一个队伍位置。仅服务器有效。
 	 *
-	 * 由装配流程调用：先为每份 PawnData 生成一个位置，再逐个登记，
+	 * 由装配流程调用：先为名单里的每份 PawnData 生成一个位置，再逐个登记，
 	 * 之后才生成 Pawn。第一个登记的位置会自动成为出战位。
 	 *
 	 * 超过 `GGYGO_MAX_SQUAD_SIZE` 的登记会被拒绝 —— 每个位置带一个 ASC，
@@ -117,6 +146,20 @@ protected:
 
 	/** 位置是否可以出战（有实体且未死亡）。 */
 	bool CanSlotBeActive(const AGGYGOCharacterSlot* Slot) const;
+
+	/**
+	 * 本局的编队名单：这一局带哪几个角色，按什么顺序。
+	 *
+	 * 与 `Slots` 的区别是**名单是意图，位置是结果**。名单先于装配存在，
+	 * 由局外的编成流程（菜单选择、存档读取）填入；位置是照名单造出来的运行时对象。
+	 *
+	 * 分开两者而不是直接改 `Slots`，是因为"玩家想带谁"这件事在没有关卡、
+	 * 没有 GameMode 的时候就该能表达，而位置必须有世界才能生成。
+	 *
+	 * 复制给拥有者：UI 在装配完成前就要显示编队预览。
+	 */
+	UPROPERTY(Replicated)
+	TArray<TObjectPtr<const UGGYGOPawnData>> Roster;
 
 	/**
 	 * 队伍位置。

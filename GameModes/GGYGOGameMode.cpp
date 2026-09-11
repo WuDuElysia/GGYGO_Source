@@ -94,7 +94,7 @@ void AGGYGOGameMode::HandleStartingNewPlayer_Implementation(APlayerController* N
 
 void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 {
-	if (!Experience || Experience->SquadMembers.Num() == 0)
+	if (!Experience)
 	{
 		return;
 	}
@@ -105,6 +105,24 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
 			TEXT("SpawnSquadForPlayer: PlayerState 上没有 SquadComponent，无法生成队伍。"));
+		return;
+	}
+
+	// 名单来源：玩家的编成结果优先，没有则用玩法配置里的默认编队。
+	//
+	// 这个优先级是编成功能的接入点：局外流程只要在装配前调用
+	// `SquadComponent->SetRoster()`，这里就会用玩家选的阵容；
+	// 什么都没设置时（新档、调试关卡、自动化测试）回落到 Experience 的默认编队，
+	// 于是"没有编成界面"也不会导致空场景。
+	const bool bUsedPlayerRoster = !SquadComponent->GetRoster().IsEmpty();
+	const TArray<TObjectPtr<const UGGYGOPawnData>>& SquadRoster =
+		bUsedPlayerRoster ? SquadComponent->GetRoster() : Experience->SquadMembers;
+
+	if (SquadRoster.IsEmpty())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("SpawnSquadForPlayer: 既没有编队名单，Experience [%s] 也没有配默认编队，不会生成任何角色。"),
+			*GetNameSafe(Experience));
 		return;
 	}
 
@@ -123,9 +141,9 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 	// 全队的属性、冷却、组规则就都已就绪。阶段二生成的 Pawn 无论以什么顺序
 	// 初始化，都不会遇到"属性集还没到"的情况 —— 这是 ASC 放在位置上的目的。
 	TArray<AGGYGOCharacterSlot*> SpawnedSlots;
-	SpawnedSlots.Reserve(Experience->SquadMembers.Num());
+	SpawnedSlots.Reserve(SquadRoster.Num());
 
-	for (const TObjectPtr<const UGGYGOPawnData>& PawnData : Experience->SquadMembers)
+	for (const TObjectPtr<const UGGYGOPawnData>& PawnData : SquadRoster)
 	{
 		if (!PawnData)
 		{
@@ -174,7 +192,8 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 	// 没有它就只能靠断点或逐个 Actor 翻查。
 	const AGGYGOCharacterBase* ActiveCharacter = SquadComponent->GetActiveCharacter();
 	UE_LOG(LogGGYGOAbilitySystem, Display,
-		TEXT("SpawnSquadForPlayer: 装配完成，位置 %d 个，出战 [%s]。"),
+		TEXT("SpawnSquadForPlayer: 装配完成，名单来源 [%s]，位置 %d 个，出战 [%s]。"),
+		bUsedPlayerRoster ? TEXT("玩家编队") : TEXT("Experience 默认编队"),
 		SquadComponent->GetSlotCount(), *GetNameSafe(ActiveCharacter));
 }
 
