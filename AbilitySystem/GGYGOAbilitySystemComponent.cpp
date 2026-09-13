@@ -9,6 +9,7 @@
 #include "AbilitySystem/Groups/GGYGOAbilityGroupConfig.h"
 #include "Engine/World.h"
 #include "GameFramework/Pawn.h"
+#include "System/GGYGOGameplayTags.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilitySystemComponent)
 
