@@ -19,7 +19,7 @@
 #pragma once
 
 #include "AbilitySystemComponent.h"
-#include "AbilitySystem/Attributes/GGYGOAttributeSetBase.h"
+#include "AbilitySystem/Attributes/GGYGOAttributeSet.h"
 
 #include "GGYGOCombatSet.generated.h"
 
@@ -27,7 +27,7 @@ class UObject;
 struct FFrame;
 
 UCLASS(BlueprintType)
-class GGYGO_API UGGYGOCombatSet : public UGGYGOAttributeSetBase
+class GGYGO_API UGGYGOCombatSet : public UGGYGOAttributeSet
 {
 	GENERATED_BODY()
 

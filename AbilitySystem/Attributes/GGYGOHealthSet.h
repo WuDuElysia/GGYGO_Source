@@ -27,7 +27,7 @@
 #pragma once
 
 #include "AbilitySystemComponent.h"
-#include "AbilitySystem/Attributes/GGYGOAttributeSetBase.h"
+#include "AbilitySystem/Attributes/GGYGOAttributeSet.h"
 
 #include "GGYGOHealthSet.generated.h"
 
@@ -36,7 +36,7 @@ struct FFrame;
 struct FGameplayEffectModCallbackData;
 
 UCLASS(BlueprintType)
-class GGYGO_API UGGYGOHealthSet : public UGGYGOAttributeSetBase
+class GGYGO_API UGGYGOHealthSet : public UGGYGOAttributeSet
 {
 	GENERATED_BODY()
 

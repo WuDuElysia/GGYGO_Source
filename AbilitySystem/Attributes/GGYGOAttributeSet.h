@@ -1,14 +1,9 @@
 /**
- * @file GGYGOAttributeSetBase.h
- * @brief 所有新版 GGYGO AttributeSet 的公共基类
+ * @file GGYGOAttributeSet.h
+ * @brief 所有 GGYGO AttributeSet 的公共基类
  *
  * 只提供两样东西：`GetWorld()`（AttributeSet 不是 Actor，要靠 Outer 拿 World）
  * 和取回项目 ASC 的类型化便利函数。具体属性由派生 Set 定义。
- *
- * ## 关于类名
- * 对应 Lyra 的 `ULyraAttributeSet`，按命名习惯本应叫 `UGGYGOAttributeSet`，
- * 但那个名字被 `Attributes/GGYGOAttributeSet.h` 里的单体 Set 占用。
- * 那个 Set 仍被若干蓝图 GE 资产引用，删除会断引用，因此本类暂用 Base 后缀。
  *
  * ## 拆分依据（按 Lyra 的分法）
  *   - `UGGYGOHealthSet`：目标侧的**承受**属性。生命、韧性，以及一次性的 Damage / Healing / PoiseDamage 元属性。
@@ -21,7 +16,7 @@
 
 #include "AttributeSet.h"
 
-#include "GGYGOAttributeSetBase.generated.h"
+#include "GGYGOAttributeSet.generated.h"
 
 class AActor;
 class UGGYGOAbilitySystemComponent;
@@ -39,17 +34,12 @@ struct FGameplayEffectSpec;
  *   void  InitHealth(float NewVal);                  // 写基础值（初始化用）
  *
  * 静态句柄不只用于读写，回调里判断"这次改的是哪个属性"也依赖它。
- *
- * 注意：旧的 `Attributes/GGYGOAttributeSet.h` 也定义了同名宏。两个头文件不要在同一个
- * 编译单元里同时包含，否则会触发宏重定义警告。
  */
-#ifndef ATTRIBUTE_ACCESSORS
 #define ATTRIBUTE_ACCESSORS(ClassName, PropertyName) \
 	GAMEPLAYATTRIBUTE_PROPERTY_GETTER(ClassName, PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_GETTER(PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_SETTER(PropertyName) \
 	GAMEPLAYATTRIBUTE_VALUE_INITTER(PropertyName)
-#endif
 
 /**
  * 属性变化广播委托。
@@ -67,12 +57,12 @@ struct FGameplayEffectSpec;
 DECLARE_MULTICAST_DELEGATE_SixParams(FGGYGOAttributeEvent, AActor* /*EffectInstigator*/, AActor* /*EffectCauser*/, const FGameplayEffectSpec* /*EffectSpec*/, float /*EffectMagnitude*/, float /*OldValue*/, float /*NewValue*/);
 
 UCLASS()
-class GGYGO_API UGGYGOAttributeSetBase : public UAttributeSet
+class GGYGO_API UGGYGOAttributeSet : public UAttributeSet
 {
 	GENERATED_BODY()
 
 public:
-	UGGYGOAttributeSetBase();
+	UGGYGOAttributeSet();
 
 	/** AttributeSet 不是 Actor，World 通过 Outer 间接取得。 */
 	virtual UWorld* GetWorld() const override;

@@ -28,7 +28,7 @@ GGYGO 当前采用 **Unreal 对象负责生命周期与引擎边界，纯 C++ Pi
 1. `ABaseCharacter` 是 Actor/GAS 宿主，也是唯一的角色帧调度入口。
 2. `UGGYGOCharacterRuntimeComponent` 是单一运行时宿主组件，负责创建和销毁纯 C++ 子系统，但不启用自己的 `TickComponent`。
 3. `FInputData`、`FRuntimeData`、各 Pipeline、Processor、State、`FGYGOStateManager` 和 `FMotionDriver` 不升级为 UObject。
-4. `UAbilitySystemComponent`、`UGGYGOAttributeSet`、`UCharConfigData`、`UZZZAnimInstance` 保留 Unreal 对象身份。
+4. `UAbilitySystemComponent`、各 AttributeSet、`UCharConfigData`、`UZZZAnimInstance` 保留 Unreal 对象身份。
 5. `FRuntimeData` 是逻辑侧运行时 Model 聚合入口；`FRuntimeData::ZZZAnim` 是写给新版 ZZZ 动画层的游戏线程投影。
 6. ZZZ 动画层通过 Snapshot 消费逻辑结果；AnimBP/AnimInstance 不反向成为逻辑字段的权威写入者。
 
@@ -71,7 +71,7 @@ Source/GGYGO/
 │  │  ├─ GGYGOAbilityCost.h
 │  │  └─ GGYGOAbilityFailureMessages.h
 │  ├─ Attributes/
-│  │  ├─ GGYGOAttributeSetBase.h / .cpp
+│  │  ├─ GGYGOAttributeSet.h / .cpp
 │  │  ├─ GGYGOHealthSet.h / .cpp
 │  │  └─ GGYGOCombatSet.h / .cpp
 │  └─ Groups/
@@ -94,8 +94,6 @@ Source/GGYGO/
 │        ├─ ZZZLocomotionDecisions.h / ZZZLocomotionDecisions.cpp
 │        ├─ ZZZLocomotionEvents.h / ZZZLocomotionEvents.cpp
 │        └─ ZZZLocomotionRules.h / ZZZLocomotionRules.cpp
-├─ Attributes/
-│  └─ GGYGOAttributeSet.h / GGYGOAttributeSet.cpp
 ├─ Components/
 │  └─ GGYGOCharacterRuntimeComponent.h / GGYGOCharacterRuntimeComponent.cpp
 ├─ Contracts/
@@ -226,7 +224,6 @@ Lyra 组件化与消息机制所需的 `ModularGameplay`、`GameFeatures`、`Gam
 ```text
 ABaseCharacter (ACharacter + IAbilitySystemInterface)
 ├─ ASC : UAbilitySystemComponent                    Unreal/GAS 对象
-├─ AttributeSet : UGGYGOAttributeSet                Unreal/GAS 对象
 ├─ RuntimeComponent : UGGYGOCharacterRuntimeComponent Unreal 生命周期薄壳
 │  └─ TUniquePtr<FCharacterControlPipeline>
 │     ├─ TUniquePtr<FInputData>
@@ -246,7 +243,7 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 - `APlayerCharacter`：Enhanced Input 绑定、玩家摄像机角度配置。
 - `UGGYGOCharacterRuntimeComponent`：不独立 Tick 的 Unreal 生命周期薄壳，只持有并转发给 `FCharacterControlPipeline`。
 - `UAbilitySystemComponent`：Ability、GameplayEffect、GameplayTag 和 ASC 查询。
-- `UGGYGOAttributeSet`：GAS 属性及 GameplayEffect 执行后的属性处理。
+- `UGGYGOHealthSet` / `UGGYGOCombatSet`：GAS 属性及 GameplayEffect 执行后的属性处理。由 `AGGYGOCharacterSlot` 以默认子对象持有，不挂在角色身上。
 - `UCharConfigData`：角色配置 DataAsset。
 - `UZZZAnimInstance`：引擎拥有的 AnimInstance、快照消费和 AnimBP 查询入口。
 - `UAnimSequence`、`UBlendSpace`、`USkeletalMeshComponent`、`UCharacterMovementComponent`：Unreal 动画/移动对象。
@@ -336,16 +333,14 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 **字段**：
 
 - `ASC`：Actor 子对象形式的 `UAbilitySystemComponent`。
-- `AttributeSet`：Actor 子对象形式的 `UGGYGOAttributeSet`。
 - `DefaultAbilities`、`DefaultEffects`：蓝图可配置的 Ability/Effect 数组；当前 BeginPlay 不自动调用对应应用函数。
 - `CharacterConfig`：`UCharConfigData` 资产引用。
 - `RuntimeComponent`：`UGGYGOCharacterRuntimeComponent`，只托管单一 `FCharacterControlPipeline`。
 
 **函数**：
 
-- `ABaseCharacter()`：开启 `PrimaryActorTick`；创建 ASC、AttributeSet 和 Runtime Component。
+- `ABaseCharacter()`：开启 `PrimaryActorTick`；创建 ASC 和 Runtime Component。
 - `GetAbilitySystemComponent()`：返回 `ASC`，供 `IAbilitySystemInterface` 和 GAS 使用。
-- `GetAttributeSet()`：返回 `AttributeSet` 非拥有指针。
 - `GetCurrentSpeed()`：读取 `RuntimeData.Movement.CurrentSpeed`。
 - `GetMoveAngle()`：读取 `RuntimeData.Movement.MoveAngle`。
 - `GetCurrentState()`：读取 `RuntimeData.State.CurrentState`。
@@ -442,7 +437,6 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 - `GGYGOGEs::Restriction::{BlockAll, BlockCombat, BlockMoveOnly, Invincible}`：限制类 GE soft class pointer。
 - `GGYGOGEs::Cooldown::{CooldownEvade, CooldownSkill}`：冷却类 GE soft class pointer。
-- `GGYGOGEs::Attribute::InjuredSlowdown`：受伤减速 GE soft class pointer。
 - `InitGEGlobals()`：按 Restriction → Cooldown → Attribute 顺序对所有 soft class pointer 调用 `LoadSynchronous`。当前没有加载失败回退或诊断。
 
 ### 5.9 `GGYGOTags.h`
@@ -458,21 +452,7 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 ## 6. 属性、配置、输入和逻辑数据
 
-### 6.1 `Attributes/GGYGOAttributeSet.h` / `Attributes/GGYGOAttributeSet.cpp`
-
-**`UGGYGOAttributeSet`**：GAS `UAttributeSet`，公开属性为 `Health`、`MaxHealth`、`AttackPower`、`Defense`、`MoveSpeed`、`IncomingDamage`。`ATTRIBUTE_ACCESSORS` 宏为每项生成 Getter/Setter/Initializer。
-
-**函数**：
-
-- `UGGYGOAttributeSet()`：当前不设置默认属性值。
-- `PreAttributeChange(const FGameplayAttribute&, float&)`：调用父类；Health 使用 `ClampHealth`，MoveSpeed 使用 `ClampMoveSpeed`。
-- `PostGameplayEffectExecute(const FGameplayEffectModCallbackData&)`：调用父类；修改目标是 IncomingDamage 时转给 `HandleIncomingDamage`。
-- `ClampHealth(float&)`：把 Health 限制在 0 与 `GetMaxHealth()` 之间。
-- `ClampStamina(float&)`：当前空函数，等待 Stamina/MaxStamina 属性；当前没有调用链。
-- `ClampMoveSpeed(float&)`：把速度限制为不小于 0。
-- `HandleIncomingDamage(const FGameplayEffectModCallbackData&)`：读取 IncomingDamage，清零元属性；若伤害大于 0，则扣减 Health 并再次钳制。死亡委托没有实现。
-
-### 6.2 `Data/Config/UCharConfigData.h` / `Data/Config/UCharConfigData.cpp`
+### 6.1 `Data/Config/UCharConfigData.h` / `Data/Config/UCharConfigData.cpp`
 
 - `FStateTransitionBlend`：USTRUCT，保存 `BlendInTime` 和 `BlendOutTime`。
 - `UCharConfigData`：角色配置 DataAsset，保存默认 Blend、按状态覆盖、循环/非循环播放速率、`FMovementConfig`、默认 Ability 和 GE 数组。
@@ -486,12 +466,12 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 当前没有把 DataAsset 中的 DefaultAbilities/DefaultEffects 自动复制到 `ABaseCharacter`，也没有自动驱动 MotionDriver。
 
-### 6.3 `Movement/MovementConfig.h`
+### 6.2 `Movement/MovementConfig.h`
 
 - `FMovementConfig`：header-only USTRUCT。字段包括 SprintMultiplier、WalkToRunHoldSeconds、SprintSpeed、AirControlFactor、DodgeSpeed、DodgeDuration、KnockbackDecay、RootMotionScale、TurnBackReleaseTimeSeconds、TurnBackSecondSegmentTimeSeconds、TurnBackDurationSeconds、bDebugMotion。
 - 当前实际消费：`FGaitAuthorityProcessor` 读取 `WalkToRunHoldSeconds`；`FMotionDriver::Init` 读取 `RootMotionScale`；`FTurnBackPhaseProcessor::Init` 读取 TurnBack 释放时间和总时长，d1 不再由 `TurnBackSecondSegmentTimeSeconds` 时间点触发，而由动画 `CanYaw` Notify 触发。`TurnBackSecondSegmentTimeSeconds` 保留为配置兼容字段，当前运行时不消费。
 
-### 6.4 `Data/Input/InputData.h`
+### 6.3 `Data/Input/InputData.h`
 
 - `FProcessedInput`：保存处理后的 Move/Look、攻击/闪避/冲刺/强制步行持续状态和两个 Buffer Timer。
   - `IsAttackPressed()`：判断攻击计时器是否大于 0。
@@ -503,13 +483,13 @@ ABaseCharacter (ACharacter + IAbilitySystemInterface)
 
 `FInputPipeline` 是当前唯一写入 FInputData 的系统。
 
-### 6.5 `Data/Runtime/RuntimeData.h`
+### 6.4 `Data/Runtime/RuntimeData.h`
 
 `FRuntimeData` 聚合 `Intent`、`View`、`Gait`、`Movement`、`Arbiter`、`State`、`RootMotion`、`ZZZAnim`。
 
 - `ResetFrameIntents()`：只调用 `Intent.ResetFrameIntents`，清理帧级攻击/闪避意图，不清理跨帧 Model 状态。
 
-### 6.6 `Data/Runtime/*.h`
+### 6.5 `Data/Runtime/*.h`
 
 这些文件没有 `.cpp`，是 header-only 纯运行时 Model：
 
@@ -985,8 +965,7 @@ TurnBack Phase 和 CanYaw/d1 标记由逻辑层维护，AnimBP 只消费快照�
 - 没有具体的 GameplayAbility 派生类（`UGGYGOGameplayAbility` 只是抽象基类，不能直接激活）；移动由 `FMotionDriver` 完成，没有独立移动类；当前没有测试实现。
 - 当前玩家没有攻击/闪避 Enhanced Input 回调。
 - `FActionArbiter`、`FHealthArbiter`、`FStaminaArbiter` 的核心业务仍有 TODO/空实现。
-- AttributeSet 没有 Stamina 属性，`ClampStamina` 是空钩子。
-- AttributeSet 没有死亡委托或死亡状态自动切换。
+- 没有 Stamina 属性集，`FStaminaArbiter` 缺少数据来源。
 - `DefaultAbilities`/`DefaultEffects` 的应用函数存在，但 BeginPlay 当前不会自动调用。
 - `FZZZAnimRuntimeModel.Velocity2DLength`、`LastInputDirectionAngle` 当前没有有效写入方；`AnimBlendX/AnimBlendY` 已由 `FMovementParameterProcessor` 写入并发布给 AnimBP。
 - `FRuntimeData.Movement.bIsGrounded` 当前没有运行时写入方，保持模型默认值 true；SnapshotCapture 只读取该字段。
