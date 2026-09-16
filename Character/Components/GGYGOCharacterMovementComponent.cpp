@@ -6,6 +6,7 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Animation/AnimInstance.h"
+#include "Character/Components/GGYGOCurveRootMotionSource.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -48,6 +49,24 @@ namespace GGYGOMovementConstants
 	 * 所以三个相位对接收端只有两种含义。
 	 */
 	constexpr uint8 TurnBackCurveDrivenFlag = FSavedMove_Character::FLAG_Custom_2;
+
+	/**
+	 * 曲线位移源的实例名。
+	 *
+	 * root motion source 按名字管理（挂载、查询、摘除），所以每个语义段必须有
+	 * 各自的名字。同名会被引擎当成同一个源，`Matches` 也用它做网络匹配。
+	 */
+	const FName CurveBrakeSourceName(TEXT("GGYGO.CurveBrake"));
+	const FName CurveTurnBackSourceName(TEXT("GGYGO.CurveTurnBack"));
+
+	/**
+	 * 曲线位移源的优先级。
+	 *
+	 * 只有最高优先级的 Override 源生效，其余被忽略。刹停与转身在设计上互斥，
+	 * 给转身更高的值是兜底：万一两者同时在场，转身赢。
+	 */
+	constexpr uint16 CurveBrakePriority = 10;
+	constexpr uint16 CurveTurnBackPriority = 20;
 }
 
 // ============================================================================
@@ -84,6 +103,20 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 		SavedTurnBackElapsed = MoveComp->TurnBackElapsed;
 		SavedTurnBackEntryYaw = MoveComp->TurnBackEntryYaw;
 		bSavedTurnBackInputLatched = MoveComp->bTurnBackInputLatched;
+
+		// 曲线位移源在场时禁止 move 合并。
+		//
+		// 合并会把角色拉回起点重演一次更长的 move，而曲线速度是逐帧变化的
+		// （走路刹停从 459 一路衰减到 0），重演时只剩下最后一帧的曲线值，
+		// 算出来的滑行距离与客户端实际走过的不同。
+		//
+		// 引擎自己的 `CanCombineWith` 只挡 anim montage 的 root motion，
+		// 不挡 root motion source；而刹停期间两帧的 `Acceleration` 都是零，
+		// 恰好落在引擎"允许合并"的分支里。所以必须自己挡。
+		if (MoveComp->HasCurveRootMotionSource())
+		{
+			bForceNoCombine = true;
+		}
 	}
 }
 
@@ -255,6 +288,20 @@ bool UGGYGOCharacterMovementComponent::IsCurveDrivingSpeed() const
 	return GetScaledCurveSpeed() > KINDA_SMALL_NUMBER;
 }
 
+bool UGGYGOCharacterMovementComponent::HasCurveRootMotionSource() const
+{
+	// 按类型判定而不是按实例名：将来再加曲线驱动段（冲刺、受击位移）时不用改这里。
+	for (const TSharedPtr<FRootMotionSource>& Source : CurrentRootMotion.RootMotionSources)
+	{
+		if (Source.IsValid() && Source->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct())
+		{
+			return true;
+		}
+	}
+
+	return false;
+}
+
 void UGGYGOCharacterMovementComponent::CacheAbilitySystemComponent()
 {
 	// 经 PawnExtension 拿 ASC 而不是自己 FindComponentByClass：
@@ -395,27 +442,14 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 	{
 		ResolveGait(DeltaSeconds);
 		UpdateTurnBack(DeltaSeconds);
+		UpdateCurveBrake();
 	}
 
-	// 转身的曲线接管段（Turning / Braking）接管位移方向：把加速度改成曲线给出的世界方向。
+	// 转身段的位移源在所有角色上同步，所以放在本地控制判断之外。
 	//
-	// 改 Acceleration 而不是直接改 Velocity，是为了让加减速、摩擦、坡度
-	// 仍然由 CMC 处理 —— 直接设速度会让角色撞墙时失去正常的滑动行为。
-	//
-	// 非本地控制端也要执行：`UpdateFromCompressedFlags` 已经恢复了相位，
-	// 不覆盖方向会让它按玩家输入的方向移动，与本地端分歧。
-	//
-	// `RunOut` 段刻意不覆盖：那一段方向取玩家输入，让 Acceleration 保持原值即可。
-	// 曲线在那一段给出的方向恰好等于入口朝向的反方向（也就是角色转身后的正前方），
-	// 玩家不改输入时两者一致，改了输入就应该跟输入走。
-	if (IsTurnBackCurveDriven())
-	{
-		const FVector TurnBackDirection = ResolveTurnBackWorldDirection();
-		if (!TurnBackDirection.IsNearlyZero())
-		{
-			Acceleration = TurnBackDirection * GetMaxAcceleration();
-		}
-	}
+	// 必须在这里而不是更早或更晚：引擎紧接着就会在 `PerformMovement` 里
+	// `CurrentRootMotion.PrepareRootMotion`，晚一步挂的 source 要等下一帧才生效。
+	UpdateTurnBackRootMotion();
 
 	Super::UpdateCharacterStateBeforeMovement(DeltaSeconds);
 }
@@ -648,6 +682,89 @@ void UGGYGOCharacterMovementComponent::ResetTurnBack()
 	// 立刻触发下一次转身，角色原地反复转身。
 }
 
+void UGGYGOCharacterMovementComponent::ApplyCurveRootMotionSource(FName InstanceName, uint16 Priority, float BaseYaw, bool bEndOnZeroSpeed)
+{
+	// 已在场就不重挂，于是调用方可以每帧无条件调用。
+	if (GetRootMotionSource(InstanceName).IsValid())
+	{
+		return;
+	}
+
+	TSharedPtr<FRootMotionSource_GGYGOCurve> Source = MakeShared<FRootMotionSource_GGYGOCurve>();
+	Source->InstanceName = InstanceName;
+	Source->Priority = Priority;
+	Source->BaseYaw = BaseYaw;
+	Source->SpeedScale = MovementSet ? FMath::Max(MovementSet->RootMotionScale, 0.0f) : 1.0f;
+	Source->bEndOnZeroSpeed = bEndOnZeroSpeed;
+
+	ApplyRootMotionSource(Source);
+}
+
+void UGGYGOCharacterMovementComponent::UpdateTurnBackRootMotion()
+{
+	const bool bCurveDrivenEnabled = MovementSet && MovementSet->bUseCurveDrivenSpeed;
+
+	if (!bCurveDrivenEnabled || !IsTurnBackCurveDriven())
+	{
+		RemoveRootMotionSource(GGYGOMovementConstants::CurveTurnBackSourceName);
+		return;
+	}
+
+	// 基准取相位入口朝向而不是当前朝向：角色在这一段一直在转，
+	// 用当前朝向会把已经转过的角度重复计入，直线滑行被拖成弧线。
+	//
+	// 不自我终结：生命周期由相位机管。转身中间那几帧曲线速度为 0 时
+	// source 输出零速度把角色压住，而不是把控制权交还给正按着反方向键的玩家。
+	ApplyCurveRootMotionSource(
+		GGYGOMovementConstants::CurveTurnBackSourceName,
+		GGYGOMovementConstants::CurveTurnBackPriority,
+		TurnBackEntryYaw,
+		/*bEndOnZeroSpeed=*/false);
+}
+
+void UGGYGOCharacterMovementComponent::UpdateCurveBrake()
+{
+	// 曲线驱动被整体关掉时不参与。这个开关是调试用的总闸，
+	// 关掉之后移动应当完全回退到配置的固定速度。
+	const bool bCurveDrivenEnabled = MovementSet && MovementSet->bUseCurveDrivenSpeed;
+
+	// 转身有自己的一套曲线接管（含 `RunOut` 段刻意把方向交回输入），
+	// 让刹停在那期间插手会覆盖掉那个设计。
+	//
+	// 有输入就摘掉：刹停可以被随时打断，玩家按方向应当立刻恢复正常移动。
+	// 判据用 Acceleration 而非原始摇杆输入 —— 它已被 FSavedMove_Character 保存，
+	// 回放时取值与首次执行一致。
+	const bool bHasMoveInput = GetCurrentAcceleration().SizeSquared2D() > KINDA_SMALL_NUMBER;
+
+	if (!bCurveDrivenEnabled
+		|| bHasMoveInput
+		|| TurnBackPhase != EGGYGOTurnBackPhase::None
+		|| !IsMovingOnGround())
+	{
+		RemoveRootMotionSource(GGYGOMovementConstants::CurveBrakeSourceName);
+		return;
+	}
+
+	// 无输入而曲线仍在给速度 —— 只有 `_End` 这类刹停动画会出现这种组合，
+	// 站立与静止兜底姿势的 `RootMotion_Speed` 恒为 0。所以这一个条件就够了，
+	// 不需要额外记"松手那一帧"的下降沿。
+	//
+	// 不需要在这里判断"曲线停了没"：source 自己会在速度归零时置 Finished，
+	// 引擎下一帧的 `CleanUpInvalidRootMotion` 会把它摘掉。
+	if (!CurveMotion.HasUsableSpeed())
+	{
+		return;
+	}
+
+	// 基准取当前朝向：松手那一刻角色的朝向就是刹停动画的段起点朝向。
+	// 自我终结：曲线衰减到 0 即滑行结束，不需要外部状态机跟着。
+	ApplyCurveRootMotionSource(
+		GGYGOMovementConstants::CurveBrakeSourceName,
+		GGYGOMovementConstants::CurveBrakePriority,
+		UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : 0.0f,
+		/*bEndOnZeroSpeed=*/true);
+}
+
 bool UGGYGOCharacterMovementComponent::IsReverseRunInput() const
 {
 	// 只有跑动中才触发。走路时的反向输入应当直接转身走回去，
@@ -782,21 +899,6 @@ void UGGYGOCharacterMovementComponent::UpdateTurnBack(float DeltaSeconds)
 		break;
 	}
 	}
-}
-
-FVector UGGYGOCharacterMovementComponent::ResolveTurnBackWorldDirection() const
-{
-	// 曲线已是 UE 轴序（X 前、Y 右），直接用，不交换两轴。
-	FVector LocalDirection(CurveMotion.Direction.X, CurveMotion.Direction.Y, 0.0f);
-
-	if (LocalDirection.IsNearlyZero())
-	{
-		// 没有曲线方向时沿入口朝向直行。返回零向量会让角色在刹车段原地不动，
-		// 那比方向略有偏差更糟。
-		LocalDirection = FVector::ForwardVector;
-	}
-
-	return FRotator(0.0f, TurnBackEntryYaw, 0.0f).RotateVector(LocalDirection.GetSafeNormal2D());
 }
 
 FNetworkPredictionData_Client* UGGYGOCharacterMovementComponent::GetPredictionData_Client() const

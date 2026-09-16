@@ -15,6 +15,22 @@
  *   正常 tick 与 move 回放时都会被调用，是有状态逻辑的正确位置
  * - `FSavedMove_GGYGO` 保存步态与计时器 —— 回放时能还原，预测才成立
  *
+ * ## 两条位移通道
+ * 移动分成两类，走的通道不同：
+ *
+ * - **输入驱动**（走、跑）：方向来自玩家输入，速度上限来自 `GetMaxSpeed()` 的曲线值。
+ *   位移由 `CalcVelocity` 算，玩家能一边走一边转向。
+ *
+ * - **动画驱动**（刹停、转身）：方向与速度都来自曲线，输入完全不参与。
+ *   走 `FRootMotionSource_GGYGOCurve`，Override 模式让引擎整段跳过 `CalcVelocity`。
+ *
+ * 第二类不能用 `GetMaxSpeed()` 实现。速度上限只是个上限，玩家松手后
+ * `Acceleration` 归零，`CalcVelocity` 会按 `BrakingDecelerationWalking` 主动制动，
+ * 上限再高也没有东西驱动位移 —— 刹停动画那 330cm 滑行会整段丢失。
+ * 而伪造一个假 `Acceleration` 去骗过 `CalcVelocity` 又会与真实输入抢同一个通道。
+ * root motion source 是引擎给这件事准备的正规通道：带优先级仲裁、
+ * 状态进 `FSavedMove_Character::SavedRootMotion` 参与预测、位移仍走 `MoveAlongFloor`。
+ *
  * ## 步态的判定依据
  * 用 `GetCurrentAcceleration()` 判断有无移动意图，而不是读原始摇杆值：
  * 前者已被 `SavedMove` 保存，move 回放时取值与首次执行一致，后者没有这个保证。
@@ -33,13 +49,15 @@
  * 曲线值来自动画的当前评估结果，属于本地状态。三处处理让它尽量可预测：
  * - 采样只在 `TickComponent` 里做一次，结果存进 `FSavedMove_GGYGO`，
  *   回放时还原而不重新采样（那时动画已走到别的时间点）
- * - 转身期间的 move 不允许合并，否则中间帧的方向变化会丢失
+ * - 曲线位移源在场期间的 move 不允许合并（`bForceNoCombine`），
+ *   否则合并后重演只剩最后一帧的曲线值，滑行距离与客户端不同
  * - 服务器采不到曲线时把速度上界放宽到 `MaxCurveDrivenSpeed`，
  *   避免因两端速度不同而持续校正
  *
- * 仍未解决的是：服务器若不评估动画，它重演出的**位移方向**在转身的曲线接管段
- * 会与客户端不同（那两段方向由曲线给出）。彻底解决需要把曲线量放进
- * `FCharacterNetworkMoveData` 随 ServerMove 一起发送。
+ * 仍未解决的是：服务器若不评估动画，它重演动画驱动段时读到的曲线量是空的，
+ * `FRootMotionSource_GGYGOCurve::PrepareRootMotion` 会因此判定速度为零。
+ * 位置最终仍由服务器的 `ServerMoveHandleClientError` 容差兜住，但两端轨迹不一致。
+ * 彻底解决需要把曲线量放进 `FCharacterNetworkMoveData` 随 ServerMove 一起发送。
  */
 #pragma once
 
@@ -180,6 +198,14 @@ public:
 	/** 本帧的曲线运动量。位移与方向分量处于动画段起点坐标系，轴序为 UE 局部空间（X 前、Y 右）。 */
 	const FGGYGOAnimCurveMotion& GetCurveMotion() const { return CurveMotion; }
 
+	/**
+	 * 是否有曲线位移源在场（刹停或转身）。
+	 *
+	 * 为 true 表示这一帧的速度完全由曲线决定，`CalcVelocity` 被引擎跳过，
+	 * 玩家输入不参与位移。
+	 */
+	bool HasCurveRootMotionSource() const;
+
 	/** 曲线速度是否正在接管移动。为 false 时速度来自配置的固定值。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	bool IsCurveDrivingSpeed() const;
@@ -303,6 +329,40 @@ protected:
 	/** 当前输入是否构成"要转身"（跑动中输入接近反向）。 */
 	bool IsReverseRunInput() const;
 
+	/**
+	 * 推进刹停的曲线接管。
+	 *
+	 * 判据是"没有移动输入，但曲线还在给速度"。除了 `_End` 这类刹停动画，
+	 * 没有别的动画会在无输入时给出非零速度，所以不需要额外的下降沿检测。
+	 *
+	 * 必须在曲线采样之后、`Super::UpdateCharacterStateBeforeMovement` 之前调用：
+	 * 引擎在 `PerformMovement` 里紧接着就会 `CurrentRootMotion.PrepareRootMotion`，
+	 * 晚一步挂的 source 要等下一帧才生效。
+	 */
+	void UpdateCurveBrake();
+
+	/**
+	 * 同步转身段的曲线位移源。
+	 *
+	 * 所有角色都要执行：`UpdateFromCompressedFlags` 已经在服务器与模拟代理上恢复了
+	 * 相位，不挂 source 那两端就会按玩家输入的方向移动，与本地端分歧。
+	 *
+	 * 只覆盖 `Turning` / `Braking`。`RunOut` 段方向取玩家输入 —— 曲线在那一段给出的
+	 * 方向恰好是入口朝向的反方向（角色转身后的正前方），玩家不改输入时两者一致，
+	 * 改了就该跟输入走。
+	 */
+	void UpdateTurnBackRootMotion();
+
+	/**
+	 * 挂一个曲线位移源。
+	 *
+	 * 同名 source 已存在时什么都不做，所以可以每帧无条件调用。
+	 *
+	 * `BaseYaw` 必须由调用方给出而不是在这里取当前朝向：转身段的基准是进入相位时
+	 * 记下的 `TurnBackEntryYaw`，那个值在整段转身里不变，而角色朝向一直在转。
+	 */
+	void ApplyCurveRootMotionSource(FName InstanceName, uint16 Priority, float BaseYaw, bool bEndOnZeroSpeed);
+
 	/** 转身状态整体复位。 */
 	void ResetTurnBack();
 
@@ -314,20 +374,6 @@ protected:
 	 * 网络侧也只需要同步这一个事实，所以压缩标志位只发一个 bit。
 	 */
 	bool IsTurnBackCurveDriven() const;
-
-	/**
-	 * 把曲线在动画段起点坐标系里的方向转成世界方向。
-	 *
-	 * 基准是进入转身时保存的 Actor 朝向（`TurnBackEntryYaw`），而不是当前朝向。
-	 * 曲线的分量本来就以段起点为基准，用当前朝向会把角色已经转过的角度重复计入一次，
-	 * 位移轨迹变成弧线；而急停转身要的是角色一边转身一边沿原方向滑行刹车，
-	 * 世界方向必须保持不变。
-	 *
-	 * 只在 `Turning` / `Braking` 两段调用。`RunOut` 段的方向取玩家输入，
-	 * 不经过这里 —— 曲线在那一段给出的方向恰好是入口朝向的反方向，
-	 * 与"角色转身后的正前方"等价，但玩家改了输入之后它就不再是想要的方向了。
-	 */
-	FVector ResolveTurnBackWorldDirection() const;
 
 protected:
 	/** 移动参数资产。 */
