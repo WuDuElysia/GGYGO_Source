@@ -24,22 +24,6 @@ namespace ZZZLocomotionRules
 		return FMath::Min(ConfiguredSpeed, MaxGaitBlendInterpSpeed);
 	}
 
-	float ResolveTurnBackReverseInputDotThreshold(const FZZZAnimTuning* InTuning)
-	{
-		if (!InTuning)
-		{
-			return DefaultTurnBackReverseInputDotThreshold;
-		}
-
-		const float ConfiguredThreshold = InTuning->TurnBackReverseInputDotThreshold;
-		if (!FMath::IsFinite(ConfiguredThreshold))
-		{
-			return DefaultTurnBackReverseInputDotThreshold;
-		}
-
-		return FMath::Clamp(ConfiguredThreshold, -1.0f, 0.0f);
-	}
-
 	float ResolveGaitBlendTarget(EGGYGOGait InSnapshotGait)
 	{
 		return InSnapshotGait == EGGYGOGait::Run ? 1.0f : 0.0f;

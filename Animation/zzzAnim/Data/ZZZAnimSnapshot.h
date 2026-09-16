@@ -33,7 +33,12 @@ struct FZZZAnimSnapshot
 	 */
 	bool bShouldMove = false;
 
-	/** 相对 Actor 当前水平朝向的移动方向 X（右）和 Y（前）。BlendSpace 的两个轴输入。 */
+	/**
+	 * 相对 Actor 当前水平朝向的移动方向 X（右）和 Y（前）。
+	 *
+	 * 目前无人消费：走跑混合是一维的、由步态混合值驱动，方向靠 Actor 转向解决。
+	 * 等有了侧向/后退的移动循环动画换成二维 BlendSpace 后才会接上。
+	 */
 	float AnimBlendX = 0.f;
 	float AnimBlendY = 0.f;
 

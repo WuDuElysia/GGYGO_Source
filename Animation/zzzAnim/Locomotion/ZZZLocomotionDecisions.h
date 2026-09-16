@@ -2,13 +2,14 @@
  * @file ZZZLocomotionDecisions.h
  * @brief ZZZ 动画 Locomotion 决策模块
  *
- * 只读三个上下文，不访问 Actor、RuntimeData 或 UZZZAnimInstance：
+ * 只读三个上下文，不访问 Actor 或 UZZZAnimInstance：
  *   Snap    每帧由管线重建，表示"本帧输入与逻辑现状"
  *   Memory  跨帧持久，表示"动画状态机自己记住的事"
  *   Tuning  运行期只读配置，不拥有其生命周期
  *
- * 本类不写任何状态。TurnBack 相位由移动层的 CMC 从动画曲线判定，
- * 过渡条件只读快照里的相位值；求值次数和时机都不影响状态同步。
+ * 本类不写任何状态 —— 写入集中在 `FZZZLocomotionEvents`。
+ * 这个分工的意义在于：AnimBP 的过渡条件可能被求值任意多次（甚至在 worker 线程上），
+ * 如果判定顺手改了状态，求值次数就会影响结果。
  */
 #pragma once
 
@@ -18,14 +19,15 @@
 /**
  * ZZZ Locomotion 过渡决策类。
  *
- * 判定集合包含 NotMoving_To_Conduit()、Stop_To_Conduit()、
- * Conduit_To_Moving_Direct()、Conduit_To_EnterMove()、ShouldStopMoving()，以及
- * Moving 内的 WalkRun_To_TurnBack()；WalkRun → TurnBack 的检测只读逻辑相位。
- * Back → WalkRun 的完整动画播放条件由 AnimBP 自己判断，不再由本类提供。
- * ShouldStopMoving() 是 Moving → Stop 与 EnterMove → Stop 两个 Blueprint 入口
- * 共同使用的唯一底层停止输入判定。
- * UZZZAnimInstance 负责注入上下文，并将底层结果转发给 AnimBP 的过渡入口。
- * 所有决策函数为 const 且只读，线程安全。
+ * 七个判定，对应 AnimBP 里七条需要逻辑条件的过渡：
+ * `NotMoving_To_Conduit`、`Stop_To_Conduit`、`Conduit_To_EnterMove`、
+ * `Conduit_To_Moving_Direct`、`ShouldStopMoving`（EnterMove → Stop）、
+ * `ShouldExitMoving`（Moving → Stop）、`WalkRun_To_TurnBack`。
+ *
+ * 纯动画时序的过渡不在这里：EnterMove → Moving、TurnBack → WalkRun、
+ * Stop → NotMoving 都由 AnimBP 用 `Time Remaining (ratio)` 自己判定。
+ *
+ * 所有函数 const 且只读，线程安全，求值次数与时机都不影响状态。
  */
 class FZZZLocomotionDecisions
 {
@@ -70,9 +72,12 @@ public:
 	bool ShouldExitMoving() const;
 
 	/**
-	 * WalkRun → TurnBack：移动层的转身相位已进入非 None。
+	 * WalkRun → TurnBack：移动层的转身相位处于曲线接管段（`Turning` / `Braking`）。
 	 *
-	 * 反向输入的几何判定在移动层做，这里只读结果。
+	 * 反向输入的几何判定在移动层做，这里只读相位结果。
+	 * 刻意**排除** `RunOut`：那一段方向已交回输入、与普通走跑无异，
+	 * 且若把它算进来，AnimBP 靠动画播完切回 WalkRun 之后会立刻重新进入 TurnBack，
+	 * 造成转身动画循环播放。
 	 */
 	bool WalkRun_To_TurnBack() const;
 

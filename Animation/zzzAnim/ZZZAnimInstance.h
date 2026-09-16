@@ -4,20 +4,43 @@
  *
  * 设计哲学：拓扑在蓝图，决策在 C++，求值在 AnimGraph。
  *
- * 本类只提供三类产物供 AnimBP 引用：
- *   1. 移动过渡判定（UFUNCTION → bool）：NotMoving/Stop → Conduit 的入口条件，以及
- *      Conduit 的分流条件、Moving → Stop、EnterMove → Stop 两个独立 Blueprint 入口；两个入口共享
- *      LocomotionDecisions.ShouldStopMoving() 的停止移动输入判定；Direct Conduit
- *      仅依据本帧 Snapshot_Gait == Run。EnterMove → Moving 的动画播放完成条件由
- *      AnimBP 直接使用 Time Remaining (ratio) <= 0 处理，不需要 C++ 函数
- *   2. 表现参数维护：Moving 子状态、StopValue、GaitValue 与 GaitBlendY 的维护由 C++ 每帧刷新完成；
- *      Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
- *   3. 配表查询（UFUNCTION → UAnimSequence*）：被 AnimGraph 节点 Bind
+ * ## ABP_Pyrios 实际用到的东西
+ * 状态机嵌套是 `MainStateMachine → MainGroundState → LocomotionState`，
+ * 最内层的 locomotion 状态机有五个状态与一个 Conduit：
  *
- * 本类不维护状态机循环，也不维护步态取值、Walk→Run 升级或 Sprint
- * 触发消费；步态由逻辑侧提供，动画层只消费快照并推进 GaitBlendY，维护 StopValue。
- * EnterMove 早停计时与 Moving 子状态、TurnBack 返回握手均由 FZZZLocomotionEvents 在 C++ 每帧逻辑中集中维护，
- * AnimBP 只保留状态机拓扑、过渡条件调用和动画播放。
+ * ```text
+ * NotMoving ──Locomotion_NotMoving_To_Conduit──┐
+ * Stop ───────Locomotion_Stop_To_Conduit───────┤
+ *                                          Conduit
+ *                          ┌──Conduit_To_EnterMove──→ EnterMove
+ *                          └──Conduit_To_Moving_Direct──→ Moving
+ * EnterMove ──动画剩余 <= 0.03──→ Moving
+ * EnterMove ──EnterMove_To_Stop──→ Stop
+ * Moving ─────Moving_To_Stop─────→ Stop
+ * Stop ───────动画剩余 <= 0.5────→ NotMoving
+ *
+ * Moving 内层：WalkRun ──WalkRun_To_TurnBack──→ TurnBack
+ *                      ←──动画剩余 <= 0.03────┘
+ * ```
+ *
+ * 各状态取的资产：`NotMoving` = `IdleLoop`，`EnterMove` = `WalkStart`，
+ * `TurnBack` = `TurnBack`，`Stop` 用 `StateMemory.StopValue` 在
+ * `WalkStartEnd` / `WalkEnd` / `RunEnd` 之间选，`WalkRun` 用 `WalkRun` BlendSpace
+ * 并以 `StateMemory.GaitBlendY` 驱动它的 **X 轴**（BlendSpace1D 的单轴是 X）。
+ *
+ * AnimGraph 顶层在状态机之后还接了一个作用于 `Bip001` 的 `Transform (Modify) Bone`
+ * （组件空间、只有 Z 平移 50.802）用于把骨架对齐胶囊体，以及一个惯性化节点。
+ * 那两个与 root motion 无关，动画的 in-place 化只扣水平位移与 yaw，不影响它们。
+ *
+ * ## 蓝图当前只读这三个成员
+ * `StateMemory.GaitBlendY`、`StateMemory.StopValue`，以及两个查表函数。
+ * 其余暴露出去的属性（`AnimBlend*`、`ActualVelocity*`、`bTurnBackRunOut`）
+ * 目前**没有**任何 AnimGraph 节点消费，保留它们是为了给表现层留钩子；
+ * 逐个属性的现状见各自的注释。
+ *
+ * 本类不维护状态机循环，也不解算步态：步态由移动层给出，动画层只消费快照、
+ * 推进 GaitBlendY 与 StopValue。EnterMove 早停计时与 Moving 子状态由
+ * `FZZZLocomotionEvents` 每帧维护。
  */
 #pragma once
 
@@ -51,15 +74,15 @@ public:
 	virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
 
 	// ============================================================
-	// ★★ Locomotion 过渡决策函数（AnimBP 过渡条件引用） ★★
+	// Locomotion 过渡决策函数（AnimBP 过渡条件引用）
 	//
-	// 移动过渡判定保持为快照只读视图：NotMoving → Conduit、Stop → Conduit、Conduit 的
-	// Direct/EnterMove 互补分流，以及 Moving → Stop、EnterMove → Stop 两个独立
-	// Blueprint 入口；两个 Stop 入口共同转发同一个停止输入判定。
-	// 停止判定不读取速度；EnterMove → Moving 的动画播放完成条件由 AnimBP 直接使用
-	// Time Remaining (ratio) <= 0 处理，不需要 C++ 函数。Direct 分支仅
-	// 依据 Snapshot_Gait == Run；走跑表现由 GaitBlendY 驱动，
-	// 不再通过 Moving 内 Walk→Run 状态过渡或动画层计时判定实现。
+	// 全部是快照的只读视图，无副作用，因此蓝图求值多少次、在哪个线程求值都不影响状态。
+	// 停止判定看的是「有没有移动输入」而不是速度：起步第一帧速度还是 0，
+	// 按速度判定会让起步动画晚一帧，玩家能感觉到输入迟滞。
+	//
+	// 三个纯动画时序的过渡不在这里：EnterMove → Moving、TurnBack → WalkRun、
+	// Stop → NotMoving 都由 AnimBP 自己用 `Time Remaining (ratio)` 判定 ——
+	// 那是「这段动画播完了吗」，属于表现层自己的事，C++ 不需要知道。
 	// ============================================================
 
 	/**
@@ -142,7 +165,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	FZZZAnimStateMemory StateMemory;
 
-	/** 相对 Actor 当前水平朝向的平滑移动方向 X（右）和 Y（前），供 AnimBP BlendSpace 使用。 */
+	/**
+	 * 相对 Actor 当前水平朝向的移动方向分量：X 为右、Y 为前，均已归一化。
+	 *
+	 * **当前没有 AnimGraph 节点消费这两个值。** 走跑混合用的是
+	 * `StateMemory.GaitBlendY`（速度档位），方向靠 Actor 自身转向解决。
+	 * 这两个值要等有了侧向/后退的移动循环动画、把 `WalkRun` 换成二维 BlendSpace
+	 * 之后才有去处 —— Pyrios 目前只有 `Walk_Loop` 与 `Run_Loop` 两个前向循环。
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float AnimBlendX = 0.f;
 
@@ -150,42 +180,50 @@ public:
 	float AnimBlendY = 0.f;
 
 	/**
-	 * `RootMotion_PosX/PosY` 差分得到的曲线分量速度（cm/s）。
+	 * `RootMotion_PosX/PosY` 差分得到的曲线分量速度（cm/s）与它的方向、方向角。
 	 *
-	 * 轴序是 UE 局部空间（X 前、Y 右），基准是**动画段起点的朝向**而非角色当前朝向。
-	 * 转身时角色已经转过 180 度，而这个向量仍以进入转身那一刻的朝向为基准。
+	 * 轴序是 UE 局部空间（X 前、Y 右），但基准是**动画段起点的朝向**而非角色当前朝向 ——
+	 * 转身时角色已经转过 180 度，这三个值仍以进入转身那一刻的朝向为基准。
+	 * 想拿它们算世界方向必须自己用「进入该段时的朝向」换算，直接当角色局部方向用会错。
+	 *
+	 * **当前没有 AnimGraph 节点消费。** 曲线速度已经在移动层驱动 `GetMaxSpeed`，
+	 * 表现层不需要重复读一遍；留着是为了调试时能在 AnimBP 调试面板直接看到曲线采样结果。
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	FVector AnimCurveVelocity = FVector::ZeroVector;
 
-	/** 上者的归一化方向。同样以动画段起点朝向为基准。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	FVector AnimCurveVelocityDirection = FVector::ZeroVector;
 
-	/** 动画曲线速度方向角（度）：0 为段起点正前方，+90 为其右侧。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	float AnimCurveVelocityAngle = 0.f;
 
-	/** 角色实际水平速度的世界空间单位方向。 */
+	/**
+	 * 角色**实际**速度（`Velocity`，不是曲线）的派生量：世界方向、相对 Actor 的
+	 * BlendSpace 分量（X=右、Y=前）、以及相对 Actor 的方向角（0=前，+90=右）。
+	 *
+	 * `ActualVelocityBlendX/Y` 是上面 `AnimBlendX/Y` 的数据来源，其余两个仅供调试。
+	 * **当前都没有 AnimGraph 节点消费。**
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	FVector ActualVelocityDirection = FVector::ZeroVector;
 
-	/** 角色实际速度相对 Actor 的 BlendSpace 分量：X=右，Y=前。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float ActualVelocityBlendX = 0.f;
 
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float ActualVelocityBlendY = 0.f;
 
-	/** 角色实际速度相对 Actor 的方向角（度）：0=前，+90=右。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float ActualVelocityAngle = 0.f;
 
 	/**
-	 * 转身已进入交还输入的 `RunOut` 段；AnimBP 只读。
+	 * 转身已进入交还输入的 `RunOut` 段。
 	 *
-	 * 这一段的移动方向来自玩家输入而非曲线，朝向也交回了 CMC 的自动对齐，
-	 * 所以身体朝向可能与动画姿势有偏差 —— 玩家在这一段改方向时尤其明显。
+	 * **当前没有 AnimGraph 节点消费**：`RunOut` 段 `Locomotion_WalkRun_To_TurnBack`
+	 * 为假，状态机自己就切回 WalkRun 了，不需要读这个标记来做分支。
+	 * 留着是给「想在跑出段单独做表现」留的钩子（那一段方向来自玩家输入而非曲线，
+	 * 朝向交回了 CMC 的自动对齐，玩家改方向时身体朝向会与动画姿势有偏差）。
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
 	bool bTurnBackRunOut = false;

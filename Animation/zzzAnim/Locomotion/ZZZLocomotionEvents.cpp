@@ -29,12 +29,17 @@ void FZZZLocomotionEvents::SynchronizeMovingSubState()
 
 	// MovingSubState 只是移动层转身相位的投影，供 AnimBP 读取；反向输入检测与相位切换的
 	// 唯一真相在 `UGGYGOCharacterMovementComponent::UpdateTurnBack`，这里不重复判定。
-	// 三个非 None 相位都算“转身中”；Back → WalkRun 是否离开由 AnimBP 的动画播放完成条件决定，
-	// 不把相位结束单独当作完整 TurnBack 播放完成信号。
-	Context.Memory->MovingSubState =
-		Context.Snap->TurnBackPhase == EGGYGOTurnBackPhase::None
-			? EZZZAnimMovingSubState::WalkRun
-			: EZZZAnimMovingSubState::TurnBack;
+	//
+	// 投影口径与 `FZZZLocomotionDecisions::WalkRun_To_TurnBack` 保持一致：只有曲线接管段
+	// 算「转身中」，RunOut 段算 WalkRun。两处口径必须相同，否则子状态会与 AnimBP
+	// 实际所处的状态对不上，读它做表现分支就会错。
+	const EGGYGOTurnBackPhase Phase = Context.Snap->TurnBackPhase;
+	const bool bCurveDriven = (Phase == EGGYGOTurnBackPhase::Turning)
+		|| (Phase == EGGYGOTurnBackPhase::Braking);
+
+	Context.Memory->MovingSubState = bCurveDriven
+		? EZZZAnimMovingSubState::TurnBack
+		: EZZZAnimMovingSubState::WalkRun;
 }
 
 void FZZZLocomotionEvents::AdvanceStopSelection(float DeltaSeconds)

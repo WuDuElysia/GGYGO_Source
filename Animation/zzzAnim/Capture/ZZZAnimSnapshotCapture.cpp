@@ -39,10 +39,10 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 	OutSnap.ActualVelocityAngle = MoveComp->GetLocalVelocityAngle();
 	MoveComp->GetLocalVelocityBlend(OutSnap.ActualVelocityBlendX, OutSnap.ActualVelocityBlendY);
 
-	// BlendSpace 主输入用实际速度的分量。
+	// 方向分量直接取实际速度的分量，不在这里做额外插值 —— 平滑已经由 CMC 的
+	// 加减速提供，两级平滑串联会让混合响应明显滞后于角色实际转向。
 	//
-	// 平滑由 CMC 的加减速提供，这里不再额外插值 —— 两级平滑串联会让
-	// 混合响应明显滞后于角色实际转向。
+	// 这两个值目前没有 BlendSpace 消费：走跑混合是一维的、由 GaitBlendY 驱动。
 	OutSnap.AnimBlendX = OutSnap.ActualVelocityBlendX;
 	OutSnap.AnimBlendY = OutSnap.ActualVelocityBlendY;
 

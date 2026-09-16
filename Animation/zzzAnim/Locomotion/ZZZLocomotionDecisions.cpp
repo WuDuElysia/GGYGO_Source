@@ -74,9 +74,22 @@ bool FZZZLocomotionDecisions::ShouldExitMoving() const
 
 bool FZZZLocomotionDecisions::WalkRun_To_TurnBack() const
 {
-	// 反向输入检测的唯一真相在移动层；此处只读相位：整个 TurnBack 生命周期都允许进入。
-	// 用 Phase != None 而不是只等某个具体相位，避免蓝图求值晚于相位推进时错过进入窗口 ——
-	// 相位由曲线驱动，一帧内就可能从 Turning 走到 Braking。
-	return Context.Snap
-		&& Context.Snap->TurnBackPhase != EGGYGOTurnBackPhase::None;
+	if (!Context.Snap)
+	{
+		return false;
+	}
+
+	// 只有曲线接管段（Turning / Braking）才进 TurnBack 状态，**不包括 RunOut**。
+	//
+	// 不能用 `Phase != None`：AnimBP 的 TurnBack → WalkRun 靠动画播完判定
+	// （`GetRelevantAnimTimeRemainingFraction <= 0.03`），而玩家在 RunOut 段持续按着输入时
+	// 相位会一直停在 RunOut。那样动画播完切到 WalkRun 后，下一帧本判定又成立，
+	// 立刻退回 TurnBack 从头播 —— 转身动画会无限循环直到相位超时。
+	//
+	// 排除 RunOut 在表现上也是对的：那一段的移动方向已经交回输入，与普通走跑无异，
+	// 曲线给出的速度也回升到了 Run_Loop 的量级，播通用跑步循环比播转身动画的后半段
+	// 更贴合「玩家可能已经把方向打到别处」这个事实。
+	const EGGYGOTurnBackPhase Phase = Context.Snap->TurnBackPhase;
+	return Phase == EGGYGOTurnBackPhase::Turning
+		|| Phase == EGGYGOTurnBackPhase::Braking;
 }

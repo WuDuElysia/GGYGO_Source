@@ -20,9 +20,6 @@ namespace ZZZLocomotionRules
 	/** GaitBlendY 插值速率上限（1/秒）。 */
 	inline constexpr float MaxGaitBlendInterpSpeed = 50.0f;
 
-	/** WalkRun → TurnBack 的默认反向输入点积阈值。 */
-	inline constexpr float DefaultTurnBackReverseInputDotThreshold = -0.95f;
-
 	/** 单帧推进的帧间隔上界（秒）。 */
 	inline constexpr float MaxClampedDelta = 0.1f;
 
@@ -40,9 +37,6 @@ namespace ZZZLocomotionRules
 	 * 配置为空返回默认值；配置非有限或小于等于 0 时返回 0，否则上钳到上限。
 	 */
 	float ResolveGaitBlendInterpSpeed(const FZZZAnimTuning* InTuning);
-
-	/** 解析 WalkRun → TurnBack 的反向输入点积阈值，并限制到 [-1, 0]。 */
-	float ResolveTurnBackReverseInputDotThreshold(const FZZZAnimTuning* InTuning);
 
 	/**
 	 * 由 Snapshot_Gait 推导 GaitBlendY 目标值：仅 Run 为 1，其余取值为 0。

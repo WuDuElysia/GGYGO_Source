@@ -260,8 +260,12 @@ public:
 	/**
 	 * 水平速度相对角色朝向的 BlendSpace 分量。X 为右、Y 为前，均已归一化。
 	 *
-	 * 轴序与 UE 的局部空间（X 前、Y 右）**相反**，这是动画资产侧的约定，
-	 * BlendSpace 的两个轴就是按这个顺序配的，改这里会让所有移动混合错位。
+	 * 轴序与 UE 的局部空间（X 前、Y 右）**相反**，这是动画资产侧的约定。
+	 *
+	 * 目前没有 BlendSpace 消费这两个值：走跑混合是一维的，输入是步态混合值
+	 * （`FZZZAnimStateMemory::GaitBlendY`），方向靠 Actor 自身转向解决。
+	 * 要等有了侧向/后退的移动循环动画、换成二维 BlendSpace 之后，
+	 * 这两个分量才会真正接上去。
 	 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	void GetLocalVelocityBlend(float& OutBlendX, float& OutBlendY) const;

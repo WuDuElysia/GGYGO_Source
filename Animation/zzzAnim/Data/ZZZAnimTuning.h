@@ -15,9 +15,9 @@ struct FZZZAnimTuning
 {
 	GENERATED_BODY()
 
-	/** WalkRun → TurnBack 的反向输入点积阈值；输入点积小于等于该值时视为接近反向。 */
-	UPROPERTY(EditAnywhere, Category = "Locomotion", meta = (ClampMin = "-1.0", ClampMax = "0.0"))
-	float TurnBackReverseInputDotThreshold = -0.95f;
+	// 这里不放反向输入阈值。转身的触发判定属于移动层，阈值在
+	// `UGGYGOMovementSet::TurnBackReverseInputDotThreshold`，动画层只读相位结果。
+	// 两边各存一份的话，改动画层这份不会有任何效果，却看不出来。
 
 	/** 循环动画间 BlendIn 时间（秒） */
 	UPROPERTY(EditAnywhere, Category = "Blend")
