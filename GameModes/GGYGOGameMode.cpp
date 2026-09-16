@@ -107,7 +107,62 @@ void AGGYGOGameMode::ActivateGameFeatures()
 			continue;
 		}
 
-		Subsystem.LoadAndActivateGameFeaturePlugin(PluginURL, FGameFeaturePluginLoadComplete());
+		// 计数在发起前递增：回调可能同步触发（插件已加载过时），
+		// 先增后调才能保证递减不会把计数打到负数。
+		++PendingGameFeatureCount;
+
+		Subsystem.LoadAndActivateGameFeaturePlugin(
+			PluginURL,
+			FGameFeaturePluginLoadComplete::CreateUObject(
+				this, &ThisClass::OnGameFeatureActivated, PluginURL));
+	}
+}
+
+void AGGYGOGameMode::OnGameFeatureActivated(const UE::GameFeatures::FResult& Result, FString PluginURL)
+{
+	if (Result.HasError())
+	{
+		// 只报错不阻断：让一个装不上的插件卡住所有玩家的进场，
+		// 比缺这个插件的内容严重得多。
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("GameFeature [%s] 激活失败：%s。依赖它的内容将缺失。"),
+			*PluginURL, *Result.GetError());
+	}
+
+	--PendingGameFeatureCount;
+
+	if (AreGameFeaturesReady())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Display,
+			TEXT("GameFeature 全部激活完毕，放行等待中的玩家。"));
+
+		SpawnSquadForPendingPlayers();
+	}
+}
+
+void AGGYGOGameMode::SpawnSquadForPendingPlayers()
+{
+	// 遍历当前所有玩家而不是维护一份等待名单：等待期间玩家可能断线，
+	// 名单里就会留下悬垂指针。迭代器给出的是此刻真实存在的 Controller。
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		APlayerController* PlayerController = It->Get();
+		if (!PlayerController)
+		{
+			continue;
+		}
+
+		// 已经有队伍的跳过，避免重复装配出两套位置。
+		const AGGYGOPlayerState* GGYGOPlayerState = PlayerController->GetPlayerState<AGGYGOPlayerState>();
+		const UGGYGOSquadComponent* SquadComponent =
+			GGYGOPlayerState ? GGYGOPlayerState->GetSquadComponent() : nullptr;
+
+		if (SquadComponent && SquadComponent->IsSquadAssembled())
+		{
+			continue;
+		}
+
+		SpawnSquadForPlayer(PlayerController);
 	}
 }
 
@@ -116,6 +171,17 @@ void AGGYGOGameMode::HandleStartingNewPlayer_Implementation(APlayerController* N
 	// 有意不调用 Super：父类会走默认的"生成一个 Pawn 并附身"流程。
 	if (!NewPlayer)
 	{
+		return;
+	}
+
+	// 插件还没激活完就先不生成。插件里的 Action 可能要往角色类上注入组件、
+	// 授予能力，早生成的角色会缺这些内容且不报错。
+	// 就绪回调里会通过 SpawnSquadForPendingPlayers 补上。
+	if (!AreGameFeaturesReady())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Display,
+			TEXT("HandleStartingNewPlayer: 尚有 %d 个 GameFeature 未激活完毕，[%s] 的队伍延后装配。"),
+			PendingGameFeatureCount, *GetNameSafe(NewPlayer));
 		return;
 	}
 

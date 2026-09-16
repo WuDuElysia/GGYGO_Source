@@ -110,6 +110,12 @@ AnimBP / AnimInstance 不作为任何逻辑字段的权威写入者。
 ## 装配流程
 
 `AGGYGOGameMode` 接管角色生成，不调 `Super::HandleStartingNewPlayer`。
+
+装配前先等 GameFeature 插件激活完成（`PendingGameFeatureCount` 归零）。
+插件里的 `GameFeatureAction` 可能往角色类注入组件或授予能力，那些动作在激活完成时才执行，
+早生成的角色会缺内容且不报错。插件列表为空时计数恒为零，装配路径不变。
+插件加载失败也照常放行，只报错 —— 一个装不上的插件不该让所有玩家卡在没有角色的状态。
+
 分两阶段：先为名单里每份 PawnData 建位置（此时属性与能力已就绪），
 再生成 Pawn 并 `InitializeAbilitySystem(位置的 ASC, 位置)` + `Slot->SetAvatar(Pawn)`。
 
