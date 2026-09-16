@@ -13,6 +13,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
 #include "Camera/GGYGOCameraComponent.h"
+#include "Character/Components/GGYGOHeroComponent.h"
 #include "Engine/HitResult.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/Controller.h"
@@ -504,24 +505,27 @@ void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMo
 		return;
 	}
 
-	// 只有被玩家操控的角色有相机组件。AI 角色走到这里是正常的，不报错。
-	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
+	// HeroComponent 保存“当前有效模式”及其所有者。CameraComponent 每次被引擎拉取时
+	// 再读取这个结果，因此能力不需要自己每帧重复 Push。
+	if (UGGYGOHeroComponent* HeroComponent = UGGYGOHeroComponent::FindHeroComponent(GetAvatarActorFromActorInfo()))
 	{
-		CameraComponent->PushCameraMode(CameraMode);
+		HeroComponent->SetAbilityCameraMode(CameraMode, CurrentSpecHandle);
 		ActiveCameraMode = CameraMode;
 	}
 }
 
 void UGGYGOGameplayAbility::ClearCameraMode()
 {
-	// 只清运行时标记，不弹栈。
-	//
-	// 相机模式栈没有"弹出"操作，恢复靠的是默认模式重新被推到栈顶后
-	// 权重平滑升回 1。显式弹出反而会造成一次跳变。
-	//
-	// 清的是 ActiveCameraMode 而不是 AbilityCameraMode：后者是配置，
-	// 本类实例会被复用，清了配置就等于这个能力此后永远不再接管相机。
-	ActiveCameraMode = nullptr;
+	if (ActiveCameraMode)
+	{
+		if (UGGYGOHeroComponent* HeroComponent = UGGYGOHeroComponent::FindHeroComponent(GetAvatarActorFromActorInfo()))
+		{
+			HeroComponent->ClearAbilityCameraMode(CurrentSpecHandle);
+		}
+
+		// 无论 Avatar 是否仍存在，都要清掉能力实例自己的运行时标记。
+		ActiveCameraMode = nullptr;
+	}
 }
 
 void UGGYGOGameplayAbility::ApplyCameraOffset(const FGGYGOCameraOffset& Offset)

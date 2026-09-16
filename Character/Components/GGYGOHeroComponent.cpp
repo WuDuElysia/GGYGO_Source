@@ -6,6 +6,7 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "Camera/GGYGOCameraComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Components/GameFrameworkComponentManager.h"
@@ -49,6 +50,16 @@ void UGGYGOHeroComponent::BeginPlay()
 {
 	Super::BeginPlay();
 
+	// 相机由引擎按需拉取；HeroComponent 只负责在每次拉取时给出
+	// 已完成能力覆盖仲裁的“当前有效模式”。
+	if (APawn* Pawn = GetPawn<APawn>())
+	{
+		if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(Pawn))
+		{
+			CameraComponent->DetermineCameraModeDelegate.BindUObject(this, &ThisClass::DetermineCameraMode);
+		}
+	}
+
 	// 只关心 PawnExtension 的状态：输入初始化需要 PawnData，而 PawnData 归它管。
 	BindOnActorInitStateChanged(UGGYGOPawnExtensionComponent::NAME_ActorFeatureName, FGameplayTag(), false);
 
@@ -58,9 +69,62 @@ void UGGYGOHeroComponent::BeginPlay()
 
 void UGGYGOHeroComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	if (APawn* Pawn = GetPawn<APawn>())
+	{
+		if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(Pawn))
+		{
+			CameraComponent->DetermineCameraModeDelegate.Unbind();
+			CameraComponent->ClearCameraModeStack();
+		}
+	}
+
+	AbilityCameraModeOverrides.Reset();
 	UnregisterInitStateFeature();
 
 	Super::EndPlay(EndPlayReason);
+}
+
+TSubclassOf<UGGYGOCameraMode> UGGYGOHeroComponent::DetermineCameraMode() const
+{
+	if (!AbilityCameraModeOverrides.IsEmpty())
+	{
+		return AbilityCameraModeOverrides.Last().CameraMode;
+	}
+
+	const APawn* Pawn = GetPawn<APawn>();
+	const UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Pawn);
+	const UGGYGOPawnData* PawnData = PawnExtComp ? PawnExtComp->GetPawnData<UGGYGOPawnData>() : nullptr;
+	return PawnData ? PawnData->DefaultCameraMode : nullptr;
+}
+
+void UGGYGOHeroComponent::SetAbilityCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode, const FGameplayAbilitySpecHandle& OwningSpecHandle)
+{
+	if (!CameraMode || !OwningSpecHandle.IsValid())
+	{
+		return;
+	}
+
+	AbilityCameraModeOverrides.RemoveAll([&OwningSpecHandle](const FGGYGOAbilityCameraModeOverride& Override)
+	{
+		return Override.OwningSpecHandle == OwningSpecHandle;
+	});
+
+	FGGYGOAbilityCameraModeOverride& NewOverride = AbilityCameraModeOverrides.AddDefaulted_GetRef();
+	NewOverride.CameraMode = CameraMode;
+	NewOverride.OwningSpecHandle = OwningSpecHandle;
+}
+
+void UGGYGOHeroComponent::ClearAbilityCameraMode(const FGameplayAbilitySpecHandle& OwningSpecHandle)
+{
+	if (!OwningSpecHandle.IsValid())
+	{
+		return;
+	}
+
+	AbilityCameraModeOverrides.RemoveAll([&OwningSpecHandle](const FGGYGOAbilityCameraModeOverride& Override)
+	{
+		return Override.OwningSpecHandle == OwningSpecHandle;
+	});
 }
 
 bool UGGYGOHeroComponent::CanChangeInitState(UGameFrameworkComponentManager* Manager, FGameplayTag CurrentState, FGameplayTag DesiredState) const

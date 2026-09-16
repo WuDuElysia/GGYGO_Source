@@ -28,7 +28,7 @@ class UGGYGOCameraMode;
 class UGGYGOCameraModeStack;
 class UObject;
 
-/** 由外部决定当前该用哪个相机模式。返回空表示保持现状。 */
+/** 由外部决定当前该用哪个相机模式。返回空时组件使用自身当前视图兜底。 */
 DECLARE_DELEGATE_RetVal(TSubclassOf<UGGYGOCameraMode>, FGGYGODetermineCameraModeSignature);
 
 UCLASS(meta = (BlueprintSpawnableComponent))
@@ -49,7 +49,7 @@ public:
 	/** 视角跟随的目标。默认是组件拥有者。 */
 	virtual AActor* GetTargetActor() const { return GetOwner(); }
 
-	/** 由外部提供默认（栈底）相机模式。 */
+	/** 由外部提供已仲裁的当前有效相机模式。 */
 	FGGYGODetermineCameraModeSignature DetermineCameraModeDelegate;
 
 	/**
@@ -64,14 +64,6 @@ public:
 	/** 撤销当前的镜头微调，按它自己的 `BlendOutTime` 回落。 */
 	void ClearCameraOffset();
 
-	/**
-	 * 临时推入一个相机模式。
-	 *
-	 * 能力激活期间调用，能力结束时不需要显式弹出 —— 停止推入后，
-	 * 默认模式会在下一帧重新被推到栈顶并混合回去。
-	 */
-	void PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass);
-
 	/** 清空模式栈。切换 Avatar 时调用。 */
 	void ClearCameraModeStack();
 
@@ -81,7 +73,7 @@ protected:
 	/** 引擎每帧取视角的入口。在这里求值模式栈。 */
 	virtual void GetCameraView(float DeltaTime, FMinimalViewInfo& DesiredView) override;
 
-	/** 把默认模式推到栈底。 */
+	/** 把外部仲裁出的当前有效模式推到栈顶。 */
 	virtual void UpdateCameraModes();
 
 	/** 相机模式栈。 */

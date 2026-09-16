@@ -1,6 +1,6 @@
 /**
  * @file GGYGOHeroComponent.h
- * @brief 被玩家操控的单位才挂的组件 —— 负责输入
+ * @brief 被玩家操控的单位才挂的组件 —— 负责输入与相机模式仲裁
  *
  * "Hero" 指的是**被玩家操控**，不是"英雄角色"。AI 控制的敌人不挂它，
  * 因此不必为"这个单位需不需要读手柄"写运行时判断 —— 它根本没有这个组件。
@@ -8,7 +8,8 @@
  * 队伍换角色时正好利用这一点：只有当前出战的角色挂着能响应输入的组件。
  *
  * ## 职责边界
- * 只做输入：注册 IMC、把输入绑到 Native 函数或翻译成 InputTag。
+ * 输入侧注册 IMC、把输入绑到 Native 函数或翻译成 InputTag；
+ * 相机侧只仲裁“能力覆盖 / PawnData 默认模式”，不自己 Tick、不计算视角。
  * 它**不消费** ASC 的输入缓存 —— 那需要 `PostProcessInput` 的时机，
  * 只有 PlayerController 有（见 `AGGYGOPlayerController`）。
  *
@@ -22,18 +23,32 @@
 
 #include "Components/GameFrameworkInitStateInterface.h"
 #include "Components/PawnComponent.h"
+#include "GameplayAbilitySpecHandle.h"
 
 #include "GGYGOHeroComponent.generated.h"
 
 namespace EEndPlayReason { enum Type : int; }
 
 class UGameFrameworkComponentManager;
+class UGGYGOCameraMode;
 class UGGYGOInputConfig;
 class UInputComponent;
 class UObject;
 struct FActorInitStateChangedParams;
 struct FGameplayTag;
 struct FInputActionValue;
+
+/** 一条仍处于激活状态的能力相机覆盖；数组顺序就是覆盖先后顺序。 */
+USTRUCT()
+struct FGGYGOAbilityCameraModeOverride
+{
+	GENERATED_BODY()
+
+	UPROPERTY()
+	TSubclassOf<UGGYGOCameraMode> CameraMode;
+
+	FGameplayAbilitySpecHandle OwningSpecHandle;
+};
 
 UCLASS(meta = (BlueprintSpawnableComponent))
 class GGYGO_API UGGYGOHeroComponent : public UPawnComponent, public IGameFrameworkInitStateInterface
@@ -63,6 +78,15 @@ public:
 
 	/** 由拥有者 Pawn 在 `SetupPlayerInputComponent` 里调用。 */
 	void InitializePlayerInput(UInputComponent* PlayerInputComponent);
+
+	/** 返回当前有效的相机模式：能力覆盖优先，否则使用 PawnData 默认模式。 */
+	TSubclassOf<UGGYGOCameraMode> DetermineCameraMode() const;
+
+	/** 由能力登记临时相机模式；同一 Spec 再登记会更新并移到覆盖栈顶。 */
+	void SetAbilityCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode, const FGameplayAbilitySpecHandle& OwningSpecHandle);
+
+	/** 移除指定能力的覆盖；若它在栈顶，下一条仍激活的覆盖会自然恢复。 */
+	void ClearAbilityCameraMode(const FGameplayAbilitySpecHandle& OwningSpecHandle);
 
 	/**
 	 * 输入缓冲的有效时长（秒）。
@@ -122,6 +146,10 @@ protected:
 	void HandleAbilityGroupFreed(FGameplayTag GroupTag);
 
 private:
+	/** 仍处于激活状态的能力相机覆盖，最后一项优先级最高。 */
+	UPROPERTY(Transient)
+	TArray<FGGYGOAbilityCameraModeOverride> AbilityCameraModeOverrides;
+
 	/** 本组件产生的 Ability 输入绑定句柄，用于整批解绑。 */
 	TArray<uint32> AbilityInputBindHandles;
 

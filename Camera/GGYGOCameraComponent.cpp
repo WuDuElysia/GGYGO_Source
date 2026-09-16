@@ -33,14 +33,6 @@ void UGGYGOCameraComponent::OnRegister()
 	}
 }
 
-void UGGYGOCameraComponent::PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass)
-{
-	if (CameraModeStack && CameraModeClass)
-	{
-		CameraModeStack->PushCameraMode(CameraModeClass);
-	}
-}
-
 void UGGYGOCameraComponent::ClearCameraModeStack()
 {
 	if (CameraModeStack)
@@ -56,12 +48,8 @@ void UGGYGOCameraComponent::UpdateCameraModes()
 		return;
 	}
 
-	// 每帧推一次默认模式。
-	//
-	// 看起来多余，实际上是能力结束后自动恢复的机制：能力期间它推自己的模式到栈顶，
-	// 默认模式因此被压在下面；能力停止推入后，这里的调用把默认模式重新提到栈顶，
-	// 它的权重从当前值平滑升回 1，视角就自然回来了。
-	// 若只在初始化时推一次，能力结束后就没有任何东西把视角带回去。
+	// 引擎在需要视图时驱动本组件；外部委托只返回已经完成玩法仲裁的有效模式。
+	// 每帧推入同一个类是幂等的，模式变化时则由栈负责平滑混合。
 	if (DetermineCameraModeDelegate.IsBound())
 	{
 		if (const TSubclassOf<UGGYGOCameraMode> CameraMode = DetermineCameraModeDelegate.Execute())
@@ -125,6 +113,14 @@ void UGGYGOCameraComponent::GetCameraView(float DeltaTime, FMinimalViewInfo& Des
 	check(CameraModeStack);
 
 	UpdateCameraModes();
+	if (!CameraModeStack->IsStackActivated())
+	{
+		// PawnData 尚未到达时没有模式可求值。组件保留着上一帧的世界变换，
+		// 交给 UCameraComponent 生成视图即可；首次初始化也至少落在 Pawn 上，
+		// 不会把未初始化的零向量写成世界原点镜头。
+		Super::GetCameraView(DeltaTime, DesiredView);
+		return;
+	}
 
 	FGGYGOCameraModeView CameraModeView;
 	CameraModeStack->EvaluateStack(DeltaTime, CameraModeView);
