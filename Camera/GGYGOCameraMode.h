@@ -89,6 +89,59 @@ struct FGGYGOCameraModeView
 };
 
 /**
+ * 叠加在当前模式求值结果之上的镜头微调。
+ *
+ * 存在的理由是"换模式"对小幅调整来说代价太大：换模式会丢掉当前模式的内部状态
+ * （锁定的目标、穿墙规避的臂长恢复进度），而且模式栈的混合是按整份视角做的，
+ * 连段中反复换模式会让镜头在两份视角之间来回混合。
+ *
+ * 微调走这条通道：当前模式照常求值，结果再被本结构偏移一次。
+ * 于是"重攻击时收 5 度 FOV"不需要新建一个相机模式类。
+ */
+USTRUCT(BlueprintType)
+struct FGGYGOCameraOffset
+{
+	GENERATED_BODY()
+
+	/**
+	 * 位置偏移，**相机局部空间**（X 前后、Y 左右、Z 上下）。
+	 *
+	 * 用局部空间而不是世界空间：同一份配置在角色朝任何方向时效果一致。
+	 * 正 X 把镜头推向被摄物（拉近），负 X 拉远。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Offset")
+	FVector LocationOffset = FVector::ZeroVector;
+
+	/**
+	 * 视场角增量（度）。负值收窄。
+	 *
+	 * 收窄 FOV 与拉近位置的观感不同：收 FOV 压缩透视、放大远景，
+	 * 适合表现发力；拉近位置会让近处物体变大、透视更强。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Offset")
+	float FieldOfViewDelta = 0.0f;
+
+	/** 施加时的过渡时间（秒）。0 表示立刻到位。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Offset", meta = (ClampMin = "0.0"))
+	float BlendInTime = 0.1f;
+
+	/**
+	 * 撤销时的回落时间（秒）。
+	 *
+	 * 通常要比 `BlendInTime` 长：进入可以快（配合出招的爆发感），
+	 * 回落太快会让镜头在能力结束瞬间弹回去。
+	 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Camera Offset", meta = (ClampMin = "0.0"))
+	float BlendOutTime = 0.25f;
+
+	/** 是否有实际效果。全零的配置不必参与插值。 */
+	bool IsNearlyZero() const
+	{
+		return LocationOffset.IsNearlyZero() && FMath::IsNearlyZero(FieldOfViewDelta);
+	}
+};
+
+/**
  * 相机模式基类。
  *
  * 派生类只需实现 `UpdateView`。混合权重、生命周期由栈统一管理。

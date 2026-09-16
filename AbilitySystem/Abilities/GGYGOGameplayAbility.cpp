@@ -480,6 +480,23 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 	}
 }
 
+void UGGYGOGameplayAbility::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
+	// 先应用相机配置再调父类。父类会触发蓝图的激活事件，
+	// 蓝图里可能立刻用 SetCameraMode 覆盖成别的模式，那应当赢。
+	if (AbilityCameraMode)
+	{
+		SetCameraMode(AbilityCameraMode);
+	}
+
+	if (!CameraOffset.IsNearlyZero())
+	{
+		ApplyCameraOffset(CameraOffset);
+	}
+
+	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+}
+
 void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode)
 {
 	if (!CameraMode)
@@ -497,16 +514,38 @@ void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMo
 
 void UGGYGOGameplayAbility::ClearCameraMode()
 {
-	// 只清标记，不弹栈。
+	// 只清运行时标记，不弹栈。
 	//
 	// 相机模式栈没有"弹出"操作，恢复靠的是默认模式重新被推到栈顶后
 	// 权重平滑升回 1。显式弹出反而会造成一次跳变。
+	//
+	// 清的是 ActiveCameraMode 而不是 AbilityCameraMode：后者是配置，
+	// 本类实例会被复用，清了配置就等于这个能力此后永远不再接管相机。
 	ActiveCameraMode = nullptr;
+}
+
+void UGGYGOGameplayAbility::ApplyCameraOffset(const FGGYGOCameraOffset& Offset)
+{
+	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
+	{
+		CameraComponent->SetCameraOffset(Offset);
+	}
+}
+
+void UGGYGOGameplayAbility::ClearCameraOffset()
+{
+	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
+	{
+		CameraComponent->ClearCameraOffset();
+	}
 }
 
 void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
 {
 	// 先清相机再交给父类：父类会清理 ActorInfo，之后就拿不到 Avatar 了。
+	// 被组仲裁取消、被死亡取消、Avatar 销毁这些路径都会走到这里，
+	// 所以镜头不会永久停在演出视角。
+	ClearCameraOffset();
 	ClearCameraMode();
 
 	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);

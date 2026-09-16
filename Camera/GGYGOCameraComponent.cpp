@@ -71,6 +71,55 @@ void UGGYGOCameraComponent::UpdateCameraModes()
 	}
 }
 
+void UGGYGOCameraComponent::SetCameraOffset(const FGGYGOCameraOffset& InOffset)
+{
+	CameraOffset = InOffset;
+	bCameraOffsetActive = true;
+
+	// 不重置 alpha：上一份微调可能还没回落完就来了新的一份，
+	// 从当前强度继续过渡比归零重来更平滑。
+}
+
+void UGGYGOCameraComponent::ClearCameraOffset()
+{
+	// 保留 CameraOffset 本身，回落期间还要用它的数值和 BlendOutTime。
+	bCameraOffsetActive = false;
+}
+
+void UGGYGOCameraComponent::UpdateCameraOffsetAlpha(float DeltaTime)
+{
+	const float BlendTime = bCameraOffsetActive ? CameraOffset.BlendInTime : CameraOffset.BlendOutTime;
+	const float Target = bCameraOffsetActive ? 1.0f : 0.0f;
+
+	if (BlendTime <= 0.0f)
+	{
+		CameraOffsetAlpha = Target;
+		return;
+	}
+
+	// 按时间线性推进而不是用 FInterpTo：后者是指数逼近，永远到不了端点，
+	// 会让微调残留一个极小的偏移量。
+	const float Step = DeltaTime / BlendTime;
+	CameraOffsetAlpha = FMath::Clamp(
+		CameraOffsetAlpha + (bCameraOffsetActive ? Step : -Step), 0.0f, 1.0f);
+}
+
+void UGGYGOCameraComponent::ApplyCameraOffset(FGGYGOCameraModeView& View) const
+{
+	if (CameraOffsetAlpha <= 0.0f || CameraOffset.IsNearlyZero())
+	{
+		return;
+	}
+
+	// 位置偏移在相机局部空间：同一份配置在角色朝任何方向时观感一致。
+	const FVector LocalOffset = CameraOffset.LocationOffset * CameraOffsetAlpha;
+	View.Location += View.Rotation.RotateVector(LocalOffset);
+
+	// FOV 要钳制：多份配置叠加或误填大值会算出 0 或负数，那会让投影矩阵失效。
+	View.FieldOfView = FMath::Clamp(
+		View.FieldOfView + CameraOffset.FieldOfViewDelta * CameraOffsetAlpha, 5.0f, 170.0f);
+}
+
 void UGGYGOCameraComponent::GetCameraView(float DeltaTime, FMinimalViewInfo& DesiredView)
 {
 	check(CameraModeStack);
@@ -79,6 +128,11 @@ void UGGYGOCameraComponent::GetCameraView(float DeltaTime, FMinimalViewInfo& Des
 
 	FGGYGOCameraModeView CameraModeView;
 	CameraModeStack->EvaluateStack(DeltaTime, CameraModeView);
+
+	// 微调叠加在栈的求值结果之后：它调整的是"最终镜头"，
+	// 而不是参与模式之间的加权（那会让它被其它模式的权重稀释）。
+	UpdateCameraOffsetAlpha(DeltaTime);
+	ApplyCameraOffset(CameraModeView);
 
 	// 把算出的控制朝向写回 Controller。
 	//

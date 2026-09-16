@@ -24,6 +24,8 @@
 
 #include "Abilities/GameplayAbility.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
+// FGGYGOCameraOffset 是值成员，需要完整定义而非前向声明。
+#include "Camera/GGYGOCameraMode.h"
 
 #include "GGYGOGameplayAbility.generated.h"
 
@@ -168,19 +170,48 @@ protected:
 	/** Avatar 绑定完成。转发给蓝图。 */
 	virtual void OnPawnAvatarSet();
 
+	/**
+	 * 应用配置好的相机接管与镜头微调，然后交给父类（父类会触发蓝图的激活事件）。
+	 *
+	 * 在这里做而不是留给每个能力蓝图自己调，是因为 `AbilityCameraMode` 与
+	 * `CameraOffset` 是声明式配置 —— 配了就该生效，不该再要求配套写一遍调用。
+	 */
+	virtual void ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+
 	// ===== 相机模式 =====
 
 	/**
 	 * 激活期间接管相机。
 	 *
 	 * 只对被玩家操控的角色有效（AI 角色没有相机组件）。
-	 * 不需要显式恢复 —— 停止推入后默认模式会在下一帧混合回来，
-	 * 但仍应在能力结束时调 `ClearCameraMode` 以停止每帧推入。
+	 *
+	 * 不需要显式恢复：模式栈没有弹出操作，能力停止接管后默认模式的权重会平滑升回 1，
+	 * 视角自然回去。但仍要在能力结束时调 `ClearCameraMode` 清掉运行时标记。
+	 *
+	 * 运行中途可以再调一次换成别的模式（例如命中瞬间切到特写）。
 	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Ability|Camera")
 	void SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode);
 
 	/** 停止接管相机。能力被打断时也会经 `EndAbility` 自动调用。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Ability|Camera")
 	void ClearCameraMode();
+
+	/**
+	 * 施加一份镜头微调，叠加在**当前模式**的求值结果上。
+	 *
+	 * 与 `SetCameraMode` 的区别是它不换模式，因此不会丢掉当前模式的状态
+	 * （锁定的目标、穿墙规避的恢复进度）。攻击的镜头调整绝大多数属于这一类：
+	 * 只是想收一点 FOV、拉近一点距离，而不是换一个机位。
+	 *
+	 * 能力结束时自动撤销。运行中途可以再调一次覆盖上一份。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Ability|Camera")
+	void ApplyCameraOffset(const FGGYGOCameraOffset& Offset);
+
+	/** 立即撤销本能力施加的镜头微调，按 `BlendOutTime` 回落。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Ability|Camera")
+	void ClearCameraOffset();
 
 	/**
 	 * 能力结束时清理相机接管。
@@ -192,12 +223,34 @@ protected:
 	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
 
 	/**
-	 * 激活期间使用的相机模式。留空表示不接管相机。
+	 * 激活时接管的相机模式。留空表示不换模式。
+	 *
+	 * 用于"换机位"级别的需求：大招演出、处决特写、锁定视角。
+	 * 只是想微调距离或 FOV 的话用 `CameraOffset`，换模式会丢掉当前模式的状态。
 	 *
 	 * 配在能力上而非由代码指定，是为了让同一个能力类在不同角色上
 	 * 能有不同的演出镜头。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Camera")
+	TSubclassOf<UGGYGOCameraMode> AbilityCameraMode;
+
+	/**
+	 * 激活时施加的镜头微调，叠加在当前模式上。
+	 *
+	 * 这是每段攻击各配一份的地方：轻攻击可以留空，重攻击收 FOV、
+	 * 冲刺攻击往后拉一点。全零表示不调整。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Camera")
+	FGGYGOCameraOffset CameraOffset;
+
+	/**
+	 * 当前实际接管的模式。**运行时状态，不要在编辑器里配它**。
+	 *
+	 * 与配置字段 `AbilityCameraMode` 分开是必需的：本类是 `InstancedPerActor`，
+	 * 实例会被复用，而 `ClearCameraMode` 要把接管状态清空。
+	 * 两者共用一个字段时，第一次结束就会把配置一起清掉，之后永远不再接管相机。
+	 */
+	UPROPERTY(Transient)
 	TSubclassOf<UGGYGOCameraMode> ActiveCameraMode;
 
 	/**
