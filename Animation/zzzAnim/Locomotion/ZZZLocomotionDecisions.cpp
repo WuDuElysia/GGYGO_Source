@@ -57,7 +57,8 @@ bool FZZZLocomotionDecisions::ShouldStopMoving() const
 
 bool FZZZLocomotionDecisions::ShouldExitMoving() const
 {
-	// Moving → Stop 由无输入触发；Frozen 阶段仍保持 Moving，避免转身尚未解冻时因松开输入提前退出。
+	// Moving → Stop 由无输入触发；转身进行中仍保持 Moving，避免中途松开输入就提前退出。
+	// 转身自己的 RunOut 段本来就以松手为出口，那之后相位会变回 None，这里自然放行。
 	if (!Context.Snap || Context.Snap->bShouldMove)
 	{
 		return false;
@@ -74,10 +75,8 @@ bool FZZZLocomotionDecisions::ShouldExitMoving() const
 bool FZZZLocomotionDecisions::WalkRun_To_TurnBack() const
 {
 	// 反向输入检测的唯一真相在移动层；此处只读相位：整个 TurnBack 生命周期都允许进入。
-	// 用 Phase != None 而不是只等 Frozen，避免蓝图求值晚于释放时间点时错过进入窗口。
-	//
-	// 注意：相位机尚未在 CMC 内实现，TurnBackPhase 恒为 None，
-	// 所以本函数目前恒返回 false，AnimBP 不会进入转身状态 —— 判定本身没写错。
+	// 用 Phase != None 而不是只等某个具体相位，避免蓝图求值晚于相位推进时错过进入窗口 ——
+	// 相位由曲线驱动，一帧内就可能从 Turning 走到 Braking。
 	return Context.Snap
 		&& Context.Snap->TurnBackPhase != EGGYGOTurnBackPhase::None;
 }

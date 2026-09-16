@@ -50,10 +50,6 @@ public:
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
 	virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
 
-	/** TurnBack 动画中名为 CanYaw 的 AnimNotify 回调。 */
-	UFUNCTION()
-	void AnimNotify_CanYaw();
-
 	// ============================================================
 	// ★★ Locomotion 过渡决策函数（AnimBP 过渡条件引用） ★★
 	//
@@ -97,8 +93,8 @@ public:
 
 	/**
 	 * Moving → Stop 的独立 Blueprint 入口。
-	 * 本帧没有移动输入时通常返回 true；TurnBack 仍处于 Frozen 阶段时保持 false，避免转身尚未解冻就提前离开 Moving。
-	 * 底层转发 ShouldExitMoving()，不是速度为零判断。
+	 * 本帧没有移动输入时通常返回 true；转身相位为任一非 None 值时保持 false，
+	 * 避免转身还没走完就提前离开 Moving。底层转发 ShouldExitMoving()，不是速度为零判断。
 	 */
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_Moving_To_Stop() const;
@@ -111,12 +107,12 @@ public:
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_EnterMove_To_Stop() const;
 
-	/** WalkRun → TurnBack：有输入且摄像机修正后的输入接近角色前向的反方向。 */
+	/** WalkRun → TurnBack：移动层的转身相位已进入非 None。 */
 	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
 	bool Locomotion_WalkRun_To_TurnBack() const;
 
-	// TurnBack 相位和第二段标记由逻辑层 FTurnBackPhaseProcessor 维护，经快照读取；
-	// Back → WalkRun 的完整动画播放条件由 AnimBP 自己使用动画时间节点判断。
+	// 转身相位由 `UGGYGOCharacterMovementComponent::UpdateTurnBack` 从动画曲线判定，
+	// 经快照读取；Back → WalkRun 的完整动画播放条件由 AnimBP 自己用动画时间节点判断。
 
 	// ============================================================
 	// 配表查询（AnimBP 的 SequencePlayer 节点 Bind 此函数）
@@ -153,15 +149,20 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float AnimBlendY = 0.f;
 
-	/** RM_PosX/RM_PosY 差分得到的原始曲线分量速度（cm/s，X=左右、Y=前后）。 */
+	/**
+	 * `RootMotion_PosX/PosY` 差分得到的曲线分量速度（cm/s）。
+	 *
+	 * 轴序是 UE 局部空间（X 前、Y 右），基准是**动画段起点的朝向**而非角色当前朝向。
+	 * 转身时角色已经转过 180 度，而这个向量仍以进入转身那一刻的朝向为基准。
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	FVector AnimCurveVelocity = FVector::ZeroVector;
 
-	/** RM_PosX/RM_PosY 差分速度的归一化原始曲线分量方向；MotionDriver 转换为 UE 局部 X=前、Y=右。 */
+	/** 上者的归一化方向。同样以动画段起点朝向为基准。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	FVector AnimCurveVelocityDirection = FVector::ZeroVector;
 
-	/** 动画曲线速度方向角（度）。 */
+	/** 动画曲线速度方向角（度）：0 为段起点正前方，+90 为其右侧。 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|RootMotion")
 	float AnimCurveVelocityAngle = 0.f;
 
@@ -180,13 +181,14 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
 	float ActualVelocityAngle = 0.f;
 
-	/** 逻辑参数阶段已消费 TurnBack 的 CanYaw Notify；true 后 AnimBP 只读该输入接管许可。 */
+	/**
+	 * 转身已进入交还输入的 `RunOut` 段；AnimBP 只读。
+	 *
+	 * 这一段的移动方向来自玩家输入而非曲线，朝向也交回了 CMC 的自动对齐，
+	 * 所以身体朝向可能与动画姿势有偏差 —— 玩家在这一段改方向时尤其明显。
+	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
-	bool bCanYaw = false;
-
-	/** 当前是否已经进入逻辑第二段；AnimBP 只读逻辑标记。 */
-	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
-	bool bTurnBackSecondSegment = false;
+	bool bTurnBackRunOut = false;
 
 protected:
 	/** 动画决策快照（游戏线程写入，worker 线程与决策函数只读） */

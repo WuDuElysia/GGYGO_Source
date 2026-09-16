@@ -1,7 +1,10 @@
-// 编辑器工具：从脚本（Python）向 AnimSequence 写入 AuthoredSyncMarkers，或从固定动画起始根轨迹
-// RM_PosX/RM_PosY 烘焙 RM_VelocityDirX/Y 方向 FloatCurve。
-// 背景：FModel 导出后 .uasset 丢失同步标记；AnimSequence.AuthoredSyncMarkers 未向 Python 反射暴露，
-// set_editor_property 失败。曲线写入通过 UE 5.8 Animation Data Model/Controller 完成，避免直接改 RawCurveTracks。
+// 编辑器工具：从脚本（Python）向 AnimSequence 写入 AuthoredSyncMarkers。
+// 背景：FModel / AnimeStudio 导出后 .uasset 丢失同步标记，而 AnimSequence.AuthoredSyncMarkers
+// 未向 Python 反射暴露，set_editor_property 失败，只能绕到 C++ 这一侧写。
+//
+// root motion 曲线不在这里烘焙。那部分由 AAADocs/Scripts 下的 Python 管线完成：
+// 逐帧数据从各动作 FBX 的外部 Root 节点提取，标量设置来自 AnimeStudio 导出的 per-clip JSON。
+// 曲线名的运行时唯一定义在 GGYGOAnimCurveSampler.cpp 的 GGYGOAnimCurveNames 里。
 #pragma once
 
 #include "CoreMinimal.h"
@@ -25,14 +28,4 @@ public:
 	 */
 	UFUNCTION(BlueprintCallable, Category = "AnimTools")
 	static int32 SetAuthoredSyncMarkers(UAnimSequence* Anim, const TArray<FName>& MarkerNames, const TArray<float>& Times);
-
-	/**
-	 * 从现有 RM_PosX/RM_PosY 累计位置曲线，按 AnimSequence 采样帧生成并覆盖
-	 * RM_VelocityDirX/RM_VelocityDirY 两条真实 FloatCurve。RM_PosX/RM_PosY 的原始曲线分量约定为
-	 * X=左右、Y=前后；运行时由 MotionDriver 转换为 Bone_Root/UE 局部 X=前、Y=右。
-	 * 首帧方向为零，后续帧为水平位置增量的归一化方向；函数只修改并标脏资产，不负责保存包。
-	 * @return 写入的采样 key 数量（非编辑器构建、输入为空、无采样帧或写入失败时返回 0；源位置曲线缺失时写入全零方向曲线）
-	 */
-	UFUNCTION(BlueprintCallable, Category = "AnimTools")
-	static int32 BakeVelocityDirectionCurves(UAnimSequence* Anim);
 };

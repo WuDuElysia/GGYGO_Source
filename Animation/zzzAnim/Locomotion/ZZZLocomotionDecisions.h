@@ -7,8 +7,8 @@
  *   Memory  跨帧持久，表示"动画状态机自己记住的事"
  *   Tuning  运行期只读配置，不拥有其生命周期
  *
- * 本类不写任何状态。TurnBack 记忆与返回资格由事件层在 C++ 中维护，
- * 过渡条件只读该记忆；求值次数和时机都不影响状态同步。
+ * 本类不写任何状态。TurnBack 相位由移动层的 CMC 从动画曲线判定，
+ * 过渡条件只读快照里的相位值；求值次数和时机都不影响状态同步。
  */
 #pragma once
 
@@ -64,12 +64,16 @@ public:
 
 	/**
 	 * Moving → Stop 的停止输入判定。
-	 * 与 ShouldStopMoving 相同地检查无输入，但 TurnBack 处于任一非 None 阶段时保持 false，
-	 * 以保证逻辑时间轴完成前不会因中途松开输入而提前退出顶层 Moving。
+	 * 与 ShouldStopMoving 相同地检查无输入，但 TurnBack 处于任一非 None 相位时保持 false，
+	 * 以保证转身走完前不会因中途松开输入而提前退出顶层 Moving。
 	 */
 	bool ShouldExitMoving() const;
 
-	/** WalkRun → TurnBack：当前是 Moving、步态为 Run 且有输入，并且输入接近角色当前前向的反方向。 */
+	/**
+	 * WalkRun → TurnBack：移动层的转身相位已进入非 None。
+	 *
+	 * 反向输入的几何判定在移动层做，这里只读结果。
+	 */
 	bool WalkRun_To_TurnBack() const;
 
 private:

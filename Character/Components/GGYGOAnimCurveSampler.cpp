@@ -2,28 +2,35 @@
  * @file GGYGOAnimCurveSampler.cpp
  * @brief 动画曲线采样实现
  */
+
 #include "Character/Components/GGYGOAnimCurveSampler.h"
 
 #include "Animation/AnimInstance.h"
 
 namespace GGYGOAnimCurveNames
 {
-	/** 从动画段起点累计的位移。X 左右、Y 前后。 */
-	const FName PosX(TEXT("RM_PosX"));
-	const FName PosY(TEXT("RM_PosY"));
+	/** 从动画段起点累计的位移（厘米）。UE 轴序：X 前、Y 右。 */
+	const FName PosX(TEXT("RootMotion_PosX"));
+	const FName PosY(TEXT("RootMotion_PosY"));
 
-	/** 从动画段起点累计的路程。单调递增。 */
-	const FName Distance(TEXT("RM_Dist"));
+	/** 从动画段起点累计的路程（厘米）。单调不减。 */
+	const FName Distance(TEXT("RootMotion_Dist"));
 
 	/** 该帧速度（cm/s）。 */
-	const FName Speed(TEXT("RM_Speed"));
+	const FName Speed(TEXT("RootMotion_Speed"));
 
-	/** 从动画段起点累计的转角（度）。 */
-	const FName Yaw(TEXT("RM_Yaw"));
+	/** 从动画段起点累计的转角（度）。已解 ±180 折叠，连续。 */
+	const FName Yaw(TEXT("RootMotion_Yaw"));
 
-	/** 烘焙好的速度方向分量。 */
-	const FName VelocityDirX(TEXT("RM_VelocityDirX"));
-	const FName VelocityDirY(TEXT("RM_VelocityDirY"));
+	/** 烘焙好的速度方向分量。UE 轴序：X 前、Y 右。 */
+	const FName DirX(TEXT("RootMotion_DirX"));
+	const FName DirY(TEXT("RootMotion_DirY"));
+
+	/** 规范化有效时长（秒）。兼作"本动画烘焙过曲线"的存在性标记。 */
+	const FName ClipLength(TEXT("Cfg_ClipLength"));
+
+	/** 是否循环（0/1）。 */
+	const FName LoopTime(TEXT("Cfg_LoopTime"));
 }
 
 namespace
@@ -45,10 +52,13 @@ void FGGYGOAnimCurveMotion::Reset()
 {
 	Speed = 0.0f;
 	YawDeltaDegrees = 0.0f;
+	YawTotalDegrees = 0.0f;
 	PositionDelta = FVector::ZeroVector;
 	Velocity = FVector::ZeroVector;
 	Direction = FVector::ZeroVector;
 	DirectionAngle = 0.0f;
+	ClipLength = 0.0f;
+	bLoopClip = false;
 	bHasAuthoredDirection = false;
 	bHasPositionDelta = false;
 	bHasCurveSource = false;
@@ -77,23 +87,32 @@ void FGGYGOAnimCurveSampler::Sample(const UAnimInstance& AnimInstance, float Del
 	const float CurrentDistance = SanitizeNonNegativeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::Distance));
 	const float CurrentSpeed = SanitizeNonNegativeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::Speed));
 	const float CurrentYaw = SanitizeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::Yaw));
+	const float CurrentClipLength = SanitizeNonNegativeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::ClipLength));
 
 	const FVector AuthoredDirection(
-		SanitizeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::VelocityDirX)),
-		SanitizeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::VelocityDirY)),
+		SanitizeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::DirX)),
+		SanitizeSample(AnimInstance.GetCurveValue(GGYGOAnimCurveNames::DirY)),
 		0.0f);
 	const bool bHasAuthoredDirection = !AuthoredDirection.IsNearlyZero(KINDA_SMALL_NUMBER);
 
-	// 三个信号任一存在就说明这个动画带曲线数据。
-	// 只看 Speed 是不够的：起步动画的第一帧速度是 0，但它确实有曲线，
+	OutMotion.ClipLength = CurrentClipLength;
+	OutMotion.bLoopClip = AnimInstance.GetCurveValue(GGYGOAnimCurveNames::LoopTime) > 0.5f;
+
+	// `Cfg_ClipLength` 是烘焙管线给每个动画都写的常量曲线，恒大于 0，
+	// 所以它能单独判定"这个动画烘焙过曲线"。
+	//
+	// 剩下三个信号是给它兜底的：动画可能来自旧的烘焙批次，只有 RootMotion_* 而没有 Cfg_*。
+	// 只看 Speed 是不够的 —— 起步动画的第一帧速度是 0，但它确实有曲线，
 	// 此时应当让角色停住而不是回退到固定速度。
 	OutMotion.bHasCurveSource =
-		CurrentSpeed > KINDA_SMALL_NUMBER
+		CurrentClipLength > KINDA_SMALL_NUMBER
+		|| CurrentSpeed > KINDA_SMALL_NUMBER
 		|| bHasAuthoredDirection
 		|| CurrentDistance > KINDA_SMALL_NUMBER;
 
-	// 速度不依赖差分，拿到就能用。
+	// 速度与累计转角不依赖差分，拿到就能用。
 	OutMotion.Speed = CurrentSpeed;
+	OutMotion.YawTotalDegrees = CurrentYaw;
 
 	const auto UpdateBaseline = [&]()
 	{
@@ -118,9 +137,14 @@ void FGGYGOAnimCurveSampler::Sample(const UAnimInstance& AnimInstance, float Del
 		return;
 	}
 
-	// 累计路程回退说明换了动画段（新段的累计值从 0 重新开始）。
+	// 累计路程回退说明换了动画段，或循环动画绕回了循环点（两种情况下新的累计值都从 0 重新开始）。
 	// 此时位移差分会得到一个指向反方向的大位移，必须丢弃并重建基线。
-	// 用 RM_Dist 而不是 RM_PosX/Y 判断，因为路程单调递增，而位移可以来回摆动。
+	// 用路程而不是位移判断，因为路程单调不减，而位移可以来回摆动 ——
+	// 转身动画后半段的位移就是一路减小的，拿它判断会每帧都误判成换段。
+	//
+	// 代价是循环动画每个周期会丢掉一帧的位移增量与转角增量。这不影响速度
+	// （速度直接来自曲线，不经差分），而走跑动画的方向由输入决定、不读这里的增量，
+	// 所以目前无实际后果。
 	if (CurrentDistance < PreviousDistance - KINDA_SMALL_NUMBER)
 	{
 		UpdateBaseline();
@@ -138,7 +162,7 @@ void FGGYGOAnimCurveSampler::Sample(const UAnimInstance& AnimInstance, float Del
 		return;
 	}
 
-	// RM_Yaw 是累计角度，曲线不变时差分自然为 0，不需要额外判断。
+	// 累计转角曲线不变时差分自然为 0，不需要额外判断。
 	OutMotion.YawDeltaDegrees = SanitizeSample(CurrentYaw - PreviousYaw);
 
 	if (!PositionDelta.IsNearlyZero())
@@ -157,6 +181,8 @@ void FGGYGOAnimCurveSampler::Sample(const UAnimInstance& AnimInstance, float Del
 	{
 		OutMotion.Direction = EffectiveDirection;
 		OutMotion.bHasAuthoredDirection = bHasAuthoredDirection;
+		// 曲线已是 UE 轴序（X 前、Y 右），所以 Atan2(Y, X) 得到的就是
+		// "偏离段起点正前方多少度，右为正"。
 		OutMotion.DirectionAngle = FMath::RadiansToDegrees(
 			FMath::Atan2(EffectiveDirection.Y, EffectiveDirection.X));
 	}

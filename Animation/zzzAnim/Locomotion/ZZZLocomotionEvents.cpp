@@ -27,9 +27,9 @@ void FZZZLocomotionEvents::SynchronizeMovingSubState()
 		return;
 	}
 
-	// MovingSubState 只是 RuntimeData.Movement.TurnBack.Phase 的投影，供 AnimBP 读取；
-	// 反向输入检测与相位切换的唯一真相在逻辑层 FTurnBackPhaseProcessor，这里不重复判定。
-	// Frozen/Released 都算“转身中”；Back → WalkRun 是否离开由 AnimBP 的动画播放完成条件决定，
+	// MovingSubState 只是移动层转身相位的投影，供 AnimBP 读取；反向输入检测与相位切换的
+	// 唯一真相在 `UGGYGOCharacterMovementComponent::UpdateTurnBack`，这里不重复判定。
+	// 三个非 None 相位都算“转身中”；Back → WalkRun 是否离开由 AnimBP 的动画播放完成条件决定，
 	// 不把相位结束单独当作完整 TurnBack 播放完成信号。
 	Context.Memory->MovingSubState =
 		Context.Snap->TurnBackPhase == EGGYGOTurnBackPhase::None

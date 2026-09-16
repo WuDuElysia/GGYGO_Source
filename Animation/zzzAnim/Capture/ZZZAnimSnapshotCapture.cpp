@@ -58,8 +58,10 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 	}
 
 	// ===== 曲线运动量 =====
-	// 保持动画侧分量系（X 左右、Y 前后），不转成 UE 局部空间 ——
+	// 原样转发，不换算到角色当前朝向的局部空间 ——
 	// AnimBP 里对照曲线编辑器调参时看到的应当是同一组数值。
+	// 代价是转身时这组值的基准（动画段起点朝向）与角色当前朝向不一致，
+	// 需要世界方向的消费方自己用入口朝向换算。
 	const FGGYGOAnimCurveMotion& CurveMotion = MoveComp->GetCurveMotion();
 	OutSnap.AnimCurveVelocity = CurveMotion.Velocity;
 	OutSnap.AnimCurveVelocityDirection = CurveMotion.Direction;
@@ -67,6 +69,5 @@ void FZZZAnimSnapshotCapture::Capture(FZZZAnimSnapshot& OutSnap, const ACharacte
 
 	// ===== 转身 =====
 	OutSnap.TurnBackPhase = MoveComp->GetTurnBackPhase();
-	OutSnap.bCanYaw = MoveComp->IsTurnBackCanYaw();
-	OutSnap.bTurnBackSecondSegment = MoveComp->IsTurnBackSecondSegment();
+	OutSnap.bTurnBackRunOut = MoveComp->IsTurnBackRunOut();
 }

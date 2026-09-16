@@ -41,12 +41,13 @@ namespace GGYGOMovementConstants
 	constexpr uint8 GaitFlagMask = FSavedMove_Character::FLAG_Custom_0 | FSavedMove_Character::FLAG_Custom_1;
 
 	/**
-	 * 转身第一段标志位。
+	 * "曲线正在接管转身"标志位。
 	 *
-	 * 只同步这一个 bit 而不是完整相位：只有第一段会改变移动行为
-	 * （方向与朝向由动画接管），第二段与普通移动无异，接收端不需要区分。
+	 * 只同步这一个 bit 而不是完整相位：`Turning` 与 `Braking` 的移动行为完全一致
+	 * （方向与朝向都由曲线接管），`RunOut` 与普通移动无异，
+	 * 所以三个相位对接收端只有两种含义。
 	 */
-	constexpr uint8 TurnBackFirstSegmentFlag = FSavedMove_Character::FLAG_Custom_2;
+	constexpr uint8 TurnBackCurveDrivenFlag = FSavedMove_Character::FLAG_Custom_2;
 }
 
 // ============================================================================
@@ -64,7 +65,6 @@ void FSavedMove_GGYGO::Clear()
 
 	SavedTurnBackPhase = EGGYGOTurnBackPhase::None;
 	SavedTurnBackElapsed = 0.0f;
-	bSavedTurnBackSecondSegment = false;
 	SavedTurnBackEntryYaw = 0.0f;
 	bSavedTurnBackInputLatched = false;
 }
@@ -82,7 +82,6 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 
 		SavedTurnBackPhase = MoveComp->TurnBackPhase;
 		SavedTurnBackElapsed = MoveComp->TurnBackElapsed;
-		bSavedTurnBackSecondSegment = MoveComp->bTurnBackSecondSegment;
 		SavedTurnBackEntryYaw = MoveComp->TurnBackEntryYaw;
 		bSavedTurnBackInputLatched = MoveComp->bTurnBackInputLatched;
 	}
@@ -108,7 +107,6 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 
 		MoveComp->TurnBackPhase = SavedTurnBackPhase;
 		MoveComp->TurnBackElapsed = SavedTurnBackElapsed;
-		MoveComp->bTurnBackSecondSegment = bSavedTurnBackSecondSegment;
 		MoveComp->TurnBackEntryYaw = SavedTurnBackEntryYaw;
 		MoveComp->bTurnBackInputLatched = bSavedTurnBackInputLatched;
 	}
@@ -133,8 +131,7 @@ bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 
 	// 转身期间不合并。这段的位移方向由曲线逐帧给出，合并会丢掉中间帧的方向变化，
 	// 服务器重演出的轨迹与客户端不同。
-	if (NewGGYGOMove && (NewGGYGOMove->SavedTurnBackPhase != SavedTurnBackPhase
-		|| NewGGYGOMove->bSavedTurnBackSecondSegment != bSavedTurnBackSecondSegment))
+	if (NewGGYGOMove && NewGGYGOMove->SavedTurnBackPhase != SavedTurnBackPhase)
 	{
 		return false;
 	}
@@ -154,9 +151,12 @@ uint8 FSavedMove_GGYGO::GetCompressedFlags() const
 	// 步态占两位。static_cast 是安全的：EGGYGOGait 只有 0/1/2 三个值。
 	Result |= (static_cast<uint8>(SavedGait) << GGYGOMovementConstants::GaitFlagShift) & GGYGOMovementConstants::GaitFlagMask;
 
-	if (SavedTurnBackPhase != EGGYGOTurnBackPhase::None && !bSavedTurnBackSecondSegment)
+	// 只发"曲线是否在接管"。Turning 与 Braking 的移动行为一致，接收端不必区分；
+	// RunOut 的移动与普通移动一致，不需要这个位。
+	if (SavedTurnBackPhase == EGGYGOTurnBackPhase::Turning
+		|| SavedTurnBackPhase == EGGYGOTurnBackPhase::Braking)
 	{
-		Result |= GGYGOMovementConstants::TurnBackFirstSegmentFlag;
+		Result |= GGYGOMovementConstants::TurnBackCurveDrivenFlag;
 	}
 
 	return Result;
@@ -200,7 +200,7 @@ void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifeti
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	// SkipOwner：拥有者自己是权威解算方，收到服务器的回传只会与本地预测打架。
-	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, bReplicatedTurnBackFirstSegment, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, bReplicatedTurnBackCurveDriven, COND_SkipOwner);
 }
 
 void UGGYGOCharacterMovementComponent::BeginPlay()
@@ -397,14 +397,18 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 		UpdateTurnBack(DeltaSeconds);
 	}
 
-	// 转身第一段接管位移方向：把加速度改成曲线给出的世界方向。
+	// 转身的曲线接管段（Turning / Braking）接管位移方向：把加速度改成曲线给出的世界方向。
 	//
 	// 改 Acceleration 而不是直接改 Velocity，是为了让加减速、摩擦、坡度
 	// 仍然由 CMC 处理 —— 直接设速度会让角色撞墙时失去正常的滑动行为。
 	//
 	// 非本地控制端也要执行：`UpdateFromCompressedFlags` 已经恢复了相位，
 	// 不覆盖方向会让它按玩家输入的方向移动，与本地端分歧。
-	if (IsTurnBackFirstSegment())
+	//
+	// `RunOut` 段刻意不覆盖：那一段方向取玩家输入，让 Acceleration 保持原值即可。
+	// 曲线在那一段给出的方向恰好等于入口朝向的反方向（也就是角色转身后的正前方），
+	// 玩家不改输入时两者一致，改了输入就应该跟输入走。
+	if (IsTurnBackCurveDriven())
 	{
 		const FVector TurnBackDirection = ResolveTurnBackWorldDirection();
 		if (!TurnBackDirection.IsNearlyZero())
@@ -536,18 +540,18 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 		? static_cast<EGGYGOGait>(GaitBits)
 		: EGGYGOGait::None;
 
-	// 只恢复"是否处于第一段"这一个事实。相位的精确取值（Frozen / Released）
-	// 只影响动画表现，而表现由本地动画层自己驱动，不需要从这里取。
-	const bool bFirstSegment = (Flags & GGYGOMovementConstants::TurnBackFirstSegmentFlag) != 0;
+	// 只恢复"曲线是否在接管"这一个事实。Turning 与 Braking 的区别只在转角还不还在变，
+	// 那是表现层的事，而表现由本地动画层自己驱动，不需要从这里取。
+	const bool bCurveDriven = (Flags & GGYGOMovementConstants::TurnBackCurveDrivenFlag) != 0;
 
 	// 服务器把它转成复制属性，模拟代理才能知道转身正在发生 ——
 	// 压缩标志位只走客户端→服务器一个方向，不会转发给其它客户端。
 	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_Authority)
 	{
-		bReplicatedTurnBackFirstSegment = bFirstSegment;
+		bReplicatedTurnBackCurveDriven = bCurveDriven;
 	}
 
-	if (bFirstSegment)
+	if (bCurveDriven)
 	{
 		if (TurnBackPhase == EGGYGOTurnBackPhase::None)
 		{
@@ -556,25 +560,32 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 			TurnBackEntryYaw = UpdatedComponent
 				? UpdatedComponent->GetComponentRotation().Yaw
 				: 0.0f;
-			TurnBackPhase = EGGYGOTurnBackPhase::Frozen;
+
+			// 恢复成 Turning 而不是 Braking：这一端不知道转角走到哪了，
+			// 而 Turning 的行为是两段的超集（照样累加转角增量，
+			// 曲线在 Braking 段给的增量本就是 0，所以不会转多）。
+			TurnBackPhase = EGGYGOTurnBackPhase::Turning;
 		}
-		bTurnBackSecondSegment = false;
 	}
 	else if (TurnBackPhase != EGGYGOTurnBackPhase::None)
 	{
-		// 第一段已结束。第二段的移动与普通移动一致，直接复位即可。
+		// 曲线接管已结束。RunOut 段的移动与普通移动一致，直接复位即可。
 		ResetTurnBack();
 	}
 }
 
 void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 {
-	// 转身第一段的朝向由 `RM_Yaw` 曲线驱动。
+	// 转身的曲线接管段（Turning / Braking）朝向由 `RootMotion_Yaw` 曲线驱动。
 	//
 	// 在这里接管而不是在外部调 AddActorWorldRotation，是为了不与 CMC 的
 	// 自动朝向对齐（bOrientRotationToMovement）互相争夺 Yaw ——
 	// 绕过 Super 就等于这一帧只有曲线在转角色，不需要临时关掉那些开关再恢复。
-	if (IsTurnBackFirstSegment() && UpdatedComponent)
+	//
+	// 累加增量而不是直接设成 `EntryYaw + YawTotal`：增量对入口朝向的误差不敏感，
+	// 模拟代理那边的入口朝向是个近似值，用绝对值会让它一进入转身就跳一下。
+	// 曲线的累计转角已解 ±180 折叠，所以差分不会出现一帧 358 度的假增量。
+	if (IsTurnBackCurveDriven() && UpdatedComponent)
 	{
 		const float YawDelta = FMath::IsFinite(CurveMotion.YawDeltaDegrees)
 			? CurveMotion.YawDeltaDegrees
@@ -596,41 +607,45 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 	Super::PhysicsRotation(DeltaTime);
 }
 
-void UGGYGOCharacterMovementComponent::NotifyCanYaw()
-{
-	bTurnBackCanYawPending = true;
-}
-
 EGGYGOTurnBackPhase UGGYGOCharacterMovementComponent::GetTurnBackPhase() const
 {
 	// 模拟代理没有本地解算的相位，只有复制来的一个 bool。
-	// 映射成 Frozen 是因为动画层只判断 `!= None`，具体是哪一段它不关心。
+	// 映射成 Turning 是因为动画层只判断 `!= None`，具体是哪一段它不关心。
 	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
 	{
-		return bReplicatedTurnBackFirstSegment ? EGGYGOTurnBackPhase::Frozen : EGGYGOTurnBackPhase::None;
+		return bReplicatedTurnBackCurveDriven ? EGGYGOTurnBackPhase::Turning : EGGYGOTurnBackPhase::None;
 	}
 
 	return TurnBackPhase;
 }
 
-bool UGGYGOCharacterMovementComponent::IsTurnBackFirstSegment() const
+bool UGGYGOCharacterMovementComponent::IsTurnBackRunOut() const
+{
+	// 模拟代理恒为 false：复制过来的 bool 只表达"曲线是否在接管"，
+	// 而 RunOut 段的移动与普通移动一致，那一端不需要区分。
+	return GetTurnBackPhase() == EGGYGOTurnBackPhase::RunOut;
+}
+
+bool UGGYGOCharacterMovementComponent::IsTurnBackCurveDriven() const
 {
 	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
 	{
-		return bReplicatedTurnBackFirstSegment;
+		return bReplicatedTurnBackCurveDriven;
 	}
 
-	return TurnBackPhase != EGGYGOTurnBackPhase::None && !bTurnBackSecondSegment;
+	return TurnBackPhase == EGGYGOTurnBackPhase::Turning
+		|| TurnBackPhase == EGGYGOTurnBackPhase::Braking;
 }
 
 void UGGYGOCharacterMovementComponent::ResetTurnBack()
 {
 	TurnBackPhase = EGGYGOTurnBackPhase::None;
 	TurnBackElapsed = 0.0f;
-	bTurnBackCanYaw = false;
-	bTurnBackSecondSegment = false;
-	bTurnBackCanYawPending = false;
 	TurnBackEntryYaw = 0.0f;
+
+	// 不清 bTurnBackInputLatched：它的解闩条件是"输入离开反向阈值"，
+	// 而转身刚结束时玩家往往还按着同一个方向键。在这里清掉会让那个方向键
+	// 立刻触发下一次转身，角色原地反复转身。
 }
 
 bool UGGYGOCharacterMovementComponent::IsReverseRunInput() const
@@ -668,22 +683,21 @@ void UGGYGOCharacterMovementComponent::UpdateTurnBack(float DeltaSeconds)
 
 	const bool bReverseInput = IsReverseRunInput();
 
-	// 消费 CanYaw：控制权交还输入，进入第二段。
-	// 只在转身进行中消费 —— 其它动画里的同名通知不该启动一次转身。
-	if (bTurnBackCanYawPending)
-	{
-		bTurnBackCanYawPending = false;
-
-		if (TurnBackPhase != EGGYGOTurnBackPhase::None)
-		{
-			bTurnBackCanYaw = true;
-			bTurnBackSecondSegment = true;
-		}
-	}
-
 	const float ClampedDelta = (FMath::IsFinite(DeltaSeconds) && DeltaSeconds > 0.0f)
 		? DeltaSeconds
 		: 0.0f;
+
+	// 兜底超时。正常出口是 RunOut 段松手，这里防的是"相位卡住"：
+	// 相位推进依赖曲线，而转身动画可能被别的状态打断、或者压根没烘焙曲线，
+	// 那时相位永远推不动，bTurnBackInputLatched 也就永远不解，下一次转身再也触发不了。
+	const bool bTimedOut = TurnBackPhase != EGGYGOTurnBackPhase::None
+		&& TurnBackElapsed >= FMath::Max(MovementSet->TurnBackDurationSeconds, 0.0f);
+
+	if (bTimedOut)
+	{
+		ResetTurnBack();
+		return;
+	}
 
 	switch (TurnBackPhase)
 	{
@@ -701,43 +715,67 @@ void UGGYGOCharacterMovementComponent::UpdateTurnBack(float DeltaSeconds)
 			break;
 		}
 
-		TurnBackPhase = EGGYGOTurnBackPhase::Frozen;
+		TurnBackPhase = EGGYGOTurnBackPhase::Turning;
 		TurnBackElapsed = 0.0f;
-		bTurnBackCanYaw = false;
-		bTurnBackSecondSegment = false;
 		bTurnBackInputLatched = true;
 
-		// 记下入口朝向，整段转身的世界位移方向都以它为基准。
+		// 记下入口朝向。曲线的位移分量以动画段起点为基准，这个值就是那个基准，
+		// 整段转身的世界位移方向都靠它换算，中途不更新。
 		TurnBackEntryYaw = UpdatedComponent
 			? UpdatedComponent->GetComponentRotation().Yaw
 			: 0.0f;
 		break;
 	}
 
-	case EGGYGOTurnBackPhase::Frozen:
+	case EGGYGOTurnBackPhase::Turning:
 	{
-		// 第一段不可打断，即使玩家已经松手也要推进到可释放阶段 ——
+		// 转身段不可打断，即使玩家已经松手也要走完 ——
 		// 中途放弃会让刹车动作停在一半，角色姿态与速度对不上。
 		TurnBackElapsed += ClampedDelta;
 
-		if (TurnBackElapsed >= MovementSet->TurnBackReleaseTimeSeconds)
+		// 转角已经走够且本帧不再变化，说明动画的转身部分播完了。
+		//
+		// 两个条件都要：只看"本帧增量为 0"会把动画段刚切换、采样基线尚未建立的
+		// 那一帧（增量恒为 0）误判成转完；只看"累计转角够大"则会在转角还在
+		// 继续变化时提前切换。
+		const bool bYawReached = FMath::Abs(CurveMotion.YawTotalDegrees)
+			>= FMath::Max(MovementSet->TurnBackMinYawDegrees, 0.0f);
+		const bool bYawSettled = FMath::Abs(CurveMotion.YawDeltaDegrees)
+			<= FMath::Max(MovementSet->TurnBackYawSettleDegrees, 0.0f);
+
+		if (bYawReached && bYawSettled)
 		{
-			TurnBackPhase = EGGYGOTurnBackPhase::Released;
+			TurnBackPhase = EGGYGOTurnBackPhase::Braking;
 		}
 		break;
 	}
 
-	case EGGYGOTurnBackPhase::Released:
+	case EGGYGOTurnBackPhase::Braking:
+	{
+		// 倒滑刹车段同样不可打断：身体已经转过来了，人还在往原方向滑。
+		TurnBackElapsed += ClampedDelta;
+
+		// 曲线方向在动画段起点坐标系里的前向分量由正转负，就是"开始朝反方向跑出"。
+		// 附带速度门限是因为刹车段末速会掉到很低（Pyrios 是 52 cm/s），
+		// 那时单帧位移不足 1cm，归一化方向容易抖，容易被一帧噪声提前推进相位。
+		const bool bForwardFlipped = CurveMotion.Direction.X
+			<= -FMath::Clamp(MovementSet->TurnBackRunOutForwardThreshold, 0.0f, 1.0f);
+		const bool bFastEnough = CurveMotion.Speed
+			>= FMath::Max(MovementSet->TurnBackRunOutMinSpeed, 0.0f);
+
+		if (bForwardFlipped && bFastEnough)
+		{
+			TurnBackPhase = EGGYGOTurnBackPhase::RunOut;
+		}
+		break;
+	}
+
+	case EGGYGOTurnBackPhase::RunOut:
 	{
 		TurnBackElapsed += ClampedDelta;
 
-		const bool bTimedOut = TurnBackElapsed >= MovementSet->TurnBackDurationSeconds;
-
-		// 已交还控制权后松手即可结束：那之后的移动已经由输入主导，
-		// 继续占着转身状态只会阻止下一次转身触发。
-		const bool bReleasedByInput = bTurnBackSecondSegment && !HasMoveInput();
-
-		if (bTimedOut || bReleasedByInput)
+		// 方向已交回输入，松手即结束：继续占着转身状态只会阻止下一次转身触发。
+		if (!HasMoveInput())
 		{
 			ResetTurnBack();
 		}
@@ -748,9 +786,8 @@ void UGGYGOCharacterMovementComponent::UpdateTurnBack(float DeltaSeconds)
 
 FVector UGGYGOCharacterMovementComponent::ResolveTurnBackWorldDirection() const
 {
-	// 曲线分量系是 X 左右、Y 前后，UE 局部空间是 X 前、Y 右，所以交换两轴。
-	const FVector CurveDirection = CurveMotion.Direction;
-	FVector LocalDirection(CurveDirection.Y, CurveDirection.X, 0.0f);
+	// 曲线已是 UE 轴序（X 前、Y 右），直接用，不交换两轴。
+	FVector LocalDirection(CurveMotion.Direction.X, CurveMotion.Direction.Y, 0.0f);
 
 	if (LocalDirection.IsNearlyZero())
 	{

@@ -53,8 +53,8 @@ struct FZZZAnimStateMemory
 	int32 StopValue = 0;
 
 	/**
-	 * 当前 Moving 子状态；由 C++ pipeline 从 RuntimeData.Movement.TurnBack.Phase 投影同步，供 AnimBP 读取。
-	 * None=未进入，WalkRun=普通走跑，TurnBack=转身中（Frozen 或 Released）。
+	 * 当前 Moving 子状态；由 C++ pipeline 从移动层的转身相位投影同步，供 AnimBP 读取。
+	 * None=未进入，WalkRun=普通走跑，TurnBack=转身中（Turning / Braking / RunOut 任一）。
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "Locomotion")
 	EZZZAnimMovingSubState MovingSubState = EZZZAnimMovingSubState::None;

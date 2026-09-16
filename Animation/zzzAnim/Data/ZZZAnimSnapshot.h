@@ -12,9 +12,6 @@
  *
  * ## 数据来源
  * 全部来自 `UGGYGOCharacterMovementComponent`，由 `FZZZAnimSnapshotCapture` 抓取。
- *
- * 其中 TurnBack 三项与 AnimCurve 三项**恒为默认值**：它们依赖动画曲线采样，
- * 而曲线采样尚未接入 CMC。后果是转身表现不会触发，走跑正常。
  */
 #pragma once
 
@@ -41,32 +38,28 @@ struct FZZZAnimSnapshot
 	float AnimBlendY = 0.f;
 
 	/**
-	 * 动画曲线分量速度（cm/s，X=左右、Y=前后）。
-	 * 曲线采样尚未接入，恒为零向量。
+	 * 动画曲线分量速度（cm/s）。
+	 *
+	 * 轴序是 UE 局部空间（X 前、Y 右），但基准是**动画段起点的朝向**，
+	 * 不是角色当前朝向。转身时两者会分离：角色已经转过 180 度，
+	 * 而这个向量仍以进入转身那一刻的朝向为基准。
 	 */
 	FVector AnimCurveVelocity = FVector::ZeroVector;
 
-	/** 上者的归一化方向（原始曲线分量系）。曲线采样尚未接入，恒为零向量。 */
+	/** 上者的归一化方向。同样以动画段起点朝向为基准。 */
 	FVector AnimCurveVelocityDirection = FVector::ZeroVector;
 
-	/** 动画曲线速度方向角（度）。曲线采样尚未接入，恒为 0。 */
+	/** 动画曲线速度方向角（度）：0 为段起点正前方，+90 为其右侧。 */
 	float AnimCurveVelocityAngle = 0.f;
 
 	/** 移动输入与角色当前水平前向的点积；1 为同向，-1 为完全反向。仅诊断用途。 */
 	float InputForwardDot = 1.f;
 
-	/**
-	 * 转身相位。WalkRun/TurnBack 过渡判定的唯一依据。
-	 *
-	 * 相位机尚未在 CMC 内实现，恒为 `None`，因此转身状态不会被进入。
-	 */
+	/** 转身相位。WalkRun/TurnBack 过渡判定的唯一依据。 */
 	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;
 
-	/** 已消费 CanYaw Notify，输入接管许可。相位机尚未实现，恒为 false。 */
-	bool bCanYaw = false;
-
-	/** 转身是否已进入第二段。相位机尚未实现，恒为 false。 */
-	bool bTurnBackSecondSegment = false;
+	/** 转身是否已进入交还输入的 `RunOut` 段。 */
+	bool bTurnBackRunOut = false;
 
 	/** 当前水平速度标量（cm/s）。 */
 	float VelocityLength = 0.f;

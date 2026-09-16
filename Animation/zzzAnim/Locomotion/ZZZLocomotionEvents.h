@@ -28,7 +28,7 @@ public:
 
 	/**
 	 * 由 C++ 根据当前快照唯一同步 Moving 子状态；AnimBP 不再写入子状态。
-	 * 该同步把 Frozen/Released 投影为 TurnBack；Back → WalkRun 的动画播放完成由 AnimBP 自己判断。
+	 * 该同步把任一非 None 的转身相位投影为 TurnBack；Back → WalkRun 的动画播放完成由 AnimBP 自己判断。
 	 */
 	void SynchronizeMovingSubState();
 

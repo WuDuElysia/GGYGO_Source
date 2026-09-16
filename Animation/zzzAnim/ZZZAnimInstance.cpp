@@ -25,20 +25,6 @@ void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	RefreshDecisionContext(DeltaSeconds);
 }
 
-void UZZZAnimInstance::AnimNotify_CanYaw()
-{
-	// 把控制权交还玩家输入的时机由动画决定，而不是由代码里的固定秒数决定 ——
-	// 换一版转身动画时不必回来改配置。
-	if (const ACharacter* Character = Owner.Get())
-	{
-		if (UGGYGOCharacterMovementComponent* MoveComp =
-			Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()))
-		{
-			MoveComp->NotifyCanYaw();
-		}
-	}
-}
-
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 {
 	// 固定顺序：抓取快照 → 注入上下文 → 由 C++ 同步 Moving 子状态 → 推进表现记忆。
@@ -52,8 +38,7 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 	ActualVelocityBlendX = Snap.ActualVelocityBlendX;
 	ActualVelocityBlendY = Snap.ActualVelocityBlendY;
 	ActualVelocityAngle = Snap.ActualVelocityAngle;
-	bCanYaw = Snap.bCanYaw;
-	bTurnBackSecondSegment = Snap.bTurnBackSecondSegment;
+	bTurnBackRunOut = Snap.bTurnBackRunOut;
 
 	FZZZAnimWriteContext WriteContext;
 	WriteContext.Snap = &Snap;
@@ -72,9 +57,9 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 		|| StateMemory.MovingSubState == EZZZAnimMovingSubState::TurnBack)
 	{
 		UE_LOG(LogZZZAnim, Log,
-			TEXT("[TurnBack][Snapshot] Phase=%d SecondSegment=%d SubState=%d Gait=%d ShouldMove=%d Grounded=%d BlockMove=%d InputForwardDot=%.3f Velocity=%.2f"),
+			TEXT("[TurnBack][Snapshot] Phase=%d RunOut=%d SubState=%d Gait=%d ShouldMove=%d Grounded=%d BlockMove=%d InputForwardDot=%.3f Velocity=%.2f"),
 			static_cast<uint8>(Snap.TurnBackPhase),
-			Snap.bTurnBackSecondSegment ? 1 : 0,
+			Snap.bTurnBackRunOut ? 1 : 0,
 			static_cast<uint8>(StateMemory.MovingSubState),
 			static_cast<uint8>(Snap.Gait),
 			Snap.bShouldMove ? 1 : 0,
