@@ -82,6 +82,12 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(State_Dead, "State.Dead");
 	UE_DEFINE_GAMEPLAY_TAG(State_PoiseBreak, "State.PoiseBreak");
 	UE_DEFINE_GAMEPLAY_TAG(State_Interacting, "State.Interacting");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss, "State.Boss");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Form, "State.Boss.Form");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Form_Default, "State.Boss.Form.Default");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Phase, "State.Boss.Phase");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Phase_One, "State.Boss.Phase.One");
+	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Transforming, "State.Boss.Transforming");
 
 	// ===== 六、Restriction =====
 	UE_DEFINE_GAMEPLAY_TAG(Restriction_CantMove, "Restriction.CantMove");

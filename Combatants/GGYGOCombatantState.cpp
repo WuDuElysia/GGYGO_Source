@@ -89,6 +89,7 @@ void AGGYGOCombatantState::AttachAvatar(APawn* NewAvatar)
 	{
 		DetachAvatar(AvatarPawn);
 		AvatarPawn = NewAvatar;
+		AvatarPawn->OnDestroyed.AddUniqueDynamic(this, &ThisClass::HandleAvatarDestroyed);
 	}
 
 	SynchronizeAvatarBinding();
@@ -128,6 +129,8 @@ void AGGYGOCombatantState::DetachAvatar(APawn* ExpectedAvatar)
 		AbilitySystemComponent->SetAvatarActor(nullptr);
 	}
 
+	OldAvatar->OnDestroyed.RemoveDynamic(this, &ThisClass::HandleAvatarDestroyed);
+
 	AvatarPawn = nullptr;
 	ForceNetUpdate();
 }
@@ -135,6 +138,11 @@ void AGGYGOCombatantState::DetachAvatar(APawn* ExpectedAvatar)
 void AGGYGOCombatantState::OnRep_AvatarPawn()
 {
 	SynchronizeAvatarBinding();
+}
+
+void AGGYGOCombatantState::HandleAvatarDestroyed(AActor* DestroyedActor)
+{
+	DetachAvatar(Cast<APawn>(DestroyedActor));
 }
 
 void AGGYGOCombatantState::SynchronizeAvatarBinding()

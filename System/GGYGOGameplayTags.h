@@ -227,6 +227,18 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_PoiseBreak);
 	/** 交互中。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Interacting);
+	/** Boss 状态根标签。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss);
+	/** Boss 形态标签根。具体 Boss 可以在配置中添加子标签。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss_Form);
+	/** 阶段 B 的默认单形态。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss_Form_Default);
+	/** Boss 阶段标签根。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss_Phase);
+	/** 阶段 B 的默认第一阶段。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss_Phase_One);
+	/** Avatar 交接期间阻断普通战斗决策。阶段 E 才会正式使用。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss_Transforming);
 
 	// ============================================================
 	// 六、Restriction —— 功能限制

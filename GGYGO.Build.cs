@@ -18,6 +18,8 @@ public class GGYGO : ModuleRules
 			"GameplayAbilities",
 			"GameplayTags",
 			"GameplayTasks",
+			// Boss AIController 与 BehaviorTree 运行时。
+			"AIModule",
 			// Lyra 风格组件化基础：UGameFrameworkComponentManager、UPawnComponent、InitState 状态机。
 			"ModularGameplay",
 			// Experience / GameFeature 插件化数据驱动。

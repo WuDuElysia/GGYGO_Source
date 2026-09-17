@@ -13,6 +13,7 @@
 #include "GGYGOCombatantState.generated.h"
 
 class APawn;
+class AActor;
 class UAbilitySystemComponent;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOCombatSet;
@@ -65,6 +66,10 @@ protected:
 	/** 客户端收到 Avatar 复制后走与服务器相同的绑定路径。 */
 	UFUNCTION()
 	void OnRep_AvatarPawn();
+
+	/** 服务器上的 Avatar 被销毁时及时清空复制引用，避免状态宿主留下悬空 Avatar。 */
+	UFUNCTION()
+	void HandleAvatarDestroyed(AActor* DestroyedActor);
 
 	/** 把 AvatarPawn 与 ASC/PawnExtension 对齐；服务器与 OnRep 共用。 */
 	void SynchronizeAvatarBinding();
