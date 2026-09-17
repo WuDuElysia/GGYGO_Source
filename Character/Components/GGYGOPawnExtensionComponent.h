@@ -30,11 +30,9 @@
  * 变成向 Manager 的一次查询（`HaveAllFeaturesReachedInitState`）。
  *
  * ## 与 Lyra 的差异
- * 1. **ASC 既不挂 Pawn 也不挂 PlayerState，而挂队伍位置 `AGGYGOCharacterSlot`**（决策 D1）。
- *    一名玩家带多个角色，共用 PlayerState 上的一个 ASC 会让各角色共享 HP 与冷却；
- *    而挂 Pawn 会让属性集的就绪时机被 Pawn 初始化流程牵制。
- *    本组件因此只**接收**外部注入的 ASC：`InitializeAbilitySystem(SlotASC, Slot)`，
- *    `InOwnerActor` 传的就是那个位置。
+ * 1. **ASC 可以来自外部持久战斗状态宿主**。玩家是 `AGGYGOCharacterSlot`，可换形态
+ *    Boss 是 `AGGYGOBossState`；本组件只接收 `ExternalASC + OwnerActor`，不依赖宿主类型，
+ *    自己不创建也不拥有 ASC。
  * 2. **本组件不授予 AbilitySet**。Lyra 在 `ALyraPlayerState::SetPawnData` 里授予，
  *    因为 ASC 归 PlayerState；本项目归位置，所以授予方也在位置上。
  *    本组件只分发 PawnData 里属于 Pawn 的部分：移动参数与 Cue 预热。
@@ -110,9 +108,8 @@ public:
 	/**
 	 * 让本 Pawn 成为 ASC 的 Avatar。由拥有者 Pawn 调用。
 	 *
-	 * @param InASC        目标 ASC。本项目通常是 Pawn 自己持有的那个。
-	 * @param InOwnerActor ASC 的逻辑拥有者。挂 Pawn 时传 Pawn 自己；
-	 *                     队伍级 ASC 场景下传 PlayerState。
+	 * @param InASC        目标 ASC。外置宿主场景由 `AGGYGOCombatantState` 持有。
+	 * @param InOwnerActor ASC 的逻辑拥有者；玩家传 CharacterSlot，Boss 传 BossState。
 	 *
 	 * 内部会处理"该 ASC 已有别的 Avatar"的情况 —— 客户端网络延迟时，
 	 * 新 Pawn 可能在旧 Pawn 销毁前就被附身，此时要先把旧的踢下来。

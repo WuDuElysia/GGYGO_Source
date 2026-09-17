@@ -14,7 +14,8 @@
  * 只能用运行时判断绕开，而不是干脆不挂那个组件。
  *
  * ## ASC 不由本类持有
- * 决策 D1：ASC 挂在队伍位置 `AGGYGOCharacterSlot` 上，本角色只是它的 Avatar。
+ * 本类是通用 Avatar，不规定外部 ASC 宿主的具体类型。玩家由
+ * `AGGYGOCharacterSlot` 注入；可换形态 Boss 将由 `AGGYGOBossState` 注入。
  *
  * 一个 ASC 只能挂一套同类 AttributeSet，而一名玩家带多个角色（D2），
  * 所以不能像 Lyra 那样共用 PlayerState 上的一个 ASC。但也不放在本类身上 ——
@@ -58,7 +59,7 @@ public:
 	/**
 	 * 类型化的 ASC 访问器，省掉调用方的 Cast。
 	 *
-	 * 返回队伍位置注入的 ASC，**注入完成前为 nullptr**，调用方必须判空。
+	 * 返回外部战斗状态宿主注入的 ASC，**注入完成前为 nullptr**，调用方必须判空。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOAbilitySystemComponent* GetGGYGOAbilitySystemComponent() const;

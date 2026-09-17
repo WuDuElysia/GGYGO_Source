@@ -31,40 +31,27 @@
  */
 #pragma once
 
-#include "AbilitySystemInterface.h"
-#include "GameFramework/Info.h"
+#include "Combatants/GGYGOCombatantState.h"
 
 #include "GGYGOCharacterSlot.generated.h"
 
 class APawn;
-class UAbilitySystemComponent;
-class UGGYGOAbilitySystemComponent;
-class UGGYGOCombatSet;
-class UGGYGOHealthSet;
 class UGGYGOPawnData;
 class UObject;
 
 /**
  * 队伍中的一个角色位置。
  *
- * 派生自 `AInfo`：本类没有空间存在感，不需要 Transform 复制、碰撞或 Tick。
+ * 通过 `AGGYGOCombatantState` 间接派生自 `AInfo`：本类没有空间存在感，
+ * 不需要 Transform 复制、碰撞或 Tick。
  */
 UCLASS(meta = (ShortTooltip = "队伍中一个位置的角色数据宿主"))
-class GGYGO_API AGGYGOCharacterSlot : public AInfo, public IAbilitySystemInterface
+class GGYGO_API AGGYGOCharacterSlot : public AGGYGOCombatantState
 {
 	GENERATED_BODY()
 
 public:
 	AGGYGOCharacterSlot(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
-
-	//~IAbilitySystemInterface
-	/** 返回本位置的 ASC。这是该角色所有 GAS 交互的入口。 */
-	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
-	//~End of IAbilitySystemInterface
-
-	/** 类型化访问器，省掉调用方的 Cast。构造完成后始终非空。 */
-	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
-	UGGYGOAbilitySystemComponent* GetGGYGOAbilitySystemComponent() const { return AbilitySystemComponent; }
 
 	/**
 	 * 确定本位置装哪个角色，并授予该角色的能力。仅服务器。
@@ -78,56 +65,12 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
 	const UGGYGOPawnData* GetPawnData() const { return PawnData; }
 
-	/**
-	 * 设置本位置 ASC 的 Avatar。仅服务器；客户端通过复制回调走同样的流程。
-	 *
-	 * 这是全项目唯一调用 `InitAbilityActorInfo` 的地方。集中在这里是因为
-	 * "Owner 恒为本 Slot、Avatar 随 Pawn 变"这条规则一旦有第二个写入点，
-	 * 就会出现两处对 Avatar 是谁的判断不一致。
-	 *
-	 * 传 nullptr 表示本位置当前没有实体（尚未生成或已销毁）。此时纯数值 GE
-	 * 继续正常结算，但依赖 Avatar 的能力无法激活。
-	 */
-	void SetAvatar(APawn* NewAvatar);
-
-	/** 当前承载本位置的 Pawn。没有实体时为 nullptr。 */
-	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
-	APawn* GetAvatarPawn() const { return AvatarPawn; }
-
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
-
-	/** 绑定 ASC 的 Owner 为本 Slot。此时 Avatar 通常尚不存在。 */
-	virtual void PostInitializeComponents() override;
-
-	/** 客户端收到 Avatar 变更：重新绑定 ActorInfo，否则客户端侧的 Avatar 仍是旧的。 */
-	UFUNCTION()
-	void OnRep_AvatarPawn();
-
-	/** 本位置的 ASC。Owner 恒为本 Slot，Avatar 为当前 Pawn。 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Squad", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;
-
-	/**
-	 * 生命与韧性。
-	 *
-	 * 作为默认子对象持有而不是靠 AbilitySet 授予：`InitializeComponent` 阶段
-	 * 就被 ASC 发现，任何时刻读它都不会为空。持一份引用同时也是防 GC。
-	 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Squad", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UGGYGOHealthSet> HealthSet;
-
-	/** 输出侧属性（攻击力、削韧）。持有理由同 `HealthSet`。 */
-	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Squad", meta = (AllowPrivateAccess = "true"))
-	TObjectPtr<UGGYGOCombatSet> CombatSet;
 
 	/** 本位置装的角色定义。复制给客户端用于 UI 与表现。 */
 	UPROPERTY(Replicated)
 	TObjectPtr<const UGGYGOPawnData> PawnData;
-
-	/** 当前 Avatar。复制以便客户端也能把 ActorInfo 指向正确的 Pawn。 */
-	UPROPERTY(ReplicatedUsing = OnRep_AvatarPawn)
-	TObjectPtr<APawn> AvatarPawn;
 
 	/** 能力是否已授予。防止 `InitializeForPawnData` 被重复调用时重复授予。 */
 	bool bAbilitiesGranted = false;

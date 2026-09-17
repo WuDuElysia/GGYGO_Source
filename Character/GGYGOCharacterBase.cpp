@@ -52,8 +52,8 @@ UAbilitySystemComponent* AGGYGOCharacterBase::GetAbilitySystemComponent() const
 
 UGGYGOAbilitySystemComponent* AGGYGOCharacterBase::GetGGYGOAbilitySystemComponent() const
 {
-	// ASC 不属于本角色，而属于它所在的队伍位置（决策 D1）。
-	// 本角色只是那个 ASC 的 Avatar，通过协调者拿到被注入的那一个。
+	// ASC 不属于本角色，而属于与战斗状态同生命周期的外部宿主。
+	// 本角色只是那个 ASC 的 Avatar，通过协调者拿到被注入的实例。
 	//
 	// **可能返回 nullptr**：从 Pawn 生成到队伍位置注入 ASC 之间存在一个窗口。
 	// 调用方必须判空，不能沿用"角色一定有 ASC"的旧假设。
@@ -71,8 +71,8 @@ void AGGYGOCharacterBase::PostInitializeComponents()
 {
 	Super::PostInitializeComponents();
 
-	// 这里**不再**绑定 ASC。ASC 归队伍位置（`AGGYGOCharacterSlot`）持有，
-	// 由装配方在生成本角色后调用 `PawnExtComponent->InitializeAbilitySystem(SlotASC, Slot)` 注入。
+	// 这里**不绑定 ASC**。外部 CombatantState 在生成本角色后通过
+	// `AttachAvatar` 统一注入，Character 不知道宿主是玩家 Slot 还是 BossState。
 	//
 	// 之所以不能在这里自己建一个再绑：那样属性集只能跟着 Pawn 的初始化流程走，
 	// 而本角色的 HealthComponent 也在同一段流程里初始化，两者先后无法保证。

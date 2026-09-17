@@ -5,7 +5,6 @@
 #include "GameModes/GGYGOGameMode.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
-#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
 #include "GameFramework/PlayerController.h"
@@ -281,14 +280,9 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 			continue;
 		}
 
-		// 把位置的 ASC 注入 Pawn 的协调者：Owner 是位置，Avatar 是 Pawn。
-		if (UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Member))
-		{
-			PawnExtComp->InitializeAbilitySystem(Slot->GetGGYGOAbilitySystemComponent(), Slot);
-		}
-
-		// 反向绑定：让位置的 ASC 知道自己的 Avatar 是谁。
-		Slot->SetAvatar(Member);
+		// 唯一装配入口：状态宿主同时更新复制引用、PawnExtension 与 AbilityActorInfo。
+		// 生成方不再直接写 PawnExtension，避免两个调用方争抢当前 Avatar。
+		Slot->AttachAvatar(Member);
 
 		// 第一个登记的位置会由 SquadComponent 自动设为出战并被附身。
 		SquadComponent->RegisterSlot(Slot);

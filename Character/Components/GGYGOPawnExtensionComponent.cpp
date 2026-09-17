@@ -127,10 +127,13 @@ void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemCo
 	check(InASC);
 	check(InOwnerActor);
 
-	if (AbilitySystemComponent == InASC)
+	APawn* Pawn = GetPawnChecked<APawn>();
+	if (AbilitySystemComponent == InASC &&
+		InASC->GetOwnerActor() == InOwnerActor &&
+		InASC->GetAvatarActor() == Pawn)
 	{
-		// 幂等：同一个 ASC 重复初始化直接返回。
-		// Pawn 的 PostInitializeComponents 与 Controller 变更都可能触发这条路径。
+		// 只有 ASC、Owner、Avatar 三者都一致才算幂等。
+		// 仅比较 ASC 会掩盖外部宿主已经清空/替换 Avatar 的情况。
 		return;
 	}
 
@@ -140,7 +143,6 @@ void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemCo
 		UninitializeAbilitySystem();
 	}
 
-	APawn* Pawn = GetPawnChecked<APawn>();
 	AActor* ExistingAvatar = InASC->GetAvatarActor();
 
 	UE_LOG(LogGGYGOAbilitySystem, Verbose,
