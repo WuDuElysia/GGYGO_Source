@@ -6,6 +6,7 @@
 #include "GGYGOBossAIController.generated.h"
 
 class AGGYGOBossState;
+struct FGGYGOBossActionDefinition;
 
 /** 阶段 B 只负责 Possess 与启动 BehaviorTree；目标/仇恨在阶段 D 加入。 */
 UCLASS(Blueprintable)
@@ -19,6 +20,13 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Boss")
 	AGGYGOBossState* GetBossState() const { return BossState; }
 
+	/** Encounter 提供可复现的决策种子；仅服务器决策时消费。 */
+	void InitializeDecisionStream(int32 EncounterSeed);
+
+	float GetActionWeight(const FGGYGOBossActionDefinition& Action) const;
+	float DrawActionWeight(float TotalWeight);
+	void RecordActionSelection(const TArray<FGGYGOBossActionDefinition>& Actions, FGameplayTag SelectedActionTag);
+
 protected:
 	virtual void OnPossess(APawn* InPawn) override;
 	virtual void OnUnPossess() override;
@@ -27,4 +35,7 @@ protected:
 	TObjectPtr<AGGYGOBossState> BossState;
 
 	bool bBehaviorTreeStarted = false;
+
+	FRandomStream DecisionRandom;
+	TMap<FGameplayTag, float> RuntimeActionWeights;
 };

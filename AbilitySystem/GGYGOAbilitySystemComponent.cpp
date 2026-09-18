@@ -76,6 +76,16 @@ void UGGYGOAbilitySystemComponent::TryActivateAbilitiesOnSpawn()
 	}
 }
 
+bool UGGYGOAbilitySystemComponent::CanActivateAbilityByHandle(
+	FGameplayAbilitySpecHandle Handle, FGameplayTagContainer& OutFailureTags) const
+{
+	OutFailureTags.Reset();
+	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
+	return Spec && Spec->Ability && AbilityActorInfo.IsValid() &&
+		Spec->Ability->CanActivateAbility(
+			Handle, AbilityActorInfo.Get(), nullptr, nullptr, &OutFailureTags);
+}
+
 void UGGYGOAbilitySystemComponent::CancelAbilitiesByFunc(TShouldCancelAbilityFunc ShouldCancelFunc, bool bReplicateCancelAbility)
 {
 	ABILITYLIST_SCOPE_LOCK();

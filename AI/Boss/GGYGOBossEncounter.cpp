@@ -87,6 +87,7 @@ bool AGGYGOBossEncounter::SpawnBoss()
 		NewState->Destroy();
 		return false;
 	}
+	NewController->InitializeDecisionStream(EncounterSeed);
 
 	AGGYGOBossCharacter* NewAvatar = World->SpawnActorDeferred<AGGYGOBossCharacter>(
 		PawnClass,

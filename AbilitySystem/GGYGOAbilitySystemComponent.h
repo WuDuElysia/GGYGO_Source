@@ -124,6 +124,12 @@ public:
 	/** 清空全部输入缓存（含 held）。切换 Pawn、屏蔽输入或重置时调用。 */
 	void ClearAbilityInput();
 
+	/**
+	 * 无副作用查询某个 Spec 此刻能否激活。AI 决策用它复用 GAS 的
+	 * Tag、Cooldown、Cost 与组仲裁，不在 BT 里拷贝第二套规则。
+	 */
+	bool CanActivateAbilityByHandle(FGameplayAbilitySpecHandle Handle, FGameplayTagContainer& OutFailureTags) const;
+
 	// ===== 组仲裁 =====
 
 	/**

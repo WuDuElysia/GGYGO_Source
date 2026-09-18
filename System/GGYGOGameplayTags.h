@@ -114,6 +114,11 @@ namespace GGYGOGameplayTags
 	/** 切人。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Intent_SwitchCharacter);
 
+	/** Boss AI 语义动作根标签，不是玩家输入。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction);
+	/** 阶段 C 的近战竖切动作。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction_Attack_Melee);
+
 	// ============================================================
 	// 三、AbilityGroup —— 组仲裁的组身份
 	//

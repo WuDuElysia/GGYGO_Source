@@ -11,6 +11,7 @@
 
 class UBehaviorTree;
 class UGGYGOAbilitySet;
+class UGGYGOBossActionSet;
 class UGGYGOPawnData;
 
 /** 一个可生成的 Boss 形态。阶段 E 会在此基础上加入 Exit/Enter 配置。 */
@@ -38,6 +39,10 @@ struct FGGYGOBossPhaseDefinition
 	/** 进入该阶段的归一化生命阈值；阶段 B 的第一阶段通常为 1。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float EnterHealthThreshold = 1.0f;
+
+	/** 该阶段的可选语义动作；冷却和能否激活仍以 GAS 为真源。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly)
+	TObjectPtr<const UGGYGOBossActionSet> ActionSet;
 };
 
 /**

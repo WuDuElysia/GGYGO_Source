@@ -48,6 +48,10 @@ protected:
 	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
 	bool bSpawnOnBeginPlay = true;
 
+	/** AI 随机决策种子；同一配置可复现相同选择序列。 */
+	UPROPERTY(EditInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
+	int32 EncounterSeed = 1337;
+
 	UPROPERTY(Transient, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
 	TObjectPtr<AGGYGOBossState> BossState;
 
