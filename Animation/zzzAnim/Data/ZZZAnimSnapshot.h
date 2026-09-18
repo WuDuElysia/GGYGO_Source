@@ -2,7 +2,7 @@
  * @file ZZZAnimSnapshot.h
  * @brief ZZZ 动画快照结构体
  *
- * 每帧从移动层抓取一份不变的值，供 worker 线程与决策函数读取。
+ * 每帧从项目通用 AnimationStateFrame 适配一份不变的值，供 worker 线程与旧决策函数读取。
  *
  * ## 为什么要快照
  * AnimBP 的过渡条件可能在 worker 线程上求值，而移动层的状态在游戏线程被改写，
@@ -11,7 +11,9 @@
  * 多个过渡条件不会基于不同时刻的状态做出互相矛盾的决定。
  *
  * ## 数据来源
- * 全部来自 `UGGYGOCharacterMovementComponent`，由 `FZZZAnimSnapshotCapture` 抓取。
+ * 稳定语义来自 `FGGYGOAnimationStateFrame`，旧调试字段来自
+ * `FGGYGOAnimationDebugFrame`，由 `FZZZAnimSnapshotCapture` 做纯数据映射。
+ * 本结构只服务迁移期兼容，不再直接读取 Actor、CMC 或 ASC。
  */
 #pragma once
 

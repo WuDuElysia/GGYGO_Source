@@ -1,23 +1,14 @@
 ﻿/**
  * @file ZZZAnimInstance.cpp
- * @brief ZZZ 动画决策层实现
+ * @brief ZZZ 动画迁移期兼容实现
  */
 
 #include "Animation/zzzAnim/ZZZAnimInstance.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
-#include "Character/Components/GGYGOCharacterMovementComponent.h"
-#include "Components/SkeletalMeshComponent.h"
-#include "GameFramework/Character.h"
 
 // ============================================================================
 // AnimInstance 生命周期
 // ============================================================================
-
-void UZZZAnimInstance::NativeInitializeAnimation()
-{
-	Super::NativeInitializeAnimation();
-	Owner = Cast<ACharacter>(TryGetPawnOwner());
-}
 
 void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
@@ -27,8 +18,9 @@ void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 
 void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 {
-	// 固定顺序：抓取快照 → 注入上下文 → 由 C++ 同步 Moving 子状态 → 推进表现记忆。
-	SnapshotCapture.Capture(Snap, Owner.Get());
+	// 通用基类已在 Super::NativeUpdateAnimation 中完成唯一一次跨层抓取。
+	// 这里只做旧数据面的兼容适配，不再访问 Actor、CMC 或 ASC。
+	LegacySnapshotAdapter.Capture(Snap, GetAnimationStateFrame(), GetAnimationDebugFrame());
 	AnimBlendX = Snap.AnimBlendX;
 	AnimBlendY = Snap.AnimBlendY;
 	AnimCurveVelocity = Snap.AnimCurveVelocity;
@@ -69,11 +61,6 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 			Snap.VelocityLength);
 	}
 #endif
-}
-
-void UZZZAnimInstance::NativeThreadSafeUpdateAnimation(float DeltaSeconds)
-{
-	Super::NativeThreadSafeUpdateAnimation(DeltaSeconds);
 }
 
 // ============================================================================

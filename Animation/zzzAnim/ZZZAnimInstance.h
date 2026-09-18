@@ -1,8 +1,10 @@
 /**
  * @file ZZZAnimInstance.h
- * @brief ZZZ 动画的 C++ 决策层
+ * @brief 现有 ZZZ AnimBP 的迁移期兼容实例
  *
- * 设计哲学：拓扑在蓝图，决策在 C++，求值在 AnimGraph。
+ * 新架构由 `UGGYGOAnimInstanceBase` 发布单向只读的 AnimationStateFrame。
+ * 本类暂时保留旧过渡函数、状态记忆和资产查询，保证 ABP_Pyrios 在逐步改线期间
+ * 仍可运行；完成 Anim-C 后应继续收缩，而不是作为新动画功能的扩展入口。
  *
  * ## ABP_Pyrios 实际用到的东西
  * 状态机嵌套是 `MainStateMachine → MainGroundState → LocomotionState`，
@@ -45,7 +47,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Animation/AnimInstance.h"
+#include "Animation/Runtime/GGYGOAnimInstanceBase.h"
 #include "Animation/zzzAnim/Data/ZZZAnimSet.h"
 #include "Animation/zzzAnim/Data/ZZZAnimTuning.h"
 #include "Animation/zzzAnim/Data/ZZZAnimContext.h"
@@ -56,11 +58,10 @@
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionEvents.h"
 #include "ZZZAnimInstance.generated.h"
 
-class ACharacter;
 class UBlendSpace;
 
 UCLASS()
-class GGYGO_API UZZZAnimInstance : public UAnimInstance
+class GGYGO_API UZZZAnimInstance : public UGGYGOAnimInstanceBase
 {
 	GENERATED_BODY()
 
@@ -69,9 +70,7 @@ public:
 	// AnimInstance 生命周期
 	// ============================================================
 
-	virtual void NativeInitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
-	virtual void NativeThreadSafeUpdateAnimation(float DeltaSeconds) override;
 
 	// ============================================================
 	// Locomotion 过渡决策函数（AnimBP 过渡条件引用）
@@ -233,20 +232,11 @@ protected:
 	FZZZAnimSnapshot Snap;
 
 private:
-	/** 抓取快照 → 注入上下文（判定层只读视图、事件层可写上下文）→ 推进。 */
+	/** 通用语义帧适配成旧快照 → 注入兼容上下文 → 推进旧表现记忆。 */
 	void RefreshDecisionContext(float DeltaSeconds);
 
-	/**
-	 * 拥有者。
-	 *
-	 * 类型是 `ACharacter` 而不是具体角色类，因为动画层需要的一切都通过
-	 * `UGGYGOCharacterMovementComponent` 取得，而 CMC 是 `ACharacter` 的既有子对象。
-	 * 不绑定具体角色类，同一个 AnimBP 就能挂在任意角色类上；
-	 * 没有项目 CMC 的角色只会得到全默认的快照，不会崩。
-	 */
-	TWeakObjectPtr<ACharacter> Owner;
-
-	FZZZAnimSnapshotCapture SnapshotCapture;
+	/** 把通用 AnimationStateFrame 转成现有 AnimBP 仍在使用的旧快照。 */
+	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
 	FZZZLocomotionDecisions LocomotionDecisions;
 	FZZZLocomotionEvents LocomotionEvents;
 };
