@@ -30,6 +30,14 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
 	bool HasAnimationStateTag(FGameplayTag Tag) const;
 
+	/** 当前权威步态是否为 Run。只描述语义事实，不知道 AnimBP 的状态拓扑。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
+	bool IsAnimationRunGait() const;
+
+	/** 转身是否处于 Turning / Braking 的曲线接管段（明确排除 RunOut）。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
+	bool IsTurnBackCurveDriven() const;
+
 	const FGGYGOAnimationStateFrame& GetAnimationStateFrame() const { return AnimationState; }
 
 protected:

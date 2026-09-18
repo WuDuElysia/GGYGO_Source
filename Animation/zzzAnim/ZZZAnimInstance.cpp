@@ -37,22 +37,18 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 	WriteContext.Tuning = &Tuning;
 	WriteContext.Memory = &StateMemory;
 
-	LocomotionDecisions.SetContext(WriteContext.ToRead());
 	LocomotionEvents.SetContext(WriteContext);
-	LocomotionEvents.SynchronizeMovingSubState();
 	LocomotionEvents.AdvanceGaitBlend(DeltaSeconds);
 
 #if !UE_BUILD_SHIPPING
 	// TurnBack 诊断。全部字段取自快照，不回头读移动层 ——
 	// 快照之外再取一次值，两者可能来自不同时刻，日志就会自相矛盾。
-	if (Snap.TurnBackPhase != EGGYGOTurnBackPhase::None
-		|| StateMemory.MovingSubState == EZZZAnimMovingSubState::TurnBack)
+	if (Snap.TurnBackPhase != EGGYGOTurnBackPhase::None)
 	{
 		UE_LOG(LogZZZAnim, Log,
-			TEXT("[TurnBack][Snapshot] Phase=%d RunOut=%d SubState=%d Gait=%d ShouldMove=%d Grounded=%d BlockMove=%d InputForwardDot=%.3f Velocity=%.2f"),
+			TEXT("[TurnBack][Snapshot] Phase=%d RunOut=%d Gait=%d ShouldMove=%d Grounded=%d BlockMove=%d InputForwardDot=%.3f Velocity=%.2f"),
 			static_cast<uint8>(Snap.TurnBackPhase),
 			Snap.bTurnBackRunOut ? 1 : 0,
-			static_cast<uint8>(StateMemory.MovingSubState),
 			static_cast<uint8>(Snap.Gait),
 			Snap.bShouldMove ? 1 : 0,
 			Snap.bGrounded ? 1 : 0,
@@ -61,45 +57,6 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 			Snap.VelocityLength);
 	}
 #endif
-}
-
-// ============================================================================
-// Locomotion 过渡决策
-// ============================================================================
-
-bool UZZZAnimInstance::Locomotion_NotMoving_To_Conduit() const
-{
-	return LocomotionDecisions.NotMoving_To_Conduit();
-}
-
-bool UZZZAnimInstance::Locomotion_Stop_To_Conduit() const
-{
-	return LocomotionDecisions.Stop_To_Conduit();
-}
-
-bool UZZZAnimInstance::Locomotion_Conduit_To_EnterMove() const
-{
-	return LocomotionDecisions.Conduit_To_EnterMove();
-}
-
-bool UZZZAnimInstance::Locomotion_Conduit_To_Moving_Direct() const
-{
-	return LocomotionDecisions.Conduit_To_Moving_Direct();
-}
-
-bool UZZZAnimInstance::Locomotion_Moving_To_Stop() const
-{
-	return LocomotionDecisions.ShouldExitMoving();
-}
-
-bool UZZZAnimInstance::Locomotion_EnterMove_To_Stop() const
-{
-	return LocomotionDecisions.ShouldStopMoving();
-}
-
-bool UZZZAnimInstance::Locomotion_WalkRun_To_TurnBack() const
-{
-	return LocomotionDecisions.WalkRun_To_TurnBack();
 }
 
 // ============================================================================

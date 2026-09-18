@@ -14,34 +14,6 @@ void FZZZLocomotionEvents::SetContext(const FZZZAnimWriteContext& InContext)
 	Context = InContext;
 }
 
-void FZZZLocomotionEvents::SynchronizeMovingSubState()
-{
-	if (!Context.Snap || !Context.Memory)
-	{
-		return;
-	}
-
-	if (!Context.Snap->bShouldMove)
-	{
-		Context.Memory->MovingSubState = EZZZAnimMovingSubState::None;
-		return;
-	}
-
-	// MovingSubState 只是移动层转身相位的投影，供 AnimBP 读取；反向输入检测与相位切换的
-	// 唯一真相在 `UGGYGOCharacterMovementComponent::UpdateTurnBack`，这里不重复判定。
-	//
-	// 投影口径与 `FZZZLocomotionDecisions::WalkRun_To_TurnBack` 保持一致：只有曲线接管段
-	// 算「转身中」，RunOut 段算 WalkRun。两处口径必须相同，否则子状态会与 AnimBP
-	// 实际所处的状态对不上，读它做表现分支就会错。
-	const EGGYGOTurnBackPhase Phase = Context.Snap->TurnBackPhase;
-	const bool bCurveDriven = (Phase == EGGYGOTurnBackPhase::Turning)
-		|| (Phase == EGGYGOTurnBackPhase::Braking);
-
-	Context.Memory->MovingSubState = bCurveDriven
-		? EZZZAnimMovingSubState::TurnBack
-		: EZZZAnimMovingSubState::WalkRun;
-}
-
 void FZZZLocomotionEvents::AdvanceStopSelection(float DeltaSeconds)
 {
 	const bool bIsMoving =
@@ -135,43 +107,20 @@ void FZZZLocomotionEvents::AdvanceGaitBlend(float DeltaSeconds)
 		return;
 	}
 
-	// Stop helper 必须先执行，随后才按原有顺序维护 GaitValue 并推进 GaitBlendY。
+	// Stop helper 必须先执行，随后推进 GaitBlendY。
 	AdvanceStopSelection(DeltaSeconds);
 
 	const bool bIsMoving =
 		Context.Snap->bShouldMove;
 
-	// GaitValue 只保存最近一次有效 Moving 步态的离散选择值。
-	// 外部若写入非法值，先规范为 None，确保后续不会把越域值带入步态选择。
-	if (Context.Memory->GaitValue < 0 || Context.Memory->GaitValue > 2)
-	{
-		Context.Memory->GaitValue = 0;
-	}
-
-	// 非 Moving 时只复位 GaitBlendY 与目标值；GaitValue 和 StopValue 的既有记录保留。
+	// 非 Moving 时只复位 GaitBlendY 与目标值；StopValue 的既有记录保留。
 	if (!bIsMoving)
 	{
 		Context.Memory->GaitBlendY = 0.0f;
 		LastGaitBlendTarget = 0.0f;
-		Context.Memory->MovingSubState = EZZZAnimMovingSubState::None;
 		bInvalidDeltaReported = false;
 		bInvalidSnapshotGaitReported = false;
 		return;
-	}
-
-	// 只有有效 Moving 步态更新离散选择值：不改写 const Snapshot_Gait；None 或非法值
-	// 保留已经规范化的最近一次有效值。
-	switch (Context.Snap->Gait)
-	{
-	case EGGYGOGait::Walk:
-		Context.Memory->GaitValue = 1;
-		break;
-	case EGGYGOGait::Run:
-		Context.Memory->GaitValue = 2;
-		break;
-	case EGGYGOGait::None:
-	default:
-		break;
 	}
 
 	// 只诊断非法源值，不改写 const Snapshot_Gait。

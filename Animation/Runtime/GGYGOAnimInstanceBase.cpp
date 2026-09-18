@@ -31,6 +31,17 @@ bool UGGYGOAnimInstanceBase::HasAnimationStateTag(FGameplayTag Tag) const
 	return Tag.IsValid() && AnimationState.OwnedStateTags.HasTag(Tag);
 }
 
+bool UGGYGOAnimInstanceBase::IsAnimationRunGait() const
+{
+	return AnimationState.Gait == EGGYGOGait::Run;
+}
+
+bool UGGYGOAnimInstanceBase::IsTurnBackCurveDriven() const
+{
+	return AnimationState.TurnBackPhase == EGGYGOTurnBackPhase::Turning
+		|| AnimationState.TurnBackPhase == EGGYGOTurnBackPhase::Braking;
+}
+
 void UGGYGOAnimInstanceBase::RefreshAnimationStateFrame()
 {
 	StateCapture.Capture(AnimationState, AnimationDebug, CharacterOwner.Get());

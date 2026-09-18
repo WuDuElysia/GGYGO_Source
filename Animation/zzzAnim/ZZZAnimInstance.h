@@ -3,25 +3,25 @@
  * @brief 现有 ZZZ AnimBP 的迁移期兼容实例
  *
  * 新架构由 `UGGYGOAnimInstanceBase` 发布单向只读的 AnimationStateFrame。
- * 本类暂时保留旧过渡函数、状态记忆和资产查询，保证 ABP_Pyrios 在逐步改线期间
- * 仍可运行；完成 Anim-C 后应继续收缩，而不是作为新动画功能的扩展入口。
+ * 本类只保留 Pyrios 的表现记忆和资产查询。状态迁移条件由 AnimBP 直接组合
+ * `AnimationState` 与通用语义查询，不再通过按状态名命名的 C++ 决策函数。
  *
  * ## ABP_Pyrios 实际用到的东西
  * 状态机嵌套是 `MainStateMachine → MainGroundState → LocomotionState`，
  * 最内层的 locomotion 状态机有五个状态与一个 Conduit：
  *
  * ```text
- * NotMoving ──Locomotion_NotMoving_To_Conduit──┐
- * Stop ───────Locomotion_Stop_To_Conduit───────┤
+ * NotMoving ──bHasMoveInput────────────────────┐
+ * Stop ───────bHasMoveInput────────────────────┤
  *                                          Conduit
- *                          ┌──Conduit_To_EnterMove──→ EnterMove
- *                          └──Conduit_To_Moving_Direct──→ Moving
+ *                          ┌──!IsAnimationRunGait──→ EnterMove
+ *                          └── IsAnimationRunGait──→ Moving
  * EnterMove ──动画剩余 <= 0.03──→ Moving
- * EnterMove ──EnterMove_To_Stop──→ Stop
- * Moving ─────Moving_To_Stop─────→ Stop
+ * EnterMove ──!bHasMoveInput─────→ Stop
+ * Moving ─────!bHasMoveInput && !IsTurnBackCurveDriven──→ Stop
  * Stop ───────动画剩余 <= 0.5────→ NotMoving
  *
- * Moving 内层：WalkRun ──WalkRun_To_TurnBack──→ TurnBack
+ * Moving 内层：WalkRun ──IsTurnBackCurveDriven──→ TurnBack
  *                      ←──动画剩余 <= 0.03────┘
  * ```
  *
@@ -34,15 +34,16 @@
  * （组件空间、只有 Z 平移 50.802）用于把骨架对齐胶囊体，以及一个惯性化节点。
  * 那两个与 root motion 无关，动画的 in-place 化只扣水平位移与 yaw，不影响它们。
  *
- * ## 蓝图当前只读这三个成员
+ * ## 蓝图当前读取面
+ * 过渡图读取 `AnimationState.bHasMoveInput` 与两个通用语义查询；状态图读取
  * `StateMemory.GaitBlendY`、`StateMemory.StopValue`，以及两个查表函数。
  * 其余暴露出去的属性（`AnimBlend*`、`ActualVelocity*`、`bTurnBackRunOut`）
  * 目前**没有**任何 AnimGraph 节点消费，保留它们是为了给表现层留钩子；
  * 逐个属性的现状见各自的注释。
  *
  * 本类不维护状态机循环，也不解算步态：步态由移动层给出，动画层只消费快照、
- * 推进 GaitBlendY 与 StopValue。EnterMove 早停计时与 Moving 子状态由
- * `FZZZLocomotionEvents` 每帧维护。
+ * 推进 GaitBlendY 与 StopValue。EnterMove 早停计时仍由
+ * `FZZZLocomotionEvents` 每帧维护，待后续还给 AnimBP。
  */
 #pragma once
 
@@ -51,7 +52,6 @@
 #include "Animation/zzzAnim/Data/ZZZAnimSet.h"
 #include "Animation/zzzAnim/Data/ZZZAnimTuning.h"
 #include "Animation/zzzAnim/Data/ZZZAnimContext.h"
-#include "Animation/zzzAnim/Locomotion/ZZZLocomotionDecisions.h"
 #include "Animation/zzzAnim/Data/ZZZAnimSnapshot.h"
 #include "Animation/zzzAnim/Capture/ZZZAnimSnapshotCapture.h"
 #include "Animation/zzzAnim/Data/ZZZAnimStateMemory.h"
@@ -71,70 +71,6 @@ public:
 	// ============================================================
 
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
-
-	// ============================================================
-	// Locomotion 过渡决策函数（AnimBP 过渡条件引用）
-	//
-	// 全部是快照的只读视图，无副作用，因此蓝图求值多少次、在哪个线程求值都不影响状态。
-	// 停止判定看的是「有没有移动输入」而不是速度：起步第一帧速度还是 0，
-	// 按速度判定会让起步动画晚一帧，玩家能感觉到输入迟滞。
-	//
-	// 三个纯动画时序的过渡不在这里：EnterMove → Moving、TurnBack → WalkRun、
-	// Stop → NotMoving 都由 AnimBP 自己用 `Time Remaining (ratio)` 判定 ——
-	// 那是「这段动画播完了吗」，属于表现层自己的事，C++ 不需要知道。
-	// ============================================================
-
-	/**
-	 * NotMoving → Conduit：本帧有移动意图。
-	 *
-	 * 该函数只读取快照，不访问 Actor 或移动层。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_NotMoving_To_Conduit() const;
-
-	/**
-	 * Stop → Conduit：重新启动移动入口，仅当本帧有移动输入/意图时返回 true。
-	 * 上下文缺失时返回 false；不读取速度、Gait 或 StateMemory。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_Stop_To_Conduit() const;
-
-	/**
-	 * Conduit → EnterMove：本帧 Snapshot_Gait 不是 Run，走起步路径；上下文缺失时同样成立。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_Conduit_To_EnterMove() const;
-
-	/**
-	 * Conduit → Moving：本帧 Snapshot_Gait 已是 Run，走直接进入路径。
-	 *
-	 * 只读取快照，不产生副作用。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_Conduit_To_Moving_Direct() const;
-
-	/**
-	 * Moving → Stop 的独立 Blueprint 入口。
-	 * 本帧没有移动输入时通常返回 true；转身相位为任一非 None 值时保持 false，
-	 * 避免转身还没走完就提前离开 Moving。底层转发 ShouldExitMoving()，不是速度为零判断。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_Moving_To_Stop() const;
-
-	/**
-	 * EnterMove → Stop 的独立 Blueprint 入口。
-	 * 仅当本帧没有移动输入时返回 true；底层直接转发 ShouldStopMoving()，不负责 EnterMove → Moving
-	 * 的动画完成判断。
-	 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_EnterMove_To_Stop() const;
-
-	/** WalkRun → TurnBack：移动层的转身相位已进入非 None。 */
-	UFUNCTION(BlueprintPure, Category = "Cond|Locomotion", meta = (BlueprintThreadSafe))
-	bool Locomotion_WalkRun_To_TurnBack() const;
-
-	// 转身相位由 `UGGYGOCharacterMovementComponent::UpdateTurnBack` 从动画曲线判定，
-	// 经快照读取；Back → WalkRun 的完整动画播放条件由 AnimBP 自己用动画时间节点判断。
 
 	// ============================================================
 	// 配表查询（AnimBP 的 SequencePlayer 节点 Bind 此函数）
@@ -158,7 +94,7 @@ public:
 	FZZZAnimTuning Tuning;
 
 	// ============================================================
-	// 动画状态机记忆（C++ pipeline 写入，决策函数与 AnimGraph 只读）
+	// 迁移期表现记忆（C++ pipeline 写入，AnimGraph 只读）
 	// ============================================================
 
 	UPROPERTY(BlueprintReadOnly, Category = "State|Locomotion")
@@ -219,7 +155,7 @@ public:
 	/**
 	 * 转身已进入交还输入的 `RunOut` 段。
 	 *
-	 * **当前没有 AnimGraph 节点消费**：`RunOut` 段 `Locomotion_WalkRun_To_TurnBack`
+	 * **当前没有 AnimGraph 节点消费**：`RunOut` 段 `IsTurnBackCurveDriven`
 	 * 为假，状态机自己就切回 WalkRun 了，不需要读这个标记来做分支。
 	 * 留着是给「想在跑出段单独做表现」留的钩子（那一段方向来自玩家输入而非曲线，
 	 * 朝向交回了 CMC 的自动对齐，玩家改方向时身体朝向会与动画姿势有偏差）。
@@ -228,7 +164,7 @@ public:
 	bool bTurnBackRunOut = false;
 
 protected:
-	/** 动画决策快照（游戏线程写入，worker 线程与决策函数只读） */
+	/** 迁移期表现快照（游戏线程写入，表现记忆只读）。 */
 	FZZZAnimSnapshot Snap;
 
 private:
@@ -237,6 +173,5 @@ private:
 
 	/** 把通用 AnimationStateFrame 转成现有 AnimBP 仍在使用的旧快照。 */
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
-	FZZZLocomotionDecisions LocomotionDecisions;
 	FZZZLocomotionEvents LocomotionEvents;
 };
