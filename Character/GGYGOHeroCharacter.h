@@ -25,6 +25,7 @@
 
 class UGGYGOCameraComponent;
 class UGGYGOHeroComponent;
+class UGGYGOPyriosRenderComponent;
 class UObject;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "被玩家操控的角色"))
@@ -57,4 +58,8 @@ private:
 	 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOCameraComponent> CameraComponent;
+
+	/** Per-character stylized rendering. Inert for meshes without configured materials. */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UGGYGOPyriosRenderComponent> StylizedRenderComponent;
 };
