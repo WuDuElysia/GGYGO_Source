@@ -25,10 +25,11 @@ struct FZZZAnimStateMemory
 	GENERATED_BODY()
 
 	/**
-	 * WalkRun BlendSpace 的 Y 轴输入，取值域为 [0, 1]；
+	 * WalkRun BlendSpace1D 的 X 轴混合权重：0 = Walk，1 = Run。
+	 * GaitBlendY 是已序列化的旧成员名；蓝图显示为 Walk Run Blend Alpha，保留成员名以兼容已有拆分引脚。
 	 * 唯一写入方：FZZZLocomotionEvents。
 	 */
-	UPROPERTY(BlueprintReadOnly, Category = "Locomotion")
+	UPROPERTY(BlueprintReadOnly, Category = "Locomotion", meta = (DisplayName = "Walk Run Blend Alpha"))
 	float GaitBlendY = 0.f;
 
 	/**
