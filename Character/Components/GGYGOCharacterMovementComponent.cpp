@@ -38,7 +38,7 @@ namespace GGYGOMovementConstants
 	 * CMC 给项目预留了四个自定义位（FLAG_Custom_0..3）。三个步态值需要 2 位，
 	 * 用掉 0 和 1，剩下 2 和 3 给后续功能（蹲伏、锁定）。
 	 */
-	constexpr uint8 GaitFlagShift = 0;
+	constexpr uint8 GaitFlagShift = 4;
 	constexpr uint8 GaitFlagMask = FSavedMove_Character::FLAG_Custom_0 | FSavedMove_Character::FLAG_Custom_1;
 
 	/**
@@ -49,6 +49,7 @@ namespace GGYGOMovementConstants
 	 * 所以三个相位对接收端只有两种含义。
 	 */
 	constexpr uint8 TurnBackCurveDrivenFlag = FSavedMove_Character::FLAG_Custom_2;
+	constexpr uint8 ForceWalkFlag = FSavedMove_Character::FLAG_Custom_3;
 
 	/**
 	 * 曲线位移源的实例名。
@@ -78,7 +79,12 @@ void FSavedMove_GGYGO::Clear()
 	Super::Clear();
 
 	SavedGait = EGGYGOGait::None;
+	NetworkGait = EGGYGOGait::None;
+	bNetworkTurnBackCurveDriven = false;
 	SavedWalkHoldTimer = 0.0f;
+	bSavedForceWalkRequested = false;
+	bSavedPreviousHasMoveInput = false;
+	bSavedPreviousMovementBlocked = false;
 	bSavedWantsRunOnNextMove = false;
 	SavedCurveMotion.Reset();
 
@@ -95,7 +101,12 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
 	{
 		SavedGait = MoveComp->ResolvedGait;
+		NetworkGait = SavedGait;
+		bNetworkTurnBackCurveDriven = MoveComp->IsTurnBackCurveDriven();
 		SavedWalkHoldTimer = MoveComp->WalkHoldTimer;
+		bSavedForceWalkRequested = MoveComp->bForceWalkRequested;
+		bSavedPreviousHasMoveInput = MoveComp->bPreviousHasMoveInput;
+		bSavedPreviousMovementBlocked = MoveComp->bPreviousMovementBlocked;
 		bSavedWantsRunOnNextMove = MoveComp->bWantsRunOnNextMove;
 		SavedCurveMotion = MoveComp->CurveMotion;
 
@@ -120,6 +131,18 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 	}
 }
 
+void FSavedMove_GGYGO::PostUpdate(ACharacter* C, EPostUpdateMode PostUpdateMode)
+{
+	Super::PostUpdate(C, PostUpdateMode);
+	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
+	{
+		NetworkGait = MoveComp->ResolvedGait;
+		bNetworkTurnBackCurveDriven = MoveComp->IsTurnBackCurveDriven();
+		// 升档/转身入口帧的结果必须按本次 move 发送，不能推迟到下一帧。
+		bForceNoCombine |= NetworkGait != SavedGait || bNetworkTurnBackCurveDriven;
+	}
+}
+
 void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 {
 	Super::PrepMoveFor(C);
@@ -131,6 +154,9 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 		// 于是回放中途可能升档，而首次执行时并没有 —— 预测就失配了。
 		MoveComp->ResolvedGait = SavedGait;
 		MoveComp->WalkHoldTimer = SavedWalkHoldTimer;
+		MoveComp->bForceWalkRequested = bSavedForceWalkRequested;
+		MoveComp->bPreviousHasMoveInput = bSavedPreviousHasMoveInput;
+		MoveComp->bPreviousMovementBlocked = bSavedPreviousMovementBlocked;
 		MoveComp->bWantsRunOnNextMove = bSavedWantsRunOnNextMove;
 
 		// 恢复曲线量而不是重新采样：回放时动画已经走到别的时间点了。
@@ -152,6 +178,12 @@ bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	// 步态不同不能合并：合并后服务器只会看到一个步态值，
 	// 另一帧就会按错误的速度上限重演。
 	if (NewGGYGOMove && NewGGYGOMove->SavedGait != SavedGait)
+	{
+		return false;
+	}
+	if (NewGGYGOMove && (NewGGYGOMove->bSavedForceWalkRequested != bSavedForceWalkRequested
+		|| NewGGYGOMove->bSavedPreviousHasMoveInput != bSavedPreviousHasMoveInput
+		|| NewGGYGOMove->bSavedPreviousMovementBlocked != bSavedPreviousMovementBlocked))
 	{
 		return false;
 	}
@@ -182,14 +214,17 @@ uint8 FSavedMove_GGYGO::GetCompressedFlags() const
 	uint8 Result = Super::GetCompressedFlags();
 
 	// 步态占两位。static_cast 是安全的：EGGYGOGait 只有 0/1/2 三个值。
-	Result |= (static_cast<uint8>(SavedGait) << GGYGOMovementConstants::GaitFlagShift) & GGYGOMovementConstants::GaitFlagMask;
+	Result |= (static_cast<uint8>(NetworkGait) << GGYGOMovementConstants::GaitFlagShift) & GGYGOMovementConstants::GaitFlagMask;
 
 	// 只发"曲线是否在接管"。Turning 与 Braking 的移动行为一致，接收端不必区分；
 	// RunOut 的移动与普通移动一致，不需要这个位。
-	if (SavedTurnBackPhase == EGGYGOTurnBackPhase::Turning
-		|| SavedTurnBackPhase == EGGYGOTurnBackPhase::Braking)
+	if (bNetworkTurnBackCurveDriven)
 	{
 		Result |= GGYGOMovementConstants::TurnBackCurveDrivenFlag;
+	}
+	if (bSavedForceWalkRequested)
+	{
+		Result |= GGYGOMovementConstants::ForceWalkFlag;
 	}
 
 	return Result;
@@ -234,6 +269,7 @@ void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifeti
 
 	// SkipOwner：拥有者自己是权威解算方，收到服务器的回传只会与本地预测打架。
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, bReplicatedTurnBackCurveDriven, COND_SkipOwner);
+	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, ResolvedGait, COND_SkipOwner);
 }
 
 void UGGYGOCharacterMovementComponent::BeginPlay()
@@ -319,6 +355,7 @@ void UGGYGOCharacterMovementComponent::CacheAbilitySystemComponent()
 				if (const UGGYGOPawnExtensionComponent* PawnExt = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(GetOwner()))
 				{
 					AbilitySystemComponent = PawnExt->GetGGYGOAbilitySystemComponent();
+					ResetLocomotionState();
 				}
 			}));
 
@@ -328,15 +365,37 @@ void UGGYGOCharacterMovementComponent::CacheAbilitySystemComponent()
 				// 必须清掉：ASC 换 Avatar 后旧指针指向的 ASC 已不代表本角色，
 				// 继续用它查 Tag 会读到别人的状态。
 				AbilitySystemComponent = nullptr;
+				ResetLocomotionState();
 			}));
 	}
 }
 
 void UGGYGOCharacterMovementComponent::SetMovementSet(const UGGYGOMovementSet* InMovementSet)
 {
+	ResetLocomotionState();
 	MovementSet = InMovementSet;
 
 	ApplyMovementSetToComponent();
+}
+
+void UGGYGOCharacterMovementComponent::ResetLocomotionState()
+{
+	ResolvedGait = EGGYGOGait::None;
+	WalkHoldTimer = 0.0f;
+	bWantsRunOnNextMove = false;
+	bForceWalkRequested = false;
+	bPreviousHasMoveInput = false;
+	bPreviousMovementBlocked = false;
+}
+
+void UGGYGOCharacterMovementComponent::SetForceWalkRequested(bool bRequested)
+{
+	bForceWalkRequested = bRequested;
+	if (bRequested)
+	{
+		WalkHoldTimer = 0.0f;
+		bWantsRunOnNextMove = false;
+	}
 }
 
 void UGGYGOCharacterMovementComponent::ApplyMovementSetToComponent()
@@ -388,7 +447,9 @@ float UGGYGOCharacterMovementComponent::GetMaxSpeed() const
 	const float CurveSpeed = GetScaledCurveSpeed();
 	if (CurveSpeed > KINDA_SMALL_NUMBER)
 	{
-		return CurveSpeed;
+		return bForceWalkRequested
+			? FMath::Min(CurveSpeed, MovementSet->GetSpeedForGait(EGGYGOGait::Walk))
+			: CurveSpeed;
 	}
 
 	const float GaitSpeed = MovementSet->GetSpeedForGait(ResolvedGait);
@@ -402,7 +463,7 @@ float UGGYGOCharacterMovementComponent::GetMaxSpeed() const
 	//
 	// 只在"曲线不可用"时放宽：服务器能采到曲线时走上面那条分支，精确一致。
 	const bool bIsLocallyControlled = CharacterOwner && CharacterOwner->IsLocallyControlled();
-	if (!bIsLocallyControlled && MovementSet->bUseCurveDrivenSpeed && ResolvedGait != EGGYGOGait::None)
+	if (!bIsLocallyControlled && MovementSet->bUseCurveDrivenSpeed && ResolvedGait != EGGYGOGait::None && !bForceWalkRequested)
 	{
 		return FMath::Max(GaitSpeed, FMath::Max(MovementSet->MaxCurveDrivenSpeed, 0.0f));
 	}
@@ -470,7 +531,7 @@ void UGGYGOCharacterMovementComponent::ResolveGait(float DeltaSeconds)
 
 	EGGYGOGait FrameGait = EGGYGOGait::None;
 
-	if (bBlocked)
+	if (bBlocked || !bOnGround)
 	{
 		// 被禁止移动时不消费 Run 契约 —— 禁止解除后玩家仍然期望闪避后直接跑。
 		FrameGait = EGGYGOGait::None;
@@ -481,6 +542,10 @@ void UGGYGOCharacterMovementComponent::ResolveGait(float DeltaSeconds)
 		// 闪避后如果玩家没有立刻接移动，那个"直接进 Run"的意图就已经过期了。
 		bWantsRunOnNextMove = false;
 		FrameGait = EGGYGOGait::None;
+	}
+	else if (bForceWalkRequested)
+	{
+		FrameGait = EGGYGOGait::Walk;
 	}
 	else if (bWantsRunOnNextMove)
 	{
@@ -499,21 +564,16 @@ void UGGYGOCharacterMovementComponent::ResolveGait(float DeltaSeconds)
 		FrameGait = EGGYGOGait::Walk;
 	}
 
-	UpdateWalkHoldTimer(FrameGait, bHasMoveInput, bBlocked, bOnGround, bMoveInputRising, bBlockReleased, DeltaSeconds);
+	UpdateWalkHoldTimer(FrameGait, bHasMoveInput, bBlocked || bForceWalkRequested,
+		bOnGround, bMoveInputRising, bBlockReleased, DeltaSeconds);
 
 	// 计时达标则本帧立即升档并归零，不等下一帧 —— 延后一帧会让升档时机
 	// 与配置的阈值差一个帧时长，在低帧率下可感知。
-	if (FrameGait == EGGYGOGait::Walk && bHasMoveInput && !bBlocked)
+	if (FrameGait == EGGYGOGait::Walk && bHasMoveInput && !bBlocked && !bForceWalkRequested && bOnGround
+		&& MovementSet && WalkHoldTimer >= MovementSet->GetSanitizedWalkToRunHoldSeconds())
 	{
-		const float Threshold = MovementSet
-			? MovementSet->GetSanitizedWalkToRunHoldSeconds()
-			: TNumericLimits<float>::Max();
-
-		if (WalkHoldTimer >= Threshold)
-		{
-			FrameGait = EGGYGOGait::Run;
-			WalkHoldTimer = 0.0f;
-		}
+		FrameGait = EGGYGOGait::Run;
+		WalkHoldTimer = 0.0f;
 	}
 
 	ResolvedGait = FrameGait;
@@ -563,6 +623,11 @@ void UGGYGOCharacterMovementComponent::UpdateWalkHoldTimer(EGGYGOGait FrameGait,
 void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 {
 	Super::UpdateFromCompressedFlags(Flags);
+	// 自主端重演时 PrepMoveFor 已还原起始状态；网络位携带的是该 move 的结果。
+	if (CharacterOwner && CharacterOwner->IsLocallyControlled())
+	{
+		return;
+	}
 
 	// 这是非本地控制端获得步态的**唯一**途径。
 	// 与 UpdateCharacterStateBeforeMovement 里的 IsLocallyControlled() 判断配对：
@@ -573,6 +638,7 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 	ResolvedGait = (GaitBits <= static_cast<uint8>(EGGYGOGait::Run))
 		? static_cast<EGGYGOGait>(GaitBits)
 		: EGGYGOGait::None;
+	bForceWalkRequested = (Flags & GGYGOMovementConstants::ForceWalkFlag) != 0;
 
 	// 只恢复"曲线是否在接管"这一个事实。Turning 与 Braking 的区别只在转角还不还在变，
 	// 那是表现层的事，而表现由本地动画层自己驱动，不需要从这里取。

@@ -8,10 +8,12 @@
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Camera/GGYGOCameraComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "EnhancedInputSubsystems.h"
 #include "GameFramework/Controller.h"
+#include "GameFramework/Character.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "Input/GGYGOInputComponent.h"
@@ -69,6 +71,7 @@ void UGGYGOHeroComponent::BeginPlay()
 
 void UGGYGOHeroComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	Input_ForceWalkReleased();
 	if (APawn* Pawn = GetPawn<APawn>())
 	{
 		if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(Pawn))
@@ -283,12 +286,20 @@ void UGGYGOHeroComponent::InitializePlayerInput(UInputComponent* PlayerInputComp
 
 	// 解绑上一次的能力输入。换角色时若不解绑，旧角色的能力仍会响应按键。
 	GGYGOIC->RemoveBinds(AbilityInputBindHandles);
+	GGYGOIC->RemoveBinds(ForceWalkInputBindHandles);
+	Input_ForceWalkReleased();
 
 	GGYGOIC->BindNativeAction(InputConfig, GGYGOGameplayTags::InputTag_Move, ETriggerEvent::Triggered, this, &ThisClass::Input_Move, /*bLogIfNotFound=*/true);
 	GGYGOIC->BindNativeAction(InputConfig, GGYGOGameplayTags::InputTag_Look_Mouse, ETriggerEvent::Triggered, this, &ThisClass::Input_LookMouse, /*bLogIfNotFound=*/true);
 
 	// 手柄视角是可选的：只用键鼠的项目不配它，不该因此报错。
 	GGYGOIC->BindNativeAction(InputConfig, GGYGOGameplayTags::InputTag_Look_Stick, ETriggerEvent::Triggered, this, &ThisClass::Input_LookStick, /*bLogIfNotFound=*/false);
+	if (const UInputAction* ForceWalkAction = InputConfig->FindNativeInputActionForTag(GGYGOGameplayTags::InputTag_ForceWalk, false))
+	{
+		ForceWalkInputBindHandles.Add(GGYGOIC->BindAction(ForceWalkAction, ETriggerEvent::Triggered, this, &ThisClass::Input_ForceWalkPressed).GetHandle());
+		ForceWalkInputBindHandles.Add(GGYGOIC->BindAction(ForceWalkAction, ETriggerEvent::Completed, this, &ThisClass::Input_ForceWalkReleased).GetHandle());
+		ForceWalkInputBindHandles.Add(GGYGOIC->BindAction(ForceWalkAction, ETriggerEvent::Canceled, this, &ThisClass::Input_ForceWalkReleased).GetHandle());
+	}
 
 	GGYGOIC->BindAbilityActions(InputConfig, this, &ThisClass::Input_AbilityInputTagPressed, &ThisClass::Input_AbilityInputTagReleased, AbilityInputBindHandles);
 
@@ -321,6 +332,28 @@ void UGGYGOHeroComponent::Input_Move(const FInputActionValue& InputActionValue)
 	// 因此被 SavedMove 保存并获得网络预测。CMC 看不见的输入无法参与预测。
 	Pawn->AddMovementInput(RotationBasis.GetUnitAxis(EAxis::X) * Value.Y);
 	Pawn->AddMovementInput(RotationBasis.GetUnitAxis(EAxis::Y) * Value.X);
+}
+
+void UGGYGOHeroComponent::Input_ForceWalkPressed()
+{
+	if (const ACharacter* Character = GetPawn<ACharacter>())
+	{
+		if (UGGYGOCharacterMovementComponent* MoveComp = Character->IsLocallyControlled() ? Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()) : nullptr)
+		{
+			MoveComp->SetForceWalkRequested(true);
+		}
+	}
+}
+
+void UGGYGOHeroComponent::Input_ForceWalkReleased()
+{
+	if (const ACharacter* Character = GetPawn<ACharacter>())
+	{
+		if (UGGYGOCharacterMovementComponent* MoveComp = Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()))
+		{
+			MoveComp->SetForceWalkRequested(false);
+		}
+	}
 }
 
 void UGGYGOHeroComponent::Input_LookMouse(const FInputActionValue& InputActionValue)

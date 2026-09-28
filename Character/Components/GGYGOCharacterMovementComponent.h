@@ -95,6 +95,7 @@ public:
 
 	/** 把本 move 的状态写回 CMC。回放前调用，是 `SetMoveFor` 的逆操作。 */
 	virtual void PrepMoveFor(ACharacter* C) override;
+	virtual void PostUpdate(ACharacter* C, EPostUpdateMode PostUpdateMode) override;
 
 	/**
 	 * 能否与下一个 move 合并发送。
@@ -110,8 +111,15 @@ public:
 	/** 本次 move 生效的步态。 */
 	EGGYGOGait SavedGait = EGGYGOGait::None;
 
+	/** 本次 move 解算后的结果发给服务器；回放仍使用 SavedGait 的起始状态。 */
+	EGGYGOGait NetworkGait = EGGYGOGait::None;
+	bool bNetworkTurnBackCurveDriven = false;
+
 	/** 本次 move 开始时的走跑计时器读数。 */
 	float SavedWalkHoldTimer = 0.0f;
+	bool bSavedForceWalkRequested = false;
+	bool bSavedPreviousHasMoveInput = false;
+	bool bSavedPreviousMovementBlocked = false;
 
 	/** 本次 move 开始时是否持有"下次移动直接进 Run"的契约。 */
 	bool bSavedWantsRunOnNextMove = false;
@@ -187,6 +195,13 @@ public:
 	 * 传 nullptr 是合法的，此时全部走 CMC 的引擎默认值。
 	 */
 	void SetMovementSet(const UGGYGOMovementSet* InMovementSet);
+
+	/** 显式强制步行优先于自动升 Run 与下一次移动直接 Run。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement")
+	void SetForceWalkRequested(bool bRequested);
+
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
+	bool IsForceWalkRequested() const { return bForceWalkRequested; }
 
 	/** 当前移动参数。可能为 nullptr。 */
 	const UGGYGOMovementSet* GetMovementSet() const { return MovementSet; }
@@ -300,6 +315,9 @@ protected:
 	/** 缓存 ASC。由 PawnExtension 的 ASC 就绪委托触发。 */
 	void CacheAbilitySystemComponent();
 
+	/** 重装配置或解绑 Avatar 时清理本 Pawn 的步态、计时与输入边沿记忆。 */
+	void ResetLocomotionState();
+
 	/**
 	 * 解算本帧步态。
 	 *
@@ -385,6 +403,7 @@ protected:
 	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;
 
 	/** 本帧步态。 */
+	UPROPERTY(Replicated)
 	EGGYGOGait ResolvedGait = EGGYGOGait::None;
 
 	/** 走跑计时器（秒）。只在 Walk 且持续移动时累加。 */
@@ -392,6 +411,9 @@ protected:
 
 	/** "下次移动直接进 Run" 契约。 */
 	bool bWantsRunOnNextMove = false;
+
+	/** 本地输入请求；SavedMove 的 Custom_3 同步给服务器。 */
+	bool bForceWalkRequested = false;
 
 	/** 上一帧是否有移动输入。用于识别起步上升沿。 */
 	bool bPreviousHasMoveInput = false;

@@ -108,6 +108,10 @@ protected:
 	/** 移动。把摇杆的 2D 值按摄像机水平朝向解析成世界方向。 */
 	void Input_Move(const FInputActionValue& InputActionValue);
 
+	/** 强制步行按下/释放；输入状态由 CMC 参与预测。 */
+	void Input_ForceWalkPressed();
+	void Input_ForceWalkReleased();
+
 	/** 鼠标视角。鼠标已经是像素增量，不乘 DeltaTime。 */
 	void Input_LookMouse(const FInputActionValue& InputActionValue);
 
@@ -152,6 +156,7 @@ private:
 
 	/** 本组件产生的 Ability 输入绑定句柄，用于整批解绑。 */
 	TArray<uint32> AbilityInputBindHandles;
+	TArray<uint32> ForceWalkInputBindHandles;
 
 	/** 一条被缓冲的输入请求。 */
 	struct FBufferedInput

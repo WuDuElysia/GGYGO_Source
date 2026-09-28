@@ -9,7 +9,7 @@
 namespace GGYGOMovementSetDefaults
 {
 	/** 配置值非法时的兜底走跑阈值。与字段默认值一致。 */
-	constexpr float WalkToRunHoldSeconds = 5.0f;
+	constexpr float WalkToRunHoldSeconds = 1.5f;
 
 	/** 走跑阈值上限。超过一分钟的"持续走"在任何玩法下都是配置错误。 */
 	constexpr float MaxWalkToRunHoldSeconds = 60.0f;

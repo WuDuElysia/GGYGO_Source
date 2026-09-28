@@ -50,7 +50,7 @@ public:
 	 * 任何中断（松手、被禁止移动、离地）都归零重来。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Gait", meta = (ClampMin = "0.1", ClampMax = "60.0", UIMin = "0.1", UIMax = "60.0", ForceUnits = "s"))
-	float WalkToRunHoldSeconds = 5.0f;
+	float WalkToRunHoldSeconds = 1.5f;
 
 	// ===== 旋转与加减速 =====
 
