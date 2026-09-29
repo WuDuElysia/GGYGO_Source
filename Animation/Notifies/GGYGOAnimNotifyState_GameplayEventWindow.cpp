@@ -2,8 +2,10 @@
 #include "Animation/Notifies/GGYGOAnimNotifyState_GameplayEventWindow.h"
 
 #include "AbilitySystemBlueprintLibrary.h"
+#include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Animation/ActiveMontageInstanceScope.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Engine/World.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAnimNotifyState_GameplayEventWindow)
 
@@ -30,6 +32,18 @@ void UGGYGOAnimNotifyState_GameplayEventWindow::SendEvent(
 	AActor* Owner = MeshComp ? MeshComp->GetOwner() : nullptr;
 	if (!Owner || !EventTag.IsValid())
 	{
+		return;
+	}
+	if (!UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(Owner))
+	{
+		// Persona 等预览 Actor 可以没有 ASC；游戏世界缺少接收者仍需要诊断。
+		const UWorld* World = Owner->GetWorld();
+		if (World && World->IsGameWorld())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Warning,
+				TEXT("GameplayEventWindow：游戏 Actor [%s] 没有 ASC，无法发送 [%s]，动画 [%s]。"),
+				*Owner->GetPathName(), *EventTag.ToString(), *GetNameSafe(Animation));
+		}
 		return;
 	}
 
