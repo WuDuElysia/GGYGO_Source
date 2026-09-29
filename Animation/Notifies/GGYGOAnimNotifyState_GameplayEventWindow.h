@@ -25,7 +25,8 @@ public:
 		const FAnimNotifyEventReference& EventReference) override;
 
 protected:
-	void SendEvent(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation, FGameplayTag EventTag) const;
+	void SendEvent(USkeletalMeshComponent* MeshComp, UAnimSequenceBase* Animation, FGameplayTag EventTag,
+		const FAnimNotifyEventReference& EventReference) const;
 
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Gameplay Event")
 	FGameplayTag BeginEventTag;

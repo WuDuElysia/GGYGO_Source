@@ -58,6 +58,8 @@ public:
 	virtual void ExternalCancel() override;
 	virtual FString GetDebugString() const override;
 	virtual void OnDestroy(bool AbilityEnded) override;
+	/** 纠正预测位置时在 ReadyForActivation 前设置；普通播放保持 0。 */
+	void SetStartTimeSeconds(float InTime) { StartTimeSeconds = InTime; }
 
 	/**
 	 * 播放 Montage 并等待事件。
@@ -155,4 +157,8 @@ private:
 
 	/** Montage 结束委托。 */
 	FOnMontageEnded MontageEndedDelegate;
+	float StartTimeSeconds = 0.0f;
+	int32 MontageInstanceId = INDEX_NONE;
+	bool bEndingTask = false;
+	bool bBlendingOut = false;
 };

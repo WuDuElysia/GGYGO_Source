@@ -7,6 +7,7 @@
 #include "Camera/GGYGOCameraComponent.h"
 #include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Components/GGYGOPyriosRenderComponent.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOHeroCharacter)
 
@@ -14,6 +15,7 @@ AGGYGOHeroCharacter::AGGYGOHeroCharacter(const FObjectInitializer& ObjectInitial
 	: Super(ObjectInitializer)
 {
 	HeroComponent = CreateDefaultSubobject<UGGYGOHeroComponent>(TEXT("HeroComponent"));
+	MeleeTraceComponent = CreateDefaultSubobject<UGGYGOMeleeTraceComponent>(TEXT("MeleeTraceComponent"));
 
 	CameraComponent = CreateDefaultSubobject<UGGYGOCameraComponent>(TEXT("CameraComponent"));
 

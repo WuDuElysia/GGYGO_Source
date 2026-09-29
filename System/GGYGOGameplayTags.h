@@ -332,6 +332,9 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_HitWindowEnd);
 	/** 连段窗口开启，此时按键可衔接下一段。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_ComboWindow);
+	/** 普攻连段允许切换区间的开始与结束。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_ComboWindowBegin);
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_ComboWindowEnd);
 	/** 可取消点，此后允许被其他动作打断。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_CancelPoint);
 	/** 命中确认。由命中判定组件发出。 */

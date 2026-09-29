@@ -112,6 +112,12 @@ public:
 	/** 取消所有由输入激活的能力（`OnInputTriggered` 与 `WhileInputActive`）。 */
 	void CancelInputActivatedAbilities(bool bReplicateCancelAbility);
 
+	/** 服务器拒绝后续普攻请求时，纠正拥有者的预测段；只匹配同一次激活。 */
+	UFUNCTION(Client, Reliable)
+	void ClientCorrectComboStep(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey ActivationKey,
+		int32 Revision, int32 RequestId, int32 ServerStep, float MontagePosition,
+		bool bWindowOpen, bool bWindowClosed, bool bAccepted);
+
 	/** 输入按下。把匹配该 InputTag 的 Spec 放进 pressed 与 held 缓存，不立即激活。 */
 	void AbilityInputTagPressed(const FGameplayTag& InputTag);
 

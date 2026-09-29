@@ -26,6 +26,7 @@
 class UGGYGOCameraComponent;
 class UGGYGOHeroComponent;
 class UGGYGOPyriosRenderComponent;
+class UGGYGOMeleeTraceComponent;
 class UObject;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "被玩家操控的角色"))
@@ -46,6 +47,10 @@ public:
 
 protected:
 private:
+	/** 由攻击能力在服务器按命中窗口开关。 */
+	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Combat", meta = (AllowPrivateAccess = "true"))
+	TObjectPtr<UGGYGOMeleeTraceComponent> MeleeTraceComponent;
+
 	/** 输入处理。IMC 与优先级在这个组件的细节面板里配。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOHeroComponent> HeroComponent;

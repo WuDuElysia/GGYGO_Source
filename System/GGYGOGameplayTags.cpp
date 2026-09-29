@@ -122,6 +122,8 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_HitWindowBegin, "Event.Montage.HitWindowBegin");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_HitWindowEnd, "Event.Montage.HitWindowEnd");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindow, "Event.Montage.ComboWindow");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindowBegin, "Event.Montage.ComboWindowBegin");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindowEnd, "Event.Montage.ComboWindowEnd");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_CancelPoint, "Event.Montage.CancelPoint");
 	UE_DEFINE_GAMEPLAY_TAG(Event_HitConfirm, "Event.HitConfirm");
 

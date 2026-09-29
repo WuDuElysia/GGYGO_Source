@@ -3,6 +3,7 @@
  * @brief 项目 ASC 实现
  */
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "AbilitySystem/Abilities/GGYGOPlayerComboAbility.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOAbilityTagRelationshipMapping.h"
@@ -159,6 +160,18 @@ void UGGYGOAbilitySystemComponent::AbilityInputTagPressed(const FGameplayTag& In
 			InputPressedSpecHandles.AddUnique(AbilitySpec.Handle);
 			InputHeldSpecHandles.AddUnique(AbilitySpec.Handle);
 		}
+	}
+}
+
+void UGGYGOAbilitySystemComponent::ClientCorrectComboStep_Implementation(FGameplayAbilitySpecHandle AbilityHandle,
+	FPredictionKey ActivationKey, int32 Revision, int32 RequestId, int32 ServerStep, float MontagePosition,
+	bool bWindowOpen, bool bWindowClosed, bool bAccepted)
+{
+	FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(AbilityHandle);
+	UGGYGOPlayerComboAbility* Combo = Spec ? Cast<UGGYGOPlayerComboAbility>(Spec->GetPrimaryInstance()) : nullptr;
+	if (Combo && Combo->IsActive() && Combo->GetCurrentActivationInfo().GetActivationPredictionKey() == ActivationKey)
+	{
+		Combo->CorrectPredictedStep(Revision, RequestId, ServerStep, MontagePosition, bWindowOpen, bWindowClosed, bAccepted);
 	}
 }
 

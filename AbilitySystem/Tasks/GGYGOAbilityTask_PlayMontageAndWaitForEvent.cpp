@@ -51,6 +51,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 {
 	if (!Ability)
 	{
+		EndTask();
 		return;
 	}
 
@@ -58,6 +59,8 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	if (!ASC)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayMontageAndWaitForEvent: 没有 ASC。"));
+		OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
+		EndTask();
 		return;
 	}
 
@@ -73,6 +76,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		{
 			OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
 		}
+		EndTask();
 		return;
 	}
 
@@ -84,7 +88,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		EventTags,
 		FGameplayEventTagMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::OnGameplayEvent));
 
-	if (ASC->PlayMontage(Ability, Ability->GetCurrentActivationInfo(), MontageToPlay, Rate, StartSection) <= 0.0f)
+	if (ASC->PlayMontage(Ability, Ability->GetCurrentActivationInfo(), MontageToPlay, Rate, StartSection, StartTimeSeconds) <= 0.0f)
 	{
 		// 播放失败（Montage 为空、Slot 配错、或被更高优先级的 Montage 拒绝）。
 		UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -95,7 +99,13 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		{
 			OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
 		}
+		EndTask();
 		return;
+	}
+	if (bEndingTask || !ShouldBroadcastAbilityTaskDelegates()) { return; }
+	if (const FAnimMontageInstance* Instance = AnimInstance->GetActiveInstanceForMontage(MontageToPlay))
+	{
+		MontageInstanceId = Instance->GetInstanceID();
 	}
 
 	// 能力被取消时要一起收尾。取消可能来自组仲裁、死亡或玩家操作。
@@ -133,6 +143,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ExternalCancel()
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 {
+	bEndingTask = true;
 	// 解绑事件监听是必需的。不解绑的话，后续动画里的同名事件会被这个
 	// 已经过期的任务接到，表现为"上一招的判定在下一招里又开了一次"。
 	if (Ability)
@@ -149,6 +160,16 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	{
 		ASC->RemoveGameplayEventTagContainerDelegate(EventTags, EventHandle);
 	}
+	const FGameplayAbilityActorInfo* ActorInfo = Ability ? Ability->GetCurrentActorInfo() : nullptr;
+	if (UAnimInstance* AnimInstance = ActorInfo ? ActorInfo->GetAnimInstance() : nullptr)
+	{
+		// 同一 Montage 也可能已被重新播放，只能解绑本次实例。
+		if (FAnimMontageInstance* Instance = AnimInstance->GetMontageInstanceForID(MontageInstanceId))
+		{
+			Instance->OnMontageBlendingOutStarted.Unbind();
+			Instance->OnMontageEnded.Unbind();
+		}
+	}
 
 	Super::OnDestroy(AbilityEnded);
 }
@@ -160,7 +181,12 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsNotifyValid() const
 
 	// 判断"当前正在播的是不是本任务播的那个 Montage"。
 	// 不判断的话，本任务的 Montage 已被顶掉后仍会响应新 Montage 的结束事件。
-	return AnimInstance && MontageToPlay && AnimInstance->Montage_IsPlaying(MontageToPlay);
+	const UAbilitySystemComponent* ASC = AbilitySystemComponent.Get();
+	const FAnimMontageInstance* Instance = AnimInstance && MontageToPlay
+		? AnimInstance->GetActiveInstanceForMontage(MontageToPlay) : nullptr;
+	return !bEndingTask && !bBlendingOut && Instance && ASC
+		&& ASC->GetCurrentMontage() == MontageToPlay && ASC->GetAnimatingAbility() == Ability
+		&& (MontageInstanceId == INDEX_NONE || Instance->GetInstanceID() == MontageInstanceId);
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::StopPlayingMontage()
@@ -183,7 +209,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::StopPlayingMontage()
 	const FAnimMontageInstance* MontageInstance = AnimInstance->GetActiveInstanceForMontage(MontageToPlay);
 	if (ASC->GetAnimatingAbility() == Ability
 		&& ASC->GetCurrentMontage() == MontageToPlay
-		&& MontageInstance)
+		&& MontageInstance && (MontageInstanceId == INDEX_NONE || MontageInstance->GetInstanceID() == MontageInstanceId))
 	{
 		// 先清委托再停：Montage_Stop 会同步触发结束回调，
 		// 不先清会在任务销毁过程中再走一遍广播。
@@ -203,17 +229,18 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::StopPlayingMontage()
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnAbilityCancelled()
 {
-	if (StopPlayingMontage())
+	StopPlayingMontage();
+	if (!bEndingTask && ShouldBroadcastAbilityTaskDelegates())
 	{
-		if (ShouldBroadcastAbilityTaskDelegates())
-		{
-			OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
-		}
+		OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
 	}
+	EndTask();
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut(UAnimMontage* Montage, bool bInterrupted)
 {
+	if (bEndingTask || Montage != MontageToPlay) { return; }
+	bBlendingOut = true;
 	// 只有本能力仍是动画的驱动者时才恢复 root motion 缩放，
 	// 否则会覆盖掉接手动画的那个能力设的值。
 	if (Ability && Ability->GetCurrentMontage() == MontageToPlay)
@@ -255,6 +282,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut(UAnimMon
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 {
+	if (bEndingTask || Montage != MontageToPlay) { return; }
 	if (!bInterrupted && ShouldBroadcastAbilityTaskDelegates())
 	{
 		OnCompleted.Broadcast(FGameplayTag(), FGameplayEventData());
@@ -266,9 +294,16 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* 
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnGameplayEvent(FGameplayTag EventTag, const FGameplayEventData* Payload)
 {
-	if (!ShouldBroadcastAbilityTaskDelegates())
+	if (!Payload || !ShouldBroadcastAbilityTaskDelegates() || !IsNotifyValid())
 	{
 		return;
+	}
+	if (const UAnimMontage* Source = Cast<UAnimMontage>(Payload->OptionalObject))
+	{
+		if (Source != MontageToPlay) { return; }
+		// GameplayEventWindow 把本地播放实例 ID+1 放入 Magnitude；0 表示无上下文。
+		if (Payload->EventMagnitude > 0.0f && MontageInstanceId != INDEX_NONE
+			&& FMath::RoundToInt(Payload->EventMagnitude) - 1 != MontageInstanceId) { return; }
 	}
 
 	// 拷一份负载再广播：原始指针指向 ASC 内部的临时对象，
