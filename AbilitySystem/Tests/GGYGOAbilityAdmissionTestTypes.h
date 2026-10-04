@@ -41,7 +41,8 @@ public:
 		const FGameplayAbilityActorInfo* ActorInfo);
 
 protected:
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 
 	int32 BusinessActivationCount = 0;
@@ -77,10 +78,17 @@ public:
 	static FGGYGOAbilityAdmissionLifecycleObserver LifecycleObserver;
 
 protected:
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
-	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
+#if WITH_DEV_AUTOMATION_TESTS
+	virtual void ObserveAbilityActivationEntryForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		const FGameplayEventData* TriggerEventData) override;
+	virtual void ObserveAbilityActivationReturnForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		const FGameplayEventData* TriggerEventData) override;
+	virtual void ObserveAbilityEndEntryForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		bool bReplicateEndAbility, bool bWasCancelled) override;
+#endif
 
 private:
 	void ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation Observation,
@@ -97,8 +105,7 @@ public:
 	UGGYGOAbilityAdmissionUncancelableTestAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
 protected:
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original) override;
 };
 
 UCLASS(Transient)

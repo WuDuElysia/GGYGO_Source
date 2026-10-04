@@ -1,9 +1,10 @@
 #include "Input/Tests/GGYGOInputTestTypes.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
-#include "Components/SceneComponent.h"
+#include "Combatants/GGYGOCombatantState.h"
 #include "CoreGlobals.h"
 #include "Engine/Engine.h"
 #include "Engine/GameViewportClient.h"
@@ -64,20 +65,7 @@ void UGGYGOInputTestGameInstance::Shutdown()
 
 void AGGYGOInputTestController::InitInputSystem()
 {
-	if (bUseNativeInputInitialization)
-	{
-		Super::InitInputSystem();
-		return;
-	}
-	if (!PlayerInput)
-	{
-		PlayerInput = NewObject<UEnhancedPlayerInput>(this, NAME_None, RF_Transient);
-	}
-	if (!InputComponent)
-	{
-		InputComponent = NewObject<UGGYGOInputComponent>(this, NAME_None, RF_Transient);
-		InputComponent->RegisterComponent();
-	}
+	Super::InitInputSystem();
 }
 
 bool AGGYGOInputTestController::EnableNativeInputInitializationForTest()
@@ -100,6 +88,17 @@ void UGGYGOInputTestHeroComponent::ConfigureMappingForTest(const UInputMappingCo
 	DefaultInputMappings.Reset();
 	DefaultInputMappings.Add(Mapping);
 	InputMappingPriority = Priority;
+}
+
+bool UGGYGOInputTestHeroComponent::ObserveLocalAbilitySystemForTest(
+	UGGYGOPawnExtensionComponent* Extension, FString& OutError)
+{
+	return PrepareLocalAbilitySystemSubscription(Extension, OutError);
+}
+
+void UGGYGOInputTestHeroComponent::StopObservingLocalAbilitySystemForTest()
+{
+	ReleaseLocalAbilitySystemSubscription();
 }
 
 bool UGGYGOInputTestHeroComponent::ObserveNativeMappingRebuildForTest(UEnhancedInputLocalPlayerSubsystem* Subsystem)
@@ -147,11 +146,12 @@ UGGYGOInputTestAbility::UGGYGOInputTestAbility(const FObjectInitializer& ObjectI
 	GroupTag = FGameplayTag();
 }
 
-void UGGYGOInputTestAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
+void UGGYGOInputTestAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayAbilitySpecHandle Handle,
 	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
 	const FGameplayEventData* TriggerEventData)
 {
-	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (IsActive())
 	{
 		++ActivationCount;
@@ -159,13 +159,22 @@ void UGGYGOInputTestAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
 }
 
 AGGYGOInputTestPawn::AGGYGOInputTestPawn(const FObjectInitializer& ObjectInitializer)
-	: Super(ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UGGYGOCharacterMovementComponent>(ACharacter::CharacterMovementComponentName))
 {
-	TestRoot = CreateDefaultSubobject<USceneComponent>(TEXT("TestRoot"));
-	SetRootComponent(TestRoot);
 	PawnExtension = CreateDefaultSubobject<UGGYGOPawnExtensionComponent>(TEXT("PawnExtension"));
 	Hero = CreateDefaultSubobject<UGGYGOInputTestHeroComponent>(TEXT("Hero"));
-	AbilitySystem = CreateDefaultSubobject<UGGYGOAbilitySystemComponent>(TEXT("AbilitySystem"));
+}
+
+void AGGYGOInputTestPawn::SetAbilitySystemHostForTest(AGGYGOCombatantState* Host)
+{
+	check(IsValid(Host) && AbilitySystemHost.IsExplicitlyNull());
+	AbilitySystemHost = Host;
+}
+
+UGGYGOAbilitySystemComponent* AGGYGOInputTestPawn::GetASCForTest() const
+{
+	const AGGYGOCombatantState* Host = AbilitySystemHost.Get();
+	return Host ? Host->GetGGYGOAbilitySystemComponent() : nullptr;
 }
 
 UGGYGOInputComponent* AGGYGOInputTestPawn::GetInputComponentForTest() const
@@ -204,6 +213,7 @@ struct FGGYGOInputTestFixture::FState
 	TStrongObjectPtr<UInputAction> AbilityAction;
 	AGGYGOInputTestController* Controller = nullptr;
 	AGGYGOInputTestPawn* Pawn = nullptr;
+	AGGYGOCombatantState* AbilitySystemHost = nullptr;
 };
 
 FGGYGOInputTestFixture::FGGYGOInputTestFixture() : State(MakeUnique<FState>()) {}
@@ -273,7 +283,7 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	State->Viewport.Reset(NewObject<UGGYGOInputTestViewport>(State->Engine, NAME_None, RF_Transient));
 	Context->GameViewport = State->Viewport.Get();
 	State->Viewport->Init(*Context, State->GameInstance.Get(), false);
-	// Legacy mode has no window; neither fixture mode assigns GEngine->GameViewport or GWorld.
+	// Ordinary mode has no window; neither fixture mode assigns GEngine->GameViewport or GWorld.
 	if (State->bNativeMovementOrigin)
 	{
 		if (!Test.TestTrue(TEXT("[Input.NativeBirthTest] native window requires an initialized Slate application"),
@@ -333,8 +343,21 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	}
 	else
 	{
-		State->LocalPlayer.Reset(NewObject<ULocalPlayer>(State->Engine, NAME_None, RF_Transient));
-		State->GameInstance->AddLocalPlayer(State->LocalPlayer.Get(), FPlatformUserId::CreateFromInternalId(0));
+		UClass* ConfiguredPlayerClass = State->Engine->LocalPlayerClass.Get();
+		if (!IsValid(ConfiguredPlayerClass) || !ConfiguredPlayerClass->IsChildOf(UGGYGOLocalPlayer::StaticClass()))
+		{
+			Test.AddError(FString::Printf(TEXT("[Input.Fixture] LocalPlayerClass=%s Reason=RequiredProjectLocalPlayerClassInvalid."),
+				*GetPathNameSafe(ConfiguredPlayerClass)));
+			return false;
+		}
+		FString Error;
+		State->LocalPlayer.Reset(State->GameInstance->CreateLocalPlayer(FPlatformUserId::CreateFromInternalId(0), Error, false));
+		if (!State->LocalPlayer.IsValid() || State->LocalPlayer->GetClass() != ConfiguredPlayerClass)
+		{
+			Test.AddError(FString::Printf(TEXT("[Input.Fixture] CreateLocalPlayer Class=%s Player=%s Error=%s Reason=ConfiguredPlayerCreationFailed."),
+				*GetPathNameSafe(ConfiguredPlayerClass), *GetPathNameSafe(State->LocalPlayer.Get()), *Error));
+			return false;
+		}
 	}
 	if (!Test.TestNotNull(TEXT("real EnhancedInput LocalPlayer subsystem"), GetInputSubsystem())) { return false; }
 
@@ -349,6 +372,11 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 		if (!Test.TestNull(TEXT("native birth starts with the actual empty Controller input slot"), State->Controller->PlayerInput.Get())
 			|| !Test.TestNull(TEXT("native birth uses the configured default, with no Controller override"), State->Controller->GetOverridePlayerInputClass().Get())
 			|| !Test.TestTrue(TEXT("native construction choice installed before SetPlayer"), State->Controller->EnableNativeInputInitializationForTest())) { return false; }
+	}
+	else if (!State->Controller->EnableNativeInputInitializationForTest())
+	{
+		Test.AddError(TEXT("[Input.Fixture] Reason=NativeInputChoiceRejectedBeforeSetPlayer."));
+		return false;
 	}
 	State->Controller->SetPlayer(State->LocalPlayer.Get());
 	if (State->bNativeMovementOrigin)
@@ -382,6 +410,14 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 			State->Mapping->MapKey(State->MoveAction.Get(), Key);
 		}
 	}
+	else
+	{
+		// The ordinary fixture also provides valid movement configuration for Hero's native rebuild.
+		for (const FKey& Key : { EKeys::W, EKeys::A, EKeys::S, EKeys::D })
+		{
+			State->Mapping->MapKey(State->MoveAction.Get(), Key);
+		}
+	}
 	FGGYGOInputAction MoveBinding;
 	MoveBinding.InputAction = State->MoveAction.Get();
 	MoveBinding.InputTag = GGYGOGameplayTags::InputTag_Move;
@@ -398,6 +434,26 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 
 	State->Pawn = State->World->SpawnActor<AGGYGOInputTestPawn>();
 	if (!Test.TestNotNull(TEXT("private Pawn"), State->Pawn)) { return false; }
+	FActorSpawnParameters HostSpawnParameters;
+	HostSpawnParameters.Owner = State->Controller;
+	State->AbilitySystemHost = State->World->SpawnActor<AGGYGOInputTestAbilitySystemHost>(HostSpawnParameters);
+	if (!IsValid(State->AbilitySystemHost) || !IsValid(State->AbilitySystemHost->GetGGYGOAbilitySystemComponent()))
+	{
+		Test.AddError(FString::Printf(TEXT("[Input.Fixture] Host=%s Pawn=%s Reason=RequiredAbilitySystemHostCreationFailed."),
+			*GetPathNameSafe(State->AbilitySystemHost), *GetPathNameSafe(State->Pawn)));
+		return false;
+	}
+	State->Pawn->SetAbilitySystemHostForTest(State->AbilitySystemHost);
+	if (!State->bNativeMovementOrigin)
+	{
+		FString SubscriptionError;
+		if (!State->Pawn->GetHeroForTest()->ObserveLocalAbilitySystemForTest(
+			State->Pawn->GetPawnExtensionForTest(), SubscriptionError))
+		{
+			Test.AddError(SubscriptionError);
+			return false;
+		}
+	}
 	State->Pawn->GetHeroForTest()->ConfigureMappingForTest(State->Mapping.Get(), 0);
 	if (State->bNativeMovementOrigin
 		&& !Test.TestTrue(TEXT("observe only the original subsystem's actual rebuild notification"),
@@ -416,7 +472,8 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	{
 		return false;
 	}
-	State->Pawn->GetPawnExtensionForTest()->InitializeAbilitySystem(State->Pawn->GetASCForTest(), State->Pawn);
+	// The real Host alone initializes, installs and publishes this Avatar's ASC resource.
+	State->AbilitySystemHost->AttachAvatar(State->Pawn);
 	if (State->bNativeMovementOrigin)
 	{
 		// The source gate needs first normal setup, not the legacy fixture's second Hero init.
@@ -446,8 +503,12 @@ void FGGYGOInputTestFixture::Shutdown()
 		State->Pawn->GetHeroForTest()->StopObservingNativeMappingRebuildForTest();
 		State->Pawn->GetHeroForTest()->ReleasePlayerInput();
 		State->Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem(State->Pawn->GetASCForTest());
-		State->Pawn->Destroy();
+		State->Pawn->GetHeroForTest()->StopObservingLocalAbilitySystemForTest();
 	}
+	if (IsValid(State->AbilitySystemHost)) { State->AbilitySystemHost->DetachAvatar(State->Pawn); }
+	if (IsValid(State->AbilitySystemHost)) { State->AbilitySystemHost->Destroy(); }
+	State->AbilitySystemHost = nullptr;
+	if (IsValid(State->Pawn)) { State->Pawn->Destroy(); }
 	State->Pawn = nullptr;
 	if (State->GameInstance.IsValid())
 	{

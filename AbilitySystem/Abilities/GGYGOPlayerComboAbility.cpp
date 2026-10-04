@@ -91,9 +91,11 @@ EDataValidationResult UGGYGOPlayerComboAbility::IsDataValid(FDataValidationConte
 }
 #endif
 
-bool UGGYGOPlayerComboAbility::ValidateDamageEffectDependency(FString& OutError) const
+bool UGGYGOPlayerComboAbility::ValidateDamageEffectDependency(FString& OutError,
+	TSubclassOf<UGameplayEffect>* OutResolvedEffect) const
 {
 	OutError.Reset();
+	if (OutResolvedEffect) { *OutResolvedEffect = TSubclassOf<UGameplayEffect>(); }
 	// Read the configured class before TSubclassOf's type filter can turn an invalid selection into null.
 	TSubclassOf<UGameplayEffect> ConfiguredEffect = DamageEffect;
 	const UClass* ConfiguredClass = ConfiguredEffect.GetGCPtr().Get();
@@ -130,8 +132,13 @@ bool UGGYGOPlayerComboAbility::ValidateDamageEffectDependency(FString& OutError)
 		OutError = TEXT("模式=Shared，配置=GameData.DamageGameplayEffect_SetByCaller：必需的共享预载GE不可用。");
 		return false;
 	}
-	return IsChosenClassValid(ResolvedClass, ConfiguredClass ? TEXT("Override") : TEXT("Shared"),
-		ConfiguredClass ? TEXT("DamageEffect") : TEXT("GameData.DamageGameplayEffect_SetByCaller"));
+	if (!IsChosenClassValid(ResolvedClass, ConfiguredClass ? TEXT("Override") : TEXT("Shared"),
+		ConfiguredClass ? TEXT("DamageEffect") : TEXT("GameData.DamageGameplayEffect_SetByCaller")))
+	{
+		return false;
+	}
+	if (OutResolvedEffect) { *OutResolvedEffect = ResolvedEffect; }
+	return true;
 }
 
 bool UGGYGOPlayerComboAbility::CanActivateAbilityAdditional(FGameplayAbilitySpecHandle Handle,
@@ -158,57 +165,80 @@ void UGGYGOPlayerComboAbility::NativeOnAbilityFailedToActivate(const FGameplayTa
 	Super::NativeOnAbilityFailedToActivate(FailedReason);
 }
 
-void UGGYGOPlayerComboAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-	const FGameplayEventData* TriggerEventData)
+void UGGYGOPlayerComboAbility::InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original)
 {
-	if (LocalActivationGeneration == MAX_uint64)
+	if (!Original.HasActivation() || !CaptureCurrentActivation().HasSameActivation(Original))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：本地激活代次已耗尽，拒绝复用实例。"));
-		Super::EndAbility(Handle, ActorInfo, ActivationInfo, false, true);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Initialize rejected: missing or invalid GA original activation."),
+			*GetPathNameSafe(this));
 		return;
 	}
-	const uint64 ThisGeneration = ++LocalActivationGeneration;
-	EndRequestedActivationGeneration = 0;
-	bCleaningUp = false;
+	if (ResourceActivation.HasActivation() || MontageTask || InputTask || TraceComponent || ActiveMesh
+		|| MontageCallbackRegistration.IsValid() || InputCallbackRegistration.IsValid()
+		|| TraceWindow.HasWindow() || TraceHitSubscription.IsValid() || WatchdogHandle.IsValid()
+		|| OriginalWorld.IsValid() || bChangedMeshTick || bAddedMeshPrerequisite)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Initialize rejected: original resources have not been released."),
+			*GetPathNameSafe(this));
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
+	ResourceActivation = Original;
 	Window.Reset();
 	CurrentStep = INDEX_NONE;
 	LastRequestId = 0;
 	StepSyncRevision = 0;
 	CurrentStepToken = 0;
-	MontageTask = nullptr;
-	InputTask = nullptr;
-	TraceComponent = nullptr;
-	ActiveMesh = nullptr;
-	bChangedMeshTick = false;
+	Super::InitializeAbilityActivation(Original);
+}
 
-	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
-	if (!IsActivationCurrent(ThisGeneration)) { return; }
+void UGGYGOPlayerComboAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	const FGameplayEventData* TriggerEventData)
+{
+	if (!IsActivationCurrent(Original))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Body rejected: GA original activation/Initialize prerequisite is not current."),
+			*GetPathNameSafe(this));
+		if (Original.HasActivation()) { RequestAbilityEnd(Original, true, true); }
+		return;
+	}
+	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	if (!IsActivationCurrent(Original)) { return; }
 
 	FString DamageDependencyError;
 	if (!ValidateDamageEffectDependency(DamageDependencyError))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前拒绝激活：%s"),
 			*GetPathNameSafe(this), *DamageDependencyError);
-		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		RequestAbilityEnd(Original, true, true);
 		return;
 	}
 
 	ACharacter* Character = GetCharacterFromActorInfo();
 	ActiveMesh = Character ? Character->GetMesh() : nullptr;
 	TraceComponent = Character ? Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() : nullptr;
-	if (!ActiveMesh || !TraceComponent || !IsStepPlayable(0))
+	OriginalWorld = GetWorld();
+	if (!IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid() || !IsStepPlayable(0))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：Avatar、Trace 或第一段配置无效。"));
-		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Body rejected: Avatar/Mesh [%s], Trace [%s], World [%s] or first step is invalid."),
+			*GetPathNameSafe(this), *GetPathNameSafe(ActiveMesh), *GetPathNameSafe(TraceComponent), *GetPathNameSafe(OriginalWorld.Get()));
+		RequestAbilityEnd(Original, true, true);
 		return;
 	}
 	const bool bCommitted = CommitAbility(Handle, ActorInfo, ActivationInfo);
-	if (!IsActivationCurrent(ThisGeneration)) { return; }
+	if (!IsActivationCurrent(Original)) { return; }
 	if (!bCommitted)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：激活提交失败。"));
-		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
+	if (!IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] original Mesh/Trace/World became invalid during Commit."), *GetPathNameSafe(this));
+		RequestAbilityEnd(Original, true, true);
 		return;
 	}
 
@@ -219,67 +249,137 @@ void UGGYGOPlayerComboAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle
 		ActiveMesh->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones;
 		ActiveMesh->bEnableUpdateRateOptimizations = false;
 		bChangedMeshTick = true;
-		TraceComponent->AddTickPrerequisiteComponent(ActiveMesh);
-		TraceComponent->OnMeleeHit.AddUniqueDynamic(this, &ThisClass::HandleMeleeHit);
+		const auto HasMeshPrerequisite = [Trace = TraceComponent.Get(), Mesh = ActiveMesh.Get()]()
+		{
+			return Trace->PrimaryComponentTick.GetPrerequisites().ContainsByPredicate([Mesh](const FTickPrerequisite& Prerequisite)
+			{
+				return Prerequisite.PrerequisiteObject.Get() == Mesh && Prerequisite.Get() == &Mesh->PrimaryComponentTick;
+			});
+		};
+		if (!HasMeshPrerequisite())
+		{
+			TraceComponent->AddTickPrerequisiteComponent(ActiveMesh);
+			if (!IsActivationCurrent(Original)) { return; }
+			bAddedMeshPrerequisite = HasMeshPrerequisite();
+			if (!bAddedMeshPrerequisite)
+			{
+				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Trace [%s] failed to add original Mesh [%s] tick prerequisite."),
+					*GetPathNameSafe(this), *GetPathNameSafe(TraceComponent), *GetPathNameSafe(ActiveMesh));
+				RequestAbilityEnd(Original, true, true);
+				return;
+			}
+		}
 	}
-	InputTask = UGGYGOAbilityTask_WaitComboInput::WaitComboInput(this);
-	if (!InputTask)
+	UGGYGOAbilityTask_WaitComboInput* const StartedInputTask = UGGYGOAbilityTask_WaitComboInput::WaitComboInput(this);
+	if (!IsActivationCurrent(Original))
 	{
-		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		if (IsValid(StartedInputTask)) { StartedInputTask->TaskOwnerEnded(); }
 		return;
 	}
-	InputTask->OnPress.AddDynamic(this, &ThisClass::HandleInputPressed);
-	StartStep(0);
-	if (!IsActivationCurrent(ThisGeneration)) { return; }
+	if (!IsValid(StartedInputTask))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] WaitComboInput factory failed."), *GetPathNameSafe(this));
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
+	InputTask = StartedInputTask;
+	const TWeakObjectPtr<ThisClass> WeakThis(this);
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> WeakInputTask(StartedInputTask);
+	const FDelegateHandle Registration = StartedInputTask->RegisterNativeCallback(
+		FGGYGOComboInputNativeDelegate::CreateLambda([WeakThis, WeakInputTask, Original](int32 SourceStep, int32 RequestId)
+		{
+			ThisClass* Self = WeakThis.Get();
+			if (Self && WeakInputTask.IsValid() && Self->InputTask == WeakInputTask.Get() && Self->IsActivationCurrent(Original))
+			{
+				Self->HandleInputPressed(Original, SourceStep, RequestId);
+			}
+		}));
+	if (!IsActivationCurrent(Original) || InputTask != StartedInputTask)
+	{
+		if (WeakInputTask.IsValid())
+		{
+			StartedInputTask->UnregisterNativeCallback(Registration);
+			if (WeakInputTask.IsValid()) { StartedInputTask->TaskOwnerEnded(); }
+		}
+		return;
+	}
+	InputCallbackRegistration = Registration;
+	if (!Registration.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Input Task [%s] pre-Ready native registration failed."),
+			*GetPathNameSafe(this), *GetPathNameSafe(StartedInputTask));
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
+	StartStep(Original, 0);
+	if (!IsActivationCurrent(Original) || InputTask != StartedInputTask) { return; }
 	if (!MontageTask || !ComboSteps.IsValidIndex(CurrentStep))
 	{
-		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
+	if (!WeakInputTask.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] original Input Task became invalid before Ready."), *GetPathNameSafe(this));
+		RequestAbilityEnd(Original, true, true);
 		return;
 	}
 
-	UGGYGOAbilityTask_WaitComboInput* const StartedInputTask = InputTask;
 	StartedInputTask->ReadyForActivation();
-	if (!IsActivationCurrent(ThisGeneration) || InputTask != StartedInputTask) { return; }
+	if (!IsActivationCurrent(Original) || InputTask != StartedInputTask) { return; }
+	if (!WeakInputTask.IsValid() || !StartedInputTask->IsActive())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] original Input Task did not remain active after Ready."), *GetPathNameSafe(this));
+		RequestAbilityEnd(Original, true, true);
+	}
 }
 
-bool UGGYGOPlayerComboAbility::IsActivationCurrent(uint64 ExpectedGeneration) const
+bool UGGYGOPlayerComboAbility::IsActivationCurrent(const FGGYGOAbilityActivationHandle& Original) const
 {
-	return LocalActivationGeneration == ExpectedGeneration
-		&& EndRequestedActivationGeneration != ExpectedGeneration
-		&& !bCleaningUp
-		&& IsActive();
+	return ResourceActivation.HasSameActivation(Original)
+		&& CaptureCurrentActivation().HasSameActivation(Original);
 }
 
-void UGGYGOPlayerComboAbility::HandleDeferredEnd(uint64 ExpectedGeneration, FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-	bool bReplicateEndAbility, bool bWasCancelled)
+bool UGGYGOPlayerComboAbility::IsStepCurrent(const FGGYGOAbilityActivationHandle& Original,
+	uint64 ExpectedStepToken, const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ExpectedTask) const
 {
-	if (LocalActivationGeneration != ExpectedGeneration
-		|| EndRequestedActivationGeneration != ExpectedGeneration) { return; }
-	EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+	return IsActivationCurrent(Original) && ExpectedStepToken != 0 && CurrentStepToken == ExpectedStepToken
+		&& IsValid(ExpectedTask) && MontageTask == ExpectedTask;
 }
 
-bool UGGYGOPlayerComboAbility::StartStep(int32 Index, float Position)
+bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !IsStepPlayable(Index) || !ActiveMesh || !TraceComponent) { return false; }
+	if (!IsActivationCurrent(Original)) { return false; }
+	if (!IsStepPlayable(Index) || !IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] StartStep %d rejected: step/Mesh/Trace/original World is invalid."),
+			*GetPathNameSafe(this), Index);
+		RequestAbilityCancel(Original, true);
+		return false;
+	}
 	if (StepTokenCounter == MAX_uint64)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：段激活令牌已耗尽。"));
-		K2_CancelAbility();
+		RequestAbilityCancel(Original, true);
 		return false;
 	}
-	const FGGYGOComboStep& Step = ComboSteps[Index];
+	const FGGYGOComboStep Step = ComboSteps[Index];
 	if (!ActiveMesh->DoesSocketExist(Step.TraceStartSocket) || !ActiveMesh->DoesSocketExist(Step.TraceEndSocket))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：段 %d 的武器 Socket 不存在 [%s → %s]。"),
 			Index, *Step.TraceStartSocket.ToString(), *Step.TraceEndSocket.ToString());
-		K2_CancelAbility();
+		RequestAbilityCancel(Original, true);
 		return false;
 	}
-	TraceComponent->EndTraceWindow();
-	ReleaseMontageTask();
-	if (!IsActivationCurrent(ThisGeneration)) { return false; }
+	const TWeakObjectPtr<UWorld> StepWorld = OriginalWorld;
+	FTimerHandle PreviousWatchdog = WatchdogHandle;
+	WatchdogHandle.Invalidate();
+	StepWorld->GetTimerManager().ClearTimer(PreviousWatchdog);
+	if (!IsActivationCurrent(Original)) { return false; }
+	ReleaseTraceWindow(Original);
+	if (!IsActivationCurrent(Original)) { return false; }
+	ReleaseMontageTask(Original);
+	if (!IsActivationCurrent(Original)) { return false; }
 	Window.Reset();
 	CurrentStep = Index;
 	const uint64 ThisStepToken = ++StepTokenCounter;
@@ -294,9 +394,16 @@ bool UGGYGOPlayerComboAbility::StartStep(int32 Index, float Position)
 		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::PlayMontageAndWaitForEvent(
 		this, TEXT("PlayerCombo"), Step.Montage, Events, Step.PlayRate,
 		Position > 0.0f ? NAME_None : Step.MainSection);
-	if (!StartedMontageTask)
+	if (!IsActivationCurrent(Original) || CurrentStepToken != ThisStepToken)
 	{
-		K2_CancelAbility();
+		if (IsValid(StartedMontageTask)) { StartedMontageTask->TaskOwnerEnded(); }
+		return false;
+	}
+	if (!IsValid(StartedMontageTask))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Montage Task factory failed for [%s]."),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage));
+		RequestAbilityCancel(Original, true);
 		return false;
 	}
 	MontageTask = StartedMontageTask;
@@ -306,131 +413,280 @@ bool UGGYGOPlayerComboAbility::StartStep(int32 Index, float Position)
 		|| !FMath::IsFinite(MontageLength) || MontageLength <= 0.0f)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：段 %d 的实际播放速率或时长无效。"), Index);
-		K2_CancelAbility();
+		RequestAbilityCancel(Original, true);
 		return false;
 	}
 	StartedMontageTask->SetStartTimeSeconds(Position);
-	StartedMontageTask->OnCompleted.AddDynamic(this, &ThisClass::HandleMontageCompleted);
-	StartedMontageTask->OnInterrupted.AddDynamic(this, &ThisClass::HandleMontageInterrupted);
-	StartedMontageTask->OnCancelled.AddDynamic(this, &ThisClass::HandleMontageInterrupted);
-	StartedMontageTask->OnBlendOut.AddDynamic(this, &ThisClass::HandleMontageBlendOut);
-	StartedMontageTask->EventReceived.AddDynamic(this, &ThisClass::HandleMontageEvent);
+	const TWeakObjectPtr<ThisClass> WeakThis(this);
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> WeakTask(StartedMontageTask);
+	const auto ResolveOriginalCaller = [WeakThis, WeakTask, Original, ThisStepToken]() -> ThisClass*
+	{
+		ThisClass* Self = WeakThis.Get();
+		return Self && Self->IsStepCurrent(Original, ThisStepToken, WeakTask.Get()) ? Self : nullptr;
+	};
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks;
+	Callbacks.OnCompleted = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
+		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
+		{
+			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageCompleted(Original, Tag, Data); }
+		});
+	Callbacks.OnInterrupted = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
+		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
+		{
+			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageInterrupted(Original, Tag, Data); }
+		});
+	Callbacks.OnCancelled = Callbacks.OnInterrupted;
+	Callbacks.OnBlendOut = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
+		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
+		{
+			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageBlendOut(Original, Tag, Data); }
+		});
+	Callbacks.EventReceived = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
+		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
+		{
+			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageEvent(Original, Tag, Data); }
+		});
+	const FDelegateHandle Registration = StartedMontageTask->RegisterNativeCallbacks(MoveTemp(Callbacks));
+	if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get()))
+	{
+		if (WeakTask.IsValid())
+		{
+			StartedMontageTask->UnregisterNativeCallbacks(Registration);
+			if (WeakTask.IsValid()) { StartedMontageTask->TaskOwnerEnded(); }
+		}
+		return false;
+	}
+	MontageCallbackRegistration = Registration;
+	if (!Registration.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Task [%s] pre-Ready native registration failed."),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(StartedMontageTask));
+		RequestAbilityCancel(Original, true);
+		return false;
+	}
 	UE_LOG(LogGGYGOAbilitySystem, Display, TEXT("PlayerCombo：%s 段 %d，Montage=%s，Rate=%.2f。"),
 		HasAuthority(&CurrentActivationInfo) ? TEXT("服务器") : TEXT("预测端"), Index + 1,
 		*GetNameSafe(Step.Montage), Step.PlayRate);
 	StartedMontageTask->ReadyForActivation();
-	if (!IsActivationCurrent(ThisGeneration) || CurrentStepToken != ThisStepToken
-		|| CurrentStep != Index || MontageTask != StartedMontageTask) { return false; }
+	if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get()) || CurrentStep != Index) { return false; }
+	if (!StartedMontageTask->IsActive())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Task [%s] did not remain active after Ready."),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(StartedMontageTask));
+		RequestAbilityCancel(Original, true);
+		return false;
+	}
 	// 默认收尾路径显式钉住，防止编辑器中意外关联到其他段或循环。
 	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo())
 	{
 		ASC->CurrentMontageSetNextSectionName(Step.MainSection, Step.EndSection);
+		if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get())) { return false; }
 		ASC->CurrentMontageSetNextSectionName(Step.EndSection, NAME_None);
-		if (!IsActivationCurrent(ThisGeneration) || CurrentStepToken != ThisStepToken
-			|| CurrentStep != Index || MontageTask != StartedMontageTask) { return false; }
+		if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get())) { return false; }
+	}
+	else
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d original ASC is unavailable."), *GetPathNameSafe(this), Index);
+		RequestAbilityCancel(Original, true);
+		return false;
 	}
 	const float RemainingPlayTime = FMath::Max(0.0f, MontageLength - Position);
 	const float Timeout = RemainingPlayTime / EffectivePlayRate + 2.0f;
-	UWorld* const World = GetWorld();
+	UWorld* const World = StepWorld.Get();
 	if (!World || !FMath::IsFinite(Timeout))
 	{
-		K2_CancelAbility();
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d watchdog rejected: original World or timeout is invalid."),
+			*GetPathNameSafe(this), Index);
+		RequestAbilityCancel(Original, true);
 		return false;
 	}
-	const FTimerDelegate WatchdogDelegate = FTimerDelegate::CreateUObject(
-		this, &ThisClass::HandleWatchdog, ThisGeneration, ThisStepToken);
-	World->GetTimerManager().SetTimer(WatchdogHandle, WatchdogDelegate, Timeout, false);
+	const FTimerDelegate WatchdogDelegate = FTimerDelegate::CreateLambda([ResolveOriginalCaller, Original, ThisStepToken]()
+	{
+		if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleWatchdog(Original, ThisStepToken); }
+	});
+	FTimerHandle StartedWatchdog;
+	World->GetTimerManager().SetTimer(StartedWatchdog, WatchdogDelegate, Timeout, false);
+	if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get()))
+	{
+		if (StepWorld.IsValid()) { StepWorld->GetTimerManager().ClearTimer(StartedWatchdog); }
+		return false;
+	}
+	WatchdogHandle = StartedWatchdog;
 	return true;
 }
 
-void UGGYGOPlayerComboAbility::ReleaseMontageTask()
+void UGGYGOPlayerComboAbility::ReleaseMontageTask(const FGGYGOAbilityActivationHandle& Original)
 {
-	if (!MontageTask) { return; }
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* PreviousTask = MontageTask;
+	if (!ResourceActivation.HasSameActivation(Original)) { return; }
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> PreviousTask(MontageTask.Get());
+	const FDelegateHandle Registration = MontageCallbackRegistration;
 	MontageTask = nullptr;
-	PreviousTask->OnCompleted.Clear();
-	PreviousTask->OnInterrupted.Clear();
-	PreviousTask->OnCancelled.Clear();
-	PreviousTask->OnBlendOut.Clear();
-	PreviousTask->EventReceived.Clear();
+	MontageCallbackRegistration.Reset();
+	if (!PreviousTask.IsValid()) { return; }
+	PreviousTask->UnregisterNativeCallbacks(Registration);
 	// EndTask 解除监听但保留动画，下一次 ASC PlayMontage 负责自然混合顶替。
-	PreviousTask->EndTask();
+	if (PreviousTask.IsValid()) { PreviousTask->EndTask(); }
 }
 
-void UGGYGOPlayerComboAbility::HandleInputPressed(int32 SourceStep, int32 RequestId)
+void UGGYGOPlayerComboAbility::ReleaseTraceWindow(const FGGYGOAbilityActivationHandle& Original)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
+	if (!ResourceActivation.HasSameActivation(Original)) { return; }
+	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace(TraceComponent.Get());
+	const FGGYGOMeleeTraceWindowHandle OriginalWindow = TraceWindow;
+	const FDelegateHandle Subscription = TraceHitSubscription;
+	TraceWindow = {};
+	TraceHitSubscription.Reset();
+	if (!OriginalTrace.IsValid()) { return; }
+	if (Subscription.IsValid()) { OriginalTrace->UnsubscribeWindowHit(Subscription); }
+	if (OriginalTrace.IsValid() && OriginalWindow.HasWindow()) { OriginalTrace->CloseOwnedTraceWindow(OriginalWindow); }
+}
+
+void UGGYGOPlayerComboAbility::HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId)
+{
+	if (!IsActivationCurrent(Original) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
+	UWorld* const World = OriginalWorld.Get();
+	if (!World)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] input rejected: original World is unavailable."), *GetPathNameSafe(this));
+		RequestAbilityCancel(Original, true);
+		return;
+	}
 	if (RequestId <= LastRequestId || RequestId > 65535) { return; }
 	LastRequestId = RequestId;
 	if (SourceStep != CurrentStep || ComboSteps[CurrentStep].NextStepIndex == INDEX_NONE
-		|| !Window.Store(RequestId, GetWorld()->GetTimeSeconds(), InputBufferSeconds))
+		|| !Window.Store(RequestId, World->GetTimeSeconds(), InputBufferSeconds))
 	{
-		RejectRequest(RequestId);
+		RejectRequest(Original, RequestId);
 		return;
 	}
-	TryAdvanceCombo();
+	TryAdvanceCombo(Original);
 }
 
-void UGGYGOPlayerComboAbility::TryAdvanceCombo()
+void UGGYGOPlayerComboAbility::TryAdvanceCombo(const FGGYGOAbilityActivationHandle& Original)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
-	const double Now = GetWorld()->GetTimeSeconds();
+	if (!IsActivationCurrent(Original) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
+	UWorld* const World = OriginalWorld.Get();
+	if (!World)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] advance rejected: original World is unavailable."), *GetPathNameSafe(this));
+		RequestAbilityCancel(Original, true);
+		return;
+	}
+	const uint64 ExpectedStepToken = CurrentStepToken;
+	const double Now = World->GetTimeSeconds();
 	if (Window.HasExpired(Now))
 	{
 		const int32 ExpiredId = Window.PendingRequestId;
 		Window.PendingRequestId = 0;
-		RejectRequest(ExpiredId);
-		if (!IsActivationCurrent(ThisGeneration)) { return; }
+		RejectRequest(Original, ExpiredId);
+		if (!IsActivationCurrent(Original) || CurrentStepToken != ExpectedStepToken) { return; }
 	}
 	const int32 RequestId = Window.Consume(Now);
 	if (RequestId == 0) { return; }
 	const int32 Next = ComboSteps[CurrentStep].NextStepIndex;
-	if (Next <= CurrentStep || !IsStepPlayable(Next)) { RejectRequest(RequestId); return; }
-	if (StartStep(Next) && IsActivationCurrent(ThisGeneration)
+	if (Next <= CurrentStep || !IsStepPlayable(Next)) { RejectRequest(Original, RequestId); return; }
+	if (StartStep(Original, Next) && IsActivationCurrent(Original)
 		&& CurrentStep == Next && CurrentStepToken != 0)
 	{
-		SendAuthoritativeStep(RequestId, true);
+		SendAuthoritativeStep(Original, RequestId, true);
 	}
 }
 
-void UGGYGOPlayerComboAbility::HandleMontageEvent(FGameplayTag EventTag, FGameplayEventData EventData)
+void UGGYGOPlayerComboAbility::HandleMontageEvent(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayTag EventTag, FGameplayEventData EventData)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !ComboSteps.IsValidIndex(CurrentStep)
+	if (!IsActivationCurrent(Original) || !ComboSteps.IsValidIndex(CurrentStep)
 		|| EventData.OptionalObject != ComboSteps[CurrentStep].Montage
 		|| (EventData.OptionalObject2 && EventData.OptionalObject2 != ActiveMesh)) { return; }
 	if (EventTag == GGYGOGameplayTags::Event_Montage_ComboWindowBegin)
 	{
-		if (!Window.bClosed) { Window.bOpen = true; TryAdvanceCombo(); }
+		if (!Window.bClosed) { Window.bOpen = true; TryAdvanceCombo(Original); }
 	}
 	else if (EventTag == GGYGOGameplayTags::Event_Montage_ComboWindowEnd)
 	{
 		const int32 Pending = Window.PendingRequestId;
 		Window.Close();
-		if (Pending > 0) { RejectRequest(Pending); }
+		if (Pending > 0) { RejectRequest(Original, Pending); }
 	}
-	else if (HasAuthority(&CurrentActivationInfo) && TraceComponent)
+	else if (HasAuthority(&CurrentActivationInfo))
 	{
-		if (EventTag == GGYGOGameplayTags::Event_Montage_HitWindowBegin)
-		{
-			const FGGYGOComboStep& Step = ComboSteps[CurrentStep];
-			TraceComponent->BeginTraceWindow(Step.TraceStartSocket, Step.TraceEndSocket, Step.TraceRadius);
-		}
-		else if (EventTag == GGYGOGameplayTags::Event_Montage_HitWindowEnd) { TraceComponent->EndTraceWindow(); }
+		if (EventTag == GGYGOGameplayTags::Event_Montage_HitWindowBegin) { OpenTraceWindow(Original); }
+		else if (EventTag == GGYGOGameplayTags::Event_Montage_HitWindowEnd) { ReleaseTraceWindow(Original); }
 	}
 }
 
-void UGGYGOPlayerComboAbility::RejectRequest(int32 RequestId)
+void UGGYGOPlayerComboAbility::OpenTraceWindow(const FGGYGOAbilityActivationHandle& Original)
 {
-	SendAuthoritativeStep(RequestId, false);
+	if (!IsActivationCurrent(Original) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
+	const FGGYGOComboStep Step = ComboSteps[CurrentStep];
+	const uint64 ExpectedStepToken = CurrentStepToken;
+	const TWeakObjectPtr<ThisClass> WeakThis(this);
+	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace(TraceComponent.Get());
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> WeakTask(MontageTask.Get());
+	ReleaseTraceWindow(Original);
+	if (!IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get())) { return; }
+	if (!OriginalTrace.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open rejected: original Trace component is invalid."), *GetPathNameSafe(this));
+		RequestAbilityCancel(Original, true);
+		return;
+	}
+	FGGYGOMeleeTraceWindowHandle OpenedWindow;
+	const EGGYGOMeleeTraceWindowOpenResult OpenResult = OriginalTrace->TryOpenOwnedTraceWindow(
+		Step.TraceStartSocket, Step.TraceEndSocket, Step.TraceRadius, {}, OpenedWindow);
+	if (!IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get()))
+	{
+		if (OriginalTrace.IsValid() && OpenedWindow.HasWindow()) { OriginalTrace->CloseOwnedTraceWindow(OpenedWindow); }
+		return;
+	}
+	if (OpenResult != EGGYGOMeleeTraceWindowOpenResult::Opened)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open failed: Trace [%s], Montage [%s], sockets [%s -> %s], radius %.3f, result %d."),
+			*GetPathNameSafe(this), *GetPathNameSafe(OriginalTrace.Get()), *GetPathNameSafe(Step.Montage),
+			*Step.TraceStartSocket.ToString(), *Step.TraceEndSocket.ToString(), Step.TraceRadius, static_cast<int32>(OpenResult));
+		RequestAbilityCancel(Original, true);
+		return;
+	}
+	TraceWindow = OpenedWindow;
+	FDelegateHandle Subscription;
+	const EGGYGOMeleeTraceWindowSubscribeResult SubscribeResult = OriginalTrace->SubscribeWindowHit(OpenedWindow,
+		FGGYGOMeleeTraceWindowHitDelegate::CreateLambda(
+			[WeakThis, WeakTask, OriginalTrace, Original, ExpectedStepToken, OpenedWindow](
+				const FGGYGOMeleeTraceWindowHandle& ReportedWindow, AActor* HitActor, const FHitResult& HitResult)
+			{
+				ThisClass* Self = WeakThis.Get();
+				if (Self && Self->IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get())
+					&& OriginalTrace.IsValid() && Self->TraceComponent == OriginalTrace.Get()
+					&& ReportedWindow == OpenedWindow && Self->TraceWindow == OpenedWindow
+					&& OriginalTrace->QueryOwnedTraceWindow(OpenedWindow) == EGGYGOMeleeTraceWindowQueryResult::Active)
+				{
+					Self->HandleMeleeHit(Original, ExpectedStepToken, OpenedWindow, HitActor, HitResult);
+				}
+			}), Subscription);
+	if (!IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get()) || TraceWindow != OpenedWindow)
+	{
+		if (OriginalTrace.IsValid() && Subscription.IsValid()) { OriginalTrace->UnsubscribeWindowHit(Subscription); }
+		if (OriginalTrace.IsValid()) { OriginalTrace->CloseOwnedTraceWindow(OpenedWindow); }
+		return;
+	}
+	TraceHitSubscription = Subscription;
+	if (SubscribeResult != EGGYGOMeleeTraceWindowSubscribeResult::Subscribed || !Subscription.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace subscription failed: Trace [%s], result %d."),
+			*GetPathNameSafe(this), *GetPathNameSafe(OriginalTrace.Get()), static_cast<int32>(SubscribeResult));
+		RequestAbilityCancel(Original, true);
+	}
 }
 
-void UGGYGOPlayerComboAbility::SendAuthoritativeStep(int32 RequestId, bool bAccepted)
+
+void UGGYGOPlayerComboAbility::RejectRequest(const FGGYGOAbilityActivationHandle& Original, int32 RequestId)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !HasAuthority(&CurrentActivationInfo)
+	SendAuthoritativeStep(Original, RequestId, false);
+}
+
+void UGGYGOPlayerComboAbility::SendAuthoritativeStep(const FGGYGOAbilityActivationHandle& Original, int32 RequestId, bool bAccepted)
+{
+	if (!IsActivationCurrent(Original) || !HasAuthority(&CurrentActivationInfo)
 		|| !CurrentActorInfo || CurrentActorInfo->IsLocallyControlled()) { return; }
 	UGGYGOAbilitySystemComponent* ASC = GetGGYGOAbilitySystemComponentFromActorInfo();
 	UAnimInstance* AnimInstance = CurrentActorInfo->GetAnimInstance();
@@ -453,23 +709,31 @@ void UGGYGOPlayerComboAbility::SendAuthoritativeStep(int32 RequestId, bool bAcce
 
 void UGGYGOPlayerComboAbility::ReceiveAbilityCorrection(const FGameplayAbilityTargetDataHandle& Correction)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || HasAuthority(&CurrentActivationInfo) || Correction.Num() != 1) { return; }
+	const FGGYGOAbilityActivationHandle Original = ResourceActivation;
+	if (!IsActivationCurrent(Original) || HasAuthority(&CurrentActivationInfo) || Correction.Num() != 1) { return; }
 	const FGameplayAbilityTargetData* TargetData = Correction.Get(0);
 	if (!TargetData || TargetData->GetScriptStruct() != FGGYGOComboCorrectionData::StaticStruct()) { return; }
+	if (!IsActivationCurrent(Original)) { return; }
 	const FGGYGOComboCorrectionData& ComboCorrection = static_cast<const FGGYGOComboCorrectionData&>(*TargetData);
 	if (!ComboCorrection.HasValidFields() || !IsStepPlayable(ComboCorrection.ServerStep)) { return; }
 	const float ServerMontageLength = ComboSteps[ComboCorrection.ServerStep].Montage->GetPlayLength();
 	if (!FMath::IsFinite(ServerMontageLength) || ComboCorrection.Position > ServerMontageLength) { return; }
-	CorrectPredictedStep(ComboCorrection.Revision, ComboCorrection.RequestId, ComboCorrection.ServerStep,
+	CorrectPredictedStepForActivation(Original, ComboCorrection.Revision, ComboCorrection.RequestId, ComboCorrection.ServerStep,
 		ComboCorrection.Position, ComboCorrection.bWindowOpen, ComboCorrection.bWindowClosed, ComboCorrection.bAccepted);
 }
 
 void UGGYGOPlayerComboAbility::CorrectPredictedStep(int32 Revision, int32 RequestId, int32 ServerStep, float Position,
 	bool bWindowOpen, bool bWindowClosed, bool bAccepted)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || HasAuthority(&CurrentActivationInfo)
+	const FGGYGOAbilityActivationHandle Original = ResourceActivation;
+	CorrectPredictedStepForActivation(Original, Revision, RequestId, ServerStep, Position, bWindowOpen, bWindowClosed, bAccepted);
+}
+
+void UGGYGOPlayerComboAbility::CorrectPredictedStepForActivation(const FGGYGOAbilityActivationHandle& Original,
+	int32 Revision, int32 RequestId, int32 ServerStep, float Position,
+	bool bWindowOpen, bool bWindowClosed, bool bAccepted)
+{
+	if (!IsActivationCurrent(Original) || HasAuthority(&CurrentActivationInfo)
 		|| Revision <= StepSyncRevision || RequestId <= 0 || RequestId > 65535
 		|| !FMath::IsFinite(Position) || !IsStepPlayable(ServerStep)
 		|| Position < 0.0f || Position > ComboSteps[ServerStep].Montage->GetPlayLength()
@@ -484,20 +748,20 @@ void UGGYGOPlayerComboAbility::CorrectPredictedStep(int32 Revision, int32 Reques
 		const uint64 PreviousStepToken = CurrentStepToken;
 		const float SafePosition = FMath::Clamp(Position, 0.0f,
 			FMath::Max(0.0f, ComboSteps[ServerStep].Montage->GetPlayLength() - 0.001f));
-		if (!StartStep(ServerStep, SafePosition))
+		if (!StartStep(Original, ServerStep, SafePosition))
 		{
-			if (!IsActivationCurrent(ThisGeneration)) { return; }
+			if (!IsActivationCurrent(Original)) { return; }
 			// ReadyForActivation can synchronously move the same activation to a newer step.
 			// In that case this correction stack must leave the new task and its timer alone.
 			if (CurrentStep != PreviousStep || CurrentStepToken != PreviousStepToken)
 			{
-				if (!MontageTask || !MontageTask->IsActive()) { K2_CancelAbility(); }
+				if (!IsValid(MontageTask) || !MontageTask->IsActive()) { RequestAbilityCancel(Original, true); }
 				return;
 			}
-			K2_CancelAbility();
+			RequestAbilityCancel(Original, true);
 			return;
 		}
-		if (!IsActivationCurrent(ThisGeneration) || CurrentStep != ServerStep) { return; }
+		if (!IsActivationCurrent(Original) || CurrentStep != ServerStep) { return; }
 		Window.bOpen = bWindowOpen;
 		Window.bClosed = bWindowClosed;
 	}
@@ -505,142 +769,198 @@ void UGGYGOPlayerComboAbility::CorrectPredictedStep(int32 Revision, int32 Reques
 		RequestId, bAccepted ? TEXT("确认") : TEXT("拒绝"), ServerStep + 1);
 }
 
-void UGGYGOPlayerComboAbility::HandleMontageCompleted(FGameplayTag EventTag, FGameplayEventData EventData)
+void UGGYGOPlayerComboAbility::HandleMontageCompleted(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayTag EventTag, FGameplayEventData EventData)
 {
-	if (!IsActivationCurrent(LocalActivationGeneration)) { return; }
-	EndAbility(CurrentSpecHandle, CurrentActorInfo, CurrentActivationInfo, HasAuthority(&CurrentActivationInfo), false);
+	if (!IsActivationCurrent(Original)) { return; }
+	RequestAbilityEnd(Original, HasAuthority(&CurrentActivationInfo), false);
 }
 
-void UGGYGOPlayerComboAbility::HandleMontageInterrupted(FGameplayTag EventTag, FGameplayEventData EventData)
+void UGGYGOPlayerComboAbility::HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayTag EventTag, FGameplayEventData EventData)
 {
-	if (IsActivationCurrent(LocalActivationGeneration)) { K2_CancelAbility(); }
+	if (IsActivationCurrent(Original)) { RequestAbilityCancel(Original, true); }
 }
 
-void UGGYGOPlayerComboAbility::HandleMontageBlendOut(FGameplayTag EventTag, FGameplayEventData EventData)
+void UGGYGOPlayerComboAbility::HandleMontageBlendOut(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayTag EventTag, FGameplayEventData EventData)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration)) { return; }
+	if (!IsActivationCurrent(Original)) { return; }
 	const int32 Pending = Window.PendingRequestId;
 	Window.Close();
-	if (TraceComponent) { TraceComponent->EndTraceWindow(); }
-	if (Pending > 0) { RejectRequest(Pending); }
+	const uint64 ExpectedStepToken = CurrentStepToken;
+	ReleaseTraceWindow(Original);
+	if (!IsActivationCurrent(Original) || CurrentStepToken != ExpectedStepToken) { return; }
+	if (Pending > 0) { RejectRequest(Original, Pending); }
 }
 
-void UGGYGOPlayerComboAbility::HandleWatchdog(uint64 ExpectedActivationGeneration, uint64 ExpectedStepToken)
+void UGGYGOPlayerComboAbility::HandleWatchdog(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken)
 {
-	if (!IsActivationCurrent(ExpectedActivationGeneration) || CurrentStepToken != ExpectedStepToken) { return; }
+	if (!IsActivationCurrent(Original) || CurrentStepToken != ExpectedStepToken) { return; }
 	UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("PlayerCombo：动画完成回调超时，释放动作。"));
-	K2_CancelAbility();
+	RequestAbilityCancel(Original, true);
 }
 
-void UGGYGOPlayerComboAbility::HandleMeleeHit(AActor* HitActor, const FHitResult& HitResult)
+void UGGYGOPlayerComboAbility::HandleMeleeHit(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
+	const FGGYGOMeleeTraceWindowHandle& OriginalWindow, AActor* HitActor, const FHitResult& HitResult)
 {
-	const uint64 ThisGeneration = LocalActivationGeneration;
-	if (!IsActivationCurrent(ThisGeneration) || !HasAuthority(&CurrentActivationInfo)
-		|| !HitActor || HitActor == GetAvatarActorFromActorInfo() || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
-	UAbilitySystemComponent* TargetASC = UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(HitActor);
-	AActor* SourceAvatar = GetAvatarActorFromActorInfo();
-	if (!TargetASC || !SourceAvatar) { return; }
-	const FGGYGOComboStep& Step = ComboSteps[CurrentStep];
-	FGGYGOHitEffectPayload HitPayload;
-	const TSubclassOf<UGameplayEffect> ResolvedDamageEffect = UGGYGOGameData::ResolveDamageGameplayEffect(
-		DamageEffect, bUseSharedDamageEffectWhenUnset);
-	if (!DamageEffect && bUseSharedDamageEffectWhenUnset && !ResolvedDamageEffect)
+	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace(TraceComponent.Get());
+	const TWeakObjectPtr<ThisClass> WeakThis(this);
+	const auto IsOriginalHitCurrent = [WeakThis, Original, ExpectedStepToken, OriginalWindow, OriginalTrace]()
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("PlayerCombo：[%s] 已选择共享伤害GE，但预载结果不可用；本次使用无伤害GE的命中Cue路径。请检查System启动诊断及GameData伤害GE配置。"),
-			*GetNameSafe(SourceAvatar));
+		const ThisClass* Self = WeakThis.Get();
+		return Self && Self->IsActivationCurrent(Original) && Self->CurrentStepToken == ExpectedStepToken && Self->TraceWindow == OriginalWindow
+			&& OriginalTrace.IsValid() && Self->TraceComponent == OriginalTrace.Get()
+			&& OriginalTrace->QueryOwnedTraceWindow(OriginalWindow) == EGGYGOMeleeTraceWindowQueryResult::Active;
+	};
+	if (!IsOriginalHitCurrent() || !HasAuthority(&CurrentActivationInfo)
+		|| !IsValid(HitActor) || HitActor == GetAvatarActorFromActorInfo() || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
+	const FGGYGOComboStep Step = ComboSteps[CurrentStep];
+	const FGameplayTag OriginalHitCueTag = HitCueTag;
+	UAbilitySystemComponent* TargetASC = UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(HitActor);
+	if (!IsOriginalHitCurrent()) { return; }
+	AActor* SourceAvatar = GetAvatarActorFromActorInfo();
+	if (!IsValid(TargetASC) || !IsValid(SourceAvatar)) { return; }
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalTargetASC(TargetASC);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalSourceASC(GetAbilitySystemComponentFromActorInfo());
+	const FString AbilityPath = GetPathNameSafe(this);
+	const FString MontagePath = GetPathNameSafe(Step.Montage);
+	const FString SourcePath = GetPathNameSafe(SourceAvatar);
+	const FString TargetPath = GetPathNameSafe(HitActor);
+	const int32 OriginalStep = CurrentStep;
+	const auto AbortOriginalHit = [WeakThis, Original, AbilityPath, MontagePath, SourcePath, TargetPath, OriginalStep](const FString& Reason)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("PlayerCombo runtime hit Ability [%s] Source [%s] Target [%s] Step %d Montage [%s] failed: %s."),
+			*AbilityPath, *SourcePath, *TargetPath, OriginalStep, *MontagePath, *Reason);
+		if (ThisClass* Self = WeakThis.Get())
+		{
+			// Internal dependency failure ends this captured original, even if user cancellation is disabled.
+			// GA validates stale/busy sources and owns cleanup/continuation; there is no alternate request.
+			const FGGYGOAbilityTerminationResult Result = Self->RequestAbilityEnd(Original, true, true);
+			switch (Result.Outcome)
+			{
+			case EGGYGOAbilityTerminationOutcome::Completed:
+			case EGGYGOAbilityTerminationOutcome::Accepted:
+			case EGGYGOAbilityTerminationOutcome::Deferred:
+			case EGGYGOAbilityTerminationOutcome::AlreadyPending:
+				break;
+			default:
+				UE_LOG(LogGGYGOAbilitySystem, Error,
+					TEXT("PlayerCombo runtime hit Ability [%s] Step %d original failure End was not accepted: outcome %d, reason %d."),
+					*AbilityPath, OriginalStep, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
+				break;
+			}
+		}
+	};
+	TSubclassOf<UGameplayEffect> ResolvedDamageEffect;
+	FString DamageDependencyError;
+	if (!ValidateDamageEffectDependency(DamageDependencyError, &ResolvedDamageEffect))
+	{
+		AbortOriginalHit(DamageDependencyError);
+		return;
 	}
+	const FString EffectPath = GetPathNameSafe(ResolvedDamageEffect.Get());
+	FGGYGOHitEffectPayload HitPayload;
 	if (!BuildHitEffectPayload(TargetASC, ResolvedDamageEffect, GetAbilityLevel(), HitResult,
 		SourceAvatar->GetActorLocation(), HitPayload))
 	{
+		AbortOriginalHit(FString::Printf(TEXT("BuildHitEffectPayload returned false for GE [%s]; see the original Builder diagnostic."), *EffectPath));
 		return;
 	}
+	if (!IsOriginalHitCurrent() || !OriginalTargetASC.IsValid()) { return; }
 	if (HitPayload.EffectSpec.IsValid())
 	{
 		HitPayload.EffectSpec.Data->SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_Damage, Step.Damage);
 		HitPayload.EffectSpec.Data->SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_PoiseDamage, Step.PoiseDamage);
-		if (UAbilitySystemComponent* SourceASC = GetAbilitySystemComponentFromActorInfo())
+		if (OriginalSourceASC.IsValid())
 		{
-			SourceASC->ApplyGameplayEffectSpecToTarget(*HitPayload.EffectSpec.Data.Get(), TargetASC);
+			OriginalSourceASC->ApplyGameplayEffectSpecToTarget(*HitPayload.EffectSpec.Data.Get(), OriginalTargetASC.Get());
+			if (!IsOriginalHitCurrent() || !OriginalTargetASC.IsValid()) { return; }
 		}
 	}
-	if (HitCueTag.IsValid())
+	if (OriginalHitCueTag.IsValid())
 	{
 		// 碰撞已经成立；GE 被免疫或拒绝不应吞掉命中表现。
-		TargetASC->ExecuteGameplayCue(HitCueTag, HitPayload.CueParameters);
+		OriginalTargetASC->ExecuteGameplayCue(OriginalHitCueTag, HitPayload.CueParameters);
 	}
 }
 
-void UGGYGOPlayerComboAbility::EndAbility(FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-	bool bReplicateEndAbility, bool bWasCancelled)
+void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context)
 {
-	if (!IsEndAbilityValid(Handle, ActorInfo)) { return; }
-	if (ScopeLockCount > 0)
+	if (!ResourceActivation.HasSameActivation(Context.GetOriginalActivation()))
 	{
-		if (EndRequestedActivationGeneration != LocalActivationGeneration)
+		if (ResourceActivation.HasActivation() || MontageTask || InputTask || TraceComponent || ActiveMesh
+			|| MontageCallbackRegistration.IsValid() || InputCallbackRegistration.IsValid()
+			|| TraceWindow.HasWindow() || TraceHitSubscription.IsValid() || WatchdogHandle.IsValid()
+			|| OriginalWorld.IsValid() || bChangedMeshTick || bAddedMeshPrerequisite)
 		{
-			const uint64 ExpectedGeneration = LocalActivationGeneration;
-			EndRequestedActivationGeneration = ExpectedGeneration;
-			WaitingToExecute.Add(FPostLockDelegate::CreateUObject(this, &ThisClass::HandleDeferredEnd,
-				ExpectedGeneration, Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled));
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] resource cleanup rejected: GA original activation does not match resource source."),
+				*GetPathNameSafe(this));
 		}
+		Super::CleanupAbilityResourcesForTermination(Context);
 		return;
 	}
-	if (bCleaningUp) { return; }
-
-	bCleaningUp = true;
-	const uint64 EndingGeneration = LocalActivationGeneration;
-	Window.Close();
-	if (UWorld* World = GetWorld()) { World->GetTimerManager().ClearTimer(WatchdogHandle); }
-	CurrentStep = INDEX_NONE;
-	CurrentStepToken = 0;
-
-	UGGYGOAbilityTask_WaitComboInput* const EndingInputTask = InputTask;
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const EndingMontageTask = MontageTask;
-	UGGYGOMeleeTraceComponent* const EndingTraceComponent = TraceComponent;
-	USkeletalMeshComponent* const EndingMesh = ActiveMesh;
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> EndingInputTask(InputTask.Get());
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> EndingMontageTask(MontageTask.Get());
+	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> EndingTraceComponent(TraceComponent.Get());
+	const TWeakObjectPtr<USkeletalMeshComponent> EndingMesh(ActiveMesh.Get());
+	const TWeakObjectPtr<UWorld> EndingWorld = OriginalWorld;
+	FTimerHandle EndingWatchdog = WatchdogHandle;
+	const FDelegateHandle EndingInputRegistration = InputCallbackRegistration;
+	const FDelegateHandle EndingMontageRegistration = MontageCallbackRegistration;
+	const FGGYGOMeleeTraceWindowHandle EndingTraceWindow = TraceWindow;
+	const FDelegateHandle EndingTraceSubscription = TraceHitSubscription;
 	const bool bRestoreMesh = bChangedMeshTick;
+	const bool bRemovePrerequisite = bAddedMeshPrerequisite;
 	const EVisibilityBasedAnimTickOption MeshTickToRestore = SavedMeshTick;
 	const bool bUpdateRateToRestore = bSavedUpdateRateOptimizations;
 
+	// Detach every original member before unregistering, restoring or ending external resources.
+	ResourceActivation = {};
+	Window.Close();
+	CurrentStep = INDEX_NONE;
+	CurrentStepToken = 0;
 	InputTask = nullptr;
 	MontageTask = nullptr;
 	TraceComponent = nullptr;
 	ActiveMesh = nullptr;
+	OriginalWorld.Reset();
+	WatchdogHandle.Invalidate();
+	InputCallbackRegistration.Reset();
+	MontageCallbackRegistration.Reset();
+	TraceWindow = {};
+	TraceHitSubscription.Reset();
 	bChangedMeshTick = false;
+	bAddedMeshPrerequisite = false;
 	bSavedUpdateRateOptimizations = false;
 	SavedMeshTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 
-	if (EndingTraceComponent)
+	if (EndingWorld.IsValid()) { EndingWorld->GetTimerManager().ClearTimer(EndingWatchdog); }
+	if (EndingTraceComponent.IsValid())
 	{
-		EndingTraceComponent->EndTraceWindow();
-		EndingTraceComponent->OnMeleeHit.RemoveDynamic(this, &ThisClass::HandleMeleeHit);
-		if (EndingMesh) { EndingTraceComponent->RemoveTickPrerequisiteComponent(EndingMesh); }
+		if (EndingTraceSubscription.IsValid()) { EndingTraceComponent->UnsubscribeWindowHit(EndingTraceSubscription); }
+		if (EndingTraceComponent.IsValid() && EndingTraceWindow.HasWindow()) { EndingTraceComponent->CloseOwnedTraceWindow(EndingTraceWindow); }
+		if (EndingTraceComponent.IsValid() && EndingMesh.IsValid() && bRemovePrerequisite)
+		{
+			EndingTraceComponent->RemoveTickPrerequisiteComponent(EndingMesh.Get());
+		}
 	}
-	if (EndingMesh && bRestoreMesh)
+	if (EndingMesh.IsValid() && bRestoreMesh)
 	{
 		EndingMesh->VisibilityBasedAnimTickOption = MeshTickToRestore;
 		EndingMesh->bEnableUpdateRateOptimizations = bUpdateRateToRestore;
 	}
-	if (EndingInputTask)
+	if (EndingInputTask.IsValid())
 	{
-		EndingInputTask->OnPress.Clear();
-		EndingInputTask->TaskOwnerEnded();
+		EndingInputTask->UnregisterNativeCallback(EndingInputRegistration);
+		if (EndingInputTask.IsValid()) { EndingInputTask->TaskOwnerEnded(); }
 	}
-	if (EndingMontageTask)
+	if (EndingMontageTask.IsValid())
 	{
-		EndingMontageTask->OnCompleted.Clear();
-		EndingMontageTask->OnInterrupted.Clear();
-		EndingMontageTask->OnCancelled.Clear();
-		EndingMontageTask->OnBlendOut.Clear();
-		EndingMontageTask->EventReceived.Clear();
+		EndingMontageTask->UnregisterNativeCallbacks(EndingMontageRegistration);
 		// GAS normally ends tasks after OnGameplayAbilityEnded; stop this task's Montage before that notification.
-		EndingMontageTask->TaskOwnerEnded();
+		if (EndingMontageTask.IsValid()) { EndingMontageTask->TaskOwnerEnded(); }
 	}
-	if (LocalActivationGeneration != EndingGeneration) { return; }
-
-	// Do not touch instance state after Super: its end notification can reactivate this same instance.
-	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+	Super::CleanupAbilityResourcesForTermination(Context);
 }

@@ -2,9 +2,10 @@
 
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "Character/Components/GGYGOHeroComponent.h"
+#include "Combatants/GGYGOCombatantState.h"
 #include "Engine/GameInstance.h"
 #include "Engine/GameViewportClient.h"
-#include "GameFramework/Pawn.h"
+#include "GameFramework/Character.h"
 #include "InputMappingContext.h"
 #include "InputTriggers.h"
 #include "Player/GGYGOPlayerController.h"
@@ -18,7 +19,6 @@ class UGGYGOInputComponent;
 class UGGYGOPawnExtensionComponent;
 class UInputAction;
 class ULocalPlayer;
-class USceneComponent;
 class UWorld;
 
 /** Owns only the standalone context/local players; no online or GI-wide service startup. */
@@ -43,7 +43,7 @@ public:
 	virtual void NotifyPlayerRemoved(int32 PlayerIndex, ULocalPlayer* RemovedPlayer) override {}
 };
 
-/** Creates input objects owned by this controller, without changing project defaults. */
+/** Uses the project's native input birth, without changing project defaults. */
 UCLASS(Transient)
 class AGGYGOInputTestController : public AGGYGOPlayerController
 {
@@ -51,7 +51,7 @@ class AGGYGOInputTestController : public AGGYGOPlayerController
 
 public:
 	virtual void InitInputSystem() override;
-	/** Explicit fixture choice, set before SetPlayer; a native failure never uses the legacy path. */
+	/** Records the fixture's native initialization choice before SetPlayer. */
 	bool EnableNativeInputInitializationForTest();
 	/** Explicit test consumption of the real PC entry; never installs another frame scheduler. */
 	void ConsumeInputForTest(float DeltaTime = 0.0f);
@@ -68,6 +68,9 @@ class UGGYGOInputTestHeroComponent : public UGGYGOHeroComponent
 
 public:
 	void ConfigureMappingForTest(const UInputMappingContext* Mapping, int32 Priority);
+	/** Owns the real typed notice subscription while this fixture deliberately stays before BeginPlay. */
+	bool ObserveLocalAbilitySystemForTest(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
+	void StopObservingLocalAbilitySystemForTest();
 	bool ObserveNativeMappingRebuildForTest(UEnhancedInputLocalPlayerSubsystem* Subsystem);
 	void StopObservingNativeMappingRebuildForTest();
 	int32 GetNativeMappingRebuildCountForTest() const { return NativeMappingRebuildCount; }
@@ -102,7 +105,8 @@ public:
 	int32 GetActivationCountForTest() const { return ActivationCount; }
 
 protected:
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 
 private:
@@ -110,9 +114,20 @@ private:
 	int32 ActivationCount = 0;
 };
 
+/** Concrete fixture configuration; ASC ownership and binding lifecycle remain inherited from the production Host. */
+UCLASS(Transient)
+class AGGYGOInputTestAbilitySystemHost : public AGGYGOCombatantState
+{
+	GENERATED_BODY()
+
+public:
+	AGGYGOInputTestAbilitySystemHost(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get())
+		: Super(ObjectInitializer) {}
+};
+
 /** Synthetic world does not begin play; initialization/release use the real public entries. */
 UCLASS(Transient)
-class AGGYGOInputTestPawn : public APawn
+class AGGYGOInputTestPawn : public ACharacter
 {
 	GENERATED_BODY()
 
@@ -120,8 +135,9 @@ public:
 	AGGYGOInputTestPawn(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	UGGYGOInputTestHeroComponent* GetHeroForTest() const { return Hero; }
 	UGGYGOPawnExtensionComponent* GetPawnExtensionForTest() const { return PawnExtension; }
-	UGGYGOAbilitySystemComponent* GetASCForTest() const { return AbilitySystem; }
+	UGGYGOAbilitySystemComponent* GetASCForTest() const;
 	UGGYGOInputComponent* GetInputComponentForTest() const;
+	void SetAbilitySystemHostForTest(AGGYGOCombatantState* Host);
 
 protected:
 	virtual UInputComponent* CreatePlayerInputComponent() override;
@@ -129,13 +145,10 @@ protected:
 
 private:
 	UPROPERTY()
-	TObjectPtr<USceneComponent> TestRoot;
-	UPROPERTY()
 	TObjectPtr<UGGYGOPawnExtensionComponent> PawnExtension;
 	UPROPERTY()
 	TObjectPtr<UGGYGOInputTestHeroComponent> Hero;
-	UPROPERTY()
-	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystem;
+	TWeakObjectPtr<AGGYGOCombatantState> AbilitySystemHost;
 };
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -153,7 +166,7 @@ public:
 	FGGYGOInputTestFixture& operator=(const FGGYGOInputTestFixture&) = delete;
 
 	bool Initialize(FAutomationTestBase& Test);
-	/** Real configured LP and native Controller/PlayerInput birth; no fallback to Initialize's legacy mode. */
+	/** Also owns the real native window and observes the first actual mapping rebuild. */
 	bool InitializeNativeMovementOrigin(FAutomationTestBase& Test);
 	void Shutdown();
 	UWorld* GetWorld() const;

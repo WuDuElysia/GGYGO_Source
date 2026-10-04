@@ -106,6 +106,20 @@ void UGGYGOPlayerComboLifecycleTestAbility::UsePredictingActivationModeForTest()
 	GetCurrentActivationInfoRef().ActivationMode = EGameplayAbilityActivationMode::Predicting;
 }
 
+void UGGYGOPlayerComboLifecycleTestAbility::ApplyAbilityTagsToGameplayEffectSpec(
+	FGameplayEffectSpec& Spec, FGameplayAbilitySpec* AbilitySpec) const
+{
+	Super::ApplyAbilityTagsToGameplayEffectSpec(Spec, AbilitySpec);
+	++SpecExtensionCount;
+	if (bInvalidateNextRequiredSpec && IsValid(Spec.Def.Get()) && Spec.GetContext().IsValid())
+	{
+		bInvalidateNextRequiredSpec = false;
+		++InvalidatedSpecCount;
+		// The production Builder must reject the actual outgoing Spec after this native extension.
+		Spec.Def = nullptr;
+	}
+}
+
 void UGGYGOPlayerComboLifecycleTestAbility::ProcessEvent(UFunction* Function, void* Parms)
 {
 	if (Function && Function->GetFName() == GetK2ActivateAbilityFunctionName()
@@ -134,7 +148,13 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Abilities/GameplayAbilityTargetTypes.h"
+#include "AbilitySystemBlueprintLibrary.h"
+#include "AbilitySystemGlobals.h"
+#include "Components/SphereComponent.h"
+#include "GameplayCueManager.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/ScopeExit.h"
+#include "NativeGameplayTags.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
 #include "TimerManager.h"
@@ -278,12 +298,84 @@ struct FGGYGOPlayerComboLifecycleFixture
 	{
 		return World && Ability ? World->GetTimerManager().GetTimerRemaining(Ability->WatchdogHandle) : -1.0f;
 	}
+	FTimerHandle GetWatchdogHandle() const
+	{
+		return Ability ? Ability->WatchdogHandle : FTimerHandle{};
+	}
+	bool HasResourcesForActivation(const FGGYGOAbilityActivationHandle& Original) const
+	{
+		return Ability && Ability->ResourceActivation.HasSameActivation(Original)
+			&& Ability->ActiveMesh == Mesh && Ability->TraceComponent == Trace
+			&& Ability->OriginalWorld.Get() == World;
+	}
+	bool HasMeshPrerequisite() const
+	{
+		return Trace && Mesh && Trace->PrimaryComponentTick.GetPrerequisites().ContainsByPredicate(
+			[this](const FTickPrerequisite& Prerequisite)
+			{
+				return Prerequisite.PrerequisiteObject.Get() == Mesh
+					&& Prerequisite.Get() == &Mesh->PrimaryComponentTick;
+			});
+	}
+	FGGYGOMeleeTraceWindowHandle GetTraceWindow() const
+	{
+		return Ability ? Ability->TraceWindow : FGGYGOMeleeTraceWindowHandle{};
+	}
+	void ConfigureRuntimeHitDamage(TSubclassOf<UGameplayEffect> EffectClass, FGameplayTag CueTag)
+	{
+		Ability->DamageEffect = EffectClass;
+		Ability->bUseSharedDamageEffectWhenUnset = false;
+		Ability->HitCueTag = CueTag;
+	}
+	bool CaptureNativeTaskLedgerForRuntimeTest(TArray<UGameplayTask*>& OutTasks) const
+	{
+		OutTasks.Reset();
+		if (!IsValid(Ability)) { return false; }
+		for (UGameplayTask* Task : Ability->ActiveTasks) { OutTasks.Add(Task); }
+		return true;
+	}
+	bool AreRuntimeResourceMembersDetachedForTest(FString& OutDiagnostic) const
+	{
+		if (!IsValid(Ability))
+		{
+			OutDiagnostic = TEXT("Ability unavailable");
+			return false;
+		}
+		const bool bMeshCleared = !Ability->ActiveMesh;
+		const bool bMontageTaskCleared = !Ability->MontageTask;
+		const bool bInputTaskCleared = !Ability->InputTask;
+		const bool bTraceCleared = !Ability->TraceComponent;
+		const bool bActivationCleared = !Ability->ResourceActivation.HasActivation();
+		const bool bWorldCleared = Ability->OriginalWorld.IsExplicitlyNull();
+		const bool bMontageCallbackCleared = !Ability->MontageCallbackRegistration.IsValid();
+		const bool bInputCallbackCleared = !Ability->InputCallbackRegistration.IsValid();
+		const bool bHitSubscriptionCleared = !Ability->TraceHitSubscription.IsValid();
+		const bool bMeshRestoreFlagCleared = !Ability->bChangedMeshTick;
+		const bool bPrerequisiteFlagCleared = !Ability->bAddedMeshPrerequisite;
+		OutDiagnostic = FString::Printf(TEXT("MeshCleared=%d MontageTaskCleared=%d InputTaskCleared=%d TraceCleared=%d ActivationCleared=%d WorldCleared=%d MontageCallbackCleared=%d InputCallbackCleared=%d HitSubscriptionCleared=%d MeshRestoreFlagCleared=%d PrerequisiteFlagCleared=%d StepToken=%llu"),
+			bMeshCleared, bMontageTaskCleared, bInputTaskCleared, bTraceCleared, bActivationCleared, bWorldCleared,
+			bMontageCallbackCleared, bInputCallbackCleared, bHitSubscriptionCleared, bMeshRestoreFlagCleared,
+			bPrerequisiteFlagCleared, static_cast<unsigned long long>(Ability->CurrentStepToken));
+		return bMeshCleared && bMontageTaskCleared && bInputTaskCleared && bTraceCleared && bActivationCleared
+			&& bWorldCleared && bMontageCallbackCleared && bInputCallbackCleared && bHitSubscriptionCleared
+			&& bMeshRestoreFlagCleared && bPrerequisiteFlagCleared && Ability->CurrentStepToken == 0;
+	}
 	float GetExpectedWatchdogRemainingFromCurrentTask() const
 	{
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const Task = GetMontageTask();
 		const float EffectiveRate = Task ? Task->GetEffectivePlayRate() : 0.0f;
 		return Montage && FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f
 			? Montage->GetPlayLength() / EffectiveRate + 2.0f
+			: -1.0f;
+	}
+	float GetExpectedWatchdogRemainingFromStartPosition(float StartPosition) const
+	{
+		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const Task = GetMontageTask();
+		if (!Montage || !Task || !FMath::IsFinite(StartPosition)
+			|| StartPosition < 0.0f || StartPosition > Montage->GetPlayLength()) { return -1.0f; }
+		const float EffectiveRate = Task->GetEffectivePlayRate();
+		return FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f
+			? FMath::Max(0.0f, Montage->GetPlayLength() - StartPosition) / EffectiveRate + 2.0f
 			: -1.0f;
 	}
 };
@@ -295,11 +387,11 @@ namespace
 		UEngine* Engine = nullptr;
 		UWorld* World = nullptr;
 
-		explicit FGGYGOComboLifecycleTestWorld(UEngine* InEngine)
+		explicit FGGYGOComboLifecycleTestWorld(UEngine* InEngine, bool bCreatePhysicsScene = false)
 			: Engine(InEngine)
 		{
 			UWorld::InitializationValues Init;
-			Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(false)
+			Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(bCreatePhysicsScene)
 				.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
 			World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true,
 				ERHIFeatureLevel::Num, &Init);
@@ -518,7 +610,128 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
 	FGGYGOPlayerComboLifecycleFixture Fixture;
 	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
-	if (!TestTrue(TEXT("纠正接收路径初始激活"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle))) { return false; }
+	const bool bHadMeshPrerequisiteBeforeActivation = Fixture.HasMeshPrerequisite();
+	const auto CheckActiveResources = [&](const FGGYGOAbilityActivationHandle& OriginalActivation,
+		const TCHAR* Label, float ExpectedStartPosition)
+	{
+		const auto Check = [&](const TCHAR* Detail, bool bCondition)
+		{
+			return TestTrue(FString::Printf(TEXT("%s %s"), Label, Detail), bCondition);
+		};
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const CurrentMontageTask = Fixture.GetMontageTask();
+		UGGYGOAbilityTask_WaitComboInput* const CurrentInputTask = Fixture.GetInputTask();
+		const float WatchdogRemaining = Fixture.GetWatchdogRemaining();
+		bool bPassed = Check(TEXT("持有非空原激活身份"), OriginalActivation.HasActivation());
+		bPassed &= Check(TEXT("本地原激活仍活跃"), Fixture.Ability->IsActive()
+			&& Fixture.Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation));
+		bPassed &= Check(TEXT("实际 Mesh/Trace/World 资源属于原激活"), Fixture.HasResourcesForActivation(OriginalActivation));
+		bPassed &= Check(TEXT("实际 Montage Task 活跃"), IsValid(CurrentMontageTask) && CurrentMontageTask->IsActive());
+		bPassed &= Check(TEXT("实际 Input Task 活跃"), IsValid(CurrentInputTask) && CurrentInputTask->IsActive());
+		bPassed &= Check(TEXT("仅持有两项实际 Task"), Fixture.Ability->GetActiveTaskCountForTest() == 2);
+		bPassed &= Check(TEXT("真实 Montage 播放已建立"), Fixture.AnimInstance->Montage_IsActive(Fixture.Montage));
+		bPassed &= Check(TEXT("实际 Montage cursor 匹配明确起播位置"), FMath::IsNearlyEqual(
+			Fixture.AnimInstance->Montage_GetPosition(Fixture.Montage), ExpectedStartPosition, 0.02f));
+		bPassed &= Check(TEXT("实际 Montage section 为 Main"),
+			Fixture.AnimInstance->Montage_GetCurrentSection(Fixture.Montage) == FName(TEXT("Main")));
+		bPassed &= Check(TEXT("Mesh 刷新和 URO 接管已建立"), Fixture.HasActiveMesh()
+			&& Fixture.Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
+			&& !Fixture.Mesh->bEnableUpdateRateOptimizations);
+		bPassed &= Check(TEXT("实际 Mesh tick prerequisite 已建立"), Fixture.HasMeshPrerequisite());
+		bPassed &= Check(TEXT("原 watchdog 已建立且使用实际 Task 速率"), FMath::IsFinite(WatchdogRemaining)
+			&& WatchdogRemaining > 0.0f && TestWorld.World->GetTimerManager().IsTimerActive(Fixture.GetWatchdogHandle())
+			&& FMath::IsNearlyEqual(WatchdogRemaining,
+				Fixture.GetExpectedWatchdogRemainingFromStartPosition(ExpectedStartPosition), 0.02f));
+		return bPassed;
+	};
+	const auto EndNormalActivation = [&](const FGGYGOAbilityActivationHandle& OriginalActivation, const TCHAR* Label)
+	{
+		// Observe fixed original resources; neither notification callback requests a successor.
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const EndingMontageTask = Fixture.GetMontageTask();
+		UGGYGOAbilityTask_WaitComboInput* const EndingInputTask = Fixture.GetInputTask();
+		const FTimerHandle EndingWatchdog = Fixture.GetWatchdogHandle();
+		const FGGYGOMeleeTraceWindowHandle EndingWindow = Fixture.GetTraceWindow();
+		const auto ResourcesAreRestored = [&]
+		{
+			return Fixture.WereAllResourcesCleanedBeforeBroadcast(EndingMontageTask, EndingInputTask)
+				&& !TestWorld.World->GetTimerManager().TimerExists(EndingWatchdog)
+				&& Fixture.HasMeshPrerequisite() == bHadMeshPrerequisiteBeforeActivation
+				&& !Fixture.GetTraceWindow().HasWindow()
+				&& (!EndingWindow.HasWindow()
+					|| Fixture.Trace->QueryOwnedTraceWindow(EndingWindow) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
+		};
+		int32 NativeEndCount = 0;
+		int32 CompletedCount = 0;
+		bool bInsideNativeEndCallback = false;
+		bool bInsideCompletedCallback = false;
+		bool bNativeEndParametersMatch = false;
+		bool bResourcesRestoredBeforeNativeBroadcast = false;
+		bool bResourcesRestoredAtCompletion = false;
+		bool bCompletionFollowedNativeCallbackExit = false;
+		FGGYGOAbilityTerminationCompletedNotice CompletedNotice;
+		const FDelegateHandle NativeEndHandle = Fixture.ASC->OnAbilityEnded.AddLambda(
+			[&](const FAbilityEndedData& Data)
+			{
+				if (Data.AbilityThatEnded != Fixture.Ability) { return; }
+				bInsideNativeEndCallback = true;
+				++NativeEndCount;
+				bNativeEndParametersMatch = Data.AbilitySpecHandle == Fixture.AbilityHandle
+					&& !Data.bReplicateEndAbility && !Data.bWasCancelled;
+				bResourcesRestoredBeforeNativeBroadcast = ResourcesAreRestored();
+				bInsideNativeEndCallback = false;
+			});
+		const FDelegateHandle CompletedHandle = Fixture.ASC->OnAbilityTerminationCompleted().AddLambda(
+			[&](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+			{
+				bInsideCompletedCallback = true;
+				++CompletedCount;
+				CompletedNotice = Notice;
+				bCompletionFollowedNativeCallbackExit = NativeEndCount == 1 && !bInsideNativeEndCallback;
+				bResourcesRestoredAtCompletion = ResourcesAreRestored();
+				bInsideCompletedCallback = false;
+			});
+		const FGGYGOAbilityTerminationResult EndResult = Fixture.Ability->RequestAbilityEnd(OriginalActivation, false, false);
+		Fixture.ASC->OnAbilityEnded.Remove(NativeEndHandle);
+		Fixture.ASC->OnAbilityTerminationCompleted().Remove(CompletedHandle);
+
+		const auto Check = [&](const TCHAR* Detail, bool bCondition)
+		{
+			return TestTrue(FString::Printf(TEXT("%s %s"), Label, Detail), bCondition);
+		};
+		bool bPassed = Check(TEXT("正常结束请求返回 Completed/None"), EndResult.Outcome == EGGYGOAbilityTerminationOutcome::Completed
+			&& EndResult.Reason == EGGYGOAbilityTerminationReason::None);
+		bPassed &= Check(TEXT("结束结果匹配固定原激活"), EndResult.Original.GetOriginalActivation().HasSameActivation(OriginalActivation));
+		bPassed &= Check(TEXT("结束结果保留正常 End 参数"), EndResult.Original.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::End
+			&& !EndResult.Original.GetReplicateEndAbility() && !EndResult.Original.WasCancelled());
+		bPassed &= Check(TEXT("原生结束广播恰好一次且参数匹配"), NativeEndCount == 1 && bNativeEndParametersMatch);
+		bPassed &= Check(TEXT("原生结束广播前实际已持资源恢复"), bResourcesRestoredBeforeNativeBroadcast);
+		bPassed &= Check(TEXT("原完成通知恰好一次且有精确完成事实"), CompletedCount == 1 && CompletedNotice.HasCompletion()
+			&& CompletedNotice.GetReason() == EGGYGOAbilityTerminationReason::None);
+		bPassed &= Check(TEXT("完成通知匹配固定原激活及同一次终止"),
+			CompletedNotice.GetOriginal().GetOriginalActivation().HasSameActivation(OriginalActivation)
+			&& CompletedNotice.GetOriginal().GetOriginalTermination().HasSameTermination(EndResult.Original.GetOriginalTermination()));
+		bPassed &= Check(TEXT("完成通知发生在原生结束回调退出后"), bCompletionFollowedNativeCallbackExit);
+		bPassed &= Check(TEXT("完成通知时实际资源保持恢复"), bResourcesRestoredAtCompletion);
+		bPassed &= Check(TEXT("请求返回后两项通知回调均已退出"), !bInsideNativeEndCallback && !bInsideCompletedCallback);
+		bPassed &= Check(TEXT("请求返回后原激活已结束且实际资源仍恢复"), !Fixture.Ability->IsActive()
+			&& !Fixture.Ability->CaptureCurrentActivation().HasActivation() && ResourcesAreRestored());
+		return bPassed;
+	};
+
+	FGGYGOAbilityActivationHandle OriginalForScopeCleanup;
+	ON_SCOPE_EXIT
+	{
+		// Return through the formal original End before the fixture unregisters Mesh/ASC.
+		// Normal A/B termination leaves the ability inactive, so this sends no duplicate request.
+		if (!IsValid(Fixture.Ability) || !Fixture.Ability->IsActive()) { return; }
+		if (!TestTrue(TEXT("正常叶退出清理持有受控 Try 返回的固定原身份"), OriginalForScopeCleanup.HasActivation())) { return; }
+		EndNormalActivation(OriginalForScopeCleanup, TEXT("正常叶退出清理"));
+	};
+	const FGGYGOAbilityActivationRequestResult ActivationA = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	OriginalForScopeCleanup = ActivationA.OriginalActivation;
+	if (!TestTrue(TEXT("纠正接收路径初始激活"), ActivationA.bNativeAccepted)) { return false; }
+	if (!TestTrue(TEXT("A 受控激活请求 Accepted/None"), ActivationA.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& ActivationA.Reason == EGGYGOAbilityActivationRequestReason::None)
+		|| !CheckActiveResources(ActivationA.OriginalActivation, TEXT("A"), 0.0f)) { return false; }
 	Fixture.Ability->UsePredictingActivationModeForTest();
 	FGameplayAbilityTargetDataHandle CorrectStep = MakeComboCorrection(7, 19, 1, 0.25f);
 	TestEqual(TEXT("通过 GAS TargetDataHandle 发送精确载荷类型"), CorrectStep.Num(), 1);
@@ -546,7 +759,574 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("较新拒绝载荷回滚到服务器段"), Fixture.Ability->GetCurrentComboStep(), 0);
 	Fixture.Ability->ReceiveAbilityCorrection(MakeComboCorrection(7, 20, 1, 0.1f, false, false, false));
 	TestEqual(TEXT("旧修订不能回滚较新服务器段"), Fixture.Ability->GetCurrentComboStep(), 0);
-	Fixture.Ability->FinishForTest();
+	if (!CheckActiveResources(ActivationA.OriginalActivation, TEXT("纠正后的 A"), 0.1f)) { return false; }
+	if (!TestFalse(TEXT("A 纠正阶段未取得 Owned Trace 窗口"), Fixture.GetTraceWindow().HasWindow())) { return false; }
+	if (!EndNormalActivation(ActivationA.OriginalActivation, TEXT("A"))) { return false; }
+
+	// Caller continuation: A's request and both notifications have returned before controlled B starts.
+	const FGGYGOAbilityActivationRequestResult ActivationB = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	OriginalForScopeCleanup = ActivationB.OriginalActivation;
+	if (!TestTrue(TEXT("A 完成后受控 B 请求 Accepted/None"), ActivationB.bNativeAccepted
+		&& ActivationB.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& ActivationB.Reason == EGGYGOAbilityActivationRequestReason::None)
+		|| !TestTrue(TEXT("同一实例/Spec 的 B 获得不同于 A 的原激活身份"), ActivationB.OriginalActivation.HasActivation()
+			&& !ActivationB.OriginalActivation.HasSameActivation(ActivationA.OriginalActivation))
+		|| !CheckActiveResources(ActivationB.OriginalActivation, TEXT("B"), 0.0f)) { return false; }
+	TestEqual(TEXT("B 正常重新从首段开始"), Fixture.Ability->GetCurrentComboStep(), 0);
+	if (!TestFalse(TEXT("B 开窗事件前没有 Owned Trace 窗口"), Fixture.GetTraceWindow().HasWindow())) { return false; }
+	FAnimMontageInstance* const PlayingInstance = Fixture.AnimInstance->GetActiveInstanceForMontage(Fixture.Montage);
+	if (!TestNotNull(TEXT("B 开窗事件使用当前真实 Montage 实例"), PlayingInstance)) { return false; }
+	FGameplayEventData HitWindowEvent;
+	HitWindowEvent.EventTag = GGYGOGameplayTags::Event_Montage_HitWindowBegin;
+	HitWindowEvent.Instigator = Fixture.Character;
+	HitWindowEvent.Target = Fixture.Character;
+	HitWindowEvent.OptionalObject = Fixture.Montage;
+	HitWindowEvent.OptionalObject2 = Fixture.Mesh;
+	HitWindowEvent.EventMagnitude = static_cast<float>(PlayingInstance->GetInstanceID() + 1);
+	Fixture.ASC->HandleGameplayEvent(HitWindowEvent.EventTag, &HitWindowEvent);
+	const FGGYGOMeleeTraceWindowHandle WindowB = Fixture.GetTraceWindow();
+	if (!TestTrue(TEXT("ASC 事件经真实 Montage Task/生产 Combo 建立 B 的 Owned Trace 窗口"),
+		WindowB.HasWindow() && Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Active
+		&& Fixture.Trace->IsTracing())
+		|| !CheckActiveResources(ActivationB.OriginalActivation, TEXT("开窗后的 B"), 0.0f)) { return false; }
+	if (!EndNormalActivation(ActivationB.OriginalActivation, TEXT("B"))) { return false; }
+	TestTrue(TEXT("B 正常结束后确切原 Owned Trace 窗口为 Inactive"),
+		Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
 	return true;
+}
+
+namespace
+{
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_PlayerComboRuntimeHitCue, "GameplayCue.GGYGO.Tests.PlayerCombo.RuntimeHit");
+
+	enum class EComboRuntimeHitCase : uint8 { NoGE, ValidGE, InvalidRequiredGE, InvalidRequiredSpec };
+
+	struct FComboRuntimeResources
+	{
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* MontageTask;
+		UGGYGOAbilityTask_WaitComboInput* InputTask;
+		FTimerHandle Watchdog;
+		FGGYGOMeleeTraceWindowHandle Window;
+
+		explicit FComboRuntimeResources(const FGGYGOPlayerComboLifecycleFixture& Fixture)
+			: MontageTask(Fixture.GetMontageTask()), InputTask(Fixture.GetInputTask()),
+			Watchdog(Fixture.GetWatchdogHandle()), Window(Fixture.GetTraceWindow()) {}
+	};
+
+	bool AreRuntimeResourcesRestored(const FGGYGOPlayerComboLifecycleFixture& Fixture,
+		const FComboRuntimeResources& Resources, bool bHadPrerequisite)
+	{
+		return Fixture.WereAllResourcesCleanedBeforeBroadcast(Resources.MontageTask, Resources.InputTask)
+			&& !Fixture.World->GetTimerManager().TimerExists(Resources.Watchdog)
+			&& Fixture.HasMeshPrerequisite() == bHadPrerequisite
+			&& !Fixture.GetTraceWindow().HasWindow() && !Fixture.Trace->IsComponentTickEnabled()
+			&& (!Resources.Window.HasWindow()
+				|| Fixture.Trace->QueryOwnedTraceWindow(Resources.Window) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
+	}
+
+	/** Read-only snapshots taken inside the same synchronous ending call, before any fixture/world teardown. */
+	struct FComboRuntimeResourceObservation
+	{
+		bool bSourcesPresent = false;
+		bool bOriginalTasksPresent = false;
+		bool bNativeLedgerObserved = false;
+		bool bMontageTaskValid = false;
+		bool bInputTaskValid = false;
+		bool bMontageTaskActive = false;
+		bool bInputTaskActive = false;
+		bool bMontageOwnerFinished = false;
+		bool bInputOwnerFinished = false;
+		TArray<UGameplayTask*> NativeTasks;
+		TArray<TPair<FString, bool>> RestoredChecks;
+		FString Diagnostic;
+
+		FComboRuntimeResourceObservation() = default;
+		FComboRuntimeResourceObservation(const FGGYGOPlayerComboLifecycleFixture& Fixture,
+			const FComboRuntimeResources& Resources, bool bHadPrerequisite)
+		{
+			bSourcesPresent = IsValid(Fixture.Ability) && IsValid(Fixture.World) && IsValid(Fixture.Trace)
+				&& IsValid(Fixture.Mesh) && IsValid(Fixture.AnimInstance) && IsValid(Fixture.Montage);
+			bOriginalTasksPresent = Resources.MontageTask && Resources.InputTask
+				&& static_cast<UGameplayTask*>(Resources.MontageTask) != static_cast<UGameplayTask*>(Resources.InputTask);
+			bNativeLedgerObserved = Fixture.CaptureNativeTaskLedgerForRuntimeTest(NativeTasks);
+			Diagnostic = FString::Printf(TEXT("SourcesPresent=%d AbilityValid=%d WorldValid=%d TraceValid=%d MeshValid=%d AnimInstanceValid=%d MontageValid=%d OriginalTasksPresent=%d NativeLedgerObserved=%d NativeCount=%d NativeTasks=["),
+				bSourcesPresent, IsValid(Fixture.Ability), IsValid(Fixture.World), IsValid(Fixture.Trace), IsValid(Fixture.Mesh),
+				IsValid(Fixture.AnimInstance), IsValid(Fixture.Montage), bOriginalTasksPresent, bNativeLedgerObserved, NativeTasks.Num());
+			for (UGameplayTask* Task : NativeTasks)
+			{
+				Diagnostic.Appendf(TEXT("{%s@%p State=%d OwnerFinished=%d}"), *GetPathNameSafe(Task), static_cast<void*>(Task),
+					Task ? static_cast<int32>(Task->GetState()) : INDEX_NONE, Task && Task->HasOwnerFinished());
+			}
+			Diagnostic += TEXT("]; ");
+			if (!bSourcesPresent)
+			{
+				Diagnostic += TEXT("required fixture source unavailable; resource checks rejected");
+				return;
+			}
+			// TaskOwnerEnded marks the saved tasks Finished/garbage before native End retires their owner ledger.
+			// Observe their actual state here; IsValid=false must never skip a missing or unfinished task check.
+			bMontageTaskValid = IsValid(Resources.MontageTask);
+			bInputTaskValid = IsValid(Resources.InputTask);
+			bMontageTaskActive = Resources.MontageTask && Resources.MontageTask->IsActive();
+			bInputTaskActive = Resources.InputTask && Resources.InputTask->IsActive();
+			bMontageOwnerFinished = Resources.MontageTask && Resources.MontageTask->HasOwnerFinished();
+			bInputOwnerFinished = Resources.InputTask && Resources.InputTask->HasOwnerFinished();
+			Diagnostic.Appendf(TEXT("OriginalMontageTask=%s@%p Valid=%d State=%d Active=%d OwnerFinished=%d; OriginalInputTask=%s@%p Valid=%d State=%d Active=%d OwnerFinished=%d; "),
+				*GetPathNameSafe(Resources.MontageTask), static_cast<void*>(Resources.MontageTask),
+				bMontageTaskValid, Resources.MontageTask ? static_cast<int32>(Resources.MontageTask->GetState()) : INDEX_NONE, bMontageTaskActive, bMontageOwnerFinished,
+				*GetPathNameSafe(Resources.InputTask), static_cast<void*>(Resources.InputTask),
+				bInputTaskValid, Resources.InputTask ? static_cast<int32>(Resources.InputTask->GetState()) : INDEX_NONE, bInputTaskActive, bInputOwnerFinished);
+			const auto Record = [this](const TCHAR* Name, bool bValue) { RestoredChecks.Emplace(Name, bValue); };
+			FString MemberDiagnostic;
+			Record(TEXT("原成员及订阅句柄脱开"), Fixture.AreRuntimeResourceMembersDetachedForTest(MemberDiagnostic));
+			Diagnostic += MemberDiagnostic + TEXT("; ");
+			Record(TEXT("Combo step 复位"), Fixture.Ability->GetCurrentComboStep() == INDEX_NONE);
+			Record(TEXT("Trace 已停止"), !Fixture.Trace->IsTracing());
+			Record(TEXT("Trace Tick 已关闭"), !Fixture.Trace->IsComponentTickEnabled());
+			Record(TEXT("当前 Owned Window 成员清空"), !Fixture.GetTraceWindow().HasWindow());
+			Record(TEXT("确切原 Owned Window 已捕获"), Resources.Window.HasWindow());
+			const EGGYGOMeleeTraceWindowQueryResult WindowQuery = Fixture.Trace->QueryOwnedTraceWindow(Resources.Window);
+			Record(TEXT("确切原 Owned Window 为 Inactive"), WindowQuery == EGGYGOMeleeTraceWindowQueryResult::Inactive);
+			Record(TEXT("Montage Task 已 Finished"), Resources.MontageTask && Resources.MontageTask->IsFinished());
+			Record(TEXT("Montage Task OwnerFinished"), bMontageOwnerFinished);
+			Record(TEXT("Montage Task OnCompleted 脱开"), Resources.MontageTask && !Resources.MontageTask->OnCompleted.IsBound());
+			Record(TEXT("Montage Task OnInterrupted 脱开"), Resources.MontageTask && !Resources.MontageTask->OnInterrupted.IsBound());
+			Record(TEXT("Montage Task OnCancelled 脱开"), Resources.MontageTask && !Resources.MontageTask->OnCancelled.IsBound());
+			Record(TEXT("Montage Task OnBlendOut 脱开"), Resources.MontageTask && !Resources.MontageTask->OnBlendOut.IsBound());
+			Record(TEXT("Montage Task EventReceived 脱开"), Resources.MontageTask && !Resources.MontageTask->EventReceived.IsBound());
+			Record(TEXT("Input Task 已 Finished"), Resources.InputTask && Resources.InputTask->IsFinished());
+			Record(TEXT("Input Task OwnerFinished"), bInputOwnerFinished);
+			Record(TEXT("Input Task OnPress 脱开"), Resources.InputTask && !Resources.InputTask->OnPress.IsBound());
+			Record(TEXT("Mesh Tick 策略恢复"), Fixture.Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+			Record(TEXT("Mesh UpdateRate 策略恢复"), Fixture.Mesh->bEnableUpdateRateOptimizations);
+			Record(TEXT("Mesh prerequisite 恢复"), Fixture.HasMeshPrerequisite() == bHadPrerequisite);
+			Record(TEXT("原 watchdog handle 已捕获"), Resources.Watchdog.IsValid());
+			Record(TEXT("当前 watchdog handle 清空"), !Fixture.GetWatchdogHandle().IsValid());
+			Record(TEXT("当前 watchdog 无剩余时间"), Fixture.GetWatchdogRemaining() < 0.0f);
+			Record(TEXT("确切原 watchdog 不存在"), !Fixture.World->GetTimerManager().TimerExists(Resources.Watchdog));
+			Record(TEXT("原 Montage 停止"), !Fixture.AnimInstance->Montage_IsActive(Fixture.Montage));
+			Diagnostic.Appendf(TEXT("ComboStep=%d WindowQuery=%d MeshTick=%d UpdateRate=%d Prerequisite=%d ExpectedPrerequisite=%d WatchdogRemaining=%.6f CurrentWatchdogValid=%d OriginalWatchdogValid=%d OriginalWatchdogExists=%d MontageActive=%d;"),
+				Fixture.Ability->GetCurrentComboStep(), static_cast<int32>(WindowQuery), static_cast<int32>(Fixture.Mesh->VisibilityBasedAnimTickOption),
+				Fixture.Mesh->bEnableUpdateRateOptimizations, Fixture.HasMeshPrerequisite(), bHadPrerequisite, Fixture.GetWatchdogRemaining(),
+				Fixture.GetWatchdogHandle().IsValid(), Resources.Watchdog.IsValid(), Fixture.World->GetTimerManager().TimerExists(Resources.Watchdog),
+				Fixture.AnimInstance->Montage_IsActive(Fixture.Montage));
+			for (const TPair<FString, bool>& Check : RestoredChecks) { Diagnostic.Appendf(TEXT(" %s=%d;"), *Check.Key, Check.Value); }
+		}
+
+		bool WereProjectResourcesRestored() const
+		{
+			if (!bSourcesPresent || !bOriginalTasksPresent || RestoredChecks.IsEmpty()) { return false; }
+			for (const TPair<FString, bool>& Check : RestoredChecks) { if (!Check.Value) { return false; } }
+			return true;
+		}
+		bool CheckNativeLedger(FAutomationTestBase& Test, const TCHAR* Stage,
+			const FComboRuntimeResources& Resources, bool bExpectOriginalTasks) const
+		{
+			bool bPassed = Test.TestTrue(FString::Printf(TEXT("真实 hit %s 必需观察来源有效"), Stage), bSourcesPresent);
+			bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s 两个不同原 Task 已捕获"), Stage), bOriginalTasksPresent);
+			bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s 原生 Task 账本实际已读取"), Stage), bNativeLedgerObserved);
+			bPassed &= Test.TestEqual(FString::Printf(TEXT("真实 hit %s 原生 Task 账本数量精确"), Stage), NativeTasks.Num(), bExpectOriginalTasks ? 2 : 0);
+			if (bExpectOriginalTasks)
+			{
+				bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s 账本含确切原 Montage Task"), Stage), NativeTasks.Contains(Resources.MontageTask));
+				bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s 账本含确切原 Input Task"), Stage), NativeTasks.Contains(Resources.InputTask));
+			}
+			return bPassed;
+		}
+		bool CheckBeforeTrigger(FAutomationTestBase& Test, const FComboRuntimeResources& Resources) const
+		{
+			Test.AddInfo(FString::Printf(TEXT("E14-C resources Stage=BeforeTrigger; %s"), *Diagnostic));
+			bool bPassed = CheckNativeLedger(Test, TEXT("触发前"), Resources, true);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 触发前原 Montage Task 有效"), bMontageTaskValid);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 触发前原 Input Task 有效"), bInputTaskValid);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 触发前原 Montage Task 正在执行"), bMontageTaskActive);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 触发前原 Input Task 正在执行"), bInputTaskActive);
+			bPassed &= Test.TestFalse(TEXT("真实 hit 触发前原 Montage Task Owner 未结束"), bMontageOwnerFinished);
+			bPassed &= Test.TestFalse(TEXT("真实 hit 触发前原 Input Task Owner 未结束"), bInputOwnerFinished);
+			return bPassed;
+		}
+		bool CheckAfterCleanup(FAutomationTestBase& Test, const TCHAR* Stage,
+			const FComboRuntimeResources& Resources, bool bExpectOriginalTasks) const
+		{
+			Test.AddInfo(FString::Printf(TEXT("E14-C resources Stage=%s; %s"), Stage, *Diagnostic));
+			bool bPassed = CheckNativeLedger(Test, Stage, Resources, bExpectOriginalTasks);
+			bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s 资源分项实际已捕获"), Stage), !RestoredChecks.IsEmpty());
+			for (const TPair<FString, bool>& Check : RestoredChecks)
+			{
+				bPassed &= Test.TestTrue(FString::Printf(TEXT("真实 hit %s %s"), Stage, *Check.Key), Check.Value);
+			}
+			return bPassed;
+		}
+	};
+
+	/** Owns only public observation subscriptions and the query target, never the Combo's resources. */
+	struct FComboRuntimeHitProbe
+	{
+		AActor* Target = nullptr;
+		UGGYGOAbilitySystemComponent* TargetASC = nullptr;
+		UGameplayCueManager* CueManager = nullptr;
+		FDelegateHandle ApplyHandle;
+		FDelegateHandle CueHandle;
+		int32 AppliedCount = 0;
+		int32 CueCount = 0;
+		bool bObservedSourcesMatch = true;
+
+		~FComboRuntimeHitProbe()
+		{
+			if (IsValid(TargetASC)) { TargetASC->OnGameplayEffectAppliedDelegateToSelf.Remove(ApplyHandle); }
+			if (IsValid(CueManager)) { CueManager->OnGameplayCueRouted().Remove(CueHandle); }
+		}
+
+		bool Initialize(FAutomationTestBase& Test, const FGGYGOPlayerComboLifecycleFixture& Fixture, FGameplayTag CueTag)
+		{
+			if (!Test.TestNotNull(TEXT("真实 hit 独立 PhysicsScene"), Fixture.World->GetPhysicsScene())) { return false; }
+			Target = Fixture.World->SpawnActor<AActor>();
+			if (!Test.TestNotNull(TEXT("真实 hit 查询目标"), Target)) { return false; }
+			USphereComponent* Sphere = NewObject<USphereComponent>(Target);
+			if (!Test.TestNotNull(TEXT("真实 hit 查询碰撞体"), Sphere)
+				|| !Test.TestTrue(TEXT("真实 hit 目标 Root 设置成功"), Target->SetRootComponent(Sphere))) { return false; }
+			Sphere->SetSphereRadius(8.0f);
+			Sphere->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+			Sphere->SetCollisionResponseToAllChannels(ECR_Ignore);
+			Sphere->SetCollisionResponseToChannel(ECC_Pawn, ECR_Block);
+			Sphere->RegisterComponent();
+			TargetASC = NewObject<UGGYGOAbilitySystemComponent>(Target);
+			if (!Test.TestNotNull(TEXT("真实 hit TargetASC"), TargetASC)) { return false; }
+			TargetASC->RegisterComponent();
+			TargetASC->InitAbilityActorInfo(Target, Target);
+			CueManager = UAbilitySystemGlobals::Get().GetGameplayCueManager();
+			if (!Test.TestNotNull(TEXT("真实 Cue 路由 Manager"), CueManager)
+				|| !Test.TestTrue(TEXT("真实 hit 目标组件和原生 ASC 发现路径有效"), Sphere->IsRegistered()
+					&& TargetASC->IsRegistered() && TargetASC->IsOwnerActorAuthoritative()
+					&& UAbilitySystemBlueprintLibrary::GetAbilitySystemComponent(Target) == TargetASC)
+				|| !Test.TestTrue(TEXT("真实 hit Cue Tag 已注册且目标未被抑制"), CueTag.IsValid()
+					&& !CueManager->ShouldSuppressGameplayCues(Target))) { return false; }
+			UGGYGOAbilitySystemComponent* const SourceASC = Fixture.ASC;
+			AActor* const SourceAvatar = Fixture.Character;
+			ApplyHandle = TargetASC->OnGameplayEffectAppliedDelegateToSelf.AddLambda(
+				[this, SourceASC](UAbilitySystemComponent* Source, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle)
+				{
+					++AppliedCount;
+					bObservedSourcesMatch &= Source == SourceASC && IsValid(Spec.Def.Get()) && Spec.GetContext().IsValid();
+				});
+			CueHandle = CueManager->OnGameplayCueRouted().AddLambda(
+				[this, SourceAvatar, CueTag](AActor* Actor, FGameplayTag Tag, EGameplayCueEvent::Type Event,
+					const FGameplayCueParameters& Parameters, EGameplayCueExecutionOptions)
+				{
+					if (Actor == Target && Tag == CueTag && Event == EGameplayCueEvent::Executed)
+					{
+						++CueCount;
+						bObservedSourcesMatch &= Parameters.Instigator.Get() == SourceAvatar;
+					}
+				});
+			return Test.TestTrue(TEXT("真实 Apply/Cue 观察订阅已建立"), ApplyHandle.IsValid() && CueHandle.IsValid());
+		}
+
+		bool SweepOneHit(FAutomationTestBase& Test, const FGGYGOPlayerComboLifecycleFixture& Fixture)
+		{
+			const FVector Motion(0.0, 0.0, 80.0);
+			const FVector Start = Fixture.Mesh->GetSocketLocation(Fixture.TraceStartBone);
+			if (!Test.TestTrue(TEXT("真实 Sweep 起点有限"), !Start.ContainsNaN())
+				|| !Test.TestTrue(TEXT("真实 Sweep 目标移到路径中段"), Target->SetActorLocation(Start + Motion * 0.5))) { return false; }
+			const int32 InitialApplied = AppliedCount;
+			const int32 InitialCues = CueCount;
+			Fixture.Trace->TickComponent(1.0f / 60.0f, LEVELTICK_All, nullptr);
+			if (!Test.TestTrue(TEXT("真实 Owned Sweep 首帧仅建立基线"), AppliedCount == InitialApplied && CueCount == InitialCues)) { return false; }
+			const FVector NewMeshLocation = Fixture.Mesh->GetComponentLocation() + Motion;
+			Fixture.Mesh->SetWorldLocation(NewMeshLocation);
+			if (!Test.TestTrue(TEXT("真实 Sweep Mesh 已完成非零位移"), Fixture.Mesh->GetComponentLocation().Equals(NewMeshLocation))) { return false; }
+			Fixture.Trace->TickComponent(1.0f / 60.0f, LEVELTICK_All, nullptr);
+			CueManager->FlushPendingCues();
+			return true;
+		}
+	};
+
+	/** Observes one saved Original and the resources it actually held before the triggering hit. */
+	struct FComboRuntimeEndObservation
+	{
+		FGGYGOPlayerComboLifecycleFixture& Fixture;
+		FGGYGOAbilityActivationHandle Original;
+		FComboRuntimeResources Resources;
+		bool bHadPrerequisite;
+		FComboRuntimeResourceObservation BeforeResources;
+		FComboRuntimeResourceObservation AbilityEndResources;
+		FComboRuntimeResourceObservation EndResources;
+		FComboRuntimeResourceObservation CompletedResources;
+		FDelegateHandle AbilityEndHandle;
+		FDelegateHandle EndHandle;
+		FDelegateHandle CompletedHandle;
+		FAbilityEndedData AbilityEndedData;
+		FAbilityEndedData EndedData;
+		FGGYGOAbilityTerminationCompletedNotice Notice;
+		int32 AbilityEndCount = 0;
+		int32 EndCount = 0;
+		int32 CompletedCount = 0;
+		int32 ObservationOrder = 0;
+		int32 AbilityEndOrder = 0;
+		int32 EndOrder = 0;
+		int32 CompletedOrder = 0;
+		bool bInsideAbilityEnd = false;
+		bool bInsideEnd = false;
+		bool bAbilityEndResourcesRestored = false;
+		bool bEndResourcesRestored = false;
+		bool bCompletedResourcesRestored = false;
+		bool bEndAfterAbilityEndExit = false;
+		bool bCompletionAfterEndExit = false;
+
+		FComboRuntimeEndObservation(FGGYGOPlayerComboLifecycleFixture& InFixture,
+			const FGGYGOAbilityActivationHandle& InOriginal, bool bInHadPrerequisite)
+			: Fixture(InFixture), Original(InOriginal), Resources(InFixture), bHadPrerequisite(bInHadPrerequisite),
+			BeforeResources(InFixture, Resources, bInHadPrerequisite)
+		{
+			AbilityEndHandle = Fixture.Ability->OnGameplayAbilityEndedWithData.AddLambda([this](const FAbilityEndedData& Data)
+			{
+				bInsideAbilityEnd = true;
+				++AbilityEndCount;
+				AbilityEndOrder = ++ObservationOrder;
+				AbilityEndedData = Data;
+				AbilityEndResources = FComboRuntimeResourceObservation(Fixture, Resources, bHadPrerequisite);
+				bAbilityEndResourcesRestored = AbilityEndResources.WereProjectResourcesRestored();
+				bInsideAbilityEnd = false;
+			});
+			EndHandle = Fixture.ASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data)
+			{
+				if (Data.AbilityThatEnded != Fixture.Ability && Data.AbilitySpecHandle != Fixture.AbilityHandle) { return; }
+				bInsideEnd = true;
+				++EndCount;
+				EndOrder = ++ObservationOrder;
+				EndedData = Data;
+				bEndAfterAbilityEndExit = AbilityEndCount == 1 && !bInsideAbilityEnd;
+				EndResources = FComboRuntimeResourceObservation(Fixture, Resources, bHadPrerequisite);
+				bEndResourcesRestored = AreRuntimeResourcesRestored(Fixture, Resources, bHadPrerequisite);
+				bInsideEnd = false;
+			});
+			CompletedHandle = Fixture.ASC->OnAbilityTerminationCompleted().AddLambda(
+				[this](const FGGYGOAbilityTerminationCompletedNotice& InNotice)
+				{
+					++CompletedCount;
+					CompletedOrder = ++ObservationOrder;
+					Notice = InNotice;
+					bCompletionAfterEndExit = AbilityEndCount == 1 && EndCount == 1 && !bInsideAbilityEnd && !bInsideEnd;
+					CompletedResources = FComboRuntimeResourceObservation(Fixture, Resources, bHadPrerequisite);
+					bCompletedResourcesRestored = AreRuntimeResourcesRestored(Fixture, Resources, bHadPrerequisite);
+				});
+		}
+		~FComboRuntimeEndObservation()
+		{
+			Fixture.Ability->OnGameplayAbilityEndedWithData.Remove(AbilityEndHandle);
+			Fixture.ASC->OnAbilityEnded.Remove(EndHandle);
+			Fixture.ASC->OnAbilityTerminationCompleted().Remove(CompletedHandle);
+		}
+		bool CheckBeforeTrigger(FAutomationTestBase& Test) const
+		{
+			return BeforeResources.CheckBeforeTrigger(Test, Resources);
+		}
+		bool Check(FAutomationTestBase& Test, bool bFaultEnd) const
+		{
+			const FComboRuntimeResourceObservation ReturnedResources(Fixture, Resources, bHadPrerequisite);
+			Test.AddInfo(FString::Printf(TEXT("E14-C native end observation: expected Ability=%s Spec=%s GAReplicate=%d Cancel=%d; GA Count=%d Ability=%s Spec=%s Replicate=%d Cancel=%d Order=%d ProjectResourcesRestored=%d; ASC Count=%d Ability=%s Spec=%s Replicate=%d Cancel=%d Order=%d ResourcesRestored=%d GAExited=%d; Completed Count=%d Order=%d ResourcesRestored=%d NativeCallbacksExited=%d."),
+				*GetPathNameSafe(Fixture.Ability), *Fixture.AbilityHandle.ToString(), bFaultEnd, bFaultEnd,
+				AbilityEndCount, *GetPathNameSafe(AbilityEndedData.AbilityThatEnded.Get()), *AbilityEndedData.AbilitySpecHandle.ToString(),
+				AbilityEndedData.bReplicateEndAbility, AbilityEndedData.bWasCancelled, AbilityEndOrder, bAbilityEndResourcesRestored,
+				EndCount, *GetPathNameSafe(EndedData.AbilityThatEnded.Get()), *EndedData.AbilitySpecHandle.ToString(),
+				EndedData.bReplicateEndAbility, EndedData.bWasCancelled, EndOrder, bEndResourcesRestored, bEndAfterAbilityEndExit,
+				CompletedCount, CompletedOrder, bCompletedResourcesRestored, bCompletionAfterEndExit));
+			bool bPassed = Test.TestTrue(TEXT("真实 hit GA 原生结束观察订阅有效"), AbilityEndHandle.IsValid());
+			bPassed &= Test.TestTrue(TEXT("真实 hit ASC 原生结束观察订阅有效"), EndHandle.IsValid());
+			bPassed &= Test.TestTrue(TEXT("真实 hit Completed 观察订阅有效"), CompletedHandle.IsValid());
+			bPassed &= Test.TestEqual(TEXT("真实 hit GA 原生结束恰好一次"), AbilityEndCount, 1);
+			bPassed &= Test.TestTrue(TEXT("真实 hit GA 原生结束 Ability 身份精确"), AbilityEndedData.AbilityThatEnded == Fixture.Ability);
+			bPassed &= Test.TestTrue(TEXT("真实 hit GA 原生结束 Spec 身份精确"), AbilityEndedData.AbilitySpecHandle == Fixture.AbilityHandle);
+			bPassed &= Test.TestEqual(TEXT("真实 hit GA 原生结束取消参数精确"), AbilityEndedData.bWasCancelled, bFaultEnd);
+			// GA broadcasts the actual Super End arguments; ASC's local NotifyAbilityEnded broadcasts replicate=false.
+			bPassed &= Test.TestEqual(TEXT("真实 hit GA 原生结束复制参数精确"), AbilityEndedData.bReplicateEndAbility, bFaultEnd);
+			bPassed &= Test.TestEqual(TEXT("真实 hit ASC 原生结束恰好一次"), EndCount, 1);
+			bPassed &= Test.TestTrue(TEXT("真实 hit ASC 原生结束 Ability 身份精确"), EndedData.AbilityThatEnded == Fixture.Ability);
+			bPassed &= Test.TestTrue(TEXT("真实 hit ASC 原生结束 Spec 身份精确"), EndedData.AbilitySpecHandle == Fixture.AbilityHandle);
+			bPassed &= Test.TestEqual(TEXT("真实 hit ASC 原生结束取消参数精确"), EndedData.bWasCancelled, bFaultEnd);
+			bPassed &= Test.TestFalse(TEXT("真实 hit ASC 本地结束通知复制字段固定为 false"), EndedData.bReplicateEndAbility);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 固定 Original 的 End 已精确 Completed"), CompletedCount == 1 && Notice.HasCompletion()
+				&& Notice.GetReason() == EGGYGOAbilityTerminationReason::None
+				&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Original)
+				&& Notice.GetOriginal().GetRequestKind() == EGGYGOAbilityTerminationRequestKind::End
+				&& Notice.GetOriginal().WasCancelled() == bFaultEnd
+				&& Notice.GetOriginal().GetReplicateEndAbility() == bFaultEnd);
+			bPassed &= Test.TestEqual(TEXT("真实 hit GA 原生结束先广播"), AbilityEndOrder, 1);
+			bPassed &= Test.TestEqual(TEXT("真实 hit ASC 原生结束随后广播"), EndOrder, 2);
+			bPassed &= Test.TestEqual(TEXT("真实 hit Completed 最后通知"), CompletedOrder, 3);
+			bPassed &= Test.TestTrue(TEXT("真实 hit ASC 广播时 GA 回调已退出"), bEndAfterAbilityEndExit);
+			bPassed &= Test.TestTrue(TEXT("真实 hit Completed 时两原生回调已退出"), bCompletionAfterEndExit);
+			// UE broadcasts GA data before retiring ActiveTasks; finished original tasks remain registered until native Reset.
+			bPassed &= AbilityEndResources.CheckAfterCleanup(Test, TEXT("GA"), Resources, true);
+			bPassed &= EndResources.CheckAfterCleanup(Test, TEXT("ASC"), Resources, false);
+			bPassed &= CompletedResources.CheckAfterCleanup(Test, TEXT("Completed"), Resources, false);
+			bPassed &= ReturnedResources.CheckAfterCleanup(Test, TEXT("Returned"), Resources, false);
+			bPassed &= Test.TestTrue(TEXT("真实 hit GA 广播时项目原资源已恢复且原 Task 已结束"), bAbilityEndResourcesRestored);
+			bPassed &= Test.TestTrue(TEXT("真实 hit ASC 广播时原资源已恢复"), bEndResourcesRestored);
+			bPassed &= Test.TestTrue(TEXT("真实 hit Completed 时原资源已恢复"), bCompletedResourcesRestored);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 回调返回后原能力及实际已持资源释放"), !Fixture.Ability->IsActive()
+				&& !Fixture.Ability->CaptureCurrentActivation().HasActivation()
+				&& AreRuntimeResourcesRestored(Fixture, Resources, bHadPrerequisite));
+			return bPassed;
+		}
+	};
+
+	bool SendRuntimeWindowEvent(FAutomationTestBase& Test, FGGYGOPlayerComboLifecycleFixture& Fixture, bool bOpen)
+	{
+		FAnimMontageInstance* const Instance = Fixture.AnimInstance->GetActiveInstanceForMontage(Fixture.Montage);
+		if (!Test.TestNotNull(TEXT("真实 hit 窗口事件匹配当前 Montage 实例"), Instance)) { return false; }
+		FGameplayEventData Event;
+		Event.EventTag = bOpen ? GGYGOGameplayTags::Event_Montage_HitWindowBegin : GGYGOGameplayTags::Event_Montage_HitWindowEnd;
+		Event.Instigator = Fixture.Character;
+		Event.Target = Fixture.Character;
+		Event.OptionalObject = Fixture.Montage;
+		Event.OptionalObject2 = Fixture.Mesh;
+		Event.EventMagnitude = static_cast<float>(Instance->GetInstanceID() + 1);
+		Fixture.ASC->HandleGameplayEvent(Event.EventTag, &Event);
+		const FGGYGOMeleeTraceWindowHandle Window = Fixture.GetTraceWindow();
+		return Test.TestTrue(TEXT("正式窗口事件完成 Owned 资源接线"), bOpen
+			? Window.HasWindow() && Fixture.Trace->QueryOwnedTraceWindow(Window) == EGGYGOMeleeTraceWindowQueryResult::Active
+				&& Fixture.Trace->IsTracing() && Fixture.Trace->IsComponentTickEnabled()
+			: !Window.HasWindow() && !Fixture.Trace->IsTracing());
+	}
+
+	bool RunComboRuntimeHitCase(FAutomationTestBase& Test, EComboRuntimeHitCase Case)
+	{
+		FGGYGOComboLifecycleTestWorld TestWorld(GEngine, true);
+		FGGYGOPlayerComboLifecycleFixture Fixture;
+		if (!InitializeFixture(Test, TestWorld, Fixture)) { return false; }
+		const bool bHadPrerequisite = Fixture.HasMeshPrerequisite();
+		FGGYGOAbilityActivationHandle CleanupOriginal;
+		FComboRuntimeHitProbe Probe;
+		ON_SCOPE_EXIT
+		{
+			if (!IsValid(Fixture.Ability) || !Fixture.Ability->IsActive()) { return; }
+			if (!Test.TestTrue(TEXT("真实 hit 退出清理使用受控 Try 保存身份"), CleanupOriginal.HasActivation())) { return; }
+			const FComboRuntimeResources Resources(Fixture);
+			const FGGYGOAbilityTerminationResult Result = Fixture.Ability->RequestAbilityEnd(CleanupOriginal, false, false);
+			Test.TestTrue(TEXT("真实 hit 退出清理正式原 End Completed"), Result.Outcome == EGGYGOAbilityTerminationOutcome::Completed
+				&& Result.Original.GetOriginalActivation().HasSameActivation(CleanupOriginal));
+			Test.TestTrue(TEXT("真实 hit 退出清理恢复实际已持资源"), AreRuntimeResourcesRestored(Fixture, Resources, bHadPrerequisite));
+		};
+		const FGameplayTag CueTag = TAG_PlayerComboRuntimeHitCue.GetTag();
+		if (!Probe.Initialize(Test, Fixture, CueTag)) { return false; }
+		const bool bNoGE = Case == EComboRuntimeHitCase::NoGE;
+		const TSubclassOf<UGameplayEffect> DamageClass = bNoGE
+			? TSubclassOf<UGameplayEffect>() : TSubclassOf<UGameplayEffect>(UGameplayEffect::StaticClass());
+		Fixture.ConfigureRuntimeHitDamage(DamageClass, CueTag);
+		if (Case == EComboRuntimeHitCase::InvalidRequiredSpec)
+		{
+			// Freeze this scene's explicit policy before the real group admission and activation.
+			Fixture.Ability->ConfigureExclusiveSelfPolicyForTest();
+			if (!Test.TestTrue(TEXT("不可取消 Builder 场景在受控启动前明确配置 Exclusive"),
+				Fixture.Ability->GetSelfPolicy() == EGGYGOAbilitySelfPolicy::Exclusive)) { return false; }
+		}
+		const FGGYGOAbilityActivationRequestResult Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+		CleanupOriginal = Activation.OriginalActivation;
+		if (!Test.TestTrue(TEXT("真实 hit 受控本地 Original Accepted"), Activation.bNativeAccepted
+			&& Activation.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+			&& Activation.Reason == EGGYGOAbilityActivationRequestReason::None
+			&& CleanupOriginal.HasActivation() && Fixture.Ability->IsActive()
+			&& Fixture.Ability->CaptureCurrentActivation().HasSameActivation(CleanupOriginal))
+			|| !SendRuntimeWindowEvent(Test, Fixture, true)) { return false; }
+		const auto CheckHeldResources = [&]
+		{
+			return Test.TestTrue(TEXT("真实 hit 前实际 Task/Montage/Mesh/prerequisite/watchdog 已持有"),
+				Fixture.HasResourcesForActivation(CleanupOriginal) && Fixture.GetMontageTask() && Fixture.GetMontageTask()->IsActive()
+				&& Fixture.GetInputTask() && Fixture.GetInputTask()->IsActive() && Fixture.Ability->GetActiveTaskCountForTest() == 2
+				&& Fixture.AnimInstance->Montage_IsActive(Fixture.Montage)
+				&& Fixture.Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
+				&& !Fixture.Mesh->bEnableUpdateRateOptimizations && Fixture.HasMeshPrerequisite()
+				&& Fixture.World->GetTimerManager().IsTimerActive(Fixture.GetWatchdogHandle())
+				&& FMath::IsFinite(Fixture.GetWatchdogRemaining()) && Fixture.GetWatchdogRemaining() > 0.0f);
+		};
+		if (!CheckHeldResources() || !Probe.SweepOneHit(Test, Fixture)) { return false; }
+		bool bPassed = Test.TestEqual(TEXT("真实 hit 正向对照公开 Apply 次数"), Probe.AppliedCount, bNoGE ? 0 : 1);
+		bPassed &= Test.TestEqual(TEXT("真实 hit 正向对照 Cue 路由一次"), Probe.CueCount, 1);
+		bPassed &= Test.TestTrue(TEXT("真实 hit 正向对照来源正确且原能力继续"), Probe.bObservedSourcesMatch
+			&& Fixture.Ability->IsActive() && Fixture.Ability->CaptureCurrentActivation().HasSameActivation(CleanupOriginal));
+		bPassed &= Test.TestEqual(TEXT("真实 hit 正向对照使用实际必需 Spec 扩展"),
+			Fixture.Ability->GetSpecExtensionCountForTest(), bNoGE ? 0 : 1);
+		if (!bPassed) { return false; }
+		const bool bFault = Case == EComboRuntimeHitCase::InvalidRequiredGE || Case == EComboRuntimeHitCase::InvalidRequiredSpec;
+		if (bFault)
+		{
+			const FGGYGOMeleeTraceWindowHandle ControlWindow = Fixture.GetTraceWindow();
+			if (!SendRuntimeWindowEvent(Test, Fixture, false)
+				|| !Test.TestTrue(TEXT("故障前正向对照的原窗口已关闭"),
+					Fixture.Trace->QueryOwnedTraceWindow(ControlWindow) == EGGYGOMeleeTraceWindowQueryResult::Inactive)
+				|| !SendRuntimeWindowEvent(Test, Fixture, true)
+				|| !Test.TestTrue(TEXT("故障命中取得同一 Original 的新窗口"), Fixture.GetTraceWindow() != ControlWindow)
+				|| !CheckHeldResources()) { return false; }
+			if (Case == EComboRuntimeHitCase::InvalidRequiredGE)
+			{
+				Fixture.ConfigureRuntimeHitDamage(UGGYGOPlayerComboLifecycleInvalidDamageEffect::StaticClass(), CueTag);
+			}
+			else
+			{
+				Fixture.Ability->SetCanBeCanceledForTest(false);
+				if (!Test.TestFalse(TEXT("Builder 故障原能力明确不可取消"), Fixture.Ability->CanBeCanceled())) { return false; }
+				Fixture.Ability->InvalidateNextRequiredSpecForTest();
+			}
+		}
+		FComboRuntimeEndObservation EndObservation(Fixture, CleanupOriginal, bHadPrerequisite);
+		if (!EndObservation.CheckBeforeTrigger(Test)) { return false; }
+		if (bFault)
+		{
+			const int32 AppliedBeforeFault = Probe.AppliedCount;
+			const int32 CuesBeforeFault = Probe.CueCount;
+			const int32 SpecsBeforeFault = Fixture.Ability->GetSpecExtensionCountForTest();
+			if (!Probe.SweepOneHit(Test, Fixture)) { return false; }
+			bPassed &= Test.TestEqual(TEXT("故障 hit 没有继续 Apply"), Probe.AppliedCount, AppliedBeforeFault);
+			bPassed &= Test.TestEqual(TEXT("故障 hit 没有继续 Cue"), Probe.CueCount, CuesBeforeFault);
+			const bool bBuilderFault = Case == EComboRuntimeHitCase::InvalidRequiredSpec;
+			bPassed &= Test.TestEqual(TEXT("故障 hit 实际进入所选 GE/Builder 分支"),
+				Fixture.Ability->GetSpecExtensionCountForTest() - SpecsBeforeFault, bBuilderFault ? 1 : 0);
+			bPassed &= Test.TestEqual(TEXT("Builder 故障来自一次实际已构造 Spec 的扩展失效"),
+				Fixture.Ability->GetInvalidatedSpecCountForTest(), bBuilderFault ? 1 : 0);
+		}
+		else
+		{
+			const FGGYGOAbilityTerminationResult EndResult = Fixture.Ability->RequestAbilityEnd(CleanupOriginal, false, false);
+			bPassed &= Test.TestTrue(TEXT("真实 hit 正常对照原 End 请求 Completed"), EndResult.Outcome == EGGYGOAbilityTerminationOutcome::Completed
+				&& EndResult.Original.GetOriginalActivation().HasSameActivation(CleanupOriginal)
+				&& EndObservation.Notice.GetOriginal().GetOriginalTermination().HasSameTermination(EndResult.Original.GetOriginalTermination()));
+		}
+		bPassed &= EndObservation.Check(Test, bFault);
+		Test.AddInfo(FString::Printf(TEXT("E14-C Case=%d behavior assertions=%s; Apply=%d Cue=%d SpecExtension=%d InvalidSpec=%d GANativeEnd=%d NativeEnd=%d Completed=%d. Production Error events remain unfiltered."),
+			static_cast<int32>(Case), bPassed ? TEXT("PASS") : TEXT("FAIL"), Probe.AppliedCount, Probe.CueCount,
+			Fixture.Ability->GetSpecExtensionCountForTest(), Fixture.Ability->GetInvalidatedSpecCountForTest(),
+			EndObservation.AbilityEndCount, EndObservation.EndCount, EndObservation.CompletedCount));
+		return bPassed;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboRuntimeHitNormalModesTest,
+	"GGYGO.AbilitySystem.PlayerCombo.RuntimeHit.NormalModes",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboRuntimeHitNormalModesTest::RunTest(const FString& Parameters)
+{
+	bool bPassed = RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::NoGE);
+	bPassed &= RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::ValidGE);
+	return bPassed;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboRuntimeHitRequiredGEFailureTest,
+	"GGYGO.AbilitySystem.PlayerCombo.RuntimeHit.RequiredGEFailure",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboRuntimeHitRequiredGEFailureTest::RunTest(const FString& Parameters)
+{
+	return RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::InvalidRequiredGE);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboRuntimeHitBuilderFailureTest,
+	"GGYGO.AbilitySystem.PlayerCombo.RuntimeHit.BuilderFailureUncancelable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboRuntimeHitBuilderFailureTest::RunTest(const FString& Parameters)
+{
+	return RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::InvalidRequiredSpec);
 }
 #endif

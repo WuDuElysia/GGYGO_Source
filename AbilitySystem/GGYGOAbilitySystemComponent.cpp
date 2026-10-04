@@ -828,7 +828,8 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Call.Handle);
 	if (!Spec || Spec->PendingRemove || !IsValid(Spec->Ability.Get())
 		|| Spec->Ability.Get() != Call.SpecAbility.Get()) { return EReason::InvalidSpec; }
-	if (!Cast<UGGYGOGameplayAbility>(Spec->Ability.Get())
+	const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Spec->Ability.Get());
+	if (!ProjectAbility || ProjectAbility->bRetriggerInstancedAbility
 		|| Spec->Ability->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::NonInstanced)
 	{
 		return EReason::UnsupportedEntry;
@@ -920,7 +921,7 @@ FGGYGOAbilityActivationRequestResult UGGYGOAbilitySystemComponent::TryActivateAb
 	if (Call.Failure != EReason::None)
 	{
 		Result.Reason = Call.Failure;
-		Result.Outcome = (Call.Failure == EReason::TerminationInProgress
+		Result.Outcome = (Call.Failure == EReason::TerminationInProgress || Call.Failure == EReason::SameInstanceRetrigger
 			|| (Call.Failure == EReason::MissingActivationBoundary && bEnclosingSameInstanceCall))
 			? EOutcome::Busy
 			: (Call.Failure == EReason::IdentityExhausted || Call.Failure == EReason::MissingActivationBoundary)
@@ -985,46 +986,49 @@ bool UGGYGOAbilitySystemComponent::CompleteControlledAbilityActivationEvaluation
 void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
 	FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability)
 {
-	// Every real new activation invalidates the previous provenance, including untouched legacy paths.
-	Ability->InvalidateOriginalTerminationForActivation();
+	// This is the actual native PreActivate notification, before public activation listeners.
+	// GA alone issues the identity; a controlled Try supplies only its outer return provenance.
+	if (Ability->IsControlledActivationTerminationBusy())
+	{
+		Ability->InvalidateOriginalTerminationForActivation();
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native activation ASC [%s] Spec [%s] Instance [%s] rejected: original lifecycle is still busy; raw entry bypassed admission."),
+			*GetPathName(), *Handle.ToString(), *GetPathNameSafe(Ability));
+		return;
+	}
 	Ability->RetireControlledActivation();
 	FControlledAbilityActivationCall* Call = ControlledAbilityActivationCall;
-	if (!Call || Call->Handle != Handle || Call->bLocalWitnessSeen)
-	{
-		return;
-	}
-	if (!Call->bCanAdmitted || Call->Failure != EGGYGOAbilityActivationRequestReason::None)
-	{
-		// Source reentry was untracked or the exact Can bridge did not admit this witness.
-		// A local native witness cannot be presented as remote-only accepted history.
-		Call->bLocalWitnessSeen = true;
-		if (Call->Failure == EGGYGOAbilityActivationRequestReason::None)
-		{
-			Call->Failure = EGGYGOAbilityActivationRequestReason::MissingActivationBoundary;
-		}
-		return;
-	}
-	// Seal the first witness before any GAS activation broadcast can reenter.
-	Call->bLocalWitnessSeen = true;
-	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
+	const bool bMatchesCall = Call && Call->Handle == Handle && !Call->bLocalWitnessSeen;
 	FActualAvatarBindingActorInfoSnapshot Actual;
 	EGGYGOAvatarBindingReason SnapshotReason;
-	if (!Spec || Spec->Ability.Get() != Call->SpecAbility.Get()
-		|| !Spec->GetAbilityInstances().Contains(Ability)
-		|| !CaptureAvatarBindingActualSnapshot(Actual, SnapshotReason)
-		|| !HasSameAvatarBindingActualSnapshot(Call->OriginalActual, Actual)
-		|| !HasSameAvatarBindingContextValue(Call->OriginalContext, GetAvatarBindingContext()))
-	{
-		Call->Failure = EGGYGOAbilityActivationRequestReason::InvalidActorInfo;
-		return;
-	}
-	Call->OriginalActivation = Ability->IssueControlledActivation(this, Handle,
-		Call->OriginalActual.Allocation.Get(), Call->Failure);
-	if (!Call->OriginalActivation.HasActivation())
+	const bool bHasActual = CaptureAvatarBindingActualSnapshot(Actual, SnapshotReason)
+		&& ValidateAvatarBindingActualSnapshot(Actual, SnapshotReason);
+	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
+	const bool bHasTryBoundary = bMatchesCall && Call->bCanAdmitted
+		&& Call->Failure == EGGYGOAbilityActivationRequestReason::None
+		&& Spec && Spec->Ability.Get() == Call->SpecAbility.Get()
+		&& bHasActual && HasSameAvatarBindingActualSnapshot(Call->OriginalActual, Actual)
+		&& HasSameAvatarBindingContextValue(Call->OriginalContext, GetAvatarBindingContext());
+	EGGYGOAbilityActivationRequestReason IssueReason = EGGYGOAbilityActivationRequestReason::InvalidActorInfo;
+	const FGGYGOAbilityActivationHandle Original = bHasActual
+		? Ability->IssueControlledActivation(this, Handle, Actual.Allocation.Get(), bHasTryBoundary, IssueReason)
+		: FGGYGOAbilityActivationHandle{};
+	if (!Original.HasActivation())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("AbilitySystem controlled activation [%s] Spec [%s] Instance [%s] could not issue original history, reason=%d."),
-			*GetPathName(), *Handle.ToString(), *GetNameSafe(Ability), static_cast<int32>(Call->Failure));
+			TEXT("AbilitySystem native activation ASC [%s] Spec [%s] Instance [%s] could not issue original history: reason=%d."),
+			*GetPathName(), *Handle.ToString(), *GetPathNameSafe(Ability), static_cast<int32>(IssueReason));
+	}
+	if (!bMatchesCall) { return; }
+	Call->bLocalWitnessSeen = true; // First witness sealed before Super can broadcast/reenter.
+	if (bHasTryBoundary && Original.HasActivation())
+	{
+		Call->OriginalActivation = Original;
+	}
+	else if (Call->Failure == EGGYGOAbilityActivationRequestReason::None)
+	{
+		Call->Failure = Original.HasActivation()
+			? EGGYGOAbilityActivationRequestReason::MissingActivationBoundary : IssueReason;
 	}
 }
 

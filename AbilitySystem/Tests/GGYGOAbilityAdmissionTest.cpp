@@ -18,11 +18,12 @@ UGGYGOAbilityAdmissionTestAbility::UGGYGOAbilityAdmissionTestAbility(const FObje
 	SelfPolicy = EGGYGOAbilitySelfPolicy::Coexist;
 }
 
-void UGGYGOAbilityAdmissionTestAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
+void UGGYGOAbilityAdmissionTestAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayAbilitySpecHandle Handle,
 	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
 	const FGameplayEventData* TriggerEventData)
 {
-	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (IsActive())
 	{
 		++BusinessActivationCount;
@@ -89,23 +90,29 @@ void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveLifecycle(
 	LifecycleObserver.ExecuteIfBound(Sample);
 }
 
-void UGGYGOAbilityAdmissionPerExecutionTestAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-	const FGameplayEventData* TriggerEventData)
+#if WITH_DEV_AUTOMATION_TESTS
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityActivationEntryForTest(
+	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
 {
 	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::ActivateBeforeSuper, ActorInfo, Handle);
-	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+}
+
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityActivationReturnForTest(
+	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
 	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::ActivateAfterSuper, ActorInfo, Handle);
 }
 
-void UGGYGOAbilityAdmissionPerExecutionTestAbility::EndAbility(const FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo,
-	bool bReplicateEndAbility, bool bWasCancelled)
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityEndEntryForTest(
+	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
 {
 	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::EndBeforeSuper, ActorInfo, Handle,
 		bReplicateEndAbility, bWasCancelled);
-	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }
+#endif
 
 UGGYGOAbilityAdmissionUncancelableTestAbility::UGGYGOAbilityAdmissionUncancelableTestAbility(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
@@ -113,12 +120,11 @@ UGGYGOAbilityAdmissionUncancelableTestAbility::UGGYGOAbilityAdmissionUncancelabl
 	SelfPolicy = EGGYGOAbilitySelfPolicy::Exclusive;
 }
 
-void UGGYGOAbilityAdmissionUncancelableTestAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-	const FGameplayEventData* TriggerEventData)
+void UGGYGOAbilityAdmissionUncancelableTestAbility::InitializeAbilityActivation(
+	const FGGYGOAbilityActivationHandle& Original)
 {
 	SetCanBeCanceled(false);
-	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	Super::InitializeAbilityActivation(Original);
 }
 
 UGGYGOAbilityAdmissionQueuedTestAbility::UGGYGOAbilityAdmissionQueuedTestAbility(const FObjectInitializer& ObjectInitializer)

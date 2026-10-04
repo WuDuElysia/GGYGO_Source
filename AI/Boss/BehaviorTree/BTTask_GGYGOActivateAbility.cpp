@@ -8,6 +8,7 @@
 #include "AbilitySystem/Abilities/GGYGOCombatActionAbility.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "BehaviorTree/BehaviorTreeComponent.h"
 #include "BehaviorTree/BlackboardComponent.h"
 #include "BehaviorTree/Blackboard/BlackboardKeyType_Name.h"
 #include "GameFramework/Pawn.h"
@@ -26,12 +27,22 @@ namespace
 	}
 }
 
+struct UBTTask_GGYGOActivateAbility::FAbilityWait
+{
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	TWeakObjectPtr<UBehaviorTreeComponent> OwnerComp;
+	FGGYGOAbilityActivationHandle OriginalActivation;
+	FDelegateHandle CompletionBinding;
+};
+
 UBTTask_GGYGOActivateAbility::UBTTask_GGYGOActivateAbility(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
 	NodeName = TEXT("Activate Boss Ability");
 	bCreateNodeInstance = true;
-	bNotifyTaskFinished = true;
+	// Native OnTaskFinished carries no original execution identity after its parent callback.
+	// Each owned wait is released at failure/completion/Abort/destruction, before native finish.
+	bNotifyTaskFinished = false;
 	SelectedActionKey.AddNameFilter(this, GET_MEMBER_NAME_CHECKED(ThisClass, SelectedActionKey));
 	SelectedActionKey.SelectedKeyName = TEXT("SelectedAction");
 }
@@ -39,7 +50,20 @@ UBTTask_GGYGOActivateAbility::UBTTask_GGYGOActivateAbility(const FObjectInitiali
 EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
-	CleanupBinding();
+	TSharedPtr<FAbilityWait> PreviousWait = MoveTemp(ActiveWait);
+	const TSharedPtr<FAbilityWait> Wait = MakeShared<FAbilityWait>();
+	Wait->OwnerComp = &OwnerComp;
+	ActiveWait = Wait;
+	LastWait = Wait;
+	CleanupBinding(MoveTemp(PreviousWait));
+	const auto FailExecution = [this, &Wait]()
+	{
+		const bool bOriginalWait = IsWaitCurrent(Wait);
+		CleanupBinding(Wait);
+		return bOriginalWait ? EBTNodeResult::Failed : EBTNodeResult::Aborted;
+	};
+	if (!IsWaitCurrent(Wait)) { return FailExecution(); }
+
 	AGGYGOBossAIController* Controller = Cast<AGGYGOBossAIController>(OwnerComp.GetAIOwner());
 	UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
 	if (!Controller)
@@ -48,7 +72,7 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 		{
 			Blackboard->ClearValue(SelectedActionKey.SelectedKeyName);
 		}
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
 
 	FGameplayTag ActionTag;
@@ -65,27 +89,33 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 	FGameplayAbilitySpecHandle SelectedHandle;
 	const bool bConsumedSelection =
 		Controller->ConsumeActionSelection(ActionSet, PhaseTag, ASC, ActionTag, SelectedHandle);
+	if (!IsWaitCurrent(Wait)) { return FailExecution(); }
 	if (Blackboard)
 	{
 		Blackboard->ClearValue(SelectedActionKey.SelectedKeyName);
 	}
+	if (!IsWaitCurrent(Wait)) { return FailExecution(); }
 
-	if (!Blackboard || !bConsumedSelection || !IsValid(Controller) ||
-		Cast<AGGYGOBossAIController>(OwnerComp.GetAIOwner()) != Controller ||
-		!IsValid(BossState) || Controller->GetBossState() != BossState ||
-		!IsValid(ASC) || BossState->GetGGYGOAbilitySystemComponent() != ASC ||
-		!IsValid(ActionSet) || ResolveActionSet(BossState) != ActionSet ||
-		!ActionTag.IsValid() || !PhaseTag.IsValid() || BossState->GetCurrentPhaseTag() != PhaseTag ||
-		!IsValid(Pawn) || Controller->GetPawn() != Pawn || ASC->GetAvatarActor() != Pawn)
+	const auto IsActionSourceCurrent = [&]()
 	{
-		return EBTNodeResult::Failed;
+		return IsWaitCurrent(Wait) && IsValid(Blackboard) && bConsumedSelection && IsValid(Controller)
+			&& Cast<AGGYGOBossAIController>(OwnerComp.GetAIOwner()) == Controller
+			&& IsValid(BossState) && Controller->GetBossState() == BossState
+			&& IsValid(ASC) && BossState->GetGGYGOAbilitySystemComponent() == ASC
+			&& IsValid(ActionSet) && ResolveActionSet(BossState) == ActionSet
+			&& ActionTag.IsValid() && PhaseTag.IsValid() && BossState->GetCurrentPhaseTag() == PhaseTag
+			&& IsValid(Pawn) && Controller->GetPawn() == Pawn && ASC->GetAvatarActor() == Pawn;
+	};
+	if (!IsActionSourceCurrent())
+	{
+		return FailExecution();
 	}
 
 	// Clearing Blackboard can synchronously notify observers. If one chose a newer action,
 	// preserve its request and let this consumed choice fail without activating alongside it.
 	if (Blackboard->GetValueAsName(SelectedActionKey.SelectedKeyName) != NAME_None)
 	{
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
 
 	FString ValidationError;
@@ -94,8 +124,9 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 		UE_LOG(LogGGYGOAbilitySystem, Error,
 			TEXT("ActivateBossAbility: ActionSet [%s] 在消费后变为无效：%s"),
 			*GetNameSafe(ActionSet), *ValidationError);
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
+	if (!IsActionSourceCurrent()) { return FailExecution(); }
 
 	const FGGYGOBossActionDefinition* Action = ActionSet->FindAction(ActionTag);
 	const FGameplayAbilitySpec* SelectedSpec = ASC->FindAbilitySpecFromHandle(SelectedHandle);
@@ -104,40 +135,73 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 		!IsValid(AbilityClass) || !SelectedSpec || !SelectedSpec->Ability ||
 		SelectedSpec->Ability->GetClass() != AbilityClass)
 	{
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
 	const UGGYGOCombatActionAbility* AbilityCDO =
 		AbilityClass->GetDefaultObject<UGGYGOCombatActionAbility>();
 	if (!AbilityCDO || AbilityCDO->GetActionTag() != ActionTag)
 	{
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
 
-	WaitingASC = ASC;
-	ActiveOwnerComp = &OwnerComp;
-	WaitingHandle = SelectedHandle;
-	bEndedDuringActivation = false;
-	bEndedDuringActivationWasCancelled = false;
-	ASC->OnAbilityEnded.AddUObject(this, &ThisClass::HandleAbilityEnded);
-
-	bInsideTryActivate = true;
-	const bool bActivated = ASC->TryActivateAbility(WaitingHandle);
-	bInsideTryActivate = false;
-
-	if (!bActivated)
+	if (!IsActionSourceCurrent() || Blackboard->GetValueAsName(SelectedActionKey.SelectedKeyName) != NAME_None)
 	{
-		CleanupBinding();
-		return EBTNodeResult::Failed;
+		return FailExecution();
 	}
-	UE_LOG(LogGGYGOAbilitySystem, Display,
-		TEXT("ActivateBossAbility: [%s] 已激活 [%s]，等待 Spec [%s] 结束。"),
-		*GetNameSafe(Controller), *ActionTag.ToString(), *WaitingHandle.ToString());
-	if (bEndedDuringActivation)
+	Wait->ASC = ASC;
+	const TWeakPtr<FAbilityWait> OriginalWait = Wait;
+	Wait->CompletionBinding = ASC->OnAbilityTerminationCompleted().AddWeakLambda(this,
+		[this, OriginalWait](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+		{
+			if (const TSharedPtr<FAbilityWait> PinnedWait = OriginalWait.Pin())
+			{
+				HandleTerminationCompleted(Notice, PinnedWait);
+			}
+		});
+	if (!Wait->CompletionBinding.IsValid())
 	{
-		const bool bWasCancelled = bEndedDuringActivationWasCancelled;
-		CleanupBinding();
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("ActivateBossAbility: ASC [%s] Spec [%s] 无法登记原终止完成订阅。"),
+			*GetNameSafe(ASC), *SelectedHandle.ToString());
+		return FailExecution();
+	}
+	const FString OriginalASCName = GetNameSafe(ASC);
+	const FString OriginalActionName = ActionTag.ToString();
+	const FGGYGOAbilityActivationRequestResult Request = ASC->TryActivateAbilityWithTerminationBoundary(SelectedHandle);
+	if (!IsWaitCurrent(Wait)) { return FailExecution(); }
+	if (Request.Outcome != EGGYGOAbilityActivationRequestOutcome::Accepted || !Request.bNativeAccepted)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Verbose,
+			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 未取得可等待的原 Activation：Outcome=%d Reason=%d NativeAccepted=%d Original=%d。"),
+			*OriginalASCName, *OriginalActionName, *SelectedHandle.ToString(), int32(Request.Outcome),
+			int32(Request.Reason), Request.bNativeAccepted ? 1 : 0, Request.OriginalActivation.HasActivation() ? 1 : 0);
+		return FailExecution();
+	}
+	if (!Request.OriginalActivation.HasActivation())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 原生请求已接受，但没有可等待的本地原 Activation。"),
+			*OriginalASCName, *OriginalActionName, *SelectedHandle.ToString());
+		return FailExecution();
+	}
+	Wait->OriginalActivation = Request.OriginalActivation;
+	// Notices inside Try arrive before its result issues our identity to this consumer.
+	// ASC seals this exact original history before dispatch; never match an unrelated early notice.
+	if (Request.OriginalTerminationCompleted.HasCompletion())
+	{
+		if (!Request.OriginalTerminationCompleted.GetOriginal().GetOriginalActivation()
+			.HasSameActivation(Wait->OriginalActivation))
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("ActivateBossAbility: ASC [%s] Spec [%s] 的同步完成历史不属于原请求。"),
+				*OriginalASCName, *SelectedHandle.ToString());
+			return FailExecution();
+		}
+		const bool bWasCancelled = Request.OriginalTerminationCompleted.GetOriginal().WasCancelled();
+		CleanupBinding(Wait);
 		return bWasCancelled ? EBTNodeResult::Failed : EBTNodeResult::Succeeded;
 	}
+	// No external call between installing the returned identity and returning InProgress.
 	return EBTNodeResult::InProgress;
 }
 
@@ -145,49 +209,65 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::AbortTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
 	// Abort 只停止等待，不默认取消可能已进入不可取消段的 GA。
-	CleanupBinding();
+	const TSharedPtr<FAbilityWait> Wait = ActiveWait;
+	if (Wait && Wait->OwnerComp.Get() == &OwnerComp)
+	{
+		if (LastWait.Pin() == Wait) { LastWait.Reset(); }
+		CleanupBinding(Wait);
+	}
 	return EBTNodeResult::Aborted;
 }
 
-void UBTTask_GGYGOActivateAbility::OnTaskFinished(
-	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory, EBTNodeResult::Type TaskResult)
+void UBTTask_GGYGOActivateAbility::BeginDestroy()
 {
-	CleanupBinding();
-	Super::OnTaskFinished(OwnerComp, NodeMemory, TaskResult);
+	LastWait.Reset();
+	CleanupBinding(ActiveWait);
+	Super::BeginDestroy();
 }
 
-void UBTTask_GGYGOActivateAbility::HandleAbilityEnded(const FAbilityEndedData& EndedData)
+bool UBTTask_GGYGOActivateAbility::IsWaitCurrent(const TSharedPtr<FAbilityWait>& Wait) const
 {
-	if (EndedData.AbilitySpecHandle != WaitingHandle)
+	const UBehaviorTreeComponent* OwnerComp = Wait ? Wait->OwnerComp.Get() : nullptr;
+	return Wait && ActiveWait == Wait && LastWait.Pin() == Wait
+		&& IsValid(this) && !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& IsValid(OwnerComp) && !OwnerComp->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
+}
+
+void UBTTask_GGYGOActivateAbility::HandleTerminationCompleted(
+	const FGGYGOAbilityTerminationCompletedNotice& Notice, const TSharedPtr<FAbilityWait>& Wait)
+{
+	if (!IsWaitCurrent(Wait) || !Notice.HasCompletion()
+		|| !Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Wait->OriginalActivation))
 	{
 		return;
 	}
-
-	if (bInsideTryActivate)
-	{
-		bEndedDuringActivation = true;
-		bEndedDuringActivationWasCancelled = EndedData.bWasCancelled;
-		return;
-	}
-
-	UBehaviorTreeComponent* OwnerComp = ActiveOwnerComp.Get();
-	const EBTNodeResult::Type Result = EndedData.bWasCancelled
+	const TWeakObjectPtr<UBehaviorTreeComponent> OriginalOwner = Wait->OwnerComp;
+	const EBTNodeResult::Type Result = Notice.GetOriginal().WasCancelled()
 		? EBTNodeResult::Failed
 		: EBTNodeResult::Succeeded;
-	CleanupBinding();
-	if (OwnerComp)
+	CleanupBinding(Wait);
+	UBehaviorTreeComponent* OwnerComp = OriginalOwner.Get();
+	if (IsValid(this) && !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& LastWait.Pin() == Wait && IsValid(OwnerComp)
+		&& !OwnerComp->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
 	{
 		FinishLatentTask(*OwnerComp, Result);
+		// No member writes or wait/successor cleanup after the native completion call.
 	}
 }
 
-void UBTTask_GGYGOActivateAbility::CleanupBinding()
+void UBTTask_GGYGOActivateAbility::CleanupBinding(TSharedPtr<FAbilityWait> Wait)
 {
-	if (UGGYGOAbilitySystemComponent* ASC = WaitingASC.Get())
+	if (!Wait) { return; }
+	if (ActiveWait == Wait) { ActiveWait.Reset(); }
+	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC = Wait->ASC;
+	const FDelegateHandle Binding = Wait->CompletionBinding;
+	Wait->CompletionBinding.Reset();
+	Wait->ASC.Reset();
+	Wait->OwnerComp.Reset();
+	Wait->OriginalActivation = {};
+	if (UGGYGOAbilitySystemComponent* ASC = OriginalASC.Get(); ASC && Binding.IsValid())
 	{
-		ASC->OnAbilityEnded.RemoveAll(this);
+		ASC->OnAbilityTerminationCompleted().Remove(Binding);
 	}
-	WaitingASC.Reset();
-	ActiveOwnerComp.Reset();
-	WaitingHandle = FGameplayAbilitySpecHandle();
 }

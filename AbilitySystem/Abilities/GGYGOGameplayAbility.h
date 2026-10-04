@@ -295,7 +295,7 @@ public:
 
 	// ===== Controlled activation identity and original termination =====
 
-	/** Copy this controlled activation's issued identity; empty is untracked, never a guessed source. */
+	/** Copy history issued at the actual native activation; empty never supplies a guessed source. */
 	FGGYGOAbilityActivationHandle CaptureCurrentActivation() const;
 
 	/**
@@ -435,7 +435,7 @@ protected:
 	 * 在这里做而不是留给每个能力蓝图自己调，是因为 `AbilityCameraMode` 与
 	 * `CameraOffset` 是声明式配置 —— 配了就该生效，不该再要求配套写一遍调用。
 	 */
-	virtual void ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+	virtual void ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override final;
 
 	// ===== 相机模式 =====
 
@@ -475,12 +475,12 @@ protected:
 	/**
 	 * 能力结束时清理相机接管。
 	 *
-	 * 必须重写它而不是只在正常结束路径里清理：能力可能被组仲裁取消、
-	 * 被死亡取消、或因 Avatar 销毁而结束，那些路径都不会走能力自己的收尾逻辑，
+	 * final 入口统一受理；派生在 CleanupAbilityResourcesForTermination 清自身原资源。
+	 * 能力可能被组仲裁取消、死亡取消或因 Avatar 销毁而结束，
 	 * 相机会永久停在演出视角。
 	 */
-	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
-	virtual void CancelAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility) override;
+	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override final;
+	virtual void CancelAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility) override final;
 
 	/**
 	 * 激活时接管的相机模式。留空表示不换模式。
@@ -532,9 +532,34 @@ protected:
 	void K2_OnPawnAvatarSet();
 
 protected:
+	/** Per-activation initialization before group finalization/camera/body. Receives only the
+	 * already-issued original; may end that original, after which no body may run. */
+	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original);
+
+	/** Business body at the original parent activation position. Default calls native Super
+	 * once, preserving BP activation. Original is authenticated existing native history;
+	 * this hook neither issues identity nor authorizes execution from Spec/key. */
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData);
+
 	/** Once per authenticated original termination, before native End. Overrides call Super.
-	 * Task playback execution remains owned by the task. Legacy End overrides still require migration. */
+	 * Task playback execution remains owned by the task; this hook owns only original resources. */
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context);
+
+#if WITH_DEV_AUTOMATION_TESTS
+	/** Synchronous read-only sampling of this invocation. No lifecycle reentry/state mutation;
+	 * borrowed parameters must not escape. Return is not a native Try/full-exit witness. */
+	virtual void ObserveAbilityActivationEntryForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		const FGameplayEventData* TriggerEventData);
+	virtual void ObserveAbilityActivationReturnForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		const FGameplayEventData* TriggerEventData);
+	virtual void ObserveAbilityEndEntryForTest(FGameplayAbilitySpecHandle Handle,
+		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+		bool bReplicateEndAbility, bool bWasCancelled);
+#endif
 
 	/** 何时尝试激活。默认输入触发。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Ability Activation")
@@ -574,18 +599,18 @@ private:
 	/** Provenance only: GAS remains the sole activation/ending authority. */
 	FGGYGOAbilityActivationHandle IssueControlledActivation(UGGYGOAbilitySystemComponent* OriginalASC,
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		EGGYGOAbilityActivationRequestReason& OutReason);
+		bool bHasControlledTryBoundary, EGGYGOAbilityActivationRequestReason& OutReason);
 	void RetireControlledActivation();
 	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle);
 	FGGYGOAbilityActivationHandle ValidateCurrentControlledActivation(bool bRequireActive = true,
 		bool bRequireSpec = true) const;
 
 	struct FOriginalTerminationRecord;
-	/** Actual base End stack span; full virtual return is witnessed by the original dispatcher. */
+	/** Actual final End stack span; owns a dispatch only when this entry created the record. */
 	class FScopedControlledActivationEnd
 	{
 	public:
-		explicit FScopedControlledActivationEnd(UGGYGOGameplayAbility* InAbility);
+		explicit FScopedControlledActivationEnd(UGGYGOGameplayAbility* InAbility, bool bInOwnsDispatch = false);
 		~FScopedControlledActivationEnd();
 		FScopedControlledActivationEnd(const FScopedControlledActivationEnd&) = delete;
 		FScopedControlledActivationEnd& operator=(const FScopedControlledActivationEnd&) = delete;
@@ -595,8 +620,28 @@ private:
 		FScopedControlledActivationEnd* Previous = nullptr;
 		FGGYGOAbilityActivationHandle Original;
 		TSharedPtr<FOriginalTerminationRecord> Termination;
+		bool bOwnsDispatch = false;
 		friend class UGGYGOGameplayAbility;
 	};
+
+	/** Stack-local final Activate span, not another activation state. A termination begun
+	 * inside Initialize/body retains this exact return obligation, including raw entries. */
+	class FScopedAbilityActivationCall
+	{
+	public:
+		explicit FScopedAbilityActivationCall(UGGYGOGameplayAbility* InAbility,
+			const FGGYGOAbilityActivationHandle& InOriginal);
+		~FScopedAbilityActivationCall();
+		FScopedAbilityActivationCall(const FScopedAbilityActivationCall&) = delete;
+		FScopedAbilityActivationCall& operator=(const FScopedAbilityActivationCall&) = delete;
+	private:
+		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+		FScopedAbilityActivationCall* Previous = nullptr;
+		FGGYGOAbilityActivationHandle Original;
+		TSharedPtr<FOriginalTerminationRecord> Termination;
+		friend class UGGYGOGameplayAbility;
+	};
+	FScopedAbilityActivationCall* AbilityActivationCall = nullptr;
 
 	bool IsControlledActivationTerminationBusy() const;
 	uint64 LastControlledActivationSerial = 0;
@@ -638,7 +683,8 @@ private:
 	};
 	TSharedPtr<FOriginalTerminationRecord> BeginOriginalTermination(
 		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult);
+		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult,
+		bool bAllowNativeRemoval = false);
 	void ResumeOriginalTermination(TSharedPtr<FOriginalTerminationRecord> Record);
 	void DeferOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record);
 	EGGYGOAbilityTerminationReason CheckOriginalTerminationSource(const FOriginalTerminationRecord& Record) const;

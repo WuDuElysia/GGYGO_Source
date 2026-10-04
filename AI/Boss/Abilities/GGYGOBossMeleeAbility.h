@@ -2,7 +2,6 @@
 #pragma once
 
 #include "AbilitySystem/Abilities/GGYGOCombatActionAbility.h"
-#include "Components/SkinnedMeshComponent.h"
 
 #include "GGYGOBossMeleeAbility.generated.h"
 
@@ -14,6 +13,7 @@ class USkeletalMeshComponent;
 class UGGYGOActionMotionProfile;
 class UGGYGOCharacterMovementComponent;
 struct FHitResult;
+struct FGGYGOMeleeTraceWindowHandle;
 
 /**
  * 一条完整的近战执行链：Montage Event 开/关 Trace，命中后应用 Damage GE 并发 Cue。
@@ -32,29 +32,15 @@ public:
 #endif
 
 protected:
-	virtual void ActivateAbility(const FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo,
-		const FGameplayAbilityActivationInfo ActivationInfo,
-		const FGameplayEventData* TriggerEventData) override;
-	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo,
-		const FGameplayAbilityActivationInfo ActivationInfo,
-		bool bReplicateEndAbility, bool bWasCancelled) override;
-
-	UFUNCTION()
-	void HandleMontageCompleted(FGameplayTag EventTag, FGameplayEventData EventData);
-
-	UFUNCTION()
-	void HandleMontageInterrupted(FGameplayTag EventTag, FGameplayEventData EventData);
-	UFUNCTION()
-	void HandleMontageBlendOut(FGameplayTag EventTag, FGameplayEventData EventData);
-	void HandleMontageTimeout();
-
-	UFUNCTION()
-	void HandleMontageEvent(FGameplayTag EventTag, FGameplayEventData EventData);
-
-	UFUNCTION()
-	void HandleMeleeHit(AActor* HitActor, const FHitResult& HitResult);
+	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original) override;
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
+	/** Prepare this original batch's actual Mesh restoration resource; no lifecycle state is issued. */
+	bool PrepareOriginalMeleeMesh(const FGGYGOAbilityActivationHandle& Original, USkeletalMeshComponent* Mesh);
+	bool HasOriginalMeleeMeshResource() const;
+	FGGYGOAbilityActivationHandle GetOriginalMeleeResourceActivation() const;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee")
 	TObjectPtr<UAnimMontage> AttackMontage;
@@ -89,21 +75,32 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee", meta = (Categories = "GameplayCue.Hit"))
 	FGameplayTag HitCueTag;
 
-	UPROPERTY(Transient)
-	TObjectPtr<UGGYGOMeleeTraceComponent> ActiveTraceComponent;
+private:
+	struct FOriginalMeleeResources;
+	// Resources and issued provenance only; GA/ASC remain the lifecycle authorities.
+	TSharedPtr<FOriginalMeleeResources> OriginalResources;
+	enum class EMontageCallback : uint8 { Completed, Interrupted, BlendOut, Event };
 
-	UPROPERTY(Transient)
-	TObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> MontageTask;
-
-	UPROPERTY(Transient)
-	TObjectPtr<USkeletalMeshComponent> ActiveMesh;
-	UPROPERTY(Transient)
-	TObjectPtr<UGGYGOCharacterMovementComponent> ActiveMotionMovement;
-	int32 ActionMotionHandle = INDEX_NONE;
-	FTimerHandle MontageTimeoutHandle;
-	EVisibilityBasedAnimTickOption SavedMeshTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
-	bool bSavedUpdateRateOptimizations = false;
-	bool bChangedMeshTick = false;
-	bool bCleaningUp = false;
-	bool bBlendingOut = false;
+	bool IsOriginalResourcesCurrent(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original) const;
+	bool AreOriginalReceiversCurrent(const TSharedPtr<FOriginalMeleeResources>& Resources) const;
+	bool IsOriginalTaskCurrent(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original,
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask) const;
+	void RequestOriginalTermination(const FGGYGOAbilityActivationHandle& Original,
+		bool bCancel, bool bWasCancelled);
+	void FailOriginalAction(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original, const TCHAR* Stage, const FString& Reason);
+	void CloseOriginalTraceWindow(const TSharedPtr<FOriginalMeleeResources>& Resources);
+	void HandleOriginalMontageCallback(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original,
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask,
+		EMontageCallback Kind, FGameplayTag EventTag, const FGameplayEventData& EventData);
+	void HandleOriginalMontageTimeout(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original,
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask);
+	void HandleOriginalMeleeHit(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original,
+		const TWeakObjectPtr<UGGYGOMeleeTraceComponent>& OriginalTrace,
+		const FGGYGOMeleeTraceWindowHandle& Window, AActor* HitActor, const FHitResult& HitResult);
 };

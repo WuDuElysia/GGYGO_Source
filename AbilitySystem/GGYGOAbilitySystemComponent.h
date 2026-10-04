@@ -380,7 +380,7 @@ public:
 	 */
 	bool CanActivateAbilityByHandle(FGameplayAbilitySpecHandle Handle, FGameplayTagContainer& OutFailureTags) const;
 
-	// ===== T1b controlled Try; T1c Can bridge/completion publisher remain pending =====
+	// ===== Controlled native Try boundary and original termination completion =====
 
 	/**
 	 * Project entry covering one complete native Try call; not an override/interceptor of
@@ -762,6 +762,8 @@ private:
 	uint64 BeginControlledAbilityActivationEvaluation(const UGGYGOGameplayAbility* Ability,
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo);
 	bool CompleteControlledAbilityActivationEvaluation(uint64 EvaluationSerial, bool bNativeRulesPassed);
+	/** Native notification issues GA history regardless of a controlled Try; only an exact
+	 * admitted Try receives an outer-return witness. Raw history never fabricates that witness. */
 	void ObserveControlledAbilityActivation(FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability);
 	void RegisterOriginalTerminationTryDependencies(
 		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record);

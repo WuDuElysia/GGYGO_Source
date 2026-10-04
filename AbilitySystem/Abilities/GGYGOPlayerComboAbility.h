@@ -3,6 +3,7 @@
 
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "AbilitySystem/Abilities/GGYGOComboTypes.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Components/SkinnedMeshComponent.h"
 #include "GGYGOPlayerComboAbility.generated.h"
 
@@ -10,6 +11,7 @@ class UGGYGOAbilityTask_PlayMontageAndWaitForEvent;
 class UGGYGOAbilityTask_WaitComboInput;
 class UGGYGOMeleeTraceComponent;
 class USkeletalMeshComponent;
+class UWorld;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOPlayerComboLifecycleFixture;
 
@@ -39,33 +41,33 @@ protected:
 		const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags,
 		FGameplayTagContainer* OptionalRelevantTags) const override;
 	virtual void NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const override;
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original) override;
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
-	virtual void EndAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	bool IsStepPlayable(int32 Index) const;
-	bool StartStep(int32 Index, float Position = 0.0f);
-	void ReleaseMontageTask();
-	void TryAdvanceCombo();
-	void RejectRequest(int32 RequestId);
-	void SendAuthoritativeStep(int32 RequestId, bool bAccepted);
-	void HandleWatchdog(uint64 ExpectedActivationGeneration, uint64 ExpectedStepToken);
-	void HandleDeferredEnd(uint64 ExpectedGeneration, FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		bool bReplicateEndAbility, bool bWasCancelled);
-	bool IsActivationCurrent(uint64 ExpectedGeneration) const;
-	UFUNCTION()
-	void HandleInputPressed(int32 SourceStep, int32 RequestId);
-	UFUNCTION()
-	void HandleMontageEvent(FGameplayTag EventTag, FGameplayEventData EventData);
-	UFUNCTION()
-	void HandleMontageCompleted(FGameplayTag EventTag, FGameplayEventData EventData);
-	UFUNCTION()
-	void HandleMontageInterrupted(FGameplayTag EventTag, FGameplayEventData EventData);
-	UFUNCTION()
-	void HandleMontageBlendOut(FGameplayTag EventTag, FGameplayEventData EventData);
-	UFUNCTION()
-	void HandleMeleeHit(AActor* HitActor, const FHitResult& HitResult);
+	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f);
+	void ReleaseMontageTask(const FGGYGOAbilityActivationHandle& Original);
+	void OpenTraceWindow(const FGGYGOAbilityActivationHandle& Original);
+	void ReleaseTraceWindow(const FGGYGOAbilityActivationHandle& Original);
+	void TryAdvanceCombo(const FGGYGOAbilityActivationHandle& Original);
+	void RejectRequest(const FGGYGOAbilityActivationHandle& Original, int32 RequestId);
+	void SendAuthoritativeStep(const FGGYGOAbilityActivationHandle& Original, int32 RequestId, bool bAccepted);
+	void HandleWatchdog(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken);
+	bool IsActivationCurrent(const FGGYGOAbilityActivationHandle& Original) const;
+	bool IsStepCurrent(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
+		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ExpectedTask) const;
+	void HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId);
+	void HandleMontageEvent(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMontageCompleted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMontageBlendOut(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMeleeHit(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
+		const FGGYGOMeleeTraceWindowHandle& OriginalWindow, AActor* HitActor, const FHitResult& HitResult);
+	void CorrectPredictedStepForActivation(const FGGYGOAbilityActivationHandle& Original,
+		int32 Revision, int32 RequestId, int32 ServerStep, float Position,
+		bool bWindowOpen, bool bWindowClosed, bool bAccepted);
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	TArray<FGGYGOComboStep> ComboSteps;
@@ -75,7 +77,7 @@ protected:
 	TSubclassOf<UGameplayEffect> DamageEffect;
 	/** 仅DamageEffect为空时选择共享预载GE；默认false为明确无GE、仍播放命中Cue的模式。
 	 *  非空DamageEffect始终优先；必需GE在准入或提交前不可用/非法时拒绝激活。
-	 *  命中期间的依赖失败传播仍待后继迁移。 */
+	 *  命中期间必需GE无效或载荷构造失败时，中止原激活且不发送该命中的Cue。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	bool bUseSharedDamageEffectWhenUnset = false;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (Categories = "GameplayCue.Hit"))
@@ -83,8 +85,9 @@ protected:
 
 private:
 	friend struct FGGYGOPlayerComboLifecycleFixture;
-	/** 仅验证本次选择的GE依赖，不加载、重试、缓存或记录激活状态。 */
-	bool ValidateDamageEffectDependency(FString& OutError) const;
+	/** 验证本次选择的GE依赖，可输出同一次解析的成功结果；成功时空结果仅用于显式无GE模式。
+	 *  不加载、重试、缓存或记录激活状态；失败清空输出。 */
+	bool ValidateDamageEffectDependency(FString& OutError, TSubclassOf<UGameplayEffect>* OutResolvedEffect = nullptr) const;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> MontageTask;
@@ -94,16 +97,21 @@ private:
 	TObjectPtr<UGGYGOMeleeTraceComponent> TraceComponent;
 	UPROPERTY(Transient)
 	TObjectPtr<USkeletalMeshComponent> ActiveMesh;
+	/** Copies of issuer-owned identity and our resources, never another activation/end state machine. */
+	FGGYGOAbilityActivationHandle ResourceActivation;
+	FDelegateHandle MontageCallbackRegistration;
+	FDelegateHandle InputCallbackRegistration;
+	FGGYGOMeleeTraceWindowHandle TraceWindow;
+	FDelegateHandle TraceHitSubscription;
+	TWeakObjectPtr<UWorld> OriginalWorld;
 	FGGYGOComboWindowState Window;
 	FTimerHandle WatchdogHandle;
 	int32 CurrentStep = INDEX_NONE;
 	int32 LastRequestId = 0;
 	int32 StepSyncRevision = 0;
-	bool bCleaningUp = false;
 	bool bChangedMeshTick = false;
+	bool bAddedMeshPrerequisite = false;
 	bool bSavedUpdateRateOptimizations = false;
-	uint64 LocalActivationGeneration = 0;
-	uint64 EndRequestedActivationGeneration = 0;
 	uint64 StepTokenCounter = 0;
 	uint64 CurrentStepToken = 0;
 	EVisibilityBasedAnimTickOption SavedMeshTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;

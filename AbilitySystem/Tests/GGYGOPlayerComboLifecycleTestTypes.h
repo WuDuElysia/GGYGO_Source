@@ -2,6 +2,7 @@
 
 #include "AbilitySystem/Abilities/GGYGOPlayerComboAbility.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
+#include "GameplayEffect.h"
 
 #include "GGYGOPlayerComboLifecycleTestTypes.generated.h"
 
@@ -27,11 +28,30 @@ public:
 	void FinishForTest();
 	void UsePredictingActivationModeForTest();
 	int32 GetActiveTaskCountForTest() const { return ActiveTasks.Num(); }
+	void ConfigureExclusiveSelfPolicyForTest() { SelfPolicy = EGGYGOAbilitySelfPolicy::Exclusive; }
+	void SetCanBeCanceledForTest(bool bCanBeCanceled) { SetCanBeCanceled(bCanBeCanceled); }
+	void InvalidateNextRequiredSpecForTest() { bInvalidateNextRequiredSpec = true; }
+	int32 GetSpecExtensionCountForTest() const { return SpecExtensionCount; }
+	int32 GetInvalidatedSpecCountForTest() const { return InvalidatedSpecCount; }
 
 	virtual void ProcessEvent(UFunction* Function, void* Parms) override;
 
+protected:
+	virtual void ApplyAbilityTagsToGameplayEffectSpec(FGameplayEffectSpec& Spec,
+		FGameplayAbilitySpec* AbilitySpec) const override;
+
 private:
 	TFunction<void()> K2ActivateAction;
+	mutable bool bInvalidateNextRequiredSpec = false;
+	mutable int32 SpecExtensionCount = 0;
+	mutable int32 InvalidatedSpecCount = 0;
+};
+
+/** A real invalid required-class selection, assigned only after successful fixture activation. */
+UCLASS(Abstract, Transient)
+class UGGYGOPlayerComboLifecycleInvalidDamageEffect : public UGameplayEffect
+{
+	GENERATED_BODY()
 };
 
 /** Executes a test callback only after Unreal's real Montage_PlayInternal has run. */

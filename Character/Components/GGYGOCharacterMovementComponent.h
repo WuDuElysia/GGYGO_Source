@@ -295,6 +295,20 @@ public:
 	/** 原 SetMoveFor 的同步身份；PostUpdate/回放/响应不得补写。不是来源认证。 */
 	FGGYGOMovementOwnerSyncScopeId SavedMovementOwnerSyncScope;
 	uint64 SavedMovementOwnerGeneration = 0;
+
+private:
+	/** Original SetMoveFor applicability; a replay snapshot, never request authority or physical Held. */
+	struct FMovementInputRequestCapture
+	{
+		FGGYGOMovementInputConsumerBindingId Binding;
+		FGGYGOMovementInputRequestIdentity Request;
+		uint64 ExecutionRequestSerial = 0;
+		uint8 Admission = 0;
+		bool bExecutionEligible = false;
+	};
+	FMovementInputRequestCapture SavedMovementInputRequest;
+	friend class UGGYGOCharacterMovementComponent;
+	friend struct FCharacterNetworkMoveData_GGYGO;
 };
 
 /** 客户端预测数据。唯一职责是让 CMC 分配出我们自己的 SavedMove 类型。 */
@@ -308,7 +322,7 @@ public:
 	virtual FSavedMovePtr AllocateNewMove() override;
 };
 
-/** 来源值仅运输、尚无服务端准入；Profile、曲线和速度仍由服务端自己的 MovementSet 解析。 */
+/** 原来源值与Owner元数据运输；服务端经M2原生receipt消费，Profile/曲线/速度仍由自身MovementSet解析。 */
 struct FCharacterNetworkMoveData_GGYGO : public FCharacterNetworkMoveData
 {
 	/** 固定 9/137 位扩展，原生 owning actor RPC 提供实际 PC/Connection 身份。 */
@@ -428,7 +442,7 @@ public:
 		FGGYGOMovementOwnerSyncDelegate Observer, FGGYGOMovementOwnerSyncObserverId& OutObserver, FString& OutError);
 	bool UnsubscribeMovementOwnerSync(const FGGYGOMovementOwnerSyncObserverId& OriginalObserver,
 		FName Reason, FString& OutError);
-	/** M3 待实现，M2 无生产调用；Ready 不能自行重发 Started 或执行编号。 */
+	/** M3a 原首次 Waiting 的一次准入；调用方先核对 Source 真实 Held，Ready 不重发 Started／执行号。 */
 	EGGYGOMovementInitialRequestAdmissionResult TryAdmitInitialMovementInputRequest(
 		const FGGYGOMovementOwnerSyncObserverId& OriginalObserver,
 		const FGGYGOMovementInputConsumerBindingId& OriginalBinding,
@@ -467,6 +481,7 @@ public:
 	bool IsForceWalkRequested() const { return bForceWalkRequested; }
 
 	/** 已接受的移动参数；未绑定或绑定被拒绝时为 nullptr。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	const UGGYGOMovementSet* GetMovementSet() const { return MovementSet; }
 
 	/** 本帧解算出的步态。动画层读它决定走跑混合。 */
@@ -648,6 +663,7 @@ private:
 	struct FMovementOwnerSyncNativeMove
 	{
 		const FCharacterNetworkMoveData_GGYGO* Move = nullptr;
+		FGGYGOMovementInputSourceCheckpoint OriginalSourceCheckpoint;
 		uint64 OriginalNonce = 0;
 		uint64 OriginalClientGeneration = 0;
 		float OriginalTimeStamp = 0.0f;
@@ -656,9 +672,24 @@ private:
 		bool bOriginalNewMove = false;
 		FMovementOwnerSyncNativeReceipt Receipt;
 		bool bEnteredNativeSimulation = false;
+		/** Applies to this original native interval only; never changes request admission. */
+		bool bSourceExecutionApplicable = false;
 	};
+	/** Borrowed authenticated original source of the sole CMC request; no Producer/Binding is minted. */
+	struct FMovementInputNativeSource
+	{
+		FMovementOwnerSyncNativeReceipt Receipt;
+		FGGYGOMovementOwnerSyncScopeId OwnerScope;
+		FGGYGOMovementInputSourceCheckpoint StartCheckpoint;
+		uint64 ExecutionRequestSerial = 0;
+	};
+	TSharedPtr<const FMovementInputNativeSource> MovementInputNativeSource;
+	/** Consume authenticated original Source values into the sole CMC request; no physical observation. */
+	bool ConsumeNativeMovementInputCheckpoint(const FMovementOwnerSyncNativeMove& OriginalMove);
 	UFUNCTION()
 	void HandleMovementOwnerControllerChanged(APawn* Pawn, AController* OldController, AController* NewController);
+	/** One M2 lifetime, initialized by native BeginPlay or the first live Source binding. */
+	bool EnsureMovementOwnerSyncLifetime();
 	void RefreshMovementOwnerSyncContext();
 	void OpenMovementOwnerSyncScope(APawn* Pawn, APlayerController* Controller, UNetConnection* Connection,
 		UNetDriver* Driver, bool bInitialLocalScope, uint64 ExpectedServerGeneration = 0);
@@ -691,7 +722,7 @@ private:
 
 	enum class ELocomotionRequestAdmission : uint8
 	{
-		None, Admitted, Released, Revoked, Failed
+		None, Admitted, Released, Revoked, Failed, Waiting
 	};
 
 	bool IsMovementInputBindingCurrent(const FGGYGOMovementInputConsumerBindingId& Binding) const;
@@ -768,6 +799,15 @@ private:
 	bool bLocomotionCurveReplayRejected = false;
 	TOptional<FLocomotionUpdateCandidate> LocomotionCurveReplayEntryState;
 	uint64 LocomotionCurveReplayEntryRequestSerial = 0;
+	/** Bounded original move capture, installed before native Prep and discarded at replay return. */
+	struct FMovementInputReplayCapture
+	{
+		FSavedMove_GGYGO::FMovementInputRequestCapture Request;
+		FGGYGOMovementOwnerSyncScopeId OwnerScope;
+		uint64 OwnerGeneration = 0;
+		FGGYGOMovementInputSourceCheckpoint Checkpoint;
+	};
+	TOptional<FMovementInputReplayCapture> MovementInputReplayCapture;
 
 	friend struct FGGYGOCurveRootMotionMoveInput;
 	friend struct FGGYGOLocomotionPreparedState;
@@ -784,10 +824,12 @@ private:
 	bool bMovementInputNeutralConsumed = false;
 	bool bMovementInputRequestOpen = false;
 	FGGYGOMovementInputFact LastMovementInputFact;
-	/** Derived original-fact transport values; never read by local admission or execution. */
+	/** Derived original-fact values; local admission never reads them, native consumption validates them before use. */
 	FGGYGOMovementInputSourceCheckpoint MovementInputSourceCheckpoint;
 	uint64 LastMovementInputRequestSerial = 0;
 	FGGYGOMovementInputRequestIdentity MovementInputRequest;
+	/** Captured by the original Started only; borrows M2 identity, never issues an owner generation or Held fact. */
+	FGGYGOMovementOwnerSyncScopeId MovementInputRequestOwnerScope;
 	uint64 LocomotionRequestSerial = 0;
 	ELocomotionRequestAdmission LocomotionRequestAdmission = ELocomotionRequestAdmission::None;
 	FString LocomotionRequestFailureReason;

@@ -166,6 +166,9 @@ struct FGGYGOHeroMovementInputScope
 	TWeakObjectPtr<UGGYGOHeroMovementMappingObserver> Observer;
 	FGGYGOMovementInputSessionIdentity Session;
 	FGGYGOMovementInputConsumerBindingId Binding;
+	FGGYGOMovementOwnerSyncObserverId OwnerSyncObserver;
+	/** Read-only original CMC notice; never Held or movement admission state. */
+	FGGYGOMovementOwnerSyncNotice OwnerSyncNotice;
 	TSet<FName> ReportedReasons;
 	bool bRetired = false;
 };
@@ -208,6 +211,26 @@ namespace GGYGOHeroMovementInput
 		}
 	}
 
+	static void ReleaseOwnerSyncSubscription(const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope, FName Reason)
+	{
+		if (!Scope.IsValid()) { return; }
+		const FGGYGOMovementOwnerSyncObserverId OriginalObserver = Scope->OwnerSyncObserver;
+		Scope->OwnerSyncObserver = {};
+		Scope->OwnerSyncNotice = {};
+		if (UGGYGOCharacterMovementComponent* Consumer = Scope->Consumer.Get())
+		{
+			if (OriginalObserver.IsSet())
+			{
+				FString Error;
+				if (!Consumer->UnsubscribeMovementOwnerSync(OriginalObserver, Reason, Error))
+				{
+					UE_LOG(LogGGYGOAbilitySystem, Verbose, TEXT("[Input/Hero Movement] Original owner-sync cleanup: %s"), *Error);
+				}
+			}
+		}
+		// No writes after precise original unsubscribe; capture destruction may reenter.
+	}
+
 	static void ReleaseResources(const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope, FName Reason)
 	{
 		if (!Scope.IsValid()) { return; }
@@ -215,6 +238,7 @@ namespace GGYGOHeroMovementInput
 		const FGGYGOMovementInputConsumerBindingId OriginalBinding = Scope->Binding;
 		Scope->Session = {};
 		Scope->Binding = {};
+		ReleaseOwnerSyncSubscription(Scope, Reason);
 		ReleaseResources(Scope->Source, OriginalSession, Scope->Consumer, OriginalBinding, Reason);
 		// No writes after Source/CMC cleanup; a reentrant successor retains its slots.
 	}
@@ -997,15 +1021,153 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 	}
 	Hero = OriginalHero.Get();
 	if (!Hero || !Hero->IsMovementInputScopeCurrent(OriginalScope) || OriginalScope->Session != Session
-		|| OriginalScope->Binding.ConsumerBindingSerial != 0)
+		|| OriginalScope->Binding.ConsumerBindingSerial != 0
+		|| Consumer->GetMovementInputBindingSerial() != Binding.ConsumerBindingSerial)
 	{
 		GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("BindInterrupted"));
 		return;
 	}
 	OriginalScope->Binding = Binding; // Both original resources precede Attach's synchronous replay.
 	const TWeakPtr<FGGYGOHeroMovementInputScope> WeakScope(OriginalScope);
+	const auto IsOriginalAssemblyCurrent = [OriginalHero, WeakScope, Session, Binding]()
+	{
+		const TSharedPtr<FGGYGOHeroMovementInputScope> Scope = WeakScope.Pin();
+		const UGGYGOHeroComponent* CurrentHero = OriginalHero.Get();
+		return CurrentHero && CurrentHero->IsMovementInputScopeCurrent(Scope)
+			&& Scope->Session == Session && Scope->Binding == Binding
+			&& Scope->Consumer->GetMovementInputBindingSerial() == Binding.ConsumerBindingSerial;
+	};
+	FGGYGOMovementOwnerSyncScopeId OwnerScope;
+	if (!Consumer->GetMovementOwnerSyncScope(OwnerScope, Error)
+		|| !OwnerScope.IsSet() || !OwnerScope.GetConsumer().HasSameIndexAndSerialNumber(Consumer)
+		|| !OwnerScope.GetOriginalPawn().HasSameIndexAndSerialNumber(OriginalScope->Pawn)
+		|| OwnerScope.GetOriginalPlayerController().Get() != OriginalScope->Pawn->GetController())
+	{
+		if (IsOriginalAssemblyCurrent())
+		{
+			GGYGOHeroMovementInput::Report(OriginalScope, TEXT("OwnerSyncScopeUnavailable"),
+				Error.IsEmpty() ? TEXT("Native owner scope does not identify this original Pawn/CMC/Controller.") : Error);
+			GGYGOHeroMovementInput::Retire(OriginalScope, TEXT("OwnerSyncScopeUnavailable"));
+		}
+		else
+		{
+			GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("OwnerSyncScopeInterrupted"));
+		}
+		return;
+	}
+	if (!IsOriginalAssemblyCurrent())
+	{
+		GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("OwnerSyncScopeInterrupted"));
+		return;
+	}
+	const auto TryAdmitHeldRequest = [WeakScope, Source, Consumer, Session, Binding, IsOriginalAssemblyCurrent]
+		(const FGGYGOMovementInputRequestIdentity* ExpectedRequest)
+	{
+		const TSharedPtr<FGGYGOHeroMovementInputScope> Scope = WeakScope.Pin();
+		if (!IsOriginalAssemblyCurrent() || !Scope->OwnerSyncObserver.IsSet()
+			|| !Scope->OwnerSyncNotice.IsSet()
+			|| Scope->OwnerSyncNotice.GetState() != EGGYGOMovementOwnerSyncState::Ready
+			|| !Scope->OwnerSyncNotice.IsInitialSynchronizationEligible()) { return; }
+		const FGGYGOMovementOwnerSyncObserverId OriginalObserver = Scope->OwnerSyncObserver;
+		const FGGYGOMovementOwnerSyncNotice OriginalReady = Scope->OwnerSyncNotice;
+		FGGYGOMovementInputRequestIdentity Request;
+		FString AdmissionError;
+		// False includes ordinary real release/no request. It never authorizes admission.
+		if (!Source->GetMovementInputRequest(Session, Request, AdmissionError)) { return; }
+		if (!IsOriginalAssemblyCurrent()
+			|| Scope->OwnerSyncObserver.GetScope() != OriginalObserver.GetScope()
+			|| Scope->OwnerSyncObserver.GetObserverSerial() != OriginalObserver.GetObserverSerial()
+			|| Scope->OwnerSyncNotice.GetNoticeSerial() != OriginalReady.GetNoticeSerial()) { return; }
+		if (Request.Session != Session || Request.RequestSerial == 0)
+		{
+			GGYGOHeroMovementInput::Report(Scope, TEXT("InitialRequestOriginMismatch"),
+				TEXT("Source Held lookup did not identify the original session's allocated request."));
+			GGYGOHeroMovementInput::Retire(Scope, TEXT("InitialRequestOriginMismatch"));
+			return;
+		}
+		// A Started callback may have released/reentered before Consume returned.
+		if (ExpectedRequest && Request != *ExpectedRequest) { return; }
+		const EGGYGOMovementInitialRequestAdmissionResult Admission = Consumer->TryAdmitInitialMovementInputRequest(
+			OriginalObserver, Binding, Request, OriginalReady, AdmissionError);
+		if (!IsOriginalAssemblyCurrent()
+			|| Scope->OwnerSyncObserver.GetScope() != OriginalObserver.GetScope()
+			|| Scope->OwnerSyncObserver.GetObserverSerial() != OriginalObserver.GetObserverSerial()
+			|| Scope->OwnerSyncNotice.GetNoticeSerial() != OriginalReady.GetNoticeSerial()) { return; }
+		if (Admission == EGGYGOMovementInitialRequestAdmissionResult::ExecutionFailed)
+		{
+			GGYGOHeroMovementInput::Report(Scope, TEXT("InitialRequestExecutionFailed"), AdmissionError);
+			// CMC retains the same FAILED request and requires real Release then Press.
+		}
+		else if (Admission == EGGYGOMovementInitialRequestAdmissionResult::Stale
+			|| Admission == EGGYGOMovementInitialRequestAdmissionResult::Rejected)
+		{
+			GGYGOHeroMovementInput::Report(Scope, TEXT("InitialRequestAdmissionRejected"), AdmissionError);
+			GGYGOHeroMovementInput::Retire(Scope, TEXT("InitialRequestAdmissionRejected"));
+		}
+		// Admitted/AlreadyAdmitted do not write a second admission state or replay Started.
+	};
+	const FGGYGOMovementOwnerSyncDelegate OwnerSyncReceiver = FGGYGOMovementOwnerSyncDelegate::CreateLambda(
+		[WeakScope, Session, Binding, OwnerScope, IsOriginalAssemblyCurrent, TryAdmitHeldRequest]
+		(const FGGYGOMovementOwnerSyncObserverId& ReceivedObserver, const FGGYGOMovementOwnerSyncNotice& Notice)
+		{
+			const TSharedPtr<FGGYGOHeroMovementInputScope> Scope = WeakScope.Pin();
+			if (!Scope.IsValid() || Scope->bRetired || Scope->Session != Session || Scope->Binding != Binding) { return; }
+			if (!ReceivedObserver.IsSet() || !Scope->OwnerSyncObserver.IsSet()
+				|| ReceivedObserver.GetScope() != OwnerScope || Scope->OwnerSyncObserver.GetScope() != OwnerScope
+				|| ReceivedObserver.GetObserverSerial() != Scope->OwnerSyncObserver.GetObserverSerial()
+				|| !Notice.IsSet() || Notice.GetScope() != OwnerScope)
+			{
+				GGYGOHeroMovementInput::Report(Scope, TEXT("OwnerSyncNoticeOriginMismatch"),
+					TEXT("Owner-sync callback did not match its original subscription and native owner scope."));
+				GGYGOHeroMovementInput::Retire(Scope, TEXT("OwnerSyncNoticeOriginMismatch"));
+				return;
+			}
+			// Terminal ownership is matched before live Pawn/Controller checks; they may already be gone.
+			if (Notice.GetState() == EGGYGOMovementOwnerSyncState::Invalidated)
+			{
+				GGYGOHeroMovementInput::Report(Scope, TEXT("OwnerSyncInvalidated"), Notice.GetReason().ToString());
+				// Return this assembly; a later real mapping rebuild still belongs to the outer input lifecycle.
+				GGYGOHeroMovementInput::ReleaseResources(Scope, TEXT("OwnerSyncInvalidated"));
+				return;
+			}
+			if (!IsOriginalAssemblyCurrent())
+			{
+				GGYGOHeroMovementInput::Retire(Scope, TEXT("OwnerSyncInputUnavailable"));
+				return;
+			}
+			if (Scope->OwnerSyncNotice.IsSet() && Notice.GetNoticeSerial() <= Scope->OwnerSyncNotice.GetNoticeSerial()) { return; }
+			Scope->OwnerSyncNotice = Notice;
+			if (Notice.GetState() == EGGYGOMovementOwnerSyncState::Ready) { TryAdmitHeldRequest(nullptr); }
+		});
+	// Direct member output is installed before synchronous replay; never save it after return.
+	if (!Consumer->SubscribeMovementOwnerSync(OwnerScope, OwnerSyncReceiver, OriginalScope->OwnerSyncObserver, Error))
+	{
+		if (IsOriginalAssemblyCurrent())
+		{
+			GGYGOHeroMovementInput::Report(OriginalScope, TEXT("OwnerSyncSubscribeRejected"), Error);
+			GGYGOHeroMovementInput::Retire(OriginalScope, TEXT("OwnerSyncSubscribeRejected"));
+		}
+		else
+		{
+			GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("OwnerSyncSubscribeInterrupted"));
+		}
+		return;
+	}
+	if (!IsOriginalAssemblyCurrent() || !OriginalScope->OwnerSyncObserver.IsSet()
+		|| OriginalScope->OwnerSyncObserver.GetScope() != OwnerScope)
+	{
+		if (OriginalScope->Session == Session && OriginalScope->Binding == Binding)
+		{
+			GGYGOHeroMovementInput::ReleaseResources(OriginalScope, TEXT("OwnerSyncReplayInterrupted"));
+		}
+		else
+		{
+			GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("OwnerSyncReplayInterrupted"));
+		}
+		return;
+	}
 	const FGGYGOMovementInputFactDelegate Receiver = FGGYGOMovementInputFactDelegate::CreateLambda(
-		[Consumer, Binding, Session, WeakScope](const FGGYGOMovementInputConsumerBindingId& ReceivedBinding,
+		[Consumer, Binding, Session, WeakScope, TryAdmitHeldRequest](const FGGYGOMovementInputConsumerBindingId& ReceivedBinding,
 			const FGGYGOMovementInputFact& Fact)
 		{
 			const TSharedPtr<FGGYGOHeroMovementInputScope> Scope = WeakScope.Pin();
@@ -1037,11 +1199,24 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 				{
 					Scope->Session = {};
 					Scope->Binding = {};
+					GGYGOHeroMovementInput::ReleaseOwnerSyncSubscription(Scope, Fact.Reason);
 				}
 				else if (Result == EGGYGOMovementInputConsumeResult::Rejected || Result == EGGYGOMovementInputConsumeResult::Stale)
 				{
 					GGYGOHeroMovementInput::Report(Scope, TEXT("FactConsumeRejected"), ConsumeError);
 					GGYGOHeroMovementInput::Retire(Scope, TEXT("FactConsumeRejected"));
+				}
+				else if (Result == EGGYGOMovementInputConsumeResult::Recorded
+					&& Fact.Kind == EGGYGOMovementInputFactKind::RequestStarted)
+				{
+					if (!ConsumeError.IsEmpty())
+					{
+						GGYGOHeroMovementInput::Report(Scope, TEXT("StartedExecutionFailed"), ConsumeError);
+					}
+					else
+					{
+						TryAdmitHeldRequest(&Fact.Request);
+					}
 				}
 			}
 		});

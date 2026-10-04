@@ -3,15 +3,17 @@
 #include "AI/Boss/Abilities/GGYGOBossMeleeAbility.h"
 #include "GGYGOBossMeleeLifecycleTestAbility.generated.h"
 
-/** 仅隔离激活准备，使用真实 GAS 激活/结束与生产 EndAbility 验证同步重入。 */
+/** 仅隔离 Montage 业务，使用原请求及生产 Mesh/Cleanup hook 验证原结束同步重入。 */
 UCLASS(Transient)
 class UGGYGOBossMeleeLifecycleTestAbility : public UGGYGOBossMeleeAbility
 {
 	GENERATED_BODY()
 public:
-	void FinishForTest();
-	bool HasActiveMeshForTest() const { return ActiveMesh != nullptr; }
+	void FinishForTest(const FGGYGOAbilityActivationHandle& Original);
+	bool HasActiveMeshForTest() const { return HasOriginalMeleeMeshResource(); }
+	FGGYGOAbilityActivationHandle GetInitializedOriginalForTest() const { return GetOriginalMeleeResourceActivation(); }
 protected:
-	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 };

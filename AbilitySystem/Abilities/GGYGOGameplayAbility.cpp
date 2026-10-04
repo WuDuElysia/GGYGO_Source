@@ -47,6 +47,7 @@ struct FGGYGOAbilityActivationHandle::FActivationProof
 	TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
 	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
 	uint64 Serial = 0;
+	bool bHasControlledTryBoundary = false; // Actual outer-return provenance, never Active.
 	FGameplayAbilitySpecHandle SpecHandle;
 	FPredictionKey ActivationKey; // Native coherence only; Serial/proof is the activation identity.
 	FGGYGOAvatarBindingContext BindingContext;
@@ -67,7 +68,8 @@ struct FGGYGOAbilityActivationHandle::FActivationProof
 
 FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
 	UGGYGOAbilitySystemComponent* OriginalASC, FGameplayAbilitySpecHandle Handle,
-	const FGameplayAbilityActorInfo* ActorInfo, EGGYGOAbilityActivationRequestReason& OutReason)
+	const FGameplayAbilityActorInfo* ActorInfo, bool bHasControlledTryBoundary,
+	EGGYGOAbilityActivationRequestReason& OutReason)
 {
 	check(IsInGameThread());
 	OutReason = EGGYGOAbilityActivationRequestReason::InvalidAbility;
@@ -101,6 +103,7 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
 	Proof->Ability = this;
 	Proof->ASC = OriginalASC;
 	Proof->Serial = ++LastControlledActivationSerial;
+	Proof->bHasControlledTryBoundary = bHasControlledTryBoundary;
 	Proof->SpecHandle = Handle;
 	Proof->ActivationKey = CurrentActivationInfo.GetActivationPredictionKey();
 	Proof->BindingContext = OriginalASC->GetAvatarBindingContext();
@@ -204,13 +207,18 @@ void UGGYGOGameplayAbility::RetireControlledActivationForNativeEnd(FGameplayAbil
 }
 
 UGGYGOGameplayAbility::FScopedControlledActivationEnd::FScopedControlledActivationEnd(
-	UGGYGOGameplayAbility* InAbility)
+	UGGYGOGameplayAbility* InAbility, bool bInOwnsDispatch)
 	: Ability(InAbility), Previous(InAbility->ControlledActivationEndScope),
-	  Original(InAbility->CurrentControlledActivation), Termination(InAbility->OriginalTermination)
+	  Original(InAbility->CurrentControlledActivation), Termination(InAbility->OriginalTermination),
+	  bOwnsDispatch(bInOwnsDispatch)
 {
 	check(IsInGameThread());
 	InAbility->ControlledActivationEndScope = this;
-	if (Termination.IsValid()) { ++Termination->OpenDispatches; }
+	if (Termination.IsValid())
+	{
+		++Termination->OpenDispatches;
+		if (bOwnsDispatch) { check(!Termination->bDriving); Termination->bDriving = true; }
+	}
 }
 
 UGGYGOGameplayAbility::FScopedControlledActivationEnd::~FScopedControlledActivationEnd()
@@ -223,6 +231,41 @@ UGGYGOGameplayAbility::FScopedControlledActivationEnd::~FScopedControlledActivat
 			OriginalAbility->RetireControlledActivationForNativeEnd(OriginalAbility->CurrentSpecHandle);
 		}
 		OriginalAbility->ControlledActivationEndScope = Previous;
+	}
+	if (Termination.IsValid())
+	{
+		// Final End has no derived tail; all native End/cleanup code precedes this last scope.
+		if (Termination->bNativeEndReturned) { Termination->bFullEndReturned = true; }
+		if (bOwnsDispatch) { Termination->bDriving = false; }
+		check(Termination->OpenDispatches > 0);
+		--Termination->OpenDispatches;
+		if (bOwnsDispatch && Termination->bContinuationReady)
+		{
+			Termination->bContinuationReady = false;
+			if (UGGYGOGameplayAbility* OriginalAbility = Ability.Get())
+			{
+				OriginalAbility->ResumeOriginalTermination(Termination);
+			}
+			else { UGGYGOGameplayAbility::FailOriginalTermination(Termination, EGGYGOAbilityTerminationReason::InvalidAbility); }
+		}
+		UGGYGOGameplayAbility::TryCompleteOriginalTermination(Termination);
+	}
+}
+
+UGGYGOGameplayAbility::FScopedAbilityActivationCall::FScopedAbilityActivationCall(
+	UGGYGOGameplayAbility* InAbility, const FGGYGOAbilityActivationHandle& InOriginal)
+	: Ability(InAbility), Previous(InAbility->AbilityActivationCall), Original(InOriginal)
+{
+	check(IsInGameThread());
+	InAbility->AbilityActivationCall = this;
+}
+
+UGGYGOGameplayAbility::FScopedAbilityActivationCall::~FScopedAbilityActivationCall()
+{
+	if (UGGYGOGameplayAbility* OriginalAbility = Ability.Get())
+	{
+		check(OriginalAbility->AbilityActivationCall == this);
+		OriginalAbility->AbilityActivationCall = Previous;
 	}
 	if (Termination.IsValid())
 	{
@@ -256,7 +299,7 @@ FGGYGOAbilityTerminationResult UGGYGOGameplayAbility::GetOriginalTerminationResu
 
 TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbility::BeginOriginalTermination(
 	const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-	bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult)
+	bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult, bool bAllowNativeRemoval)
 {
 	check(IsInGameThread());
 	using EReason = EGGYGOAbilityTerminationReason;
@@ -280,7 +323,9 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	}
 	if (!IsValid(this) || !IsInstantiated()) { OutResult.Reason = EReason::InvalidAbility; return {}; }
 	if (!IsActive()) { OutResult.Outcome = EOutcome::Stale; OutResult.Reason = EReason::NotActive; return {}; }
-	if (!CaptureCurrentActivation().HasSameActivation(Original))
+	const FGGYGOAbilityActivationHandle Current = bAllowNativeRemoval
+		? ValidateCurrentControlledActivation(true, false) : CaptureCurrentActivation();
+	if (!Current.HasSameActivation(Original))
 	{
 		OutResult.Outcome = EOutcome::Stale;
 		OutResult.Reason = EReason::ActivationChanged;
@@ -290,7 +335,7 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Original.Proof->Allocation.Pin();
 	if (!IsValid(ASC)) { OutResult.Reason = EReason::InvalidASC; return {}; }
 	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Original.Proof->SpecHandle);
-	if (!Spec || Spec->PendingRemove) { OutResult.Reason = EReason::InvalidAbility; return {}; }
+	if ((!Spec || Spec->PendingRemove) && !bAllowNativeRemoval) { OutResult.Reason = EReason::InvalidAbility; return {}; }
 	if (!ActorInfo.IsValid() || !IsEndAbilityValid(Original.Proof->SpecHandle, ActorInfo.Get()))
 	{
 		// PreActivate's witness precedes native ActiveCount++; it is not yet endable.
@@ -342,6 +387,13 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	Record->CameraModeSpec = AppliedCameraModeSpecHandle;
 	Record->CameraModeGeneration = AppliedCameraModeRequestGeneration;
 	OriginalTermination = Record; // Install before any native cancellation/cleanup callback.
+	for (FScopedAbilityActivationCall* Call = AbilityActivationCall; Call; Call = Call->Previous)
+	{
+		if (!Call->Original.HasSameActivation(Original)) { continue; }
+		check(!Call->Termination.IsValid());
+		Call->Termination = Record;
+		++Record->OpenDispatches;
+	}
 	ASC->RegisterOriginalTerminationTryDependencies(Record);
 	OutResult = GetOriginalTerminationResult(*Record);
 	return Record;
@@ -389,6 +441,12 @@ void UGGYGOGameplayAbility::TryCompleteOriginalTermination(const TSharedPtr<FOri
 			|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelReturned))
 		{
 			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::NativeEndNotObserved);
+		}
+		else if (!Record->Context.GetOriginalActivation().Proof->bHasControlledTryBoundary)
+		{
+			// Raw nonvirtual Try/CallActivate has no outer return witness. Actual original
+			// cleanup is not protocol Completed, even though final GA dispatches returned.
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::UnsupportedEntry);
 		}
 		else if (UGGYGOAbilitySystemComponent* ASC = Record->ASC.Get())
 		{
@@ -575,6 +633,7 @@ UGGYGOGameplayAbility::UGGYGOGameplayAbility(const FObjectInitializer& ObjectIni
 
 	// 每个 Actor 一个实例，运行期状态可以安全放在成员变量里。
 	InstancingPolicy = EGameplayAbilityInstancingPolicy::InstancedPerActor;
+	bRetriggerInstancedAbility = false; // Explicit request only after original termination completes.
 
 	// 客户端先预测再由服务器确认。动作游戏的输入响应感依赖这一条。
 	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::LocalPredicted;
@@ -683,6 +742,7 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 	UGGYGOAbilitySystemComponent* EvaluationASC = ActorInfo
 		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()) : nullptr;
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalEvaluationASC(EvaluationASC);
+	const TWeakObjectPtr<const UGGYGOGameplayAbility> OriginalEvaluationAbility(this);
 	const bool bHadProjectEvaluationASC = EvaluationASC != nullptr;
 	UGGYGOAbilitySystemComponent::FScopedAbilityActivationEvaluation Evaluation(
 		EvaluationASC, this, Handle, ActorInfo);
@@ -690,10 +750,40 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 		? EvaluationASC->BeginControlledAbilityActivationEvaluation(this, Handle, ActorInfo) : 0;
 	bool bCanActivate = [&]() -> bool
 	{
-		if (!ActorInfo || !ActorInfo->AbilitySystemComponent.IsValid())
+		if (!ActorInfo || !IsValid(EvaluationASC)
+			|| EvaluationASC->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
 		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem activation [%s] Spec [%s] rejected: a live project ASC/ActorInfo is required."),
+				*GetPathName(), *Handle.ToString());
 			return false;
 		}
+		const FGameplayAbilitySpec* EvaluationSpec = EvaluationASC->FindAbilitySpecFromHandle(Handle);
+		const UGGYGOGameplayAbility* SpecAbility = EvaluationSpec
+			? Cast<UGGYGOGameplayAbility>(EvaluationSpec->Ability.Get()) : nullptr;
+		if (GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::NonInstanced
+			|| bRetriggerInstancedAbility || (SpecAbility && SpecAbility->bRetriggerInstancedAbility))
+		{
+			// Native Try may execute its retrigger branch before Can on later attempts.
+			// Reject this unsupported configuration before its first activation; never rewrite it.
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem activation [%s] Spec [%s] Config [%s] rejected: non-instanced or native automatic retrigger policy is incompatible with original termination completion."),
+				*GetPathName(), *Handle.ToString(), *GetPathNameSafe(SpecAbility));
+			return false;
+		}
+		const auto IsOriginalInstanceAvailable = [&]()
+		{
+			const UGGYGOAbilitySystemComponent* ASC = OriginalEvaluationASC.Get();
+			const FGameplayAbilitySpec* Spec = ASC ? ASC->FindAbilitySpecFromHandle(Handle) : nullptr;
+			if (!Spec || Spec->PendingRemove) { return false; }
+			const UGGYGOGameplayAbility* Ability = OriginalEvaluationAbility.Get();
+			if (!Ability) { return false; }
+			const UGGYGOGameplayAbility* Instance = Ability->IsInstantiated() ? Ability
+				: (Ability->GetInstancingPolicy() == EGameplayAbilityInstancingPolicy::InstancedPerActor
+					? Cast<UGGYGOGameplayAbility>(Spec->GetPrimaryInstance()) : nullptr);
+			return !Instance || (!Instance->IsControlledActivationTerminationBusy() && !Instance->IsActive());
+		};
+		if (!IsOriginalInstanceAvailable()) { return false; }
 
 		// 父类先做冷却、消耗、Tag 需求等通用检查。
 		if (!Super::CanActivateAbility(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags))
@@ -701,9 +791,9 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 			return false;
 		}
 
-		// 再做组仲裁。用 Cast 而不是 CastChecked：Ability 可能被授予到非项目 ASC 上
-		// （例如测试用的裸 ASC），那种情况下跳过组检查而不是崩掉。
-		// Native/BP/cost callbacks may invalidate or replace the receiver. Reacquire only the original ASC.
+		// Native/BP/cost callbacks may invalidate the receiver. Reacquire only the original
+		// ability/ASC; a project GA requires its project lifecycle authority.
+		if (!IsOriginalInstanceAvailable()) { return false; }
 		if (const UGGYGOAbilitySystemComponent* GGYGOASC = OriginalEvaluationASC.Get())
 		{
 			EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
@@ -725,7 +815,10 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 			return false;
 		}
 
-		return CanActivateAbilityAdditional(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags);
+		const UGGYGOGameplayAbility* AdditionalAbility = OriginalEvaluationAbility.Get();
+		const bool bAdditionalAdmitted = AdditionalAbility
+			&& AdditionalAbility->CanActivateAbilityAdditional(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags);
+		return bAdditionalAdmitted && IsOriginalInstanceAvailable();
 	}();
 	if (ControlledEvaluationSerial != 0)
 	{
@@ -1203,7 +1296,7 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 		const AActor* AvatarActor = ActorInfo->AvatarActor.Get();
 
 		// 正在断开或即将销毁的 Avatar 不激活，等新 Avatar 绑定后重新走授予流程。
-		if (ASC && AvatarActor && !AvatarActor->GetTearOff() && (AvatarActor->GetLifeSpan() <= 0.0f))
+		if (AvatarActor && !AvatarActor->GetTearOff() && (AvatarActor->GetLifeSpan() <= 0.0f))
 		{
 			const bool bIsLocalExecution = (NetExecutionPolicy == EGameplayAbilityNetExecutionPolicy::LocalPredicted) || (NetExecutionPolicy == EGameplayAbilityNetExecutionPolicy::LocalOnly);
 			const bool bIsServerExecution = (NetExecutionPolicy == EGameplayAbilityNetExecutionPolicy::ServerOnly) || (NetExecutionPolicy == EGameplayAbilityNetExecutionPolicy::ServerInitiated);
@@ -1214,7 +1307,16 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 			// 只有角色与策略匹配的一端发起，避免两端重复激活。
 			if (bClientShouldActivate || bServerShouldActivate)
 			{
-				ASC->TryActivateAbility(Spec.Handle);
+				UGGYGOAbilitySystemComponent* ProjectASC = Cast<UGGYGOAbilitySystemComponent>(ASC);
+				if (!IsValid(ProjectASC) || ProjectASC->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+				{
+					UE_LOG(LogGGYGOAbilitySystem, Error,
+						TEXT("AbilitySystem OnSpawn [%s] Spec [%s] Avatar [%s] ASC [%s] rejected: a live project ASC is required for the controlled activation request."),
+						*GetPathName(), *Spec.Handle.ToString(), *GetNameSafe(AvatarActor), *GetPathNameSafe(ASC));
+					return;
+				}
+				// One request; native acceptance is not activation identity or termination completion.
+				ProjectASC->TryActivateAbilityWithTerminationBoundary(Spec.Handle);
 			}
 		}
 	}
@@ -1222,44 +1324,151 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 
 void UGGYGOGameplayAbility::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	ObserveAbilityActivationEntryForTest(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+#endif
+	const TWeakObjectPtr<UGGYGOGameplayAbility> OriginalAbility(this);
+	const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
+#if WITH_DEV_AUTOMATION_TESTS
+	const auto ObserveReturn = [&]()
+	{
+		if (UGGYGOGameplayAbility* Ability = OriginalAbility.Get())
+		{
+			Ability->ObserveAbilityActivationReturnForTest(Handle, ActorInfo, ActivationInfo, TriggerEventData);
+		}
+	};
+#endif
+	// Pin only this call's original allocation while passing its borrowed parameters.
+	const TSharedPtr<const FGameplayAbilityActorInfo> OriginalActorInfo = Original.HasActivation()
+		? Original.Proof->Allocation.Pin() : TSharedPtr<const FGameplayAbilityActorInfo>{};
+	if (!Original.HasActivation() || Original.Proof->SpecHandle != Handle
+		|| !OriginalActorInfo.IsValid() || OriginalActorInfo.Get() != ActorInfo
+		|| Original.Proof->ActivationKey != ActivationInfo.GetActivationPredictionKey())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem Activate [%s] Spec [%s] rejected: no matching original native activation history/arguments."),
+			*GetPathName(), *Handle.ToString());
+#if WITH_DEV_AUTOMATION_TESTS
+		ObserveReturn();
+#endif
+		return;
+	}
+	FScopedAbilityActivationCall ActivationScope(this, Original);
 	const uint64 AdmissionSequence = GetCurrentAbilityGroupAdmissionSequence();
-	// Current instance may already have been rejected by a newer attempt in a PreActivate callback.
-	// In that case it must not run its own resolver and cancel any more abilities.
+	const auto IsOriginalCurrent = [&]()
+	{
+		const UGGYGOGameplayAbility* Ability = OriginalAbility.Get();
+		const bool bCurrent = Ability && !Ability->IsControlledActivationTerminationBusy()
+			&& Ability->CurrentSpecHandle == Handle && Ability->CurrentActorInfo == ActorInfo
+			&& Ability->CurrentActivationInfo.GetActivationPredictionKey() == ActivationInfo.GetActivationPredictionKey()
+			&& Ability->ValidateCurrentControlledActivation().HasSameActivation(Original);
+		if (!bCurrent && Ability && Ability->IsActive() && !Ability->IsControlledActivationTerminationBusy())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem Activate [%s] Spec [%s] ASC [%s] stopped: original source changed across activation callout."),
+				*GetPathNameSafe(Ability), *Handle.ToString(), *GetPathNameSafe(Original.Proof->ASC.Get()));
+		}
+		return bCurrent;
+	};
+	InitializeAbilityActivation(Original);
+	if (!IsOriginalCurrent())
+	{
+		if (UGGYGOGameplayAbility* Ability = OriginalAbility.Get())
+		{
+			Ability->CompleteAbilityGroupAdmissionAttempt(AdmissionSequence);
+		}
+#if WITH_DEV_AUTOMATION_TESTS
+		ObserveReturn();
+#endif
+		return; // Original ended/deferred or source changed; never start its business body.
+	}
 	const bool bRejectedBeforeFinalization = IsAbilityGroupAdmissionRejected(AdmissionSequence);
 	bool bResolverAdmitted = true;
-	UGGYGOAbilitySystemComponent* GGYGOASC = ActorInfo
-		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get())
-		: nullptr;
-	if (!bRejectedBeforeFinalization && GGYGOASC && AdmissionSequence != 0)
+	UGGYGOAbilitySystemComponent* GGYGOASC = Original.Proof->ASC.Get();
+	if (!bRejectedBeforeFinalization && AdmissionSequence != 0)
 	{
 		bResolverAdmitted = GGYGOASC->FinalizeAbilityGroupAdmission(this, AdmissionSequence);
 	}
-	// A recursive newer attempt may reject this one while the resolver cancels competitors.
+	if (!IsOriginalCurrent())
+	{
+		if (UGGYGOGameplayAbility* Ability = OriginalAbility.Get())
+		{
+			Ability->CompleteAbilityGroupAdmissionAttempt(AdmissionSequence);
+		}
+#if WITH_DEV_AUTOMATION_TESTS
+		ObserveReturn();
+#endif
+		return;
+	}
 	const bool bRejectedAfterFinalization = ConsumeAbilityGroupAdmissionRejection(AdmissionSequence);
 	const bool bAdmissionRejected = bRejectedBeforeFinalization || !bResolverAdmitted || bRejectedAfterFinalization;
-
-	// Keep pending set throughout Resolve/Consume so recursive cancellation only marks this attempt.
 	CompleteAbilityGroupAdmissionAttempt(AdmissionSequence);
 	if (bAdmissionRejected)
 	{
-		// PreActivate 尚不能 End（Spec.ActiveCount 未增加）；进入这里时 GAS 已完成递增，
-		// 因此可安全结束并阻止镜头与蓝图业务启动。
 		EndAbility(Handle, ActorInfo, ActivationInfo, /*bReplicateEndAbility=*/true, /*bWasCancelled=*/true);
+#if WITH_DEV_AUTOMATION_TESTS
+		ObserveReturn();
+#endif
 		return;
 	}
-
-	// 先应用相机配置再调父类。父类会触发蓝图的激活事件，
-	// 蓝图里可能立刻用 SetCameraMode 覆盖成别的模式，那应当赢。
+	// Preserve camera -> native Super/BP order; camera receivers may call out.
 	if (AbilityCameraMode)
 	{
 		SetCameraMode(AbilityCameraMode);
+		if (!IsOriginalCurrent())
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			ObserveReturn();
+#endif
+			return;
+		}
 	}
-
 	if (!CameraOffset.IsNearlyZero())
 	{
 		ApplyCameraOffset(CameraOffset);
+		if (!IsOriginalCurrent())
+		{
+#if WITH_DEV_AUTOMATION_TESTS
+			ObserveReturn();
+#endif
+			return;
+		}
 	}
+	ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
+#if WITH_DEV_AUTOMATION_TESTS
+	ObserveReturn();
+#endif
+}
 
+#if WITH_DEV_AUTOMATION_TESTS
+void UGGYGOGameplayAbility::ObserveAbilityActivationEntryForTest(FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	const FGameplayEventData* TriggerEventData)
+{
+}
+
+void UGGYGOGameplayAbility::ObserveAbilityActivationReturnForTest(FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	const FGameplayEventData* TriggerEventData)
+{
+}
+
+void UGGYGOGameplayAbility::ObserveAbilityEndEntryForTest(FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	bool bReplicateEndAbility, bool bWasCancelled)
+{
+}
+#endif
+
+void UGGYGOGameplayAbility::InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original)
+{
+	// Normal default: this ability has no additional per-activation initialization.
+}
+
+void UGGYGOGameplayAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+{
 	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
 }
 
@@ -1389,16 +1598,9 @@ void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handl
 		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
 		if (!Original.HasActivation())
 		{
-			if (CurrentControlledActivation.HasActivation())
-			{
-				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem native Cancel [%s] Spec [%s] rejected: issued controlled source is invalid or still ending."),
-					*GetPathName(), *Handle.ToString());
-				return;
-			}
-			// Transitional native entry: preserves untracked GAS behavior, issues no protocol completion.
-			UE_LOG(LogGGYGOAbilitySystem, Verbose, TEXT("AbilitySystem native Cancel [%s] Spec [%s] has no controlled source; termination protocol unsupported."),
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native Cancel [%s] Spec [%s] rejected: no valid original native source or original termination is busy."),
 				*GetPathName(), *Handle.ToString());
-			Super::CancelAbility(Handle, ActorInfo, ActivationInfo, bReplicateCancelAbility);
 			return;
 		}
 		if (Handle != CurrentSpecHandle || ActorInfo != CurrentActorInfo
@@ -1417,17 +1619,9 @@ void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handl
 				*GetPathName(), *Handle.ToString(), static_cast<int32>(Result.Reason));
 			return;
 		}
-		// The entry adapter holds Busy over the full inner virtual dispatch/native Cancel return.
+		// Final adapter holds Busy through its complete inner dispatch/native Cancel return.
 		++Record->OpenDispatches;
 		ResumeOriginalTermination(Record);
-		if (Record->OpenTryCalls == 0 && !Record->bContinuationQueued && !Record->bContinuationReady
-			&& Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
-		{
-			// This synchronous raw entry cannot witness its own full virtual return. Typed callers
-			// or a later native continuation have an outer dispatcher; a related Try has an exit
-			// witness. Do not publish from this adapter's epilogue without either boundary.
-			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::UnsupportedEntry);
-		}
 		--Record->OpenDispatches;
 		TryCompleteOriginalTermination(Record);
 		return;
@@ -1447,18 +1641,48 @@ void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handl
 
 void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
 {
+#if WITH_DEV_AUTOMATION_TESTS
+	ObserveAbilityEndEntryForTest(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
+#endif
 	if (!IsEndAbilityValid(Handle, ActorInfo))
 	{
 		return;
 	}
 
-	FScopedControlledActivationEnd OriginalEndScope(this);
-	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	bool bOwnsDispatch = false;
+	if (!Record.IsValid())
+	{
+		// Native removal may already have marked this Spec PendingRemove. It can clear only
+		// the existing original resources; such teardown will fail visibly, never Completed.
+		const FGGYGOAbilityActivationHandle Original = ValidateCurrentControlledActivation(true, false);
+		if (!Original.HasActivation() || Original.Proof->SpecHandle != Handle
+			|| Original.Proof->Allocation.Pin().Get() != ActorInfo
+			|| Original.Proof->ActivationKey != ActivationInfo.GetActivationPredictionKey())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native End [%s] Spec [%s] rejected: original native source/arguments do not match."),
+				*GetPathName(), *Handle.ToString());
+			return;
+		}
+		FGGYGOAbilityTerminationResult Result;
+		Record = BeginOriginalTermination(Original, EGGYGOAbilityTerminationRequestKind::End,
+			bReplicateEndAbility, bWasCancelled, Result, /*bAllowNativeRemoval=*/true);
+		if (!Record.IsValid())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native End [%s] Spec [%s] rejected: original termination capture reason=%d."),
+				*GetPathName(), *Handle.ToString(), static_cast<int32>(Result.Reason));
+			return;
+		}
+		bOwnsDispatch = true;
+	}
+	FScopedControlledActivationEnd OriginalEndScope(this, bOwnsDispatch);
 	if (Record.IsValid())
 	{
 		const FGameplayAbilitySpec* Spec = Record->ASC.IsValid()
 			? Record->ASC->FindAbilitySpecFromHandle(Record->SpecHandle) : nullptr;
-		if (!Record->bDriving && !Record->bNativeEndStarted && !Record->bSealed
+		if (!Record->bNativeEndStarted && !Record->bSealed
 			&& Record->ASC.IsValid() && (!Spec || Spec->PendingRemove)
 			&& ValidateCurrentControlledActivation(true, false).HasSameActivation(Record->Context.GetOriginalActivation())
 			&& Record->SpecHandle == Handle && Record->ActorInfo.Pin().Get() == ActorInfo
@@ -1513,12 +1737,6 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 		Super::EndAbility(Handle, ActorInfo, Record->ActivationInfo,
 			Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
 		Record->bNativeEndReturned = true;
-		return; // Dispatcher witnesses the remaining derived End/Cancel return.
+		return; // Final End scope and original dispatcher retain the actual return obligations.
 	}
-	// Legacy direct derived End has no pre-cleanup/full-return proof. Preserve its native path;
-	// it cannot publish protocol Completed until those overrides/callers are migrated.
-	ClearCameraOffset();
-	ClearCameraMode();
-
-	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 }

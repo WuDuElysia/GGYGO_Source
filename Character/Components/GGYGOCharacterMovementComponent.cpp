@@ -234,6 +234,7 @@ namespace
 struct FGGYGOCurveRootMotionMoveInput
 {
 	TSharedPtr<const FGGYGOCurveRootMotionOrigin> Origin;
+	TSharedPtr<const UGGYGOCharacterMovementComponent::FMovementInputNativeSource> NativeSource;
 	UGGYGOCharacterMovementComponent::FLocomotionUpdateCandidate StartCandidate;
 	FVector Acceleration = FVector::ZeroVector;
 	float MovementTickTime = 0.0f;
@@ -454,6 +455,7 @@ void FSavedMove_GGYGO::Clear()
 	SavedMovementOwnerSyncScope = {};
 	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
+	SavedMovementInputRequest = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
 
@@ -488,6 +490,7 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 	SavedMovementOwnerSyncScope = {};
 	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
+	SavedMovementInputRequest = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
 
@@ -501,6 +504,13 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedMovementOwnerGeneration = Context->Notice.GetServerOwnerGeneration();
 		}
 		SavedMovementInputSourceCheckpoint = MoveComp->MovementInputSourceCheckpoint;
+		SavedMovementInputRequest.Binding = MoveComp->MovementInputBinding;
+		SavedMovementInputRequest.Request = MoveComp->MovementInputRequest;
+		SavedMovementInputRequest.ExecutionRequestSerial = MoveComp->LocomotionRequestSerial;
+		SavedMovementInputRequest.Admission = static_cast<uint8>(MoveComp->LocomotionRequestAdmission);
+		SavedMovementInputRequest.bExecutionEligible = MoveComp->LocomotionRequestSerial != 0
+			&& MoveComp->IsMovementInputBindingCurrent(MoveComp->MovementInputBinding)
+			&& !MoveComp->IsMovementInputRequestBlocked();
 		SavedGait = MoveComp->ResolvedGait;
 		NetworkGait = SavedGait;
 		bNetworkTurnBackCurveDriven = MoveComp->IsTurnBackCurveDriven();
@@ -544,8 +554,15 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 void FSavedMove_GGYGO::PostUpdate(ACharacter* C, EPostUpdateMode PostUpdateMode)
 {
 	Super::PostUpdate(C, PostUpdateMode);
+	// Native replay may update its own bookkeeping; it never replaces original request/input/result capture.
+	if (PostUpdateMode == PostUpdate_Replay) return;
 	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
 	{
+		if (SavedMovementInputRequest.Binding.ConsumerBindingSerial != 0
+			&& (!SavedMovementInputRequest.bExecutionEligible
+				|| SavedMovementInputRequest.ExecutionRequestSerial != MoveComp->LocomotionRequestSerial
+				|| SavedMovementInputRequest.Binding != MoveComp->MovementInputBinding
+				|| SavedMovementInputRequest.Request != MoveComp->MovementInputRequest)) return;
 		SavedCurveRootMotionPrepared = MoveComp->LastLocomotionCurvePrepared;
 		SavedCurveRootMotionInput = SavedCurveRootMotionPrepared.IsValid()
 			? SavedCurveRootMotionPrepared->Input : MoveComp->PendingLocomotionCurveInput;
@@ -574,12 +591,28 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 			UE_LOG(LogGGYGOMovement, Error, TEXT("Movement SavedMove rejected: CMC='%s', Reason='%s'."),
 				*MoveComp->GetPathName(), *Error);
 		}
+		const auto HasSavedIndependentSource = [](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
+		{
+			return Sources.ContainsByPredicate([](const TSharedPtr<FRootMotionSource>& Source)
+			{
+				return Source.IsValid() && IsRegisteredActionCurveSource(*Source);
+			});
+		};
+		if (MoveComp->IsMovingOnGround() && MoveComp->IsMovementInputRequestBlocked()
+			&& !MoveComp->HasIndependentGroundRootMotion() && !RootMotionMontage.IsValid()
+			&& !HasSavedIndependentSource(SavedRootMotion.RootMotionSources)
+			&& !HasSavedIndependentSource(SavedRootMotion.PendingAddRootMotionSources))
+		{
+			// A rejected original interval must not install its group over a successor's resources.
+			MoveComp->FinishLocomotionCurveReplayPreparation();
+			return;
+		}
 		// 回放这一帧之前把状态还原到当时的样子。
 		// 不还原计时器的话，回放多帧时计时器会从"现在"的值继续累加，
 		// 于是回放中途可能升档，而首次执行时并没有 —— 预测就失配了。
 		// 普通预测回放恢复本 move 的起始状态。服务器校正后的重放则必须从
 		// response 带回的权威时间连续推进，不能再覆盖成旧的预测时钟。
-		if (!MoveComp->bReplayLocomotionFromAuthority)
+		if (!MoveComp->bReplayLocomotionFromAuthority && !MoveComp->IsMovementInputRequestBlocked())
 		{
 			MoveComp->ResolvedGait = SavedGait;
 			MoveComp->WalkHoldTimer = SavedWalkHoldTimer;
@@ -613,6 +646,11 @@ bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 	{
 		return false;
 	}
+	if (NewGGYGOMove && (NewGGYGOMove->SavedMovementInputRequest.Binding != SavedMovementInputRequest.Binding
+		|| NewGGYGOMove->SavedMovementInputRequest.Request != SavedMovementInputRequest.Request
+		|| NewGGYGOMove->SavedMovementInputRequest.ExecutionRequestSerial != SavedMovementInputRequest.ExecutionRequestSerial
+		|| NewGGYGOMove->SavedMovementInputRequest.Admission != SavedMovementInputRequest.Admission
+		|| NewGGYGOMove->SavedMovementInputRequest.bExecutionEligible != SavedMovementInputRequest.bExecutionEligible)) return false;
 
 	// 步态不同不能合并：合并后服务器只会看到一个步态值，
 	// 另一帧就会按错误的速度上限重演。
@@ -662,6 +700,11 @@ bool FSavedMove_GGYGO::IsImportantMove(const FSavedMovePtr& LastAckedMovePtr) co
 	return SavedMovementInputSourceCheckpoint != LastAcked.SavedMovementInputSourceCheckpoint
 		|| SavedMovementOwnerSyncScope != LastAcked.SavedMovementOwnerSyncScope
 		|| SavedMovementOwnerGeneration != LastAcked.SavedMovementOwnerGeneration
+		|| SavedMovementInputRequest.Binding != LastAcked.SavedMovementInputRequest.Binding
+		|| SavedMovementInputRequest.Request != LastAcked.SavedMovementInputRequest.Request
+		|| SavedMovementInputRequest.ExecutionRequestSerial != LastAcked.SavedMovementInputRequest.ExecutionRequestSerial
+		|| SavedMovementInputRequest.Admission != LastAcked.SavedMovementInputRequest.Admission
+		|| SavedMovementInputRequest.bExecutionEligible != LastAcked.SavedMovementInputRequest.bExecutionEligible
 		|| Super::IsImportantMove(LastAckedMovePtr);
 }
 
@@ -701,10 +744,20 @@ void FCharacterNetworkMoveData_GGYGO::ClientFillNetworkMoveData(
 {
 	FCharacterNetworkMoveData::ClientFillNetworkMoveData(ClientMove, MoveType);
 	const FSavedMove_GGYGO& GGYGOMove = static_cast<const FSavedMove_GGYGO&>(ClientMove);
-	bHasMovementOwnerSync = GGYGOMove.SavedMovementOwnerSyncScope.IsSet();
+	// Issued capture remains original even when its weak endpoint later expires.
+	bHasMovementOwnerSync = GGYGOMove.SavedMovementOwnerSyncScope.GetScopeSerial() != 0
+		&& GGYGOMove.SavedMovementOwnerSyncScope.GetResponseNonce() != 0;
 	MovementOwnerSyncNonce = bHasMovementOwnerSync ? GGYGOMove.SavedMovementOwnerSyncScope.GetResponseNonce() : 0;
 	MovementOwnerGeneration = bHasMovementOwnerSync ? GGYGOMove.SavedMovementOwnerGeneration : 0;
-	MovementInputSourceCheckpoint = GGYGOMove.SavedMovementInputSourceCheckpoint;
+	const FGGYGOMovementInputSourceCheckpoint& Captured = GGYGOMove.SavedMovementInputSourceCheckpoint;
+	const bool bOriginalTerminal = Captured.bPresent && (Captured.bConsumerInvalidated
+		|| Captured.RequestReleasedEventSerial != 0
+		|| (Captured.SourceUnresolvedEventSerial != 0
+			&& Captured.SourceUnresolvedEventSerial > Captured.RequestStartedEventSerial));
+	// Absence is the existing no-source wire mode. Preserve the full local capture, but do not
+	// export an unadmitted start as execution provenance. Real terminal facts may still retire it.
+	MovementInputSourceCheckpoint = GGYGOMove.SavedMovementInputRequest.bExecutionEligible || bOriginalTerminal
+		? Captured : FGGYGOMovementInputSourceCheckpoint{};
 	LocomotionMotionType = GGYGOMove.NetworkLocomotionMotionType;
 	StopMotionType = GGYGOMove.NetworkStopMotionType;
 	TurnBackPhase = GGYGOMove.NetworkTurnBackPhase;
@@ -898,10 +951,23 @@ void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifeti
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, WalkRunBlendAlpha, COND_SkipOwner);
 }
 
+bool UGGYGOCharacterMovementComponent::EnsureMovementOwnerSyncLifetime()
+{
+	if (!IsInGameThread() || bMovementOwnerSyncClosed || !IsValid(this) || IsBeingDestroyed()
+		|| !IsValid(GetOwner()) || HasAnyFlags(RF_ClassDefaultObject | RF_ArchetypeObject)) return false;
+	if (MovementOwnerSyncLifetimeSerial != 0) return true;
+	MovementOwnerSyncLifetimeSerial = GGYGOMovementOwnerSync::IssueIdentity();
+	if (MovementOwnerSyncLifetimeSerial != 0) return true;
+	bMovementOwnerSyncClosed = true;
+	ReportMovementOwnerSyncOnce(FName(TEXT("ConsumerLifetimeExhausted")),
+		TEXT("M2 consumer lifetime could not be issued; native owner synchronization is closed."));
+	return false;
+}
+
 void UGGYGOCharacterMovementComponent::BeginPlay()
 {
 	Super::BeginPlay();
-	MovementOwnerSyncLifetimeSerial = GGYGOMovementOwnerSync::IssueIdentity();
+	EnsureMovementOwnerSyncLifetime(); // A valid early binding already owns this same lifetime and scope.
 	CaptureComponentDefaults();
 
 	CacheAbilitySystemComponent();
@@ -1168,6 +1234,28 @@ void UGGYGOCharacterMovementComponent::RetireMovementOwnerSyncScope(FName Reason
 	if (!Context.IsValid() || Context->bRetired) return;
 	Context->bRetired = true;
 	MovementOwnerSyncContext.Reset(); // Seal first; callbacks cannot reopen the old scope.
+	if (MovementInputNativeSource.IsValid() && MovementInputNativeSource->OwnerScope == Context->Scope)
+	{
+		// Retire borrowed native provenance before callbacks. Historical moves keep their original values.
+		MovementInputNativeSource.Reset();
+		if (MovementInputBindingSerial == 0)
+		{
+			MovementInputSourceCheckpoint = {};
+			LastMovementInputRequestSerial = 0;
+		}
+	}
+	if (MovementInputRequestOwnerScope == Context->Scope)
+	{
+		RevokeMovementInputRequest();
+	}
+	else if (Context->ObservedBindingSerial == MovementInputBindingSerial
+		|| (Context->ObservedBindingSerial == 0 && MovementInputBindingSerial == 1
+			&& bMovementInputBindingActive))
+	{
+		// Retiring this binding's original owner also closes an unused Cold window.
+		// It does not manufacture Source Released or revoke a successor request.
+		bMovementInputColdStartWindowOpen = false;
+	}
 	PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Invalidated,
 		Context->Notice.ServerOwnerGeneration, Context->Scope.ResponseNonce, false, Reason);
 }
@@ -1376,6 +1464,11 @@ void UGGYGOCharacterMovementComponent::RecordMovementInputSourceCheckpoint(const
 {
 	// This is an original-fact value cache, never an input producer or an admission gate.
 	FGGYGOMovementInputSourceCheckpoint& Checkpoint = MovementInputSourceCheckpoint;
+	if (!Checkpoint.bPresent || Checkpoint.BindingSerial != MovementInputBinding.ConsumerBindingSerial
+		|| Fact.Request.Session != MovementInputBinding.SourceSession
+		|| Fact.EventSerial != LastMovementInputFact.EventSerial || Fact.Request != LastMovementInputFact.Request
+		|| Fact.Kind != LastMovementInputFact.Kind || Fact.Reason != LastMovementInputFact.Reason
+		|| Fact.SessionMode != LastMovementInputFact.SessionMode || Fact.StartProof != LastMovementInputFact.StartProof) return;
 	Checkpoint.ConsumerFenceSerial = MovementInputBindingSerial;
 	Checkpoint.EventSerial = Fact.EventSerial;
 	Checkpoint.FactRequestSerial = Fact.Request.RequestSerial;
@@ -1413,6 +1506,100 @@ void UGGYGOCharacterMovementComponent::RecordMovementInputSourceCheckpoint(const
 	}
 }
 
+EGGYGOMovementInitialRequestAdmissionResult UGGYGOCharacterMovementComponent::TryAdmitInitialMovementInputRequest(
+	const FGGYGOMovementOwnerSyncObserverId& OriginalObserver,
+	const FGGYGOMovementInputConsumerBindingId& OriginalBinding,
+	const FGGYGOMovementInputRequestIdentity& OriginalSourceRequest,
+	const FGGYGOMovementOwnerSyncNotice& OriginalReadyNotice, FString& OutError)
+{
+	using EResult = EGGYGOMovementInitialRequestAdmissionResult;
+	OutError.Reset();
+	const auto Reject = [this, &OriginalBinding, &OriginalSourceRequest, &OriginalReadyNotice, &OutError]
+		(EResult Result, const TCHAR* Reason)
+	{
+		OutError = FString::Printf(
+			TEXT("Movement.InitialAdmission: Consumer='%s', Producer='%s', Binding=%llu, Session=%llu, InputRequest=%llu, ExecutionRequest=%llu, Scope=%llu, Nonce=%llu, Generation=%llu, Notice=%llu, Reason='%s'."),
+			*GetPathName(), *GetPathNameSafe(OriginalSourceRequest.Session.Producer.Get()),
+			static_cast<unsigned long long>(OriginalBinding.ConsumerBindingSerial),
+			static_cast<unsigned long long>(OriginalSourceRequest.Session.SessionSerial),
+			static_cast<unsigned long long>(OriginalSourceRequest.RequestSerial),
+			static_cast<unsigned long long>(LocomotionRequestSerial),
+			static_cast<unsigned long long>(OriginalReadyNotice.Scope.ScopeSerial),
+			static_cast<unsigned long long>(OriginalReadyNotice.NativeResponseNonce),
+			static_cast<unsigned long long>(OriginalReadyNotice.ServerOwnerGeneration),
+			static_cast<unsigned long long>(OriginalReadyNotice.NoticeSerial), Reason);
+		return Result;
+	};
+	if (!IsInGameThread())
+	{
+		OutError = TEXT("Movement.InitialAdmission: initial admission requires the game thread.");
+		return EResult::Rejected;
+	}
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!IsValid(this) || IsBeingDestroyed() || !IsValid(GetOwner())
+		|| !IsMovementInputBindingCurrent(OriginalBinding) || !bMovementInputSessionOpened
+		|| !OriginalSourceRequest.Session.Producer.IsValid() || OriginalSourceRequest.RequestSerial == 0
+		|| OriginalSourceRequest.Session != OriginalBinding.SourceSession
+		|| OriginalSourceRequest != MovementInputRequest || LocomotionRequestSerial == 0
+		|| !OriginalObserver.IsSet() || !IsMovementOwnerSyncContextCurrent(Context)
+		|| MovementInputRequestOwnerScope != Context->Scope || OriginalObserver.Scope != Context->Scope)
+	{
+		return Reject(EResult::Stale, TEXT("original binding, request or native owner scope is no longer current"));
+	}
+	const TSharedPtr<FMovementOwnerSyncObserverRecord>* Found =
+		Context->Observers.Find(OriginalObserver.ObserverSerial);
+	if (!Found || !Found->IsValid() || (*Found)->bClosed || !(*Found)->Callback.IsBound()
+		|| (*Found)->Id.Scope != OriginalObserver.Scope
+		|| (*Found)->Id.ObserverSerial != OriginalObserver.ObserverSerial)
+	{
+		return Reject(EResult::Stale, TEXT("original observer is not a live subscription in this exact scope"));
+	}
+	const FGGYGOMovementOwnerSyncNotice& CurrentNotice = Context->Notice;
+	if (!OriginalReadyNotice.IsSet() || OriginalReadyNotice.State != EGGYGOMovementOwnerSyncState::Ready
+		|| CurrentNotice.State != EGGYGOMovementOwnerSyncState::Ready
+		|| OriginalReadyNotice.Scope != Context->Scope
+		|| OriginalReadyNotice.NoticeSerial != CurrentNotice.NoticeSerial
+		|| OriginalReadyNotice.ServerOwnerGeneration == 0
+		|| OriginalReadyNotice.ServerOwnerGeneration != CurrentNotice.ServerOwnerGeneration
+		|| OriginalReadyNotice.NativeResponseNonce != Context->Scope.ResponseNonce
+		|| OriginalReadyNotice.NativeResponseNonce != CurrentNotice.NativeResponseNonce
+		|| OriginalReadyNotice.bInitialSynchronizationEligible != CurrentNotice.bInitialSynchronizationEligible
+		|| OriginalReadyNotice.Reason != CurrentNotice.Reason)
+	{
+		return Reject(EResult::Stale, TEXT("Ready does not match the current original native notice, nonce and generation"));
+	}
+	if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed)
+	{
+		OutError = LocomotionRequestFailureReason;
+		return EResult::ExecutionFailed;
+	}
+	if (!bMovementInputRequestOpen)
+	{
+		return Reject(EResult::Rejected, TEXT("the original Source request has already been released"));
+	}
+	if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted)
+	{
+		return EResult::AlreadyAdmitted;
+	}
+	if (LocomotionRequestAdmission != ELocomotionRequestAdmission::Waiting
+		|| !Context->bRequiresNativeResponse || !Context->bInitialLocalScope
+		|| !CurrentNotice.bInitialSynchronizationEligible)
+	{
+		return Reject(EResult::Rejected, TEXT("only the original ordinary first synchronization may admit Waiting; recovery requires real Release then Press"));
+	}
+	if (!HasAcceptedMovementSet())
+	{
+		FailLocomotionRequest(LocomotionRequestSerial, TEXT("initial waiting request has no accepted MovementSet at Ready"));
+		OutError = LocomotionRequestFailureReason;
+		return EResult::ExecutionFailed;
+	}
+	// The real Started already reserved this execution number and reset its motion.
+	// Hero verifies physical Held through Source; CMC neither polls nor synthesizes it.
+	LocomotionRequestAdmission = ELocomotionRequestAdmission::Admitted;
+	bMovementInputAdmissionDiagnosticReported = false;
+	return EResult::Admitted;
+}
+
 bool UGGYGOCharacterMovementComponent::BindMovementInputSession(
 	const FGGYGOMovementInputSessionIdentity& Session, uint64 ExpectedConsumerBindingSerial,
 	FGGYGOMovementInputConsumerBindingId& OutBinding, FString& OutError)
@@ -1440,14 +1627,49 @@ bool UGGYGOCharacterMovementComponent::BindMovementInputSession(
 	{
 		return Reject(TEXT("source requires a live Producer and an allocated SessionSerial"));
 	}
+	if (!EnsureMovementOwnerSyncLifetime())
+	{
+		return Reject(TEXT("M2 consumer lifetime is unavailable or retired; Source binding cannot reopen it"));
+	}
+	const auto FinishBinding = [this, &OutBinding, &OutError]()
+	{
+		const FGGYGOMovementInputConsumerBindingId OriginalGrant = MovementInputBinding;
+		const FString OriginalConsumerPath = GetPathName();
+		const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+		RefreshMovementOwnerSyncContext(); // CMC owns synchronous binding/scope lifecycle, including invalidation callouts.
+		UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+		if (!Self || Self->bMovementOwnerSyncClosed || !Self->IsMovementInputBindingCurrent(OriginalGrant))
+		{
+			OutBinding = {};
+			OutError = FString::Printf(TEXT("Movement Bind rejected: Consumer='%s', Binding=%llu, Reason='original grant retired during owner-scope synchronization'."),
+				*OriginalConsumerPath, static_cast<unsigned long long>(OriginalGrant.ConsumerBindingSerial));
+			return false;
+		}
+		const bool bNeedsPlayerScope = Self->CharacterOwner && Self->CharacterOwner->IsLocallyControlled()
+			&& Cast<APlayerController>(Self->CharacterOwner->GetController());
+		if (bNeedsPlayerScope && !Self->IsMovementOwnerSyncContextCurrent(Self->MovementOwnerSyncContext))
+		{
+			OutBinding = {};
+			OutError = FString::Printf(TEXT("Movement Bind rejected: Consumer='%s', Binding=%llu, Reason='no current native player owner scope after synchronization'."),
+				*OriginalConsumerPath, static_cast<unsigned long long>(OriginalGrant.ConsumerBindingSerial));
+			FString CleanupError;
+			if (!Self->InvalidateMovementInputSession(OriginalGrant, FName(TEXT("OwnerScopeUnavailable")), CleanupError))
+			{
+				UE_LOG(LogGGYGOMovement, Error, TEXT("Movement binding cleanup rejected: Consumer='%s', Binding=%llu, Reason='%s'."),
+					*OriginalConsumerPath, static_cast<unsigned long long>(OriginalGrant.ConsumerBindingSerial), *CleanupError);
+			}
+			return false;
+		}
+		OutBinding = OriginalGrant;
+		return true;
+	};
 	if (Session == MovementInputBinding.SourceSession)
 	{
 		if (!bMovementInputBindingActive)
 		{
 			return Reject(TEXT("this source session has already been retired"));
 		}
-		OutBinding = MovementInputBinding;
-		return true;
+		return FinishBinding();
 	}
 	if (Session.Producer.HasSameIndexAndSerialNumber(MovementInputBinding.SourceSession.Producer)
 		&& Session.SessionSerial <= MovementInputBinding.SourceSession.SessionSerial)
@@ -1473,14 +1695,14 @@ bool UGGYGOCharacterMovementComponent::BindMovementInputSession(
 	LastMovementInputFact = {};
 	LastMovementInputRequestSerial = 0;
 	MovementInputRequest = {};
+	MovementInputRequestOwnerScope = {};
 	bMovementInputAdmissionDiagnosticReported = false;
 	MovementInputSourceCheckpoint = {};
 	MovementInputSourceCheckpoint.bPresent = true;
 	MovementInputSourceCheckpoint.BindingSerial = MovementInputBinding.ConsumerBindingSerial;
 	MovementInputSourceCheckpoint.ConsumerFenceSerial = MovementInputBindingSerial;
 	MovementInputSourceCheckpoint.SessionSerial = Session.SessionSerial;
-	OutBinding = MovementInputBinding;
-	return true;
+	return FinishBinding();
 }
 
 bool UGGYGOCharacterMovementComponent::InvalidateMovementInputSession(
@@ -1512,6 +1734,10 @@ bool UGGYGOCharacterMovementComponent::InvalidateMovementInputSession(
 	MovementInputSourceCheckpoint.bConsumerInvalidated = true;
 	MovementInputSourceCheckpoint.ConsumerFenceSerial = MovementInputBindingSerial;
 	RevokeMovementInputRequest();
+	MovementInputRequestOwnerScope = {};
+	// Seal the old scope now. A subsequent Bind issues its own current scope synchronously.
+	// No writes follow external Invalidated callbacks; they may already install a successor.
+	RetireMovementOwnerSyncScope(Reason);
 	return true;
 }
 
@@ -1607,6 +1833,7 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 		bMovementInputSessionOpened = true;
 		ConsumedMovementInputSessionMode = Fact.SessionMode;
 		bMovementInputColdStartWindowOpen = Fact.SessionMode == EGGYGOMovementInputSessionMode::Cold
+			&& MovementInputBinding.ConsumerBindingSerial == 1
 			&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Failed;
 		break;
 	case EGGYGOMovementInputFactKind::NeutralConfirmed:
@@ -1651,15 +1878,27 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 			FailLocomotionRequest(LocomotionRequestSerial, TEXT("CMC execution request serial is exhausted"));
 			return Report(EGGYGOMovementInputConsumeResult::Rejected, TEXT("CMC execution request serial is exhausted"));
 		}
+		const TSharedPtr<FMovementOwnerSyncContext> OwnerContext = MovementOwnerSyncContext;
+		const bool bHasOriginalOwnerScope = IsMovementOwnerSyncContextCurrent(OwnerContext);
+		const bool bNeedsNativeOwnerReady = CharacterOwner && !CharacterOwner->HasAuthority()
+			&& CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy;
+		const bool bWaitForInitialOwner = bNeedsNativeOwnerReady && bHasOriginalOwnerScope
+			&& OwnerContext->bRequiresNativeResponse && OwnerContext->bInitialLocalScope
+			&& OwnerContext->Notice.State == EGGYGOMovementOwnerSyncState::Waiting
+			&& OwnerContext->Notice.bInitialSynchronizationEligible;
 		RevokeMovementInputRequest();
 		LastMovementInputRequestSerial = Fact.Request.RequestSerial;
 		MovementInputRequest = Fact.Request;
+		MovementInputRequestOwnerScope = bHasOriginalOwnerScope
+			? OwnerContext->Scope : FGGYGOMovementOwnerSyncScopeId{};
 		bMovementInputNeutralConsumed = false;
 		bMovementInputRequestOpen = true;
 		++LocomotionRequestSerial;
-		LocomotionRequestAdmission = ELocomotionRequestAdmission::Admitted;
+		LocomotionRequestAdmission = bWaitForInitialOwner
+			? ELocomotionRequestAdmission::Waiting : ELocomotionRequestAdmission::Admitted;
 		LocomotionRequestFailureReason.Reset();
-		bMovementInputAdmissionDiagnosticReported = false;
+		// Waiting is a legitimate blocked state, not the ordinary missing-source error.
+		bMovementInputAdmissionDiagnosticReported = bWaitForInitialOwner;
 		const bool bKeepRunIntent = bWantsRunOnNextMove;
 		const bool bKeepForceWalk = bForceWalkRequested;
 		ResetLocomotionState();
@@ -1667,10 +1906,33 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 		bForceWalkRequested = bKeepForceWalk;
 		LastMovementInputFact = Fact;
 		RecordMovementInputSourceCheckpoint(Fact);
-		if (!HasAcceptedMovementSet())
+		if (bNeedsNativeOwnerReady && (!bHasOriginalOwnerScope
+			|| (!bWaitForInitialOwner && (OwnerContext->Notice.State != EGGYGOMovementOwnerSyncState::Ready
+				|| OwnerContext->Notice.ServerOwnerGeneration == 0
+				|| OwnerContext->Notice.NativeResponseNonce != OwnerContext->Scope.ResponseNonce))
+			|| (Fact.StartProof == EGGYGOMovementInputStartProof::ColdPhysicalPress
+				&& !OwnerContext->Notice.bInitialSynchronizationEligible)))
+		{
+			FailLocomotionRequest(LocomotionRequestSerial,
+				TEXT("source request lacks its current native owner Ready or eligible ordinary initial wait; recovery requires real Release then Press"));
+			OutError = LocomotionRequestFailureReason;
+		}
+		else if (!HasAcceptedMovementSet())
 		{
 			FailLocomotionRequest(LocomotionRequestSerial, TEXT("new source request has no accepted MovementSet"));
 			OutError = LocomotionRequestFailureReason;
+		}
+		else if (bWaitForInitialOwner)
+		{
+			UE_LOG(LogGGYGOMovement, Verbose,
+				TEXT("Movement.InitialAdmission waiting: Consumer='%s', Producer='%s', Binding=%llu, Session=%llu, InputRequest=%llu, ExecutionRequest=%llu, Scope=%llu, Nonce=%llu, Reason='ordinary first native owner synchronization; execution remains blocked'."),
+				*GetPathName(), *GetPathNameSafe(Fact.Request.Session.Producer.Get()),
+				static_cast<unsigned long long>(Binding.ConsumerBindingSerial),
+				static_cast<unsigned long long>(Fact.Request.Session.SessionSerial),
+				static_cast<unsigned long long>(Fact.Request.RequestSerial),
+				static_cast<unsigned long long>(LocomotionRequestSerial),
+				static_cast<unsigned long long>(MovementInputRequestOwnerScope.ScopeSerial),
+				static_cast<unsigned long long>(MovementInputRequestOwnerScope.ResponseNonce));
 		}
 		return EGGYGOMovementInputConsumeResult::Recorded;
 	}
@@ -1689,19 +1951,31 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 		}
 		bMovementInputRequestOpen = false;
 		bMovementInputNeutralConsumed = false;
-		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted)
+		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Waiting)
+		{
+			RevokeMovementInputRequest(); // No admitted interval exists to manufacture Brake.
+		}
+		else if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted)
 		{
 			LocomotionRequestAdmission = ELocomotionRequestAdmission::Released;
 		}
 		break;
 	case EGGYGOMovementInputFactKind::SessionInvalidated:
+	{
 		LastMovementInputFact = Fact;
+		const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
 		if (!InvalidateMovementInputSession(Binding, Fact.Reason, OutError))
 		{
 			return EGGYGOMovementInputConsumeResult::Rejected;
 		}
-		RecordMovementInputSourceCheckpoint(Fact);
+		// Synchronous owner invalidation can end this consumer or install a successor.
+		if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+			Self && !Self->bMovementOwnerSyncClosed && !Self->IsBeingDestroyed())
+		{
+			Self->RecordMovementInputSourceCheckpoint(Fact); // Original fact/binding guard rejects a successor.
+		}
 		return EGGYGOMovementInputConsumeResult::Recorded;
+	}
 	case EGGYGOMovementInputFactKind::SourceUnresolved:
 		if (Fact.Request.RequestSerial != 0 && Fact.Request != MovementInputRequest)
 		{
@@ -1747,10 +2021,13 @@ void UGGYGOCharacterMovementComponent::CancelMovementInputLocomotion()
 void UGGYGOCharacterMovementComponent::RevokeMovementInputRequest()
 {
 	bMovementInputColdStartWindowOpen = false;
+	const bool bWasWaiting = LocomotionRequestAdmission == ELocomotionRequestAdmission::Waiting;
 	if (LocomotionRequestAdmission != ELocomotionRequestAdmission::Failed)
 	{
 		LocomotionRequestAdmission = ELocomotionRequestAdmission::Revoked;
+		MovementInputRequestOwnerScope = {};
 	}
+	if (bWasWaiting) bMovementInputAdmissionDiagnosticReported = false;
 	CancelMovementInputLocomotion();
 }
 
@@ -1780,12 +2057,83 @@ bool UGGYGOCharacterMovementComponent::FailLocomotionRequest(uint64 ExpectedRequ
 
 bool UGGYGOCharacterMovementComponent::IsMovementInputRequestBlocked() const
 {
+	const bool bOriginalReplay = MovementInputReplayCapture.IsSet()
+		&& (PreparingLocomotionCurveReplayGroup != nullptr || (CharacterOwner && CharacterOwner->bClientUpdating));
+	if (bOriginalReplay)
+	{
+		const FMovementInputReplayCapture& Capture = MovementInputReplayCapture.GetValue();
+		if (Capture.Request.Binding.ConsumerBindingSerial != 0)
+		{
+			if (!Capture.Request.bExecutionEligible || Capture.Request.ExecutionRequestSerial == 0
+				|| Capture.Request.ExecutionRequestSerial != LocomotionRequestSerial
+				|| Capture.Request.Binding != MovementInputBinding || Capture.Request.Request != MovementInputRequest
+				|| !IsMovementInputBindingCurrent(Capture.Request.Binding)
+				|| (Capture.Request.Admission != static_cast<uint8>(ELocomotionRequestAdmission::Admitted)
+					&& Capture.Request.Admission != static_cast<uint8>(ELocomotionRequestAdmission::Released))
+				|| !Capture.Checkpoint.bPresent || Capture.Checkpoint.bConsumerInvalidated
+				|| Capture.Checkpoint.BindingSerial != Capture.Request.Binding.ConsumerBindingSerial
+				|| Capture.Checkpoint.SessionSerial != Capture.Request.Request.Session.SessionSerial
+				|| Capture.Checkpoint.RequestSerial != Capture.Request.Request.RequestSerial) return true;
+			if (Capture.OwnerScope.GetScopeSerial() != 0)
+			{
+				const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+				if (!IsMovementOwnerSyncContextCurrent(Context) || Capture.OwnerScope != Context->Scope
+					|| Capture.OwnerScope != MovementInputRequestOwnerScope
+					|| (Context->bRequiresNativeResponse && (Capture.OwnerGeneration == 0
+						|| Capture.OwnerGeneration != Context->Notice.ServerOwnerGeneration))) return true;
+			}
+		}
+		else if (MovementInputBindingSerial != 0 || (CharacterOwner && !CharacterOwner->HasAuthority()
+			&& CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy)) return true;
+	}
+	const bool bNativeRemoteOwner = CharacterOwner && CharacterOwner->HasAuthority()
+		&& !CharacterOwner->IsLocallyControlled() && Cast<APlayerController>(CharacterOwner->GetController());
+	if (ActiveMovementOwnerSyncNativeMove || MovementInputNativeSource.IsValid() || bNativeRemoteOwner)
+	{
+		const TSharedPtr<const FMovementInputNativeSource> Source = MovementInputNativeSource;
+		const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+		if (!Source.IsValid() || Source->ExecutionRequestSerial == 0
+			|| Source->ExecutionRequestSerial != LocomotionRequestSerial
+			|| !IsMovementOwnerSyncReceiptCurrent(Source->Receipt)
+			|| !IsMovementOwnerSyncContextCurrent(Context) || Source->OwnerScope != Context->Scope
+			|| Source->OwnerScope != MovementInputRequestOwnerScope
+			|| (LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
+				&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Released)) return true;
+		if (const FMovementOwnerSyncNativeMove* Frame = ActiveMovementOwnerSyncNativeMove)
+		{
+			if (!Frame->bEnteredNativeSimulation || !Frame->bSourceExecutionApplicable
+				|| Frame->Move != GetCurrentNetworkMoveData() || !IsMovementOwnerSyncReceiptCurrent(Frame->Receipt)
+				|| Frame->Receipt.ClientOwnerGeneration != Frame->Receipt.OwnerGeneration
+				|| Frame->OriginalNonce != Source->Receipt.Nonce
+				|| Frame->OriginalSourceCheckpoint != Frame->Move->MovementInputSourceCheckpoint
+				|| Frame->OriginalSourceCheckpoint.BindingSerial != Source->StartCheckpoint.BindingSerial
+				|| Frame->OriginalSourceCheckpoint.SessionSerial != Source->StartCheckpoint.SessionSerial
+				|| Frame->OriginalSourceCheckpoint.RequestSerial != Source->StartCheckpoint.RequestSerial) return true;
+		}
+		return false;
+	}
 	// Lifetime serial 0 means this legacy call chain has not yet been migrated to the source interface.
-	return MovementInputBindingSerial != 0
-		&& (!IsMovementInputBindingCurrent(MovementInputBinding) || !bMovementInputSessionOpened
+	if (MovementInputBindingSerial == 0) return false;
+	if (!IsMovementInputBindingCurrent(MovementInputBinding) || !bMovementInputSessionOpened
 			|| !MovementInputBinding.SourceSession.Producer.IsValid()
 			|| (LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
-				&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Released));
+				&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Released)) return true;
+	if (MovementInputRequestOwnerScope.ScopeSerial != 0)
+	{
+		const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+		if (!IsMovementOwnerSyncContextCurrent(Context) || MovementInputRequestOwnerScope != Context->Scope) return true;
+		if (Context->bRequiresNativeResponse
+			&& (Context->Notice.State != EGGYGOMovementOwnerSyncState::Ready
+				|| Context->Notice.ServerOwnerGeneration == 0
+				|| Context->Notice.NativeResponseNonce != Context->Scope.ResponseNonce)) return true;
+	}
+	else if (CharacterOwner && !CharacterOwner->HasAuthority()
+		&& CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy)
+	{
+		return true; // An autonomous request cannot borrow the authority/AI no-scope mode.
+	}
+	// Local authority/AI with no player sync scope retains its existing legal admission.
+	return false;
 }
 
 bool UGGYGOCharacterMovementComponent::ShouldRejectMovementInputGroundLocomotion() const
@@ -2317,6 +2665,20 @@ bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const
 
 bool UGGYGOCharacterMovementComponent::HasMoveInput() const
 {
+	if (MovementInputReplayCapture.IsSet()
+		&& (PreparingLocomotionCurveReplayGroup != nullptr || (CharacterOwner && CharacterOwner->bClientUpdating))
+		&& MovementInputReplayCapture->Request.Binding.ConsumerBindingSerial != 0)
+	{
+		// Read the original interval's consumed Started/Released disposition, never today's physical Held.
+		return !IsMovementInputRequestBlocked()
+			&& MovementInputReplayCapture->Request.Admission == static_cast<uint8>(ELocomotionRequestAdmission::Admitted)
+			&& GetCurrentAcceleration().SizeSquared2D() > KINDA_SMALL_NUMBER;
+	}
+	if (ActiveMovementOwnerSyncNativeMove || MovementInputNativeSource.IsValid())
+	{
+		return !IsMovementInputRequestBlocked() && LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted
+			&& GetCurrentAcceleration().SizeSquared2D() > KINDA_SMALL_NUMBER;
+	}
 	if (MovementInputBindingSerial != 0
 		&& (IsMovementInputRequestBlocked() || LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted))
 	{
@@ -2482,12 +2844,16 @@ void UGGYGOCharacterMovementComponent::CommitLocomotionCandidate(const FLocomoti
 bool UGGYGOCharacterMovementComponent::HasCurrentLocomotionCurveOrigin(
 	const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin) const
 {
-	return Origin.IsValid() && Origin == LocomotionCurveOrigin && Origin->Owner.Get() == this
-		&& Origin->ExecutionRequestSerial != 0 && Origin->ExecutionRequestSerial == LocomotionRequestSerial
-		&& Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
-		&& IsMovementInputBindingCurrent(Origin->Binding)
-		&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted
-			|| LocomotionRequestAdmission == ELocomotionRequestAdmission::Released);
+	if (!Origin.IsValid() || Origin != LocomotionCurveOrigin || Origin->Owner.Get() != this
+		|| Origin->ExecutionRequestSerial == 0 || Origin->ExecutionRequestSerial != LocomotionRequestSerial
+		|| IsMovementInputRequestBlocked()) return false;
+	if (MovementInputNativeSource.IsValid())
+	{
+		return Origin->Binding.ConsumerBindingSerial == 0 && Origin->InputRequest.RequestSerial == 0
+			&& Origin->ExecutionRequestSerial == MovementInputNativeSource->ExecutionRequestSerial;
+	}
+	return Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
+		&& IsMovementInputBindingCurrent(Origin->Binding);
 }
 
 bool UGGYGOCharacterMovementComponent::ReportLocomotionCurveRootMotionFailure(
@@ -2576,6 +2942,7 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 	}
 	TSharedPtr<FGGYGOCurveRootMotionMoveInput> Input = MakeShared<FGGYGOCurveRootMotionMoveInput>();
 	Input->Origin = LocomotionCurveOrigin;
+	Input->NativeSource = MovementInputNativeSource; // Original authenticated source, not a synthetic local binding.
 	Input->StartCandidate = Candidate;
 	if (Candidate.MotionType == EGGYGOLocomotionMotionType::TurnBack)
 	{
@@ -2612,12 +2979,18 @@ void UGGYGOCharacterMovementComponent::ConsumeLocomotionCurvePrepared(
 {
 	if (!Prepared.IsValid() || !Prepared->Input.IsValid() || !Prepared->State.IsValid()
 		|| Prepared == ConsumedLocomotionCurvePrepared) return;
+	const TSharedPtr<const FGGYGOCurveRootMotionOrigin> Origin = Prepared->Input->Origin;
+	const bool bOriginalCurrentResource = Origin == LocomotionCurveOrigin || Origin == CompletedLocomotionCurveOrigin;
+	const bool bOriginalReplayInput = Prepared->Input == ReplayLocomotionCurveInput
+		&& MovementInputReplayCapture.IsSet() && !bLocomotionCurveReplayRejected;
+	if (!Origin.IsValid() || Origin->Owner.Get() != this || Origin->ExecutionRequestSerial != LocomotionRequestSerial
+		|| Origin->Binding != MovementInputBinding || Origin->InputRequest != MovementInputRequest
+		|| (!bOriginalCurrentResource && !bOriginalReplayInput) || IsMovementInputRequestBlocked()
+		|| Prepared->Input->NativeSource != MovementInputNativeSource) return;
 	CommitLocomotionCandidate(Prepared->State->Candidate);
 	ConsumedLocomotionCurvePrepared = Prepared;
 	LastLocomotionCurvePrepared = Prepared;
-	const TSharedPtr<const FGGYGOCurveRootMotionOrigin> Origin = Prepared->Input->Origin;
-	const bool bOriginalCurrentResource = Origin == LocomotionCurveOrigin || Origin == CompletedLocomotionCurveOrigin;
-	if (bOriginalCurrentResource && Origin.IsValid() && Origin->ExecutionRequestSerial == LocomotionRequestSerial
+	if ((bOriginalCurrentResource || bOriginalReplayInput) && Origin.IsValid() && Origin->ExecutionRequestSerial == LocomotionRequestSerial
 		&& Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
 		&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted
 			|| LocomotionRequestAdmission == ELocomotionRequestAdmission::Released))
@@ -2643,6 +3016,12 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 {
 	EndLocomotionCurveReplay();
 	OutError.Reset();
+	FMovementInputReplayCapture Capture;
+	Capture.Request = Move.SavedMovementInputRequest;
+	Capture.OwnerScope = Move.SavedMovementOwnerSyncScope;
+	Capture.OwnerGeneration = Move.SavedMovementOwnerGeneration;
+	Capture.Checkpoint = Move.SavedMovementInputSourceCheckpoint;
+	MovementInputReplayCapture = MoveTemp(Capture);
 	LastLocomotionCurvePrepared.Reset();
 	ConsumedLocomotionCurvePrepared.Reset();
 	PendingLocomotionCurveInput.Reset();
@@ -2656,6 +3035,14 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 		OutError = Reason;
 		return false;
 	};
+	if (IsMovementInputRequestBlocked())
+	{
+		// Original Waiting/stale/FAILED applicability is normal rejection, not a curve/config failure.
+		// The sole gate and Prep/Move guards preserve the current request and its resources.
+		ReplayLocomotionCurveInput.Reset();
+		ReplayLocomotionCurvePrepared.Reset();
+		return true;
+	}
 	if (ReplayLocomotionCurveInput.IsValid())
 	{
 		const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin = ReplayLocomotionCurveInput->Origin;
@@ -3675,6 +4062,7 @@ void UGGYGOCharacterMovementComponent::ServerMove_PerformMovement(const FCharact
 	}
 	if (Frame.Move)
 	{
+		Frame.OriginalSourceCheckpoint = Frame.Move->MovementInputSourceCheckpoint;
 		Frame.OriginalNonce = Frame.Move->MovementOwnerSyncNonce;
 		Frame.OriginalClientGeneration = Frame.Move->MovementOwnerGeneration;
 		Frame.OriginalTimeStamp = Frame.Move->TimeStamp;
@@ -3685,7 +4073,9 @@ void UGGYGOCharacterMovementComponent::ServerMove_PerformMovement(const FCharact
 	FMovementOwnerSyncNativeMove* Previous = ActiveMovementOwnerSyncNativeMove;
 	const bool bNativeRemote = Frame.Move && GetCurrentNetworkMoveData() == &MoveData
 		&& CharacterOwner && CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled();
-	ActiveMovementOwnerSyncNativeMove = bNativeRemote ? &Frame : nullptr;
+	const bool bRemoteOwnerCall = CharacterOwner && CharacterOwner->HasAuthority()
+		&& !CharacterOwner->IsLocallyControlled() && Cast<APlayerController>(CharacterOwner->GetController());
+	ActiveMovementOwnerSyncNativeMove = bRemoteOwnerCall ? &Frame : nullptr;
 	Super::ServerMove_PerformMovement(MoveData);
 	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
 	if (!Self) return;
@@ -3699,14 +4089,187 @@ void UGGYGOCharacterMovementComponent::ServerMove_PerformMovement(const FCharact
 		Self->MovementOwnerSyncPendingReceipt = Frame.Receipt;
 }
 
+bool UGGYGOCharacterMovementComponent::ConsumeNativeMovementInputCheckpoint(
+	const FMovementOwnerSyncNativeMove& OriginalMove)
+{
+	const FMovementOwnerSyncNativeMove* Frame = &OriginalMove;
+	const FMovementOwnerSyncNativeReceipt& Receipt = OriginalMove.Receipt;
+	if (Frame != ActiveMovementOwnerSyncNativeMove || !Frame->Move || !Frame->bEnteredNativeSimulation
+		|| Frame->Move != GetCurrentNetworkMoveData() || !IsMovementOwnerSyncReceiptCurrent(Receipt)
+		|| Frame->OriginalSourceCheckpoint != Frame->Move->MovementInputSourceCheckpoint) return false;
+	const FGGYGOMovementInputSourceCheckpoint& Checkpoint = Frame->OriginalSourceCheckpoint;
+	const auto Reject = [this, Frame, &Checkpoint](const FString& Reason)
+	{
+		ReportMovementOwnerSyncOnce(FName(TEXT("NativeSourceCheckpointRejected")), FString::Printf(
+			TEXT("Original native source rejected: Generation=%llu, Nonce=%llu, Binding=%llu, Fence=%llu, Session=%llu, Event=%llu, Request=%llu, Reason='%s'."),
+			static_cast<unsigned long long>(Frame->Receipt.OwnerGeneration),
+			static_cast<unsigned long long>(Frame->OriginalNonce),
+			static_cast<unsigned long long>(Checkpoint.BindingSerial),
+			static_cast<unsigned long long>(Checkpoint.ConsumerFenceSerial),
+			static_cast<unsigned long long>(Checkpoint.SessionSerial),
+			static_cast<unsigned long long>(Checkpoint.EventSerial),
+			static_cast<unsigned long long>(Checkpoint.RequestSerial), *Reason));
+		return false;
+	};
+	FString Error;
+	if (!Checkpoint.IsValid(&Error)) return Reject(Error);
+	if (!Checkpoint.bPresent) return false; // Original no-source/Waiting move, never promoted by current Ready.
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!IsMovementOwnerSyncContextCurrent(Context) || Context->bRequiresNativeResponse
+		|| Context->Notice.State != EGGYGOMovementOwnerSyncState::Ready
+		|| Context->Notice.ServerOwnerGeneration != Receipt.OwnerGeneration
+		|| MovementInputBindingSerial != 0)
+	{
+		return Reject(TEXT("native source has no original authority owner scope, or conflicts with a local Source binding"));
+	}
+	const TSharedPtr<const FMovementInputNativeSource> OriginalSource = MovementInputNativeSource;
+	const FGGYGOMovementInputSourceCheckpoint Previous = MovementInputSourceCheckpoint;
+	const bool bNewBinding = OriginalSource.IsValid()
+		&& (Checkpoint.BindingSerial != Previous.BindingSerial || Checkpoint.SessionSerial != Previous.SessionSerial);
+	const bool bNewNonce = OriginalSource.IsValid() && OriginalSource->Receipt.Nonce != Receipt.Nonce;
+	if ((Receipt.ClientOwnerGeneration != 0 && Receipt.ClientOwnerGeneration != Receipt.OwnerGeneration)
+		|| (Receipt.ClientOwnerGeneration == 0 && OriginalSource.IsValid()
+			&& OriginalSource->ExecutionRequestSerial != 0)) return false;
+	if (OriginalSource.IsValid())
+	{
+		if (OriginalSource->OwnerScope != Context->Scope
+			|| OriginalSource->Receipt.OwnerGeneration != Receipt.OwnerGeneration)
+			return Reject(TEXT("previous native provenance belongs to an unretired different owner scope"));
+		if (Checkpoint.BindingSerial == Previous.BindingSerial && Checkpoint.SessionSerial != Previous.SessionSerial)
+			return Reject(TEXT("an original consumer binding serial was reused for a different Source session"));
+		if (Checkpoint.BindingSerial < Previous.ConsumerFenceSerial
+			|| (bNewBinding && Checkpoint.BindingSerial <= Previous.ConsumerFenceSerial)
+			|| (!bNewBinding && Previous.bConsumerInvalidated))
+			return false; // A delayed original report cannot retire or rearm its successor.
+		if (bNewBinding && Checkpoint.SessionSerial == Previous.SessionSerial)
+			return Reject(TEXT("new consumer binding reused the retired Source session"));
+		if (!bNewBinding)
+		{
+			if (Checkpoint.SessionOpenedEventSerial != Previous.SessionOpenedEventSerial
+				|| Checkpoint.SessionMode != Previous.SessionMode)
+				return Reject(TEXT("original session opening/mode was rewritten"));
+			if (Checkpoint.EventSerial < Previous.EventSerial || Checkpoint.RequestSerial < Previous.RequestSerial)
+				return false;
+			if (Checkpoint.EventSerial == Previous.EventSerial && Checkpoint != Previous)
+			{
+				FGGYGOMovementInputSourceCheckpoint Retired = Previous;
+				Retired.bConsumerInvalidated = true;
+				Retired.ConsumerFenceSerial = Checkpoint.ConsumerFenceSerial;
+				if (!Checkpoint.bConsumerInvalidated || Retired != Checkpoint)
+					return Reject(TEXT("an original event serial was reused for different checkpoint values"));
+			}
+			if (Checkpoint.NeutralEventSerial < Previous.NeutralEventSerial
+				|| Checkpoint.SourceUnresolvedEventSerial < Previous.SourceUnresolvedEventSerial)
+				return Reject(TEXT("original neutral/unresolved watermarks regressed"));
+			if (Checkpoint.RequestSerial == Previous.RequestSerial
+				&& (Checkpoint.RequestStartedEventSerial != Previous.RequestStartedEventSerial
+					|| Checkpoint.StartProof != Previous.StartProof
+					|| Checkpoint.StartReleaseRequestSerial != Previous.StartReleaseRequestSerial
+					|| Checkpoint.StartReleaseEventSerial != Previous.StartReleaseEventSerial
+					|| Checkpoint.StartNeutralEventSerial != Previous.StartNeutralEventSerial
+					|| (Previous.RequestReleasedEventSerial != 0
+						&& Checkpoint.RequestReleasedEventSerial != Previous.RequestReleasedEventSerial)))
+				return Reject(TEXT("the same original request/start/release anchors were rewritten"));
+		}
+	}
+	const bool bNewRequest = Checkpoint.RequestSerial != 0 && (!OriginalSource.IsValid()
+		|| bNewBinding || Checkpoint.RequestSerial != Previous.RequestSerial);
+	const bool bTerminal = Checkpoint.bConsumerInvalidated
+		|| Checkpoint.RequestReleasedEventSerial != 0
+		|| Checkpoint.SourceUnresolvedEventSerial > Checkpoint.RequestStartedEventSerial;
+	if (bNewNonce && !bNewBinding && !bNewRequest)
+		return Reject(TEXT("a successor nonce cannot borrow the original open request"));
+	if (bNewRequest)
+	{
+		if (Checkpoint.StartProof == EGGYGOMovementInputStartProof::ColdPhysicalPress)
+		{
+			if ((OriginalSource.IsValid() && (bNewBinding || bNewNonce || Previous.RequestSerial != 0
+				|| Previous.SourceUnresolvedEventSerial != 0 || Previous.bConsumerInvalidated))
+				|| Checkpoint.BindingSerial != 1 || !Receipt.bInitialOwnerGeneration
+				|| !Context->bInitialLocalScope || LocomotionRequestSerial != 0
+				|| LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed)
+				return Reject(TEXT("Cold cannot recover a previous request, binding, nonce or owner"));
+		}
+		else if (OriginalSource.IsValid() && !bNewBinding && Previous.RequestSerial != 0)
+		{
+			if (Checkpoint.RequestStartedEventSerial <= Previous.EventSerial
+				|| Checkpoint.StartReleaseRequestSerial < Previous.RequestSerial
+				|| Checkpoint.StartReleaseEventSerial <= Previous.RequestStartedEventSerial
+				|| Checkpoint.StartNeutralEventSerial <= Checkpoint.StartReleaseEventSerial
+				|| (Checkpoint.StartReleaseRequestSerial == Previous.RequestSerial
+					&& Previous.RequestReleasedEventSerial != 0
+					&& Checkpoint.StartReleaseEventSerial != Previous.RequestReleasedEventSerial))
+				return Reject(TEXT("successor start lacks its original ordered release then neutral basis"));
+		}
+	}
+	const bool bOriginalReady = Receipt.ClientOwnerGeneration != 0
+		&& Receipt.ClientOwnerGeneration == Receipt.OwnerGeneration;
+	if (bNewRequest && !bTerminal && !bOriginalReady) return false;
+	if (!OriginalSource.IsValid() || bNewBinding || bNewNonce || bNewRequest)
+	{
+		if (OriginalSource.IsValid() && OriginalSource->ExecutionRequestSerial != 0
+			&& OriginalSource->ExecutionRequestSerial == LocomotionRequestSerial) RevokeMovementInputRequest();
+		TSharedPtr<FMovementInputNativeSource> Source = MakeShared<FMovementInputNativeSource>();
+		Source->Receipt = Receipt;
+		Source->OwnerScope = Context->Scope;
+		Source->StartCheckpoint = Checkpoint;
+		if (bNewRequest && !bTerminal)
+		{
+			if (LocomotionRequestSerial == MAX_uint64)
+			{
+				FailLocomotionRequest(LocomotionRequestSerial, TEXT("native CMC execution request serial is exhausted"));
+				return Reject(TEXT("native CMC execution request serial is exhausted"));
+			}
+			Source->ExecutionRequestSerial = ++LocomotionRequestSerial;
+			MovementInputRequestOwnerScope = Context->Scope;
+			LocomotionRequestAdmission = ELocomotionRequestAdmission::Admitted;
+			LocomotionRequestFailureReason.Reset();
+			bMovementInputRequestOpen = true;
+			bMovementInputAdmissionDiagnosticReported = false;
+			const bool bKeepRunIntent = bWantsRunOnNextMove;
+			const bool bKeepForceWalk = bForceWalkRequested;
+			ResetLocomotionState();
+			bWantsRunOnNextMove = bKeepRunIntent;
+			bForceWalkRequested = bKeepForceWalk;
+		}
+		MovementInputNativeSource = Source;
+	}
+	// Cache only the successfully validated original facts; no local Source identity is manufactured.
+	MovementInputSourceCheckpoint = Checkpoint;
+	LastMovementInputRequestSerial = Checkpoint.RequestSerial;
+	const TSharedPtr<const FMovementInputNativeSource> Source = MovementInputNativeSource;
+	if (!Source.IsValid() || Source->ExecutionRequestSerial == 0
+		|| Source->ExecutionRequestSerial != LocomotionRequestSerial) return false;
+	if (Checkpoint.bConsumerInvalidated || Checkpoint.SourceUnresolvedEventSerial > Checkpoint.RequestStartedEventSerial)
+	{
+		RevokeMovementInputRequest();
+		return false;
+	}
+	if (Checkpoint.RequestReleasedEventSerial != 0)
+	{
+		bMovementInputRequestOpen = false;
+		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted)
+			LocomotionRequestAdmission = ELocomotionRequestAdmission::Released;
+	}
+	if (LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
+		&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Released) return false;
+	if (!HasAcceptedMovementSet())
+	{
+		FailLocomotionRequest(LocomotionRequestSerial, TEXT("authenticated native source request has no accepted MovementSet"));
+		return false;
+	}
+	return bOriginalReady;
+}
+
 void UGGYGOCharacterMovementComponent::MoveAutonomous(
 	float ClientTimeStamp, float DeltaTime, uint8 CompressedFlags, const FVector& NewAccel)
 {
 	FMovementOwnerSyncNativeMove* Frame = ActiveMovementOwnerSyncNativeMove;
-	if (Frame && Frame->Move == GetCurrentNetworkMoveData()
+	if (Frame && Frame->Move && Frame->Move == GetCurrentNetworkMoveData()
 		&& Frame->OriginalTimeStamp == ClientTimeStamp && Frame->OriginalFlags == CompressedFlags
 		&& Frame->Move->MovementOwnerSyncNonce == Frame->OriginalNonce
 		&& Frame->Move->MovementOwnerGeneration == Frame->OriginalClientGeneration
+		&& Frame->Move->MovementInputSourceCheckpoint == Frame->OriginalSourceCheckpoint
 		&& FMath::IsFinite(DeltaTime) && DeltaTime > 0.0f && FMath::IsFinite(ClientTimeStamp)
 		&& Frame->bHasOriginalSync && Frame->OriginalNonce != 0
 		&& HasValidData() && IsActive() && CharacterOwner && CharacterOwner->HasAuthority()
@@ -3726,9 +4289,24 @@ void UGGYGOCharacterMovementComponent::MoveAutonomous(
 		{
 			Frame->Receipt = Receipt;
 			Frame->bEnteredNativeSimulation = true;
+			Frame->bSourceExecutionApplicable = ConsumeNativeMovementInputCheckpoint(*Frame);
+			if (LocomotionRequestSerial == 0 && !Frame->OriginalSourceCheckpoint.bPresent
+				&& Receipt.ClientOwnerGeneration == 0 && Receipt.bInitialOwnerGeneration)
+				bMovementInputAdmissionDiagnosticReported = true; // Ordinary initial native wait, not a missing-source Error.
 		}
 	}
-	Super::MoveAutonomous(ClientTimeStamp, DeltaTime, CompressedFlags, NewAccel);
+	const bool bOriginalReplay = CharacterOwner && CharacterOwner->bClientUpdating && MovementInputReplayCapture.IsSet();
+	if ((Frame || bOriginalReplay) && IsMovementInputRequestBlocked() && IsMovingOnGround()
+		&& !HasIndependentGroundRootMotion() && !CharacterOwner->IsPlayingNetworkedRootMotionMontage()
+		&& (LocomotionRequestSerial != 0 || bOriginalReplay))
+	{
+		// An inapplicable original interval cannot cancel/replace a later request's native sources.
+		return;
+	}
+	const bool bOriginalReleased = (Frame && Frame->bSourceExecutionApplicable
+		&& Frame->OriginalSourceCheckpoint.RequestReleasedEventSerial != 0)
+		|| (bOriginalReplay && MovementInputReplayCapture->Request.Admission == static_cast<uint8>(ELocomotionRequestAdmission::Released));
+	Super::MoveAutonomous(ClientTimeStamp, DeltaTime, CompressedFlags, bOriginalReleased ? FVector::ZeroVector : NewAccel);
 }
 
 void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacterMoveResponseDataContainer& MoveResponse)
@@ -3790,7 +4368,7 @@ void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacter
 			return;
 		}
 	}
-	if (MoveResponse.IsCorrection())
+	if (MoveResponse.IsCorrection() && !IsMovementInputRequestBlocked())
 	{
 		const FCharacterMoveResponseDataContainer_GGYGO& GGYGOResponse =
 			static_cast<const FCharacterMoveResponseDataContainer_GGYGO&>(MoveResponse);
@@ -3828,13 +4406,23 @@ void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacter
 
 bool UGGYGOCharacterMovementComponent::ClientUpdatePositionAfterServerUpdate()
 {
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	MovementInputReplayCapture.Reset();
 	LocomotionCurveReplayEntryState = CaptureLocomotionCandidate();
 	LocomotionCurveReplayEntryRequestSerial = LocomotionRequestSerial;
 	bReplayLocomotionFromAuthority = bHasPendingAuthoritativeLocomotionState;
 	const bool bUpdated = Super::ClientUpdatePositionAfterServerUpdate();
+	if (!WeakSelf.IsValid()) return bUpdated;
+	const bool bLastOriginalMoveInapplicable = MovementInputReplayCapture.IsSet()
+		&& MovementInputReplayCapture->Request.Binding.ConsumerBindingSerial != 0
+		&& (!MovementInputReplayCapture->Request.bExecutionEligible
+			|| MovementInputReplayCapture->Request.ExecutionRequestSerial != LocomotionRequestSerial
+			|| MovementInputReplayCapture->Request.Binding != MovementInputBinding
+			|| MovementInputReplayCapture->Request.Request != MovementInputRequest
+			|| MovementInputReplayCapture->OwnerScope != MovementInputRequestOwnerScope);
 	if (LocomotionCurveReplayEntryState.IsSet()
 		&& LocomotionCurveReplayEntryRequestSerial == LocomotionRequestSerial
-		&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed
+		&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed || bLastOriginalMoveInapplicable
 			|| (ReplayLocomotionCurveInput.IsValid() && ReplayLocomotionCurveInput->Origin.IsValid()
 				&& ReplayLocomotionCurveInput->Origin->ExecutionRequestSerial != LocomotionRequestSerial)))
 	{
@@ -3844,6 +4432,7 @@ bool UGGYGOCharacterMovementComponent::ClientUpdatePositionAfterServerUpdate()
 	LocomotionCurveReplayEntryState.Reset();
 	LocomotionCurveReplayEntryRequestSerial = 0;
 	EndLocomotionCurveReplay();
+	MovementInputReplayCapture.Reset();
 	bReplayLocomotionFromAuthority = false;
 	bHasPendingAuthoritativeLocomotionState = false;
 	return bUpdated;
