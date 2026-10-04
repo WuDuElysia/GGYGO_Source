@@ -1,7 +1,7 @@
 #pragma once
 
 #include "AbilitySystem/Abilities/GGYGOPlayerComboAbility.h"
-#include "Animation/AnimInstance.h"
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 
 #include "GGYGOPlayerComboLifecycleTestTypes.generated.h"
 
@@ -36,7 +36,7 @@ private:
 
 /** Executes a test callback only after Unreal's real Montage_PlayInternal has run. */
 UCLASS(Transient)
-class UGGYGOPlayerComboLifecycleTestAnimInstance : public UAnimInstance
+class UGGYGOPlayerComboLifecycleTestAnimInstance : public UGGYGOMontageGuardAnimInstance
 {
 	GENERATED_BODY()
 

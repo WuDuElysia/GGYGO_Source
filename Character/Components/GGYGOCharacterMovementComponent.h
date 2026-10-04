@@ -24,6 +24,11 @@
 #include "GGYGOCharacterMovementComponent.generated.h"
 
 class AActor;
+class APawn;
+class AController;
+class APlayerController;
+class UNetConnection;
+class UNetDriver;
 class FSavedMove_Character;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOMovementSet;
@@ -34,6 +39,80 @@ class UGGYGOCharacterMovementComponent;
 struct FRootMotionSource_GGYGOCurve;
 struct FGGYGOCurveRootMotionMoveInput;
 struct FGGYGOLocomotionPreparedState;
+
+/** CMC 原生拥有者同步状态；Ready 不代表来源或移动执行准入。 */
+enum class EGGYGOMovementOwnerSyncState : uint8
+{
+	Waiting,
+	Ready,
+	Invalidated
+};
+
+/** 原 CMC/拥有者范围的身份值；IsSet 只检查已发行形状，不证明当前有效。 */
+struct GGYGO_API FGGYGOMovementOwnerSyncScopeId
+{
+	bool IsSet() const;
+	bool operator==(const FGGYGOMovementOwnerSyncScopeId& Other) const;
+	bool operator!=(const FGGYGOMovementOwnerSyncScopeId& Other) const;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> GetConsumer() const;
+	TWeakObjectPtr<APawn> GetOriginalPawn() const;
+	TWeakObjectPtr<APlayerController> GetOriginalPlayerController() const;
+	uint64 GetConsumerLifetimeSerial() const;
+	uint64 GetOwnerContextSerial() const;
+	uint64 GetScopeSerial() const;
+	uint64 GetResponseNonce() const;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Consumer;
+	TWeakObjectPtr<APawn> OriginalPawn;
+	TWeakObjectPtr<APlayerController> OriginalPlayerController;
+	uint64 ConsumerLifetimeSerial = 0;
+	uint64 OwnerContextSerial = 0;
+	uint64 ScopeSerial = 0;
+	uint64 ResponseNonce = 0;
+};
+
+/** 精确订阅句柄；注销只作用于该记录，不会查找并替换后继 Scope。 */
+struct GGYGO_API FGGYGOMovementOwnerSyncObserverId
+{
+	bool IsSet() const;
+	const FGGYGOMovementOwnerSyncScopeId& GetScope() const;
+	uint64 GetObserverSerial() const;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	uint64 ObserverSerial = 0;
+};
+
+/** CMC 发布的原通知值；不包含 Press/Held/Neutral 或执行成功。 */
+struct GGYGO_API FGGYGOMovementOwnerSyncNotice
+{
+	bool IsSet() const;
+	const FGGYGOMovementOwnerSyncScopeId& GetScope() const;
+	EGGYGOMovementOwnerSyncState GetState() const;
+	uint64 GetNoticeSerial() const;
+	uint64 GetServerOwnerGeneration() const;
+	uint64 GetNativeResponseNonce() const;
+	bool IsInitialSynchronizationEligible() const;
+	FName GetReason() const;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	EGGYGOMovementOwnerSyncState State = EGGYGOMovementOwnerSyncState::Invalidated;
+	uint64 NoticeSerial = 0;
+	uint64 ServerOwnerGeneration = 0;
+	uint64 NativeResponseNonce = 0;
+	bool bInitialSynchronizationEligible = false;
+	FName Reason = NAME_None;
+};
+
+DECLARE_DELEGATE_TwoParams(FGGYGOMovementOwnerSyncDelegate,
+	const FGGYGOMovementOwnerSyncObserverId&, const FGGYGOMovementOwnerSyncNotice&);
+
+enum class EGGYGOMovementInitialRequestAdmissionResult : uint8
+{
+	Admitted, AlreadyAdmitted, Stale, Rejected, ExecutionFailed
+};
 
 /** Local resource identity; only the original CMC issues and consumes this reference. */
 struct FGGYGOCurveRootMotionOrigin
@@ -213,6 +292,9 @@ public:
 
 	/** Original SetMoveFor value; sending and PostUpdate_Replay must not replace it. */
 	FGGYGOMovementInputSourceCheckpoint SavedMovementInputSourceCheckpoint;
+	/** 原 SetMoveFor 的同步身份；PostUpdate/回放/响应不得补写。不是来源认证。 */
+	FGGYGOMovementOwnerSyncScopeId SavedMovementOwnerSyncScope;
+	uint64 SavedMovementOwnerGeneration = 0;
 };
 
 /** 客户端预测数据。唯一职责是让 CMC 分配出我们自己的 SavedMove 类型。 */
@@ -229,6 +311,11 @@ public:
 /** 来源值仅运输、尚无服务端准入；Profile、曲线和速度仍由服务端自己的 MovementSet 解析。 */
 struct FCharacterNetworkMoveData_GGYGO : public FCharacterNetworkMoveData
 {
+	/** 固定 9/137 位扩展，原生 owning actor RPC 提供实际 PC/Connection 身份。 */
+	static constexpr uint8 OwnerSyncWireVersion = 2;
+	bool bHasMovementOwnerSync = false;
+	uint64 MovementOwnerSyncNonce = 0;
+	uint64 MovementOwnerGeneration = 0;
 	FGGYGOMovementInputSourceCheckpoint MovementInputSourceCheckpoint;
 	EGGYGOLocomotionMotionType LocomotionMotionType = EGGYGOLocomotionMotionType::None;
 	EGGYGOStopMotionType StopMotionType = EGGYGOStopMotionType::None;
@@ -248,6 +335,14 @@ struct FCharacterNetworkMoveDataContainer_GGYGO : public FCharacterNetworkMoveDa
 /** 位置校正同时带回服务端 Locomotion 基线，随后从该基线重放未确认 move。 */
 struct FCharacterMoveResponseDataContainer_GGYGO : public FCharacterMoveResponseDataContainer
 {
+	/** ACK/correction 均运输；nonce 只来自原 NewMove 的原生调用，不从当前客户端重取。 */
+	static constexpr uint8 OwnerSyncWireVersion = 2;
+	bool bHasMovementOwnerSync = false;
+	uint64 MovementOwnerSyncNonce = 0;
+	uint64 ServerOwnerGeneration = 0;
+	uint64 AdjustmentOwnerGeneration = 0;
+	bool bMovementOwnerActive = false;
+	bool bInitialSynchronizationEligible = false;
 	EGGYGOLocomotionMotionType LocomotionMotionType = EGGYGOLocomotionMotionType::None;
 	EGGYGOStopMotionType StopMotionType = EGGYGOStopMotionType::None;
 	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;
@@ -306,6 +401,8 @@ public:
 	virtual void PhysicsRotation(float DeltaTime) override;
 	virtual void ClientHandleMoveResponse(const FCharacterMoveResponseDataContainer& MoveResponse) override;
 	virtual bool ClientUpdatePositionAfterServerUpdate() override;
+	virtual void ServerMove_PerformMovement(const FCharacterNetworkMoveData& MoveData) override;
+	virtual void MoveAutonomous(float ClientTimeStamp, float DeltaTime, uint8 CompressedFlags, const FVector& NewAccel) override;
 
 	/** 提供我们自己的预测数据类型。 */
 	virtual FNetworkPredictionData_Client* GetPredictionData_Client() const override;
@@ -324,6 +421,19 @@ public:
 	 * 未绑定有效配置时普通地面执行被拒绝；Profile 运行时求值失败整改仍待后续。
 	 */
 	bool SetMovementSet(const UGGYGOMovementSet* InMovementSet, FString* OutError = nullptr);
+
+	bool GetMovementOwnerSyncScope(FGGYGOMovementOwnerSyncScopeId& OutScope, FString& OutError) const;
+	/** 先安装原记录并写 OutObserver，再同步回放；须直接传长期原 Scope 成员。 */
+	bool SubscribeMovementOwnerSync(const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+		FGGYGOMovementOwnerSyncDelegate Observer, FGGYGOMovementOwnerSyncObserverId& OutObserver, FString& OutError);
+	bool UnsubscribeMovementOwnerSync(const FGGYGOMovementOwnerSyncObserverId& OriginalObserver,
+		FName Reason, FString& OutError);
+	/** M3 待实现，M2 无生产调用；Ready 不能自行重发 Started 或执行编号。 */
+	EGGYGOMovementInitialRequestAdmissionResult TryAdmitInitialMovementInputRequest(
+		const FGGYGOMovementOwnerSyncObserverId& OriginalObserver,
+		const FGGYGOMovementInputConsumerBindingId& OriginalBinding,
+		const FGGYGOMovementInputRequestIdentity& OriginalSourceRequest,
+		const FGGYGOMovementOwnerSyncNotice& OriginalReadyNotice, FString& OutError);
 
 	/** CMC lifetime serial; initialization captures this before registering a receiver. */
 	uint64 GetMovementInputBindingSerial() const { return MovementInputBindingSerial; }
@@ -477,6 +587,108 @@ public:
 	void GetLocalVelocityBlend(float& OutBlendX, float& OutBlendY) const;
 
 private:
+	struct FMovementOwnerSyncObserverRecord
+	{
+		FGGYGOMovementOwnerSyncObserverId Id;
+		FGGYGOMovementOwnerSyncDelegate Callback;
+		bool bClosed = false;
+	};
+	struct FMovementOwnerSyncContext
+	{
+		FGGYGOMovementOwnerSyncScopeId Scope;
+		FGGYGOMovementOwnerSyncNotice Notice;
+		TWeakObjectPtr<UNetConnection> Connection;
+		TWeakObjectPtr<UNetDriver> NetDriver;
+		TMap<uint64, TSharedPtr<FMovementOwnerSyncObserverRecord>> Observers;
+		uint64 ObservedBindingSerial = 0;
+		uint64 ExpectedServerGeneration = 0;
+		bool bConnectionCaptured = false;
+		bool bOwnerPairCaptured = false;
+		bool bObservedBindingActive = false;
+		bool bRequiresNativeResponse = false;
+		bool bInitialLocalScope = false;
+		bool bRetired = false;
+	};
+	/**
+	 * Stack-owned publication resource. Input: the exact original Context/records;
+	 * output: cancellable pending callbacks, never a gameplay state or notice queue.
+	 * Nested frames borrow Previous only until return. Terminal cleanup seals pending
+	 * records on every exit, unlinks this frame before releasing callback captures,
+	 * and retains no historical lookup. EndPlay detaches the active chain.
+	 */
+	struct FMovementOwnerSyncDispatchFrame
+	{
+		FMovementOwnerSyncDispatchFrame(UGGYGOCharacterMovementComponent* InOwner,
+			const TSharedPtr<FMovementOwnerSyncContext>& InContext, bool bInTerminal);
+		~FMovementOwnerSyncDispatchFrame();
+		FMovementOwnerSyncDispatchFrame(const FMovementOwnerSyncDispatchFrame&) = delete;
+		FMovementOwnerSyncDispatchFrame& operator=(const FMovementOwnerSyncDispatchFrame&) = delete;
+		void ClosePendingRecords();
+		TWeakObjectPtr<UGGYGOCharacterMovementComponent> Owner;
+		TSharedPtr<FMovementOwnerSyncContext> Context;
+		TArray<TSharedPtr<FMovementOwnerSyncObserverRecord>> Records;
+		FMovementOwnerSyncDispatchFrame* Previous = nullptr;
+		uint64 OwnerLifetimeSerial = 0;
+		bool bTerminal = false;
+		bool bClosing = false;
+	};
+	FMovementOwnerSyncDispatchFrame* ActiveMovementOwnerSyncDispatch = nullptr;
+	/** 单个原 PendingAdjustment 的来源附记；不是队列、执行器或第二输入状态。 */
+	struct FMovementOwnerSyncNativeReceipt
+	{
+		TWeakObjectPtr<APawn> Pawn;
+		TWeakObjectPtr<APlayerController> Controller;
+		TWeakObjectPtr<UNetConnection> Connection;
+		uint64 OwnerGeneration = 0;
+		uint64 ClientOwnerGeneration = 0;
+		uint64 Nonce = 0;
+		float TimeStamp = 0.0f;
+		bool bInitialOwnerGeneration = false;
+	};
+	struct FMovementOwnerSyncNativeMove
+	{
+		const FCharacterNetworkMoveData_GGYGO* Move = nullptr;
+		uint64 OriginalNonce = 0;
+		uint64 OriginalClientGeneration = 0;
+		float OriginalTimeStamp = 0.0f;
+		uint8 OriginalFlags = 0;
+		bool bHasOriginalSync = false;
+		bool bOriginalNewMove = false;
+		FMovementOwnerSyncNativeReceipt Receipt;
+		bool bEnteredNativeSimulation = false;
+	};
+	UFUNCTION()
+	void HandleMovementOwnerControllerChanged(APawn* Pawn, AController* OldController, AController* NewController);
+	void RefreshMovementOwnerSyncContext();
+	void OpenMovementOwnerSyncScope(APawn* Pawn, APlayerController* Controller, UNetConnection* Connection,
+		UNetDriver* Driver, bool bInitialLocalScope, uint64 ExpectedServerGeneration = 0);
+	void RetireMovementOwnerSyncScope(FName Reason);
+	void RetireServerMovementOwner(FName Reason);
+	bool IsMovementOwnerSyncContextCurrent(const TSharedPtr<FMovementOwnerSyncContext>& Context) const;
+	void PublishMovementOwnerSyncNotice(const TSharedPtr<FMovementOwnerSyncContext>& Context,
+		EGGYGOMovementOwnerSyncState State, uint64 Generation, uint64 Nonce, bool bInitialEligible, FName Reason);
+	bool IsMovementOwnerSyncReceiptCurrent(const FMovementOwnerSyncNativeReceipt& Receipt) const;
+	void ReportMovementOwnerSyncOnce(FName Reason, const FString& Detail);
+	TSharedPtr<FMovementOwnerSyncContext> MovementOwnerSyncContext;
+	TWeakObjectPtr<APawn> MovementOwnerObservedPawn;
+	TWeakObjectPtr<APawn> ServerMovementOwnerPawn;
+	TWeakObjectPtr<APlayerController> ServerMovementOwnerController;
+	TWeakObjectPtr<UNetConnection> ServerMovementOwnerConnection;
+	TWeakObjectPtr<UNetDriver> ServerMovementOwnerNetDriver;
+	FMovementOwnerSyncNativeReceipt MovementOwnerSyncPendingReceipt;
+	/** 栈内原调用标记；客户端 replay 的 CurrentNetworkMoveData 不建立此标记。 */
+	FMovementOwnerSyncNativeMove* ActiveMovementOwnerSyncNativeMove = nullptr;
+	TSet<FName> MovementOwnerSyncReportedReasons;
+	uint64 MovementOwnerSyncLifetimeSerial = 0;
+	uint64 MovementOwnerSyncLastObserverSerial = 0;
+	uint64 MovementOwnerSyncLastNoticeSerial = 0;
+	uint64 ServerMovementOwnerGeneration = 0;
+	bool bServerMovementOwnerActive = false;
+	bool bServerMovementInitialOwnerGeneration = false;
+	bool bMovementOwnerSyncEverOpened = false;
+	bool bServerMovementOwnerEverOpened = false;
+	bool bMovementOwnerSyncClosed = false;
+
 	enum class ELocomotionRequestAdmission : uint8
 	{
 		None, Admitted, Released, Revoked, Failed

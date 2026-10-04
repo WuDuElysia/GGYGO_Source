@@ -14,6 +14,9 @@
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/PlayerController.h"
+#include "Engine/NetConnection.h"
+#include "Engine/NetDriver.h"
 #include "Net/UnrealNetwork.h"
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Class.h"
@@ -21,6 +24,132 @@
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterMovementComponent)
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMovement, Log, All);
+
+namespace GGYGOMovementOwnerSync
+{
+	// 仅签身份；当前拥有者、就绪和执行状态仍由各原 CMC 唯一持有。
+	uint64 LastIdentitySerial = 0;
+	uint64 IssueIdentity()
+	{
+		if (!IsInGameThread() || LastIdentitySerial == MAX_uint64)
+		{
+			UE_LOG(LogGGYGOMovement, Error, TEXT("[Movement.OwnerSync] Identity issuance rejected: game thread required and serial must not wrap."));
+			return 0;
+		}
+		return ++LastIdentitySerial;
+	}
+
+	UNetConnection* GetConnection(APawn* Pawn, APlayerController* Controller)
+	{
+		if (!Pawn || !Controller) return nullptr;
+		if (Pawn->HasAuthority()) return Controller->GetNetConnection();
+		// 本地客户端的原生端点是 ServerConnection，PC 的 Player 是 LocalPlayer。
+		UNetDriver* Driver = Pawn->GetNetDriver();
+		return Driver ? ToRawPtr(Driver->ServerConnection) : nullptr;
+	}
+
+	bool IsConnectionLive(const UNetConnection* Connection)
+	{
+		return IsValid(Connection) && Connection->GetConnectionState() != USOCK_Closed
+			&& Connection->GetConnectionState() != USOCK_Invalid;
+	}
+
+	bool SerializeMove(FArchive& Ar, bool& Has, uint64& Nonce, uint64& Generation)
+	{
+		uint8 Version = FCharacterNetworkMoveData_GGYGO::OwnerSyncWireVersion;
+		bool Present = Ar.IsLoading() ? false : Has;
+		uint64 ReadNonce = Ar.IsLoading() ? 0 : Nonce;
+		uint64 ReadGeneration = Ar.IsLoading() ? 0 : Generation;
+		Ar.SerializeBits(&Version, 8);
+		if (Ar.IsError() || Version != FCharacterNetworkMoveData_GGYGO::OwnerSyncWireVersion)
+		{
+			Ar.SetError(); return false;
+		}
+		Ar.SerializeBits(&Present, 1);
+		if (Present) { Ar << ReadNonce; Ar << ReadGeneration; }
+		if (Ar.IsError() || (Present ? ReadNonce == 0 : (ReadNonce != 0 || ReadGeneration != 0)))
+		{
+			Ar.SetError(); return false;
+		}
+		if (Ar.IsLoading()) { Has = Present; Nonce = ReadNonce; Generation = ReadGeneration; }
+		return true;
+	}
+
+	bool SerializeResponse(FArchive& Ar, FCharacterMoveResponseDataContainer_GGYGO& Response)
+	{
+		uint8 Version = FCharacterMoveResponseDataContainer_GGYGO::OwnerSyncWireVersion;
+		bool Present = Ar.IsLoading() ? false : Response.bHasMovementOwnerSync;
+		uint64 Nonce = Ar.IsLoading() ? 0 : Response.MovementOwnerSyncNonce;
+		uint64 Generation = Ar.IsLoading() ? 0 : Response.ServerOwnerGeneration;
+		uint64 Adjustment = Ar.IsLoading() ? 0 : Response.AdjustmentOwnerGeneration;
+		bool Active = Ar.IsLoading() ? false : Response.bMovementOwnerActive;
+		bool Initial = Ar.IsLoading() ? false : Response.bInitialSynchronizationEligible;
+		Ar.SerializeBits(&Version, 8);
+		if (Ar.IsError() || Version != FCharacterMoveResponseDataContainer_GGYGO::OwnerSyncWireVersion)
+		{
+			Ar.SetError(); return false;
+		}
+		Ar.SerializeBits(&Present, 1);
+		if (Present)
+		{
+			Ar << Nonce; Ar << Generation; Ar << Adjustment;
+			Ar.SerializeBits(&Active, 1); Ar.SerializeBits(&Initial, 1);
+		}
+		if (Ar.IsError() || (Present
+			? (Nonce == 0 || Generation == 0 || Adjustment == 0 || (Initial && !Active))
+			: (Nonce != 0 || Generation != 0 || Adjustment != 0 || Active || Initial)))
+		{
+			Ar.SetError(); return false;
+		}
+		if (Ar.IsLoading())
+		{
+			Response.bHasMovementOwnerSync = Present;
+			Response.MovementOwnerSyncNonce = Nonce;
+			Response.ServerOwnerGeneration = Generation;
+			Response.AdjustmentOwnerGeneration = Adjustment;
+			Response.bMovementOwnerActive = Active;
+			Response.bInitialSynchronizationEligible = Initial;
+		}
+		return true;
+	}
+}
+
+bool FGGYGOMovementOwnerSyncScopeId::IsSet() const
+{
+	return !Consumer.IsExplicitlyNull() && !OriginalPawn.IsExplicitlyNull()
+		&& !OriginalPlayerController.IsExplicitlyNull() && ConsumerLifetimeSerial != 0
+		&& OwnerContextSerial != 0 && ScopeSerial != 0 && ResponseNonce != 0;
+}
+bool FGGYGOMovementOwnerSyncScopeId::operator==(const FGGYGOMovementOwnerSyncScopeId& Other) const
+{
+	return Consumer.HasSameIndexAndSerialNumber(Other.Consumer)
+		&& OriginalPawn.HasSameIndexAndSerialNumber(Other.OriginalPawn)
+		&& OriginalPlayerController.HasSameIndexAndSerialNumber(Other.OriginalPlayerController)
+		&& ConsumerLifetimeSerial == Other.ConsumerLifetimeSerial && OwnerContextSerial == Other.OwnerContextSerial
+		&& ScopeSerial == Other.ScopeSerial && ResponseNonce == Other.ResponseNonce;
+}
+bool FGGYGOMovementOwnerSyncScopeId::operator!=(const FGGYGOMovementOwnerSyncScopeId& Other) const { return !(*this == Other); }
+TWeakObjectPtr<UGGYGOCharacterMovementComponent> FGGYGOMovementOwnerSyncScopeId::GetConsumer() const { return Consumer; }
+TWeakObjectPtr<APawn> FGGYGOMovementOwnerSyncScopeId::GetOriginalPawn() const { return OriginalPawn; }
+TWeakObjectPtr<APlayerController> FGGYGOMovementOwnerSyncScopeId::GetOriginalPlayerController() const { return OriginalPlayerController; }
+uint64 FGGYGOMovementOwnerSyncScopeId::GetConsumerLifetimeSerial() const { return ConsumerLifetimeSerial; }
+uint64 FGGYGOMovementOwnerSyncScopeId::GetOwnerContextSerial() const { return OwnerContextSerial; }
+uint64 FGGYGOMovementOwnerSyncScopeId::GetScopeSerial() const { return ScopeSerial; }
+uint64 FGGYGOMovementOwnerSyncScopeId::GetResponseNonce() const { return ResponseNonce; }
+bool FGGYGOMovementOwnerSyncObserverId::IsSet() const { return Scope.IsSet() && ObserverSerial != 0; }
+const FGGYGOMovementOwnerSyncScopeId& FGGYGOMovementOwnerSyncObserverId::GetScope() const { return Scope; }
+uint64 FGGYGOMovementOwnerSyncObserverId::GetObserverSerial() const { return ObserverSerial; }
+bool FGGYGOMovementOwnerSyncNotice::IsSet() const
+{
+	return Scope.IsSet() && NoticeSerial != 0 && static_cast<uint8>(State) <= static_cast<uint8>(EGGYGOMovementOwnerSyncState::Invalidated);
+}
+const FGGYGOMovementOwnerSyncScopeId& FGGYGOMovementOwnerSyncNotice::GetScope() const { return Scope; }
+EGGYGOMovementOwnerSyncState FGGYGOMovementOwnerSyncNotice::GetState() const { return State; }
+uint64 FGGYGOMovementOwnerSyncNotice::GetNoticeSerial() const { return NoticeSerial; }
+uint64 FGGYGOMovementOwnerSyncNotice::GetServerOwnerGeneration() const { return ServerOwnerGeneration; }
+uint64 FGGYGOMovementOwnerSyncNotice::GetNativeResponseNonce() const { return NativeResponseNonce; }
+bool FGGYGOMovementOwnerSyncNotice::IsInitialSynchronizationEligible() const { return bInitialSynchronizationEligible; }
+FName FGGYGOMovementOwnerSyncNotice::GetReason() const { return Reason; }
 
 namespace GGYGOMovementConstants
 {
@@ -322,6 +451,8 @@ bool FGGYGOMovementInputSourceCheckpoint::Serialize(FArchive& Ar, FString* OutEr
 void FSavedMove_GGYGO::Clear()
 {
 	Super::Clear();
+	SavedMovementOwnerSyncScope = {};
+	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
@@ -354,12 +485,21 @@ void FSavedMove_GGYGO::Clear()
 void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, FNetworkPredictionData_Client_Character& ClientData)
 {
 	Super::SetMoveFor(C, InDeltaTime, NewAccel, ClientData);
+	SavedMovementOwnerSyncScope = {};
+	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
 
 	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
 	{
+		const auto& Context = MoveComp->MovementOwnerSyncContext;
+		if (MoveComp->IsMovementOwnerSyncContextCurrent(Context))
+		{
+			// Original capture only. PostUpdate/PrepMoveFor/responses never retag this move.
+			SavedMovementOwnerSyncScope = Context->Scope;
+			SavedMovementOwnerGeneration = Context->Notice.GetServerOwnerGeneration();
+		}
 		SavedMovementInputSourceCheckpoint = MoveComp->MovementInputSourceCheckpoint;
 		SavedGait = MoveComp->ResolvedGait;
 		NetworkGait = SavedGait;
@@ -467,6 +607,8 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter, float MaxDelta) const
 {
 	const FSavedMove_GGYGO* NewGGYGOMove = static_cast<const FSavedMove_GGYGO*>(NewMove.Get());
+	if (NewGGYGOMove && (NewGGYGOMove->SavedMovementOwnerSyncScope != SavedMovementOwnerSyncScope
+		|| NewGGYGOMove->SavedMovementOwnerGeneration != SavedMovementOwnerGeneration)) return false;
 	if (NewGGYGOMove && NewGGYGOMove->SavedMovementInputSourceCheckpoint != SavedMovementInputSourceCheckpoint)
 	{
 		return false;
@@ -518,6 +660,8 @@ bool FSavedMove_GGYGO::IsImportantMove(const FSavedMovePtr& LastAckedMovePtr) co
 	if (!LastAckedMovePtr.IsValid()) return true;
 	const FSavedMove_GGYGO& LastAcked = static_cast<const FSavedMove_GGYGO&>(*LastAckedMovePtr);
 	return SavedMovementInputSourceCheckpoint != LastAcked.SavedMovementInputSourceCheckpoint
+		|| SavedMovementOwnerSyncScope != LastAcked.SavedMovementOwnerSyncScope
+		|| SavedMovementOwnerGeneration != LastAcked.SavedMovementOwnerGeneration
 		|| Super::IsImportantMove(LastAckedMovePtr);
 }
 
@@ -557,6 +701,9 @@ void FCharacterNetworkMoveData_GGYGO::ClientFillNetworkMoveData(
 {
 	FCharacterNetworkMoveData::ClientFillNetworkMoveData(ClientMove, MoveType);
 	const FSavedMove_GGYGO& GGYGOMove = static_cast<const FSavedMove_GGYGO&>(ClientMove);
+	bHasMovementOwnerSync = GGYGOMove.SavedMovementOwnerSyncScope.IsSet();
+	MovementOwnerSyncNonce = bHasMovementOwnerSync ? GGYGOMove.SavedMovementOwnerSyncScope.GetResponseNonce() : 0;
+	MovementOwnerGeneration = bHasMovementOwnerSync ? GGYGOMove.SavedMovementOwnerGeneration : 0;
 	MovementInputSourceCheckpoint = GGYGOMove.SavedMovementInputSourceCheckpoint;
 	LocomotionMotionType = GGYGOMove.NetworkLocomotionMotionType;
 	StopMotionType = GGYGOMove.NetworkStopMotionType;
@@ -572,6 +719,12 @@ bool FCharacterNetworkMoveData_GGYGO::Serialize(
 {
 	const bool bParentSuccess = FCharacterNetworkMoveData::Serialize(CharacterMovement, Ar, PackageMap, MoveType);
 	if (!bParentSuccess || Ar.IsError()) return false;
+	if (!GGYGOMovementOwnerSync::SerializeMove(Ar, bHasMovementOwnerSync, MovementOwnerSyncNonce, MovementOwnerGeneration))
+	{
+		if (auto* CMC = Cast<UGGYGOCharacterMovementComponent>(&CharacterMovement))
+			CMC->ReportMovementOwnerSyncOnce(FName(TEXT("MoveWireInvalid")), TEXT("Move owner-sync version/nonce encoding rejected."));
+		return false;
+	}
 	FString SourceError;
 	if (!MovementInputSourceCheckpoint.Serialize(Ar, &SourceError))
 	{
@@ -615,8 +768,27 @@ void FCharacterMoveResponseDataContainer_GGYGO::ServerFillResponseData(
 	const FClientAdjustment& PendingAdjustment)
 {
 	FCharacterMoveResponseDataContainer::ServerFillResponseData(CharacterMovement, PendingAdjustment);
+	bHasMovementOwnerSync = false;
+	MovementOwnerSyncNonce = 0;
+	ServerOwnerGeneration = 0;
+	AdjustmentOwnerGeneration = 0;
+	bMovementOwnerActive = false;
+	bInitialSynchronizationEligible = false;
 	if (const UGGYGOCharacterMovementComponent* MoveComp = Cast<UGGYGOCharacterMovementComponent>(&CharacterMovement))
 	{
+		const auto& Receipt = MoveComp->MovementOwnerSyncPendingReceipt;
+		if (MoveComp->IsMovementOwnerSyncReceiptCurrent(Receipt) && Receipt.TimeStamp == PendingAdjustment.TimeStamp)
+		{
+			bHasMovementOwnerSync = true;
+			MovementOwnerSyncNonce = Receipt.Nonce;
+			ServerOwnerGeneration = Receipt.OwnerGeneration;
+			// A previously known generation stays original even when native ownership changed.
+			// Unknown first-sync moves use the server's original native receipt, not a rewritten SavedMove.
+			AdjustmentOwnerGeneration = Receipt.ClientOwnerGeneration != 0
+				? Receipt.ClientOwnerGeneration : Receipt.OwnerGeneration;
+			bMovementOwnerActive = true;
+			bInitialSynchronizationEligible = Receipt.bInitialOwnerGeneration;
+		}
 		LocomotionMotionType = MoveComp->LocomotionMotionType;
 		StopMotionType = MoveComp->StopMotionType;
 		TurnBackPhase = MoveComp->TurnBackPhase;
@@ -642,6 +814,14 @@ bool FCharacterMoveResponseDataContainer_GGYGO::Serialize(
 	UPackageMap* PackageMap)
 {
 	const bool bParentSuccess = FCharacterMoveResponseDataContainer::Serialize(CharacterMovement, Ar, PackageMap);
+	if (!bParentSuccess || Ar.IsError()) return false;
+	// Good ACKs carry the same owner receipt; this must not be inside IsCorrection().
+	if (!GGYGOMovementOwnerSync::SerializeResponse(Ar, *this))
+	{
+		if (auto* CMC = Cast<UGGYGOCharacterMovementComponent>(&CharacterMovement))
+			CMC->ReportMovementOwnerSyncOnce(FName(TEXT("ResponseWireInvalid")), TEXT("Response owner-sync version/receipt encoding rejected."));
+		return false;
+	}
 	if (IsCorrection())
 	{
 		uint8 MotionValue = static_cast<uint8>(LocomotionMotionType);
@@ -721,13 +901,31 @@ void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifeti
 void UGGYGOCharacterMovementComponent::BeginPlay()
 {
 	Super::BeginPlay();
+	MovementOwnerSyncLifetimeSerial = GGYGOMovementOwnerSync::IssueIdentity();
 	CaptureComponentDefaults();
 
 	CacheAbilitySystemComponent();
+	RefreshMovementOwnerSyncContext();
 }
 
 void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	bMovementOwnerSyncClosed = true;
+	ActiveMovementOwnerSyncNativeMove = nullptr;
+	// Terminal frames already own retired scopes; cancel their remaining callbacks.
+	// Current Ready subscriptions remain for the EndPlay invalidation below.
+	for (FMovementOwnerSyncDispatchFrame* Frame = ActiveMovementOwnerSyncDispatch; Frame; Frame = Frame->Previous)
+	{
+		Frame->ClosePendingRecords();
+	}
+	ActiveMovementOwnerSyncDispatch = nullptr;
+	if (APawn* Pawn = MovementOwnerObservedPawn.Get())
+	{
+		Pawn->ReceiveControllerChangedDelegate.RemoveDynamic(this,
+			&UGGYGOCharacterMovementComponent::HandleMovementOwnerControllerChanged);
+	}
+	MovementOwnerObservedPawn.Reset();
+	RetireServerMovementOwner(FName(TEXT("ConsumerEndPlay")));
 	RetireLocomotionCurveRootMotion();
 	CompletedLocomotionCurveOrigin.Reset();
 	LastLocomotionCurvePrepared.Reset();
@@ -741,7 +939,429 @@ void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPla
 		FString Error;
 		InvalidateMovementInputSession(MovementInputBinding, FName(TEXT("ConsumerEndPlay")), Error);
 	}
+	// Existing execution resources are sealed before external invalidation callbacks.
+	RetireMovementOwnerSyncScope(FName(TEXT("ConsumerEndPlay")));
 	Super::EndPlay(EndPlayReason);
+}
+
+void UGGYGOCharacterMovementComponent::ReportMovementOwnerSyncOnce(FName Reason, const FString& Detail)
+{
+	if (MovementOwnerSyncReportedReasons.Contains(Reason)) return;
+	MovementOwnerSyncReportedReasons.Add(Reason);
+	UE_LOG(LogGGYGOMovement, Warning, TEXT("[Movement.OwnerSync] CMC='%s', Pawn='%s', Reason='%s': %s"),
+		*GetPathName(), *GetPathNameSafe(CharacterOwner), *Reason.ToString(), *Detail);
+}
+
+bool UGGYGOCharacterMovementComponent::IsMovementOwnerSyncContextCurrent(
+	const TSharedPtr<FMovementOwnerSyncContext>& Context) const
+{
+	if (bMovementOwnerSyncClosed || !Context.IsValid() || Context != MovementOwnerSyncContext
+		|| Context->bRetired || !Context->Scope.IsSet()
+		|| Context->Scope.Consumer.Get() != this
+		|| Context->Scope.ConsumerLifetimeSerial != MovementOwnerSyncLifetimeSerial) return false;
+	APawn* Pawn = Context->Scope.OriginalPawn.Get();
+	APlayerController* PC = Context->Scope.OriginalPlayerController.Get();
+	if (!IsValid(Pawn) || !IsValid(PC) || Pawn != CharacterOwner
+		|| Pawn->GetController() != PC || Pawn->GetNetDriver() != Context->NetDriver.Get()
+		|| (!Pawn->HasAuthority() && (!Pawn->IsLocallyControlled()
+			|| Pawn->GetLocalRole() != ROLE_AutonomousProxy))) return false;
+	if (Context->bOwnerPairCaptured && PC->GetPawn() != Pawn) return false;
+	UNetConnection* Connection = GGYGOMovementOwnerSync::GetConnection(Pawn, PC);
+	if (Context->bConnectionCaptured
+		&& (Connection != Context->Connection.Get()
+			|| !GGYGOMovementOwnerSync::IsConnectionLive(Connection))) return false;
+	if (Context->bRequiresNativeResponse && !IsValid(Context->NetDriver.Get())) return false;
+	if (!Context->NetDriver.IsExplicitlyNull() && !Context->NetDriver.IsValid()) return false;
+	// Only the very first physical binding may claim an as-yet unbound initial scope.
+	const bool bFirstBinding = Context->ObservedBindingSerial == 0
+		&& MovementInputBindingSerial == 1 && bMovementInputBindingActive;
+	if (Context->ObservedBindingSerial != MovementInputBindingSerial && !bFirstBinding) return false;
+	if (Context->bObservedBindingActive != bMovementInputBindingActive && !bFirstBinding) return false;
+	if (Context->Notice.State == EGGYGOMovementOwnerSyncState::Ready)
+	{
+		if (PC->GetPawn() != Pawn) return false;
+		if (Context->bRequiresNativeResponse && PC->AcknowledgedPawn != Pawn) return false;
+		if (Pawn->HasAuthority() && (!bServerMovementOwnerActive
+			|| Context->Notice.ServerOwnerGeneration != ServerMovementOwnerGeneration)) return false;
+	}
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::GetMovementOwnerSyncScope(
+	FGGYGOMovementOwnerSyncScopeId& OutScope, FString& OutError) const
+{
+	OutError.Reset();
+	if (!IsInGameThread() || !IsMovementOwnerSyncContextCurrent(MovementOwnerSyncContext))
+	{
+		OutError = TEXT("Movement.OwnerSync: no current native owner scope; original owner/channel must be ready for observation.");
+		return false;
+	}
+	OutScope = MovementOwnerSyncContext->Scope;
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::SubscribeMovementOwnerSync(
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FGGYGOMovementOwnerSyncDelegate Observer,
+	FGGYGOMovementOwnerSyncObserverId& OutObserver, FString& OutError)
+{
+	OutError.Reset();
+	if (!IsInGameThread())
+	{
+		OutError = TEXT("Movement.OwnerSync: subscribe requires the game thread.");
+		return false;
+	}
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (OutObserver.IsSet() || !Observer.IsBound()
+		|| !IsMovementOwnerSyncContextCurrent(Context) || OriginalScope != Context->Scope
+		|| MovementOwnerSyncLastObserverSerial == MAX_uint64)
+	{
+		OutError = TEXT("Movement.OwnerSync: subscribe rejected: stale scope, occupied output, unbound observer or exhausted serial.");
+		return false;
+	}
+	const TSharedPtr<FMovementOwnerSyncObserverRecord> Record = MakeShared<FMovementOwnerSyncObserverRecord>();
+	Record->Id.Scope = OriginalScope;
+	Record->Id.ObserverSerial = ++MovementOwnerSyncLastObserverSerial;
+	Record->Callback = MoveTemp(Observer);
+	Context->Observers.Add(Record->Id.ObserverSerial, Record);
+	OutObserver = Record->Id;
+	// Copy before calling out: the receiver can unsubscribe or retire/destroy this scope.
+	const FGGYGOMovementOwnerSyncNotice Notice = Context->Notice;
+	const FGGYGOMovementOwnerSyncObserverId Id = Record->Id;
+	const FGGYGOMovementOwnerSyncDelegate Callback = Record->Callback;
+	Callback.Execute(Id, Notice);
+	return true; // Historical installation; no output/self writes after replay.
+}
+
+UGGYGOCharacterMovementComponent::FMovementOwnerSyncDispatchFrame::FMovementOwnerSyncDispatchFrame(
+	UGGYGOCharacterMovementComponent* InOwner,
+	const TSharedPtr<FMovementOwnerSyncContext>& InContext, bool bInTerminal)
+	: Owner(InOwner), Context(InContext), Previous(InOwner->ActiveMovementOwnerSyncDispatch),
+	  OwnerLifetimeSerial(InOwner->MovementOwnerSyncLifetimeSerial), bTerminal(bInTerminal)
+{
+	Context->Observers.GenerateValueArray(Records);
+	InOwner->ActiveMovementOwnerSyncDispatch = this;
+}
+
+void UGGYGOCharacterMovementComponent::FMovementOwnerSyncDispatchFrame::ClosePendingRecords()
+{
+	if (!bTerminal || bClosing) return;
+	bClosing = true;
+	for (const auto& Entry : Context->Observers) Entry.Value->bClosed = true;
+	// Records retains every snapshot record; removing the map cannot release captures.
+	Context->Observers.Reset();
+}
+
+UGGYGOCharacterMovementComponent::FMovementOwnerSyncDispatchFrame::~FMovementOwnerSyncDispatchFrame()
+{
+	ClosePendingRecords();
+	// Seal and unlink before user capture destructors can reenter. No CMC member tail
+	// follows Unbind/Reset; nested publications then see only live outer frames.
+	if (UGGYGOCharacterMovementComponent* Self = Owner.Get())
+	{
+		if (Self->MovementOwnerSyncLifetimeSerial == OwnerLifetimeSerial
+			&& Self->ActiveMovementOwnerSyncDispatch == this)
+			Self->ActiveMovementOwnerSyncDispatch = Self->bMovementOwnerSyncClosed ? nullptr : Previous;
+	}
+	if (bTerminal)
+	{
+		for (const auto& Record : Records) Record->Callback.Unbind();
+	}
+	Records.Reset();
+	Context.Reset();
+}
+
+bool UGGYGOCharacterMovementComponent::UnsubscribeMovementOwnerSync(
+	const FGGYGOMovementOwnerSyncObserverId& OriginalObserver, FName Reason, FString& OutError)
+{
+	OutError.Reset();
+	const FGGYGOMovementOwnerSyncScopeId& Scope = OriginalObserver.Scope;
+	if (!IsInGameThread() || !OriginalObserver.IsSet() || Scope.Consumer.Get() != this
+		|| Scope.ConsumerLifetimeSerial != MovementOwnerSyncLifetimeSerial
+		|| OriginalObserver.ObserverSerial > MovementOwnerSyncLastObserverSerial)
+	{
+		OutError = FString::Printf(TEXT("Movement.OwnerSync: foreign/unissued observer (%s)."), *Reason.ToString());
+		return false;
+	}
+	TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!Context.IsValid() || Context->Scope != Scope)
+	{
+		// Only in-flight original resources are searchable; no retired history cache.
+		for (FMovementOwnerSyncDispatchFrame* Frame = ActiveMovementOwnerSyncDispatch; Frame; Frame = Frame->Previous)
+		{
+			if (Frame->Context.IsValid() && Frame->Context->Scope == Scope)
+			{
+				Context = Frame->Context;
+				break;
+			}
+		}
+	}
+	// Already closed IDs remain idempotent without touching any successor.
+	if (!Context.IsValid() || Context->Scope != Scope) return true;
+	if (const TSharedPtr<FMovementOwnerSyncObserverRecord>* Found = Context->Observers.Find(OriginalObserver.ObserverSerial))
+	{
+		const TSharedPtr<FMovementOwnerSyncObserverRecord> Record = *Found;
+		if (Record->Id.Scope != Scope) return false;
+		Record->bClosed = true;
+		Context->Observers.Remove(OriginalObserver.ObserverSerial);
+		Record->Callback.Unbind(); // Capture destruction may reenter; no member/output writes follow.
+	}
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::PublishMovementOwnerSyncNotice(
+	const TSharedPtr<FMovementOwnerSyncContext>& Context, EGGYGOMovementOwnerSyncState State,
+	uint64 Generation, uint64 Nonce, bool bInitialEligible, FName Reason)
+{
+	if (!Context.IsValid()) return;
+	const bool bInvalidated = State == EGGYGOMovementOwnerSyncState::Invalidated;
+	FMovementOwnerSyncDispatchFrame Dispatch(this, Context, bInvalidated);
+	if (!bInvalidated && (!IsMovementOwnerSyncContextCurrent(Context)
+		|| MovementOwnerSyncLastNoticeSerial >= MAX_uint64 - 1))
+	{
+		if (MovementOwnerSyncLastNoticeSerial >= MAX_uint64 - 1)
+		{
+			bMovementOwnerSyncClosed = true;
+			ReportMovementOwnerSyncOnce(FName(TEXT("NoticeSerialExhausted")), TEXT("Native owner synchronization closed; notice serial cannot wrap."));
+			RetireMovementOwnerSyncScope(FName(TEXT("NoticeSerialExhausted")));
+		}
+		return;
+	}
+	if (MovementOwnerSyncLastNoticeSerial == MAX_uint64) return;
+	FGGYGOMovementOwnerSyncNotice Notice;
+	Notice.Scope = Context->Scope;
+	Notice.State = State;
+	Notice.NoticeSerial = ++MovementOwnerSyncLastNoticeSerial;
+	Notice.ServerOwnerGeneration = Generation;
+	Notice.NativeResponseNonce = Nonce;
+	Notice.bInitialSynchronizationEligible = bInitialEligible && !bInvalidated;
+	Notice.Reason = Reason;
+	Context->Notice = Notice;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	for (const auto& Record : Dispatch.Records)
+	{
+		if (Record->bClosed || !Context->Observers.Contains(Record->Id.ObserverSerial)) continue;
+		const FGGYGOMovementOwnerSyncObserverId Id = Record->Id;
+		{
+			FGGYGOMovementOwnerSyncDelegate Callback;
+			if (bInvalidated)
+			{
+				Record->bClosed = true;
+				Context->Observers.Remove(Id.ObserverSerial);
+				Callback = MoveTemp(Record->Callback);
+			}
+			else
+			{
+				Callback = Record->Callback;
+			}
+			if (Callback.IsBound()) Callback.Execute(Id, Notice);
+		} // Release captures before reacquiring the original weak owner.
+		UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+		if (!Self || Self->MovementOwnerSyncLifetimeSerial != Notice.Scope.ConsumerLifetimeSerial) return;
+		if (!bInvalidated && (!Self->IsMovementOwnerSyncContextCurrent(Context)
+			|| Context->Notice.NoticeSerial != Notice.NoticeSerial)) return;
+	}
+}
+
+void UGGYGOCharacterMovementComponent::RetireMovementOwnerSyncScope(FName Reason)
+{
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!Context.IsValid() || Context->bRetired) return;
+	Context->bRetired = true;
+	MovementOwnerSyncContext.Reset(); // Seal first; callbacks cannot reopen the old scope.
+	PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Invalidated,
+		Context->Notice.ServerOwnerGeneration, Context->Scope.ResponseNonce, false, Reason);
+}
+
+void UGGYGOCharacterMovementComponent::RetireServerMovementOwner(FName Reason)
+{
+	if (!bServerMovementOwnerActive) return;
+	bServerMovementOwnerActive = false;
+	bServerMovementInitialOwnerGeneration = false;
+	ServerMovementOwnerPawn.Reset();
+	ServerMovementOwnerController.Reset();
+	ServerMovementOwnerConnection.Reset();
+	ServerMovementOwnerNetDriver.Reset();
+	MovementOwnerSyncPendingReceipt = {};
+	ServerMovementOwnerGeneration = GGYGOMovementOwnerSync::IssueIdentity();
+	if (ServerMovementOwnerGeneration == 0)
+	{
+		bMovementOwnerSyncClosed = true;
+		ReportMovementOwnerSyncOnce(Reason, TEXT("Server owner retirement exhausted its identity; synchronization closed."));
+	}
+}
+
+void UGGYGOCharacterMovementComponent::OpenMovementOwnerSyncScope(
+	APawn* Pawn, APlayerController* Controller, UNetConnection* Connection, UNetDriver* Driver,
+	bool bInitialLocalScope, uint64 ExpectedServerGeneration)
+{
+	if (bMovementOwnerSyncClosed || MovementOwnerSyncContext.IsValid()
+		|| !IsValid(Pawn) || !IsValid(Controller) || MovementOwnerSyncLifetimeSerial == 0) return;
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MakeShared<FMovementOwnerSyncContext>();
+	Context->Scope.Consumer = this;
+	Context->Scope.OriginalPawn = Pawn;
+	Context->Scope.OriginalPlayerController = Controller;
+	Context->Scope.ConsumerLifetimeSerial = MovementOwnerSyncLifetimeSerial;
+	Context->Scope.OwnerContextSerial = GGYGOMovementOwnerSync::IssueIdentity();
+	Context->Scope.ScopeSerial = GGYGOMovementOwnerSync::IssueIdentity();
+	Context->Scope.ResponseNonce = GGYGOMovementOwnerSync::IssueIdentity();
+	if (!Context->Scope.IsSet())
+	{
+		bMovementOwnerSyncClosed = true;
+		ReportMovementOwnerSyncOnce(FName(TEXT("ScopeIdentityExhausted")), TEXT("Cannot issue original owner scope."));
+		return;
+	}
+	Context->Connection = Connection;
+	Context->NetDriver = Driver;
+	Context->bConnectionCaptured = Connection != nullptr;
+	Context->bOwnerPairCaptured = Controller->GetPawn() == Pawn;
+	Context->ObservedBindingSerial = MovementInputBindingSerial;
+	Context->bObservedBindingActive = bMovementInputBindingActive;
+	Context->ExpectedServerGeneration = ExpectedServerGeneration;
+	Context->bInitialLocalScope = bInitialLocalScope;
+	Context->bRequiresNativeResponse = !Pawn->HasAuthority();
+	bMovementOwnerSyncEverOpened = true;
+	MovementOwnerSyncReportedReasons.Reset();
+	MovementOwnerSyncContext = Context;
+	PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Waiting,
+		ExpectedServerGeneration, 0, bInitialLocalScope, FName(TEXT("WaitingForNativeOwnerSynchronization")));
+}
+
+void UGGYGOCharacterMovementComponent::HandleMovementOwnerControllerChanged(
+	APawn* Pawn, AController* OldController, AController* NewController)
+{
+	if (bMovementOwnerSyncClosed || Pawn != MovementOwnerObservedPawn.Get()
+		|| OldController == NewController) return;
+	if (OldController)
+	{
+		bMovementOwnerSyncEverOpened = true;
+		bServerMovementOwnerEverOpened = true;
+	}
+	RetireServerMovementOwner(FName(TEXT("NativeControllerChanged")));
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	RetireMovementOwnerSyncScope(FName(TEXT("NativeControllerChanged")));
+	if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get()) Self->RefreshMovementOwnerSyncContext();
+}
+
+void UGGYGOCharacterMovementComponent::RefreshMovementOwnerSyncContext()
+{
+	if (bMovementOwnerSyncClosed || MovementOwnerSyncLifetimeSerial == 0) return;
+	APawn* Pawn = CharacterOwner;
+	if (Pawn != MovementOwnerObservedPawn.Get())
+	{
+		if (APawn* Old = MovementOwnerObservedPawn.Get())
+			Old->ReceiveControllerChangedDelegate.RemoveDynamic(this, &UGGYGOCharacterMovementComponent::HandleMovementOwnerControllerChanged);
+		MovementOwnerObservedPawn = Pawn;
+		if (IsValid(Pawn))
+			Pawn->ReceiveControllerChangedDelegate.AddUniqueDynamic(this, &UGGYGOCharacterMovementComponent::HandleMovementOwnerControllerChanged);
+	}
+	APlayerController* PC = IsValid(Pawn) ? Cast<APlayerController>(Pawn->GetController()) : nullptr;
+	UNetDriver* Driver = IsValid(Pawn) ? Pawn->GetNetDriver() : nullptr;
+	UNetConnection* Connection = GGYGOMovementOwnerSync::GetConnection(Pawn, PC);
+	const bool bCandidate = IsValid(Pawn) && IsValid(PC)
+		&& (Pawn->HasAuthority() || (Pawn->IsLocallyControlled() && Pawn->GetLocalRole() == ROLE_AutonomousProxy))
+		&& (Pawn->HasAuthority() || IsValid(Driver))
+		&& (!Connection || GGYGOMovementOwnerSync::IsConnectionLive(Connection));
+	const bool bServerTurnover = bServerMovementOwnerActive
+		&& (!bCandidate || !Pawn->HasAuthority() || ServerMovementOwnerPawn.Get() != Pawn
+			|| ServerMovementOwnerController.Get() != PC
+			|| ServerMovementOwnerNetDriver.Get() != Driver
+			|| (!ServerMovementOwnerNetDriver.IsExplicitlyNull() && !ServerMovementOwnerNetDriver.IsValid())
+			|| (!ServerMovementOwnerConnection.IsExplicitlyNull()
+				&& (ServerMovementOwnerConnection.Get() != Connection
+					|| !GGYGOMovementOwnerSync::IsConnectionLive(Connection))));
+	if (bServerTurnover) RetireServerMovementOwner(FName(TEXT("NativeOwnerEndpointChanged")));
+	if (bCandidate && Pawn->HasAuthority() && !bServerMovementOwnerActive)
+	{
+		ServerMovementOwnerGeneration = GGYGOMovementOwnerSync::IssueIdentity();
+		if (ServerMovementOwnerGeneration == 0)
+		{
+			bMovementOwnerSyncClosed = true;
+			RetireMovementOwnerSyncScope(FName(TEXT("ServerIdentityExhausted")));
+			return;
+		}
+		bServerMovementOwnerActive = true;
+		bServerMovementInitialOwnerGeneration = !bServerMovementOwnerEverOpened;
+		bServerMovementOwnerEverOpened = true;
+		ServerMovementOwnerPawn = Pawn;
+		ServerMovementOwnerController = PC;
+		ServerMovementOwnerConnection = Connection;
+		ServerMovementOwnerNetDriver = Driver;
+	}
+	if (bServerMovementOwnerActive && ServerMovementOwnerConnection.IsExplicitlyNull() && Connection)
+		ServerMovementOwnerConnection = Connection;
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (Context.IsValid())
+	{
+		const bool bFirstBinding = Context->ObservedBindingSerial == 0
+			&& MovementInputBindingSerial == 1 && bMovementInputBindingActive;
+		const bool bChanged = !bCandidate || Context->Scope.OriginalPawn.Get() != Pawn
+			|| Context->Scope.OriginalPlayerController.Get() != PC || Context->NetDriver.Get() != Driver
+			|| (!Context->NetDriver.IsExplicitlyNull() && !Context->NetDriver.IsValid())
+			|| (Context->bConnectionCaptured && (Context->Connection.Get() != Connection
+				|| !GGYGOMovementOwnerSync::IsConnectionLive(Connection)))
+			|| (Context->bOwnerPairCaptured && PC->GetPawn() != Pawn)
+			|| (Context->Notice.State == EGGYGOMovementOwnerSyncState::Ready
+				&& (Context->bRequiresNativeResponse || !PC->IsLocalController()) && PC->AcknowledgedPawn != Pawn)
+			|| (Context->ObservedBindingSerial != MovementInputBindingSerial && !bFirstBinding)
+			|| (Context->bObservedBindingActive != bMovementInputBindingActive && !bFirstBinding)
+			|| bServerTurnover;
+		if (bChanged)
+		{
+			const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+			RetireMovementOwnerSyncScope(FName(TEXT("NativeOwnerOrInputScopeChanged")));
+			// Re-read after callouts; never issue a scope from captured old actors.
+			if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get()) Self->RefreshMovementOwnerSyncContext();
+			return;
+		}
+		if (bFirstBinding)
+		{
+			Context->ObservedBindingSerial = MovementInputBindingSerial;
+			Context->bObservedBindingActive = bMovementInputBindingActive;
+		}
+		if (!Context->bConnectionCaptured && Connection)
+		{
+			Context->Connection = Connection;
+			Context->bConnectionCaptured = true;
+		}
+		if (PC->GetPawn() == Pawn) Context->bOwnerPairCaptured = true;
+	}
+	if (!bCandidate)
+	{
+		if (Connection && !GGYGOMovementOwnerSync::IsConnectionLive(Connection))
+			ReportMovementOwnerSyncOnce(FName(TEXT("NativeConnectionClosed")), TEXT("Original native connection is closed or invalid."));
+		return;
+	}
+	if (!MovementOwnerSyncContext.IsValid())
+	{
+		OpenMovementOwnerSyncScope(Pawn, PC, Connection, Driver,
+			!bMovementOwnerSyncEverOpened && MovementInputBindingSerial <= 1,
+			Pawn->HasAuthority() ? ServerMovementOwnerGeneration : 0);
+	}
+	const TSharedPtr<FMovementOwnerSyncContext> Current = MovementOwnerSyncContext;
+	if (Current.IsValid() && !Current->bRequiresNativeResponse
+		&& Current->Notice.State == EGGYGOMovementOwnerSyncState::Waiting
+		&& IsMovementOwnerSyncContextCurrent(Current) && PC->GetPawn() == Pawn
+		&& (PC->IsLocalController() || (GGYGOMovementOwnerSync::IsConnectionLive(Connection) && PC->AcknowledgedPawn == Pawn)))
+	{
+		PublishMovementOwnerSyncNotice(Current, EGGYGOMovementOwnerSyncState::Ready,
+			ServerMovementOwnerGeneration, Current->Scope.ResponseNonce,
+			Current->bInitialLocalScope && bServerMovementInitialOwnerGeneration, FName(TEXT("NativeAuthorityOwnerReady")));
+	}
+}
+
+bool UGGYGOCharacterMovementComponent::IsMovementOwnerSyncReceiptCurrent(
+	const FMovementOwnerSyncNativeReceipt& Receipt) const
+{
+	APawn* Pawn = Receipt.Pawn.Get();
+	APlayerController* PC = Receipt.Controller.Get();
+	UNetConnection* Connection = Receipt.Connection.Get();
+	return !bMovementOwnerSyncClosed && bServerMovementOwnerActive && Receipt.Nonce != 0
+		&& Receipt.OwnerGeneration == ServerMovementOwnerGeneration
+		&& IsValid(Pawn) && Pawn == CharacterOwner && Pawn->HasAuthority()
+		&& IsValid(PC) && PC == ServerMovementOwnerController.Get() && Pawn == ServerMovementOwnerPawn.Get()
+		&& Pawn->GetController() == PC && PC->GetPawn() == Pawn && PC->AcknowledgedPawn == Pawn
+		&& Connection == ServerMovementOwnerConnection.Get() && PC->GetNetConnection() == Connection
+		&& GGYGOMovementOwnerSync::IsConnectionLive(Connection);
 }
 
 bool UGGYGOCharacterMovementComponent::IsMovementInputBindingCurrent(
@@ -1292,6 +1912,10 @@ void UGGYGOCharacterMovementComponent::CleanupFinishedActionMotion()
 
 void UGGYGOCharacterMovementComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	RefreshMovementOwnerSyncContext(); // Observe native lifecycle in the existing tick only.
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self || Self->bMovementOwnerSyncClosed) return;
 	CleanupFinishedActionMotion();
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 }
@@ -3038,8 +3662,134 @@ bool UGGYGOCharacterMovementComponent::IsReverseRunInput(EGGYGOGait Gait) const
 	return FVector::DotProduct(Forward, InputDirection) <= MovementSet->TurnBackReverseInputDotThreshold;
 }
 
+void UGGYGOCharacterMovementComponent::ServerMove_PerformMovement(const FCharacterNetworkMoveData& MoveData)
+{
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	RefreshMovementOwnerSyncContext();
+	if (!WeakSelf.IsValid() || WeakSelf->bMovementOwnerSyncClosed) return;
+	FMovementOwnerSyncNativeMove Frame;
+	// Packed data identity, not a class-name guess or replay's CurrentNetworkMoveData.
+	for (const FCharacterNetworkMoveData_GGYGO& Candidate : NetworkMoveDataContainer.MoveData)
+	{
+		if (&Candidate == &MoveData) Frame.Move = &Candidate;
+	}
+	if (Frame.Move)
+	{
+		Frame.OriginalNonce = Frame.Move->MovementOwnerSyncNonce;
+		Frame.OriginalClientGeneration = Frame.Move->MovementOwnerGeneration;
+		Frame.OriginalTimeStamp = Frame.Move->TimeStamp;
+		Frame.OriginalFlags = Frame.Move->CompressedMoveFlags;
+		Frame.bHasOriginalSync = Frame.Move->bHasMovementOwnerSync;
+		Frame.bOriginalNewMove = Frame.Move->NetworkMoveType == FCharacterNetworkMoveData::ENetworkMoveType::NewMove;
+	}
+	FMovementOwnerSyncNativeMove* Previous = ActiveMovementOwnerSyncNativeMove;
+	const bool bNativeRemote = Frame.Move && GetCurrentNetworkMoveData() == &MoveData
+		&& CharacterOwner && CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled();
+	ActiveMovementOwnerSyncNativeMove = bNativeRemote ? &Frame : nullptr;
+	Super::ServerMove_PerformMovement(MoveData);
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self) return;
+	Self->ActiveMovementOwnerSyncNativeMove = Self->bMovementOwnerSyncClosed ? nullptr : Previous;
+	if (!bNativeRemote || !Frame.bEnteredNativeSimulation
+		|| !Frame.bOriginalNewMove
+		|| !Self->IsMovementOwnerSyncReceiptCurrent(Frame.Receipt)) return;
+	const FNetworkPredictionData_Server_Character* ServerData = Self->GetPredictionData_Server_Character();
+	// Timestamp only joins this native adjustment to its exact receipt; never issues an epoch.
+	if (ServerData && ServerData->PendingAdjustment.TimeStamp == Frame.Receipt.TimeStamp)
+		Self->MovementOwnerSyncPendingReceipt = Frame.Receipt;
+}
+
+void UGGYGOCharacterMovementComponent::MoveAutonomous(
+	float ClientTimeStamp, float DeltaTime, uint8 CompressedFlags, const FVector& NewAccel)
+{
+	FMovementOwnerSyncNativeMove* Frame = ActiveMovementOwnerSyncNativeMove;
+	if (Frame && Frame->Move == GetCurrentNetworkMoveData()
+		&& Frame->OriginalTimeStamp == ClientTimeStamp && Frame->OriginalFlags == CompressedFlags
+		&& Frame->Move->MovementOwnerSyncNonce == Frame->OriginalNonce
+		&& Frame->Move->MovementOwnerGeneration == Frame->OriginalClientGeneration
+		&& FMath::IsFinite(DeltaTime) && DeltaTime > 0.0f && FMath::IsFinite(ClientTimeStamp)
+		&& Frame->bHasOriginalSync && Frame->OriginalNonce != 0
+		&& HasValidData() && IsActive() && CharacterOwner && CharacterOwner->HasAuthority()
+		&& !CharacterOwner->IsLocallyControlled())
+	{
+		FMovementOwnerSyncNativeReceipt Receipt;
+		Receipt.Pawn = CharacterOwner;
+		Receipt.Controller = Cast<APlayerController>(CharacterOwner->GetController());
+		Receipt.Connection = Receipt.Controller.IsValid() ? Receipt.Controller->GetNetConnection() : nullptr;
+		Receipt.OwnerGeneration = ServerMovementOwnerGeneration;
+		Receipt.ClientOwnerGeneration = Frame->OriginalClientGeneration;
+		Receipt.Nonce = Frame->OriginalNonce;
+		Receipt.TimeStamp = ClientTimeStamp;
+		Receipt.bInitialOwnerGeneration = bServerMovementInitialOwnerGeneration;
+		// Native Super has already accepted timestamp, positive delta, PC readiness and pause guards.
+		if (IsMovementOwnerSyncReceiptCurrent(Receipt))
+		{
+			Frame->Receipt = Receipt;
+			Frame->bEnteredNativeSimulation = true;
+		}
+	}
+	Super::MoveAutonomous(ClientTimeStamp, DeltaTime, CompressedFlags, NewAccel);
+}
+
 void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacterMoveResponseDataContainer& MoveResponse)
 {
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	RefreshMovementOwnerSyncContext();
+	if (!WeakSelf.IsValid() || WeakSelf->bMovementOwnerSyncClosed) return;
+	const FCharacterMoveResponseDataContainer_GGYGO& OwnerResponse =
+		static_cast<const FCharacterMoveResponseDataContainer_GGYGO&>(MoveResponse);
+	const uint64 ResponseGeneration = OwnerResponse.ServerOwnerGeneration;
+	const uint64 ResponseNonce = OwnerResponse.MovementOwnerSyncNonce;
+	const bool bResponseInitial = OwnerResponse.bInitialSynchronizationEligible;
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	const bool bNativeClient = CharacterOwner && !CharacterOwner->HasAuthority()
+		&& CharacterOwner->IsLocallyControlled() && CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy;
+	if (bNativeClient)
+	{
+		if (!IsMovementOwnerSyncContextCurrent(Context) || !Context->bRequiresNativeResponse
+			|| !Context->bConnectionCaptured || !Context->bOwnerPairCaptured
+			|| Context->Scope.OriginalPlayerController->AcknowledgedPawn != CharacterOwner
+			|| !OwnerResponse.bHasMovementOwnerSync
+			|| OwnerResponse.MovementOwnerSyncNonce != Context->Scope.ResponseNonce
+			|| OwnerResponse.ServerOwnerGeneration == 0)
+		{
+			ReportMovementOwnerSyncOnce(FName(TEXT("StaleNativeResponse")),
+				TEXT("Native response has no matching original owner scope/PC/nonce; discarded."));
+			return;
+		}
+		const uint64 Known = Context->Notice.ServerOwnerGeneration != 0
+			? Context->Notice.ServerOwnerGeneration : Context->ExpectedServerGeneration;
+		if (Known != 0 && OwnerResponse.ServerOwnerGeneration < Known)
+		{
+			ReportMovementOwnerSyncOnce(FName(TEXT("OldServerGeneration")), TEXT("Delayed native owner generation discarded."));
+			return;
+		}
+		const bool bTurnover = (Known != 0 && OwnerResponse.ServerOwnerGeneration != Known)
+			|| (Known == 0 && Context->bInitialLocalScope && !OwnerResponse.bInitialSynchronizationEligible);
+		if (bTurnover || !OwnerResponse.bMovementOwnerActive)
+		{
+			const uint64 NextGeneration = OwnerResponse.ServerOwnerGeneration;
+			RetireMovementOwnerSyncScope(FName(TEXT("ServerOwnerGenerationChanged")));
+			UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+			if (!Self || Self->bMovementOwnerSyncClosed || Self->MovementOwnerSyncContext.IsValid()) return;
+			// New scope and new nonce; the old request/notice is never relabelled as first sync.
+			APawn* Pawn = Context->Scope.OriginalPawn.Get();
+			APlayerController* PC = Context->Scope.OriginalPlayerController.Get();
+			if (IsValid(Pawn) && IsValid(PC) && Pawn == Self->CharacterOwner
+				&& Pawn->GetController() == PC && PC->GetPawn() == Pawn
+				&& Pawn->GetNetDriver() == Context->NetDriver.Get()
+				&& GGYGOMovementOwnerSync::GetConnection(Pawn, PC) == Context->Connection.Get()
+				&& GGYGOMovementOwnerSync::IsConnectionLive(Context->Connection.Get()))
+				Self->OpenMovementOwnerSyncScope(Pawn, PC, Context->Connection.Get(),
+					Context->NetDriver.Get(), false, NextGeneration);
+			return; // Never apply the old-generation native body to the successor.
+		}
+		if (OwnerResponse.AdjustmentOwnerGeneration != OwnerResponse.ServerOwnerGeneration)
+		{
+			ReportMovementOwnerSyncOnce(FName(TEXT("OldAdjustmentGeneration")), TEXT("Native body belongs to an original earlier generation; discarded."));
+			return;
+		}
+	}
 	if (MoveResponse.IsCorrection())
 	{
 		const FCharacterMoveResponseDataContainer_GGYGO& GGYGOResponse =
@@ -3065,6 +3815,15 @@ void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacter
 	}
 
 	Super::ClientHandleMoveResponse(MoveResponse);
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (bNativeClient && Self && Self->IsMovementOwnerSyncContextCurrent(Context)
+		&& Context->Notice.State == EGGYGOMovementOwnerSyncState::Waiting)
+	{
+		// Native correction/ACK completes before external Ready can create a later request.
+		Self->PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Ready,
+			ResponseGeneration, ResponseNonce, Context->bInitialLocalScope && bResponseInitial,
+			FName(TEXT("NativeOwnerResponseReady")));
+	}
 }
 
 bool UGGYGOCharacterMovementComponent::ClientUpdatePositionAfterServerUpdate()

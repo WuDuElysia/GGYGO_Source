@@ -20,7 +20,9 @@ public:
 	}
 	void AdvanceTestMotion(float DeltaSeconds, bool bHadMoveInput, EGGYGOGait PreviousGait)
 	{
+		CurrentRootMotion.CleanUpInvalidRootMotion(DeltaSeconds, *CharacterOwner, *this);
 		UpdateLocomotionMotion(DeltaSeconds, bHadMoveInput, PreviousGait);
+		CurrentRootMotion.PrepareRootMotion(DeltaSeconds, *CharacterOwner, *this, true);
 	}
 	void AdvanceTestBlend(float DeltaSeconds) { UpdateWalkRunBlend(DeltaSeconds); }
 	void SetTestGait(EGGYGOGait Gait) { ResolvedGait = Gait; }
