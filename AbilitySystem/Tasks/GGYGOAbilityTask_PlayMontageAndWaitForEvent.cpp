@@ -23,6 +23,15 @@ struct UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FInFlightMontagePlayCleanup
 	bool bStopRequested = false;
 };
 
+struct UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbackRegistration
+{
+	explicit FNativeCallbackRegistration(FNativeCallbacks&& InCallbacks)
+		: Handle(FDelegateHandle::GenerateNewHandle), Callbacks(MoveTemp(InCallbacks)) {}
+
+	const FDelegateHandle Handle;
+	const FNativeCallbacks Callbacks;
+};
+
 namespace
 {
 	bool StopOriginalMontageInstance(const FGGYGOMontagePlayGuardIdentity& Identity,
@@ -92,6 +101,122 @@ UGGYGOAbilityTask_PlayMontageAndWaitForEvent::UGGYGOAbilityTask_PlayMontageAndWa
 	Rate = 1.0f;
 	bStopWhenAbilityEnds = true;
 	AnimRootMotionTranslationScale = 1.0f;
+}
+
+FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCallbacks(FNativeCallbacks Callbacks)
+{
+	check(IsInGameThread());
+	const TCHAR* Reason = nullptr;
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bCancellationRequested
+		|| GetState() != EGameplayTaskState::AwaitingActivation)
+	{
+		Reason = TEXT("Task is not in its original pre-Ready AwaitingActivation state");
+	}
+	else if (NativeCallbackRegistration.IsValid()) { Reason = TEXT("a native callback package is already registered"); }
+	else if (!Callbacks.OnCompleted.IsBound() && !Callbacks.OnBlendOut.IsBound()
+		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound() && !Callbacks.EventReceived.IsBound())
+	{
+		Reason = TEXT("the native callback package has no bound callbacks");
+	}
+	if (Reason)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("MontageTask [%s] native registration rejected: Ability [%s], Montage [%s]; %s."),
+			*GetPathName(), *GetNameSafe(Ability), *GetNameSafe(MontageToPlay), Reason);
+		return {};
+	}
+
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const FString OriginalPath = GetPathName();
+	TSharedPtr<FNativeCallbackRegistration> Registration = MakeShared<FNativeCallbackRegistration>(MoveTemp(Callbacks));
+	// Delegate construction may execute capture code. Recheck before installing this exact package.
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+	if (!Task || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || Task->bEndingTask
+		|| Task->bCancellationRequested || Task->GetState() != EGameplayTaskState::AwaitingActivation
+		|| Task->NativeCallbackRegistration.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("MontageTask [%s] native registration rejected after callback construction: original pre-Ready scope changed."),
+			*OriginalPath);
+		return {};
+	}
+	const FDelegateHandle Handle = Registration->Handle;
+	Task->NativeCallbackRegistration = MoveTemp(Registration);
+	return Handle; // No task writes during subsequent destruction of argument captures.
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::UnregisterNativeCallbacks(FDelegateHandle Registration)
+{
+	check(IsInGameThread());
+	if (!Registration.IsValid() || !NativeCallbackRegistration.IsValid()
+		|| NativeCallbackRegistration->Handle != Registration) { return false; }
+	TSharedPtr<FNativeCallbackRegistration> Detached = MoveTemp(NativeCallbackRegistration);
+	Detached.Reset(); // Capture destruction may register a successor; no task writes follow.
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalCallback(
+	ENativeCallback Kind, const FGGYGOMontagePlayGuardIdentity& Original) const
+{
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+		|| GetState() == EGameplayTaskState::Finished || !ShouldBroadcastAbilityTaskDelegates()) { return false; }
+	if (Kind == ENativeCallback::Cancelled)
+	{
+		return bCancellationRequested; // Startup failure need not have installed ActorInfo or a Guard.
+	}
+	if (!MatchesOriginalMontageCallback(Original)) { return false; }
+	if (Kind == ENativeCallback::EventReceived) { return IsNotifyValid(); }
+	if (Kind != ENativeCallback::Completed && Kind != ENativeCallback::BlendOut
+		&& Kind != ENativeCallback::Interrupted) { return false; }
+	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
+	// Natural Ended remains a fact after blend-out retired ASC ownership or released the instance.
+	return Guard && Guard->IsMontagePlayGuardIdentityCurrent(Original) && IsActivatedActorInfoCurrent();
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalCallback(
+	ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData)
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
+	const auto Recheck = [&]() -> UGGYGOAbilityTask_PlayMontageAndWaitForEvent*
+	{
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+		return Task && OriginalAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Task->Ability))
+			&& OriginalASC.HasSameIndexAndSerialNumber(TWeakObjectPtr<UAbilitySystemComponent>(Task->AbilitySystemComponent.Get()))
+			&& Task->CanDispatchOriginalCallback(Kind, OriginalGuard) ? Task : nullptr;
+	};
+	if (!Recheck()) { return; }
+
+	// This immutable registration is the callback snapshot. Copying its shared reference does not
+	// copy user functors; unregister/OnDestroy may detach the member while this call owns its copy.
+	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = NativeCallbackRegistration;
+	if (NativeSnapshot.IsValid())
+	{
+		const FGGYGOPlayMontageAndWaitForEventDelegate* Callback = nullptr;
+		switch (Kind)
+		{
+		case ENativeCallback::Completed: Callback = &NativeSnapshot->Callbacks.OnCompleted; break;
+		case ENativeCallback::BlendOut: Callback = &NativeSnapshot->Callbacks.OnBlendOut; break;
+		case ENativeCallback::Interrupted: Callback = &NativeSnapshot->Callbacks.OnInterrupted; break;
+		case ENativeCallback::Cancelled: Callback = &NativeSnapshot->Callbacks.OnCancelled; break;
+		case ENativeCallback::EventReceived: Callback = &NativeSnapshot->Callbacks.EventReceived; break;
+		}
+		if (Callback) { Callback->ExecuteIfBound(EventTag, EventData); }
+	}
+	NativeSnapshot.Reset(); // Capture destructors are also external code; recheck only after they return.
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Recheck();
+	if (!Task) { return; }
+	switch (Kind)
+	{
+	case ENativeCallback::Completed: Task->OnCompleted.Broadcast(EventTag, EventData); break;
+	case ENativeCallback::BlendOut: Task->OnBlendOut.Broadcast(EventTag, EventData); break;
+	case ENativeCallback::Interrupted: Task->OnInterrupted.Broadcast(EventTag, EventData); break;
+	case ENativeCallback::Cancelled: Task->OnCancelled.Broadcast(EventTag, EventData); break;
+	case ENativeCallback::EventReceived: Task->EventReceived.Broadcast(EventTag, EventData); break;
+	}
+	// No member access after BP. Callers with an old cleanup tail reacquire their weak original task.
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(
@@ -296,19 +421,19 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ExternalCancel()
 	ReleaseRootMotionScaleLease();
 	StopPlayingMontage();
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
-	if (!Task || Task->bEndingTask) { return; }
-	if (Task->ShouldBroadcastAbilityTaskDelegates())
-	{
-		Task->OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
-	}
+	if (!Task || Task->bEndingTask || Task->GetState() == EGameplayTaskState::Finished) { return; }
+	Task->DispatchOriginalCallback(ENativeCallback::Cancelled, FGameplayTag(), FGameplayEventData());
 	Task = OriginalTask.Get();
-	if (Task && !Task->bEndingTask) { Task->Super::ExternalCancel(); }
+	if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->Super::ExternalCancel(); }
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 {
 	if (bEndingTask) { return; }
 	bEndingTask = true;
+	// Close the subscription before any cleanup. Its captures stay stack-owned until all old
+	// cleanup and Super have returned, so their destructors cannot interrupt a member-write tail.
+	TSharedPtr<FNativeCallbackRegistration> DetachedNativeCallbacks = MoveTemp(NativeCallbackRegistration);
 	if (AbilityEnded && bStopWhenAbilityEnds) { RequestInFlightMontageStop(); }
 	InFlightMontagePlayCleanup.Reset(); // The original native call's stack still holds its obligation.
 	if (UGameplayAbility* OriginalAbility = ActivatedAbility.Get())
@@ -327,6 +452,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	ReleaseRootMotionScaleLease();
 	if (AbilityEnded && bStopWhenAbilityEnds) { StopPlayingMontage(); }
 	Super::OnDestroy(AbilityEnded);
+	DetachedNativeCallbacks.Reset(); // External capture destruction; no task access follows.
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsNotifyValid() const
@@ -408,11 +534,11 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailAndEndTask(
 	if (!bEndingTask && !bCancellationRequested && ShouldBroadcastAbilityTaskDelegates())
 	{
 		bCancellationRequested = true;
-		OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
+		DispatchOriginalCallback(ENativeCallback::Cancelled, FGameplayTag(), FGameplayEventData());
 	}
 	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get())
 	{
-		if (!Task->bEndingTask) { Task->EndTask(); }
+		if (!Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->EndTask(); }
 	}
 }
 
@@ -439,12 +565,12 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnAbilityCancelled()
 	ReleaseRootMotionScaleLease();
 	StopPlayingMontage();
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
-	if (Task && !Task->bEndingTask && Task->ShouldBroadcastAbilityTaskDelegates())
+	if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished)
 	{
-		Task->OnCancelled.Broadcast(FGameplayTag(), FGameplayEventData());
+		Task->DispatchOriginalCallback(ENativeCallback::Cancelled, FGameplayTag(), FGameplayEventData());
 	}
 	Task = OriginalTask.Get();
-	if (Task && !Task->bEndingTask) { Task->EndTask(); }
+	if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->EndTask(); }
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOutForInstance(
@@ -457,28 +583,32 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut(UAnimMon
 {
 	if (bEndingTask || bCancellationRequested || bBlendingOut || Montage != MontageToPlay) { return; }
 	bBlendingOut = true;
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const FGGYGOAbilityMontagePlaybackHandle Playback = OriginalPlayback;
+	const FGGYGOMontagePlayGuardIdentity GuardIdentity = OriginalGuardIdentity;
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC = ActivatedASC;
+	const TWeakObjectPtr<UAnimMontage> OriginalMontage(MontageToPlay);
 	ReleaseRootMotionScaleLease();
-	if (UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(ActivatedASC.Get()))
+	if (UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(OriginalASC.Get()))
 	{
-		if (OriginalPlayback.HasPlayback())
+		if (Playback.HasPlayback())
 		{
-			const FGGYGOAbilityMontageClearResult Cleared = ASC->TryClearMontageAnimatingAbility(OriginalPlayback);
+			const FGGYGOAbilityMontageClearResult Cleared = ASC->TryClearMontageAnimatingAbility(Playback);
 			if (Cleared.Outcome == EGGYGOAbilityMontagePlaybackOutcome::Failed
 				|| Cleared.Outcome == EGGYGOAbilityMontagePlaybackOutcome::Rejected)
 			{
 				UE_LOG(LogGGYGOAbilitySystem, Warning,
 					TEXT("MontageTask [%s] 原混出归属清除失败：ASC [%s]，Montage [%s]，Call=%llu Instance=%d，Outcome=%d Reason=%d。"),
-					*GetNameSafe(this), *GetNameSafe(ASC), *GetNameSafe(MontageToPlay),
-					OriginalGuardIdentity.CallId, MontageInstanceId, int32(Cleared.Outcome), int32(Cleared.Reason));
+					*GetNameSafe(OriginalTask.Get()), *GetNameSafe(OriginalASC.Get()), *GetNameSafe(OriginalMontage.Get()),
+					GuardIdentity.CallId, GuardIdentity.CreatedInstanceId, int32(Cleared.Outcome), int32(Cleared.Reason));
 			}
 		}
 	}
-	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
-	if (!Guard || !Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuardIdentity)
-		|| !IsActivatedActorInfoCurrent() || !ShouldBroadcastAbilityTaskDelegates()) { return; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+	if (!Task || !Task->MatchesOriginalMontageCallback(GuardIdentity)) { return; }
 	// These are original instance facts. They do not grant authority over the current GA resource.
-	if (bInterrupted) { OnInterrupted.Broadcast(FGameplayTag(), FGameplayEventData()); }
-	else { OnBlendOut.Broadcast(FGameplayTag(), FGameplayEventData()); }
+	Task->DispatchOriginalCallback(bInterrupted ? ENativeCallback::Interrupted : ENativeCallback::BlendOut,
+		FGameplayTag(), FGameplayEventData());
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEndedForInstance(
@@ -492,17 +622,14 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* 
 	if (bEndingTask || bCancellationRequested || Montage != MontageToPlay) { return; }
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	ReleaseRootMotionScaleLease();
-	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
-	// The original instance Ended fact remains valid after natural blend-out retired ASC ownership.
-	// Do not require a current Playback Check or a still-existing/active engine instance.
-	if (!bInterrupted && Guard && Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuardIdentity)
-		&& IsActivatedActorInfoCurrent() && ShouldBroadcastAbilityTaskDelegates())
+	// Dispatch authenticates the original Ended fact, not current ASC ownership or an active instance.
+	if (!bInterrupted)
 	{
-		OnCompleted.Broadcast(FGameplayTag(), FGameplayEventData());
+		DispatchOriginalCallback(ENativeCallback::Completed, FGameplayTag(), FGameplayEventData());
 	}
 	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get())
 	{
-		if (!Task->bEndingTask) { Task->EndTask(); }
+		if (!Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->EndTask(); }
 	}
 }
 
@@ -525,7 +652,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnGameplayEvent(FGameplayTag 
 	FGameplayEventData TempData = *Payload;
 	TempData.EventTag = EventTag;
 
-	EventReceived.Broadcast(EventTag, TempData);
+	DispatchOriginalCallback(ENativeCallback::EventReceived, EventTag, MoveTemp(TempData));
 }
 
 FString UGGYGOAbilityTask_PlayMontageAndWaitForEvent::GetDebugString() const

@@ -17,6 +17,7 @@
 #pragma once
 
 #include "Components/ActorComponent.h"
+#include "Delegates/Delegate.h"
 #include "GameplayTagContainer.h"
 
 #include "GGYGOMeleeTraceComponent.generated.h"
@@ -24,9 +25,70 @@
 class AActor;
 class UObject;
 class USkeletalMeshComponent;
+class UGGYGOMeleeTraceComponent;
 struct FHitResult;
 
-/** 一次判定命中的结果。 */
+/** 原生窗口资源身份。只有签发组件能构造；不持有组件，也不代表窗口仍活动。 */
+struct GGYGO_API FGGYGOMeleeTraceWindowHandle
+{
+public:
+	FGGYGOMeleeTraceWindowHandle() = default;
+
+	/** 历史上曾取得窗口；当前有效性必须向签发组件查询。 */
+	bool HasWindow() const { return Serial != 0; }
+	bool operator==(const FGGYGOMeleeTraceWindowHandle& Other) const
+	{
+		return Serial == Other.Serial && Issuer.HasSameIndexAndSerialNumber(Other.Issuer);
+	}
+	bool operator!=(const FGGYGOMeleeTraceWindowHandle& Other) const { return !(*this == Other); }
+
+private:
+	TWeakObjectPtr<UGGYGOMeleeTraceComponent> Issuer;
+	uint64 Serial = 0;
+
+	friend class UGGYGOMeleeTraceComponent;
+};
+
+enum class EGGYGOMeleeTraceWindowOpenResult : uint8
+{
+	Opened,
+	InvalidConfiguration,
+	InvalidExpectedHandle,
+	WindowConflict,
+	Unavailable,
+	SerialExhausted
+};
+
+enum class EGGYGOMeleeTraceWindowCloseResult : uint8
+{
+	Closed,
+	AlreadyInactive,
+	InvalidHandle,
+	WrongComponent
+};
+
+enum class EGGYGOMeleeTraceWindowQueryResult : uint8
+{
+	Active,
+	Inactive,
+	InvalidHandle,
+	WrongComponent
+};
+
+enum class EGGYGOMeleeTraceWindowSubscribeResult : uint8
+{
+	Subscribed,
+	InvalidHandle,
+	WrongComponent,
+	WindowInactive,
+	InvalidCallback
+};
+
+/** Owned 窗口只报告原窗口身份和碰撞候选；调用方在注册时捕获自己的原 Activation。 */
+DECLARE_DELEGATE_ThreeParams(FGGYGOMeleeTraceWindowHitDelegate,
+	const FGGYGOMeleeTraceWindowHandle&, AActor*, const FHitResult&);
+
+/** Legacy 窗口的命中结果。 */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGOMeleeHitSignature, AActor*, HitActor, const FHitResult&, HitResult);
 
 UCLASS(meta = (BlueprintSpawnableComponent))
@@ -40,7 +102,7 @@ public:
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
 	/**
-	 * 开启判定窗口。
+	 * 开启 Legacy 判定窗口；活动 Owned 窗口存在时拒绝，不得无身份接管。
 	 *
 	 * @param InStartSocket 判定线段的起点骨骼（通常是武器根）。
 	 * @param InEndSocket   终点骨骼（通常是武器尖）。
@@ -51,7 +113,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Combat")
 	void BeginTraceWindow(FName InStartSocket, FName InEndSocket, float InTraceRadius);
 
-	/** 关闭判定窗口。 */
+	/** 关闭 Legacy 判定窗口；不得关闭活动 Owned 窗口。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Combat")
 	void EndTraceWindow();
 
@@ -59,9 +121,36 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combat")
 	bool IsTracing() const { return bIsTracing; }
 
-	/** 命中时广播。开窗调用者负责权限，组件只报告碰撞候选。 */
+	/** Legacy 命中时广播；Owned 窗口不广播此无身份事件。开窗调用者负责权限。 */
 	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Combat")
 	FGGYGOMeleeHitSignature OnMeleeHit;
+
+	/**
+	 * GameThread 原生开窗，不同步发出命中。
+	 * 空 ExpectedWindow 只取得空闲窗口；非空只替换本组件活动的同一 Owned 窗口。
+	 * 身份冲突不改窗口。获准替换后配置失败会关闭原窗口，不继续旧业务。
+	 * 先快照 ExpectedWindow，再重置 OutWindow；允许两参数引用同一变量。失败输出为空。
+	 */
+	EGGYGOMeleeTraceWindowOpenResult TryOpenOwnedTraceWindow(
+		FName InStartSocket, FName InEndSocket, float InTraceRadius,
+		const FGGYGOMeleeTraceWindowHandle& ExpectedWindow, FGGYGOMeleeTraceWindowHandle& OutWindow);
+
+	/** GameThread：仅关闭确切原窗口。已结束/被替换返回 AlreadyInactive，不影响后继窗口。 */
+	EGGYGOMeleeTraceWindowCloseResult CloseOwnedTraceWindow(const FGGYGOMeleeTraceWindowHandle& Window);
+
+	/** GameThread：Inactive 包括已结束/被替换；不维护历史结束原因。 */
+	EGGYGOMeleeTraceWindowQueryResult QueryOwnedTraceWindow(const FGGYGOMeleeTraceWindowHandle& Window) const;
+
+	/**
+	 * GameThread：订阅确切活动 Owned 窗口，失败令牌为空。窗口结束自动移除其订阅。
+	 * 每次命中快照订阅；分发中新增的订阅从后续命中开始，已退订的快照成员不再调用。
+	 */
+	EGGYGOMeleeTraceWindowSubscribeResult SubscribeWindowHit(
+		const FGGYGOMeleeTraceWindowHandle& Window, FGGYGOMeleeTraceWindowHitDelegate Callback,
+		FDelegateHandle& OutSubscription);
+
+	/** GameThread：只移除确切令牌；旧令牌不能移除后继窗口订阅。 */
+	bool UnsubscribeWindowHit(FDelegateHandle Subscription);
 
 	/**
 	 * 判定使用的碰撞通道。
@@ -118,8 +207,31 @@ protected:
 	 */
 	TArray<TWeakObjectPtr<AActor>> HitActorsThisWindow;
 
-	/** 回调中关闭或重开窗口时改变，旧扫掠不能继续广播或写回采样基线。 */
-	uint32 WindowSerial = 0;
+	/** 每次成功开窗递增，永不回绕/复用；与 bIsTracing 共同校验原窗口。 */
+	uint64 WindowSerial = 0;
+
+private:
+	/** 同一窗口的来源，不另建窗口状态或执行链。 */
+	enum class EWindowSource : uint8 { None, Legacy, Owned };
+	EWindowSource WindowSource = EWindowSource::None;
+	/** 仅生命周期清理栈内拒绝重入开窗，不是另一份窗口活动状态。 */
+	bool bClosingForLifecycle = false;
+
+	/** 原窗口持有的订阅资源；仅活动 Owned 窗口持有，结束统一释放。 */
+	struct FWindowHitSubscription
+	{
+		FGGYGOMeleeTraceWindowHandle Window;
+		FDelegateHandle Handle;
+		FGGYGOMeleeTraceWindowHitDelegate Callback;
+	};
+	TArray<FWindowHitSubscription> WindowHitSubscriptions;
+
+	EGGYGOMeleeTraceWindowOpenResult StartTraceWindow(
+		FName InStartSocket, FName InEndSocket, float InTraceRadius, EWindowSource Source);
+	/** 生命周期/内部失败的唯一清理入口；公共 Legacy End 不具备此权限。 */
+	void CloseCurrentTraceWindow();
+	bool IsActiveWindow(uint64 Serial) const;
+	void DispatchOwnedWindowHit(const FGGYGOMeleeTraceWindowHandle& Window, AActor* HitActor, const FHitResult& Hit);
 
 	friend class FGGYGOMeleeTraceSafetyTest;
 };

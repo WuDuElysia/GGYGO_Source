@@ -231,6 +231,85 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("重复注销保持关闭"), Trace->IsTracing());
 	Trace->RegisterComponent();
 	TestTrue(TEXT("清理后组件可以重新注册"), Trace->IsRegistered());
+
+	// Owned 冒烟复用同一真实查询夹具；旧动态接收器继续绑定以验证事件隔离。
+	const int32 LegacyHitCountBeforeOwned = Receiver->HitCount;
+	FGGYGOMeleeTraceWindowHandle OwnedWindow;
+	if (!TestTrue(TEXT("正常取得 Owned 窗口 A"), Trace->TryOpenOwnedTraceWindow(
+		TEXT("TraceBase"), TEXT("TraceTip"), 20.0f, FGGYGOMeleeTraceWindowHandle(), OwnedWindow)
+		== EGGYGOMeleeTraceWindowOpenResult::Opened)) { return false; }
+	const FGGYGOMeleeTraceWindowHandle OwnedWindowA = OwnedWindow;
+	TestTrue(TEXT("A 已签发且活动"), OwnedWindowA.HasWindow()
+		&& Trace->QueryOwnedTraceWindow(OwnedWindowA) == EGGYGOMeleeTraceWindowQueryResult::Active);
+	if (!TestTrue(TEXT("Expected/Out 同变量允许 A 替换为 B"), Trace->TryOpenOwnedTraceWindow(
+		TEXT("TraceBase"), TEXT("TraceTip"), 20.0f, OwnedWindow, OwnedWindow)
+		== EGGYGOMeleeTraceWindowOpenResult::Opened)) { return false; }
+	const FGGYGOMeleeTraceWindowHandle OwnedWindowB = OwnedWindow;
+	TestTrue(TEXT("B 已签发且身份不同于 A"), OwnedWindowB.HasWindow() && OwnedWindowB != OwnedWindowA);
+	TestTrue(TEXT("替换后 A 保留历史句柄但不再活动"), OwnedWindowA.HasWindow()
+		&& Trace->QueryOwnedTraceWindow(OwnedWindowA) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
+	TestTrue(TEXT("晚到 A 关闭保持幂等失效"), Trace->CloseOwnedTraceWindow(OwnedWindowA)
+		== EGGYGOMeleeTraceWindowCloseResult::AlreadyInactive);
+	FGGYGOMeleeTraceWindowHandle RejectedWindow;
+	AddExpectedError(TEXT("拒绝 Owned Begin：预期原窗口不是本组件活动 Owned 窗口"), EAutomationExpectedErrorFlags::Contains, 1);
+	TestTrue(TEXT("晚到 A 开窗明确拒绝"), Trace->TryOpenOwnedTraceWindow(
+		TEXT("TraceBase"), TEXT("TraceTip"), 20.0f, OwnedWindowA, RejectedWindow)
+		== EGGYGOMeleeTraceWindowOpenResult::WindowConflict);
+	TestFalse(TEXT("拒绝开窗不签发资源"), RejectedWindow.HasWindow());
+	if (!TestTrue(TEXT("晚到 A 开关均未影响 B"), Trace->IsTracing()
+		&& Trace->QueryOwnedTraceWindow(OwnedWindowB) == EGGYGOMeleeTraceWindowQueryResult::Active)) { return false; }
+
+	int32 OwnedBHitCount = 0;
+	int32 OwnedCHitCount = 0;
+	FGGYGOMeleeTraceWindowHandle OwnedWindowC;
+	FDelegateHandle OwnedBSubscription;
+	FDelegateHandle OwnedCSubscription;
+	const FGGYGOMeleeTraceWindowHitDelegate OwnedBCallback = FGGYGOMeleeTraceWindowHitDelegate::CreateLambda(
+		[this, Trace, OwnedWindowB, &OwnedBHitCount, &OwnedCHitCount, &OwnedWindowC, &OwnedCSubscription]
+		(const FGGYGOMeleeTraceWindowHandle& HitWindow, AActor*, const FHitResult&)
+		{
+			++OwnedBHitCount;
+			TestTrue(TEXT("B 命中携带注册时的原窗口身份"), HitWindow == OwnedWindowB);
+			if (!TestTrue(TEXT("原命中回调关闭 B"), Trace->CloseOwnedTraceWindow(OwnedWindowB)
+				== EGGYGOMeleeTraceWindowCloseResult::Closed)) { return; }
+			if (!TestTrue(TEXT("原命中回调取得新窗口 C"), Trace->TryOpenOwnedTraceWindow(
+				TEXT("TraceBase"), TEXT("TraceTip"), 20.0f, FGGYGOMeleeTraceWindowHandle(), OwnedWindowC)
+				== EGGYGOMeleeTraceWindowOpenResult::Opened)) { return; }
+			TestTrue(TEXT("C 注册自己的原窗口订阅"), Trace->SubscribeWindowHit(OwnedWindowC,
+				FGGYGOMeleeTraceWindowHitDelegate::CreateLambda(
+					[this, OriginalC = OwnedWindowC, &OwnedCHitCount]
+					(const FGGYGOMeleeTraceWindowHandle& CWindow, AActor*, const FHitResult&)
+					{
+						TestTrue(TEXT("C 命中携带注册时的原窗口身份"), CWindow == OriginalC);
+						++OwnedCHitCount;
+					}), OwnedCSubscription) == EGGYGOMeleeTraceWindowSubscribeResult::Subscribed);
+		});
+	if (!TestTrue(TEXT("B 注册原窗口订阅"), Trace->SubscribeWindowHit(OwnedWindowB, OwnedBCallback, OwnedBSubscription)
+		== EGGYGOMeleeTraceWindowSubscribeResult::Subscribed)) { return false; }
+	TickTrace(); TickTrace();
+	TestEqual(TEXT("关 B 开 C 后旧扫掠只产生一个 B 回调"), OwnedBHitCount, 1);
+	TestEqual(TEXT("旧扫掠不能把剩余命中交给 C"), OwnedCHitCount, 0);
+	TestFalse(TEXT("旧扫掠不能写回 C 的采样基线"), Trace->bHasPreviousTransform);
+	TestTrue(TEXT("C 的新采样端点与去重仍为空"), Trace->PreviousStart.IsZero()
+		&& Trace->PreviousEnd.IsZero() && Trace->HitActorsThisWindow.IsEmpty());
+	TestFalse(TEXT("B 关闭已移除原订阅令牌"), Trace->UnsubscribeWindowHit(OwnedBSubscription));
+	TestEqual(TEXT("B 原生命中未广播 Legacy 全局事件"), Receiver->HitCount, LegacyHitCountBeforeOwned);
+	if (!TestTrue(TEXT("回调重开后 B 失效且 C 活动"),
+		Trace->QueryOwnedTraceWindow(OwnedWindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive
+		&& Trace->QueryOwnedTraceWindow(OwnedWindowC) == EGGYGOMeleeTraceWindowQueryResult::Active)) { return false; }
+	TickTrace();
+	TestTrue(TEXT("C 首次 Tick 重新建立基线"), Trace->bHasPreviousTransform);
+	TestEqual(TEXT("C 首次 Tick 不命中"), OwnedCHitCount, 0);
+	TickTrace();
+	TestEqual(TEXT("C 原生扫掠命中现有两个目标"), OwnedCHitCount, 2);
+	TestEqual(TEXT("C 原生命中未广播 Legacy 全局事件"), Receiver->HitCount, LegacyHitCountBeforeOwned);
+	Trace->Deactivate();
+	TestTrue(TEXT("Deactivate 使 C 原窗口失效"), Trace->QueryOwnedTraceWindow(OwnedWindowC)
+		== EGGYGOMeleeTraceWindowQueryResult::Inactive);
+	TestFalse(TEXT("Deactivate 关闭 Owned 窗口"), Trace->IsTracing());
+	TestFalse(TEXT("Deactivate 停止 Owned Tick"), Trace->IsComponentTickEnabled());
+	TestFalse(TEXT("Deactivate 已清理 C 原订阅令牌"), Trace->UnsubscribeWindowHit(OwnedCSubscription));
+
 	Trace->OnMeleeHit.RemoveDynamic(Receiver.Get(), &UGGYGOMeleeTraceTestReceiver::HandleHit);
 	return true;
 }

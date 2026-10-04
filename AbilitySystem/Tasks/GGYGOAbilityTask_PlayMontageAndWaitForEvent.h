@@ -61,6 +61,22 @@ class GGYGO_API UGGYGOAbilityTask_PlayMontageAndWaitForEvent : public UAbilityTa
 
 public:
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent(const FObjectInitializer& ObjectInitializer);
+
+	/** Optional C++ callbacks. Callers capture their original activation and weak task by value. */
+	struct FNativeCallbacks
+	{
+		FGGYGOPlayMontageAndWaitForEventDelegate OnCompleted;
+		FGGYGOPlayMontageAndWaitForEventDelegate OnBlendOut;
+		FGGYGOPlayMontageAndWaitForEventDelegate OnInterrupted;
+		FGGYGOPlayMontageAndWaitForEventDelegate OnCancelled;
+		FGGYGOPlayMontageAndWaitForEventDelegate EventReceived;
+	};
+
+	/** One nonempty registration, only in native AwaitingActivation before ReadyForActivation.
+	 * Invalid/duplicate/late registration fails explicitly; it never replaces another package. */
+	FDelegateHandle RegisterNativeCallbacks(FNativeCallbacks Callbacks);
+	/** Detach only this registration. Destruction of its captures cannot erase a reentrant successor. */
+	bool UnregisterNativeCallbacks(FDelegateHandle Registration);
 	/** 统一计算 Montage Task 速率快照：TaskRate 只含一次全局缩放，EffectiveRate 再乘资产 RateScale。 */
 	static bool ResolvePlayRate(const UAnimMontage* Montage, float RequestedRate, float& OutTaskPlayRate, float& OutEffectivePlayRate);
 	/** 返回此任务准备播放的有效速率快照，供同一次播放的 watchdog 使用。 */
@@ -118,6 +134,12 @@ public:
 private:
 	friend class FGGYGOMontageTaskLifecycleTest;
 	struct FInFlightMontagePlayCleanup;
+	struct FNativeCallbackRegistration;
+	enum class ENativeCallback : uint8 { Completed, BlendOut, Interrupted, Cancelled, EventReceived };
+	/** Path-specific original task facts; cancellation may precede ActorInfo/Guard installation. */
+	bool CanDispatchOriginalCallback(ENativeCallback Kind, const FGGYGOMontagePlayGuardIdentity& Original) const;
+	/** Native snapshot first, then recheck the original task before its existing BP callback. */
+	void DispatchOriginalCallback(ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData);
 
 	/** 当前 Montage 是否仍由本任务驱动。 */
 	bool IsNotifyValid() const;
@@ -201,8 +223,10 @@ private:
 	int32 MontageInstanceId = INDEX_NONE;
 	bool bEndingTask = false;
 	bool bBlendingOut = false;
-	/** 本 Task 的取消通知只执行一次，阻止 BP 回调重入重复释放/广播。 */
+	/** 本 Task 的取消通知只执行一次，阻止 native/BP 回调重入重复释放/广播。 */
 	bool bCancellationRequested = false;
+	/** Subscription resource only; no GA activation identity, playback state or execution authority. */
+	TSharedPtr<FNativeCallbackRegistration> NativeCallbackRegistration;
 	FGGYGOAbilityMontagePlaybackHandle OriginalPlayback;
 	FGGYGOMontagePlayGuardIdentity OriginalGuardIdentity;
 	/** 与调用栈共持停止义务，Task 被结束/销毁也不丢失；完整播放返回后释放。 */
