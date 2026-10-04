@@ -125,8 +125,16 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
 FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivation() const
 {
 	check(IsInGameThread());
-	if (!IsValid(this) || !IsInstantiated() || !IsActive()
-		|| IsControlledActivationTerminationBusy() || !CurrentControlledActivation.Proof.IsValid())
+	return IsControlledActivationTerminationBusy() ? FGGYGOAbilityActivationHandle{}
+		: ValidateCurrentControlledActivation();
+}
+
+FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::ValidateCurrentControlledActivation(
+	bool bRequireActive, bool bRequireSpec) const
+{
+	check(IsInGameThread());
+	if (!IsValid(this) || !IsInstantiated() || (bRequireActive && !IsActive())
+		|| !CurrentControlledActivation.Proof.IsValid())
 	{
 		return {};
 	}
@@ -139,7 +147,7 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivation() 
 		return {};
 	}
 	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Proof.SpecHandle);
-	if (!Spec || !Spec->GetAbilityInstances().Contains(this))
+	if (bRequireSpec && (!Spec || !Spec->GetAbilityInstances().Contains(this)))
 	{
 		return {};
 	}
@@ -198,10 +206,11 @@ void UGGYGOGameplayAbility::RetireControlledActivationForNativeEnd(FGameplayAbil
 UGGYGOGameplayAbility::FScopedControlledActivationEnd::FScopedControlledActivationEnd(
 	UGGYGOGameplayAbility* InAbility)
 	: Ability(InAbility), Previous(InAbility->ControlledActivationEndScope),
-	  Original(InAbility->CurrentControlledActivation)
+	  Original(InAbility->CurrentControlledActivation), Termination(InAbility->OriginalTermination)
 {
 	check(IsInGameThread());
 	InAbility->ControlledActivationEndScope = this;
+	if (Termination.IsValid()) { ++Termination->OpenDispatches; }
 }
 
 UGGYGOGameplayAbility::FScopedControlledActivationEnd::~FScopedControlledActivationEnd()
@@ -215,11 +224,347 @@ UGGYGOGameplayAbility::FScopedControlledActivationEnd::~FScopedControlledActivat
 		}
 		OriginalAbility->ControlledActivationEndScope = Previous;
 	}
+	if (Termination.IsValid())
+	{
+		check(Termination->OpenDispatches > 0);
+		--Termination->OpenDispatches;
+		UGGYGOGameplayAbility::TryCompleteOriginalTermination(Termination);
+	}
 }
 
 bool UGGYGOGameplayAbility::IsControlledActivationTerminationBusy() const
 {
-	return ControlledActivationEndScope != nullptr || bIsAbilityEnding;
+	return OriginalTermination.IsValid() || ControlledActivationEndScope != nullptr || bIsAbilityEnding;
+}
+
+struct FGGYGOAbilityTerminationHandle::FTerminationProof
+{
+	TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+	uint64 Serial = 0;
+	FGGYGOAbilityActivationHandle Activation;
+};
+
+FGGYGOAbilityTerminationResult UGGYGOGameplayAbility::GetOriginalTerminationResult(
+	const FOriginalTerminationRecord& Record)
+{
+	FGGYGOAbilityTerminationResult Result;
+	Result.Original = Record.Context;
+	Result.Outcome = Record.Outcome;
+	Result.Reason = Record.Reason;
+	return Result;
+}
+
+TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbility::BeginOriginalTermination(
+	const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
+	bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult)
+{
+	check(IsInGameThread());
+	using EReason = EGGYGOAbilityTerminationReason;
+	using EOutcome = EGGYGOAbilityTerminationOutcome;
+	OutResult = {};
+	if (!Original.Proof.IsValid()) { return {}; }
+	OutResult.Original.OriginalActivation = Original;
+	if (Original.Proof->Ability.Get() != this) { OutResult.Reason = EReason::WrongIssuer; return {}; }
+	if (OriginalTermination.IsValid())
+	{
+		if (OriginalTermination->Context.GetOriginalActivation().HasSameActivation(Original))
+		{
+			OutResult = GetOriginalTerminationResult(*OriginalTermination);
+			if (OutResult.Outcome != EOutcome::Failed)
+			{
+				OutResult.Outcome = EOutcome::AlreadyPending;
+			}
+		}
+		else { OutResult.Outcome = EOutcome::Busy; OutResult.Reason = EReason::TerminationInProgress; }
+		return {};
+	}
+	if (!IsValid(this) || !IsInstantiated()) { OutResult.Reason = EReason::InvalidAbility; return {}; }
+	if (!IsActive()) { OutResult.Outcome = EOutcome::Stale; OutResult.Reason = EReason::NotActive; return {}; }
+	if (!CaptureCurrentActivation().HasSameActivation(Original))
+	{
+		OutResult.Outcome = EOutcome::Stale;
+		OutResult.Reason = EReason::ActivationChanged;
+		return {};
+	}
+	UGGYGOAbilitySystemComponent* ASC = Original.Proof->ASC.Get();
+	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Original.Proof->Allocation.Pin();
+	if (!IsValid(ASC)) { OutResult.Reason = EReason::InvalidASC; return {}; }
+	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Original.Proof->SpecHandle);
+	if (!Spec || Spec->PendingRemove) { OutResult.Reason = EReason::InvalidAbility; return {}; }
+	if (!ActorInfo.IsValid() || !IsEndAbilityValid(Original.Proof->SpecHandle, ActorInfo.Get()))
+	{
+		// PreActivate's witness precedes native ActiveCount++; it is not yet endable.
+		OutResult.Reason = EReason::NotActive;
+		return {};
+	}
+	if (Kind == EGGYGOAbilityTerminationRequestKind::Cancel && !CanBeCanceled())
+	{
+		OutResult.Reason = EReason::NotCancelable;
+		return {};
+	}
+	if (LastOriginalTerminationSerial == MAX_uint64) { OutResult.Reason = EReason::IdentityExhausted; return {}; }
+	FGGYGOAbilityTerminationContext Context;
+	Context.OriginalActivation = Original;
+	Context.RequestKind = Kind;
+	Context.bReplicateEndAbility = Kind == EGGYGOAbilityTerminationRequestKind::End && bReplicate;
+	Context.bReplicateCancelAbility = Kind == EGGYGOAbilityTerminationRequestKind::Cancel && bReplicate;
+	Context.bWasCancelled = Kind == EGGYGOAbilityTerminationRequestKind::Cancel || bWasCancelled;
+	Context.OriginalMontageCapture = ASC->CaptureMontagePlaybackOwnership(this,
+		Original.Proof->SpecHandle, CurrentActivationInfo);
+	if (Context.OriginalMontageCapture.Outcome != EGGYGOAbilityMontagePlaybackOutcome::Succeeded
+		&& Context.OriginalMontageCapture.Outcome != EGGYGOAbilityMontagePlaybackOutcome::NoOwnedPlayback)
+	{
+		OutResult.Original = Context;
+		OutResult.Outcome = EOutcome::Failed;
+		OutResult.Reason = EReason::MontageCaptureFailed;
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem termination [%s] ASC [%s] Spec [%s] montage capture failed: outcome=%d reason=%d."),
+			*GetPathName(), *GetPathNameSafe(ASC), *Original.Proof->SpecHandle.ToString(),
+			static_cast<int32>(Context.OriginalMontageCapture.Outcome), static_cast<int32>(Context.OriginalMontageCapture.Reason));
+		return {};
+	}
+	TSharedRef<FGGYGOAbilityTerminationHandle::FTerminationProof> Proof =
+		MakeShared<FGGYGOAbilityTerminationHandle::FTerminationProof>();
+	Proof->Ability = this;
+	Proof->Serial = ++LastOriginalTerminationSerial;
+	Proof->Activation = Original;
+	Context.OriginalTermination.Proof = Proof;
+	TSharedPtr<FOriginalTerminationRecord> Record = MakeShared<FOriginalTerminationRecord>();
+	Record->Context = Context;
+	Record->Ability = this;
+	Record->ASC = ASC;
+	Record->ActorInfo = ActorInfo;
+	Record->SpecHandle = Original.Proof->SpecHandle;
+	Record->ActivationInfo = CurrentActivationInfo;
+	Record->CameraOffsetComponent = AppliedCameraOffsetComponent;
+	Record->CameraOffsetHandle = AppliedCameraOffsetHandle;
+	Record->CameraModeHero = AppliedCameraModeHeroComponent;
+	Record->CameraModeSpec = AppliedCameraModeSpecHandle;
+	Record->CameraModeGeneration = AppliedCameraModeRequestGeneration;
+	OriginalTermination = Record; // Install before any native cancellation/cleanup callback.
+	ASC->RegisterOriginalTerminationTryDependencies(Record);
+	OutResult = GetOriginalTerminationResult(*Record);
+	return Record;
+}
+
+EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckOriginalTerminationSource(
+	const FOriginalTerminationRecord& Record) const
+{
+	using EReason = EGGYGOAbilityTerminationReason;
+	if (!IsValid(this) || Record.Ability.Get() != this) { return EReason::InvalidAbility; }
+	if (!Record.ASC.IsValid()) { return EReason::InvalidASC; }
+	if (OriginalTermination.Get() != &Record
+		|| !ValidateCurrentControlledActivation().HasSameActivation(Record.Context.GetOriginalActivation()))
+	{
+		return EReason::ActivationChanged;
+	}
+	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Record.ActorInfo.Pin();
+	if (!ActorInfo.IsValid() || ActorInfo.Get() != CurrentActorInfo) { return EReason::InvalidActorInfo; }
+	const FGameplayAbilitySpec* Spec = Record.ASC->FindAbilitySpecFromHandle(Record.SpecHandle);
+	if (!Spec || Spec->PendingRemove) { return EReason::InvalidAbility; }
+	return EReason::None;
+}
+
+void UGGYGOGameplayAbility::FailOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record,
+	EGGYGOAbilityTerminationReason Reason)
+{
+	if (!Record.IsValid() || Record->bSealed || Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed) { return; }
+	Record->Outcome = EGGYGOAbilityTerminationOutcome::Failed;
+	Record->Reason = Reason;
+	Record->bContinuationQueued = false; // Any retained native delegate can only retire this failed record.
+	Record->bContinuationReady = false;
+	UE_LOG(LogGGYGOAbilitySystem, Error,
+		TEXT("AbilitySystem original termination Ability [%s] ASC [%s] Spec [%s] failed: reason=%d."),
+		*GetPathNameSafe(Record->Ability.Get()), *GetPathNameSafe(Record->ASC.Get()),
+		*Record->SpecHandle.ToString(), static_cast<int32>(Reason));
+}
+
+void UGGYGOGameplayAbility::TryCompleteOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record)
+{
+	if (!Record.IsValid() || Record->bSealed || Record->OpenDispatches != 0
+		|| Record->OpenTryCalls != 0 || Record->bContinuationQueued || Record->bContinuationReady) { return; }
+	if (Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
+	{
+		if (!Record->bNativeEndObserved || !Record->bNativeEndReturned || !Record->bFullEndReturned
+			|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelReturned))
+		{
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::NativeEndNotObserved);
+		}
+		else if (UGGYGOAbilitySystemComponent* ASC = Record->ASC.Get())
+		{
+			if (ASC->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+			{
+				FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidASC);
+			}
+			else
+			{
+				ASC->TryPublishOriginalTerminationCompleted(Record);
+				return;
+			}
+		}
+		else { FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidASC); }
+	}
+	Record->bSealed = true;
+	Record->TryCompletionSlots.Reset();
+	if (UGGYGOGameplayAbility* Ability = Record->Ability.Get())
+	{
+		if (Ability->CurrentControlledActivation.HasSameActivation(Record->Context.GetOriginalActivation()))
+		{
+			Ability->RetireControlledActivation();
+		}
+		if (Ability->OriginalTermination == Record) { Ability->OriginalTermination.Reset(); }
+	}
+}
+
+void UGGYGOGameplayAbility::ResumeOriginalTermination(TSharedPtr<FOriginalTerminationRecord> Record)
+{
+	check(IsInGameThread());
+	if (!Record.IsValid() || Record->bSealed || Record->bDriving) { return; }
+	if (Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed) { TryCompleteOriginalTermination(Record); return; }
+	const EGGYGOAbilityTerminationReason SourceReason = CheckOriginalTerminationSource(*Record);
+	if (SourceReason != EGGYGOAbilityTerminationReason::None)
+	{
+		FailOriginalTermination(Record, SourceReason);
+		TryCompleteOriginalTermination(Record);
+		return;
+	}
+	if (ScopeLockCount > 0)
+	{
+		DeferOriginalTermination(Record);
+		return;
+	}
+	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Record->ActorInfo.Pin();
+	const bool bEndable = IsEndAbilityValid(Record->SpecHandle, ActorInfo.Get());
+	if (!bEndable
+		|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel
+			&& !Record->bCancelEntered && !CanBeCanceled()))
+	{
+		FailOriginalTermination(Record, !bEndable ? EGGYGOAbilityTerminationReason::NotActive
+			: EGGYGOAbilityTerminationReason::NotCancelable);
+		TryCompleteOriginalTermination(Record);
+		return;
+	}
+	Record->Outcome = EGGYGOAbilityTerminationOutcome::Accepted;
+	Record->Reason = EGGYGOAbilityTerminationReason::None;
+	Record->bDriving = true;
+	++Record->OpenDispatches;
+	if (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelEntered)
+	{
+		CancelAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo, Record->Context.GetReplicateCancelAbility());
+	}
+	else
+	{
+		EndAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo,
+			Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+	}
+	// Only immutable original history is touched after the virtual call, even if it destroyed GA.
+	Record->bDriving = false;
+	Record->bFullEndReturned = Record->bNativeEndReturned;
+	check(Record->OpenDispatches > 0);
+	--Record->OpenDispatches;
+	if (Record->bContinuationReady)
+	{
+		// Native unlock occurred inside the original virtual call. Resume only after that call
+		// returned; this consumes its one native delegate, without scheduling another executor.
+		Record->bContinuationReady = false;
+		if (UGGYGOGameplayAbility* Ability = Record->Ability.Get()) { Ability->ResumeOriginalTermination(Record); }
+		else { FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility); }
+	}
+	if (!Record->bNativeEndObserved && !Record->bContinuationQueued)
+	{
+		FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::NativeEndNotObserved);
+	}
+	TryCompleteOriginalTermination(Record);
+}
+
+void UGGYGOGameplayAbility::DeferOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record)
+{
+	if (Record->bContinuationQueued) { return; }
+	if (Record->bContinuationUsed)
+	{
+		FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::ScopeLocked);
+		TryCompleteOriginalTermination(Record);
+		return;
+	}
+	Record->bContinuationUsed = true;
+	Record->bContinuationQueued = true;
+	Record->Outcome = EGGYGOAbilityTerminationOutcome::Deferred;
+	Record->Reason = EGGYGOAbilityTerminationReason::ScopeLocked;
+	WaitingToExecute.Add(FPostLockDelegate::CreateLambda([Record]()
+	{
+		Record->bContinuationQueued = false;
+		if (Record->bSealed || Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed)
+		{
+			UGGYGOGameplayAbility::TryCompleteOriginalTermination(Record);
+			return;
+		}
+		if (Record->bDriving)
+		{
+			Record->bContinuationReady = true;
+			return;
+		}
+		if (UGGYGOGameplayAbility* Ability = Record->Ability.Get()) { Ability->ResumeOriginalTermination(Record); }
+		else
+		{
+			UGGYGOGameplayAbility::FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility);
+			UGGYGOGameplayAbility::TryCompleteOriginalTermination(Record);
+		}
+	}));
+}
+
+FGGYGOAbilityTerminationResult UGGYGOGameplayAbility::RequestAbilityEnd(
+	const FGGYGOAbilityActivationHandle& Original, bool bReplicateEndAbility, bool bWasCancelled)
+{
+	FGGYGOAbilityTerminationResult Result;
+	const TSharedPtr<FOriginalTerminationRecord> Record = BeginOriginalTermination(Original,
+		EGGYGOAbilityTerminationRequestKind::End, bReplicateEndAbility, bWasCancelled, Result);
+	if (Record.IsValid()) { ResumeOriginalTermination(Record); Result = GetOriginalTerminationResult(*Record); }
+	return Result;
+}
+
+FGGYGOAbilityTerminationResult UGGYGOGameplayAbility::RequestAbilityCancel(
+	const FGGYGOAbilityActivationHandle& Original, bool bReplicateCancelAbility)
+{
+	FGGYGOAbilityTerminationResult Result;
+	const TSharedPtr<FOriginalTerminationRecord> Record = BeginOriginalTermination(Original,
+		EGGYGOAbilityTerminationRequestKind::Cancel, bReplicateCancelAbility, true, Result);
+	if (Record.IsValid()) { ResumeOriginalTermination(Record); Result = GetOriginalTerminationResult(*Record); }
+	return Result;
+}
+
+void UGGYGOGameplayAbility::ObserveOriginalNativeEnd(UGGYGOAbilitySystemComponent* OriginalASC,
+	FGameplayAbilitySpecHandle Handle)
+{
+	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (Record.IsValid() && !Record->bSealed && Record->bNativeEndStarted
+		&& Record->ASC.Get() == OriginalASC && Record->SpecHandle == Handle && ControlledActivationEndScope
+		&& ControlledActivationEndScope->Original.HasSameActivation(Record->Context.GetOriginalActivation()))
+	{
+		const FGameplayAbilitySpec* Spec = OriginalASC->FindAbilitySpecFromHandle(Handle);
+		if (!Spec || Spec->PendingRemove || !Spec->GetAbilityInstances().Contains(this))
+		{
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility);
+			return;
+		}
+		// Native already cleared IsActive before this notification; compare original provenance
+		// and ActorInfo directly, without manufacturing a fresh active identity.
+		if (!ValidateCurrentControlledActivation(false).HasSameActivation(Record->Context.GetOriginalActivation()))
+		{
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::ActivationChanged);
+			return;
+		}
+		Record->bNativeEndObserved = true;
+	}
+}
+
+void UGGYGOGameplayAbility::InvalidateOriginalTerminationForActivation()
+{
+	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (Record.IsValid())
+	{
+		FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::ActivationChanged);
+		TryCompleteOriginalTermination(Record);
+	}
 }
 
 UGGYGOGameplayAbility::UGGYGOGameplayAbility(const FObjectInitializer& ObjectInitializer)
@@ -559,68 +904,98 @@ bool UGGYGOGameplayAbility::BuildHitEffectPayload(UAbilitySystemComponent* Targe
 	FGGYGOHitEffectPayload& OutPayload) const
 {
 	OutPayload = FGGYGOHitEffectPayload();
-
-	if (!CurrentActorInfo || !TargetAbilitySystemComponent)
+	FGGYGOHitEffectPayload Payload;
+	const FGameplayAbilitySpecHandle OriginalSpecHandle = CurrentSpecHandle;
+	UAbilitySystemComponent* SourceAbilitySystemComponent = CurrentActorInfo
+		? GetAbilitySystemComponentFromActorInfo() : nullptr;
+	const TWeakObjectPtr<const UGGYGOGameplayAbility> OriginalAbility(this);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalSource(SourceAbilitySystemComponent);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalTarget(TargetAbilitySystemComponent);
+	const bool bRequiresEffectSpec = DamageEffectClass != nullptr;
+	const TWeakObjectPtr<UClass> OriginalEffectClass(DamageEffectClass.Get());
+	// Diagnostic strings survive real extension callbacks destroying their source objects.
+	const FString AbilityPath = GetPathNameSafe(this);
+	const FString SourcePath = GetPathNameSafe(SourceAbilitySystemComponent);
+	const FString TargetPath = GetPathNameSafe(TargetAbilitySystemComponent);
+	const FString EffectClassPath = GetPathNameSafe(DamageEffectClass.Get());
+	const auto Fail = [&](const TCHAR* Reason)
 	{
+		OutPayload = FGGYGOHitEffectPayload();
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem BuildHitEffectPayload Ability [%s] Source [%s] Target [%s] GE [%s] failed: %s."),
+			*AbilityPath, *SourcePath, *TargetPath, *EffectClassPath, Reason);
 		return false;
-	}
-
-	UAbilitySystemComponent* SourceAbilitySystemComponent = GetAbilitySystemComponentFromActorInfo();
-	if (!SourceAbilitySystemComponent)
+	};
+	const auto HasOriginalObjects = [&]()
 	{
-		return false;
-	}
-
-	OutPayload.EffectContext = MakeEffectContext(CurrentSpecHandle, CurrentActorInfo);
-	if (!OutPayload.EffectContext.IsValid())
+		return OriginalAbility.IsValid() && OriginalSource.IsValid() && OriginalTarget.IsValid();
+	};
+	const auto HasValidRequiredSpec = [&]()
 	{
-		return false;
-	}
+		return OriginalEffectClass.IsValid() && Payload.EffectSpec.IsValid()
+			&& IsValid(Payload.EffectSpec.Data->Def.Get())
+			&& Payload.EffectSpec.Data->GetContext().IsValid();
+	};
+	if (!CurrentActorInfo) { return Fail(TEXT("MissingActorInfo")); }
+	if (!OriginalSource.IsValid()) { return Fail(TEXT("InvalidSourceASC")); }
+	if (!OriginalTarget.IsValid()) { return Fail(TEXT("InvalidTargetASC")); }
+	if (bRequiresEffectSpec && !OriginalEffectClass.IsValid()) { return Fail(TEXT("InvalidRequiredGEClass")); }
+
+	Payload.EffectContext = MakeEffectContext(OriginalSpecHandle, CurrentActorInfo);
+	if (!HasOriginalObjects()) { return Fail(TEXT("SourceOrTargetInvalidAfterMakeEffectContext")); }
+	if (!Payload.EffectContext.IsValid()) { return Fail(TEXT("InvalidEffectContext")); }
 
 	// AddHitResult(reset=true) 会用 TraceStart 改写 Origin，所以显式 Origin 必须最后写入。
-	OutPayload.EffectContext.AddHitResult(HitResult, /*bReset=*/true);
+	Payload.EffectContext.AddHitResult(HitResult, /*bReset=*/true);
 	FGGYGOGameplayEffectContext* GGYGOContext =
-		FGGYGOGameplayEffectContext::ExtractEffectContext(OutPayload.EffectContext);
+		FGGYGOGameplayEffectContext::ExtractEffectContext(Payload.EffectContext);
 	check(GGYGOContext);
 	GGYGOContext->SetSourceOriginSnapshot(Origin);
 
-	if (DamageEffectClass)
+	if (bRequiresEffectSpec)
 	{
-		OutPayload.EffectSpec = SourceAbilitySystemComponent->MakeOutgoingSpec(
-			DamageEffectClass, EffectLevel, OutPayload.EffectContext);
+		Payload.EffectSpec = SourceAbilitySystemComponent->MakeOutgoingSpec(
+			DamageEffectClass, EffectLevel, Payload.EffectContext);
+		if (!HasOriginalObjects()) { return Fail(TEXT("SourceOrTargetInvalidAfterMakeOutgoingSpec")); }
+		if (!HasValidRequiredSpec()) { return Fail(TEXT("RequiredSpecCreationFailed")); }
+		FGameplayAbilitySpec* AbilitySpec = SourceAbilitySystemComponent->FindAbilitySpecFromHandle(OriginalSpecHandle);
+		const bool bHasAbilitySpec = AbilitySpec != nullptr;
+		const TMap<FGameplayTag, float> OriginalSetByCallerMagnitudes = AbilitySpec
+			? AbilitySpec->SetByCallerTagMagnitudes : TMap<FGameplayTag, float>{};
+		ApplyAbilityTagsToGameplayEffectSpec(*Payload.EffectSpec.Data.Get(), AbilitySpec);
+		if (!HasOriginalObjects()) { return Fail(TEXT("SourceOrTargetInvalidAfterApplyAbilityTags")); }
+		if (!HasValidRequiredSpec()) { return Fail(TEXT("RequiredSpecInvalidAfterApplyAbilityTags")); }
 
-		if (OutPayload.EffectSpec.IsValid())
+		// The extension may remove/reenter the native Spec; use this hit's original values.
+		if (bHasAbilitySpec)
 		{
-			FGameplayAbilitySpec* AbilitySpec = SourceAbilitySystemComponent->FindAbilitySpecFromHandle(CurrentSpecHandle);
-			ApplyAbilityTagsToGameplayEffectSpec(*OutPayload.EffectSpec.Data.Get(), AbilitySpec);
-
-			// 与 UGameplayAbility::MakeOutgoingGameplayEffectSpec 保持同一套能力级 Spec 扩展。
-			if (AbilitySpec)
-			{
-				OutPayload.EffectSpec.Data->SetByCallerTagMagnitudes = AbilitySpec->SetByCallerTagMagnitudes;
-			}
-			BP_EditSpecValues(OutPayload.EffectSpec);
-
-			UAbilitySystemGlobals::Get().InitGameplayCueParameters_GESpec(
-				OutPayload.CueParameters, *OutPayload.EffectSpec.Data.Get());
+			Payload.EffectSpec.Data->SetByCallerTagMagnitudes = OriginalSetByCallerMagnitudes;
 		}
+		BP_EditSpecValues(Payload.EffectSpec);
+		if (!HasOriginalObjects()) { return Fail(TEXT("SourceOrTargetInvalidAfterBP_EditSpecValues")); }
+		if (!HasValidRequiredSpec()) { return Fail(TEXT("RequiredSpecInvalidAfterBP_EditSpecValues")); }
+		UAbilitySystemGlobals::Get().InitGameplayCueParameters_GESpec(
+			Payload.CueParameters, *Payload.EffectSpec.Data.Get());
+		if (!HasValidRequiredSpec()) { return Fail(TEXT("RequiredSpecInvalidAfterCueInitialization")); }
 	}
-
-	if (!OutPayload.EffectSpec.IsValid())
+	else
 	{
 		UAbilitySystemGlobals::Get().InitGameplayCueParameters(
-			OutPayload.CueParameters, OutPayload.EffectContext);
+			Payload.CueParameters, Payload.EffectContext);
 	}
+	if (!HasOriginalObjects()) { return Fail(TEXT("SourceOrTargetInvalidAfterCueInitialization")); }
+	if (!Payload.EffectContext.IsValid()) { return Fail(TEXT("EffectContextInvalidAfterCueInitialization")); }
 
 	// 带输出参数的 GetOwnedGameplayTags 会先 Reset 容器；这里读取 const 集合后追加，
 	// 才不会覆盖 GESpec 已聚合的 Tag。物理材质最后追加，保证有/无 GE 两条路径一致。
-	OutPayload.CueParameters.AggregatedTargetTags.AppendTags(
+	Payload.CueParameters.AggregatedTargetTags.AppendTags(
 		TargetAbilitySystemComponent->GetOwnedGameplayTags());
-	AppendPhysicalMaterialTags(HitResult, OutPayload.CueParameters.AggregatedTargetTags);
-	OutPayload.CueParameters.Location = HitResult.ImpactPoint;
-	OutPayload.CueParameters.Normal = HitResult.ImpactNormal;
-	OutPayload.CueParameters.Instigator = OutPayload.EffectContext.GetInstigator();
-	OutPayload.CueParameters.EffectCauser = OutPayload.EffectContext.GetEffectCauser();
+	AppendPhysicalMaterialTags(HitResult, Payload.CueParameters.AggregatedTargetTags);
+	Payload.CueParameters.Location = HitResult.ImpactPoint;
+	Payload.CueParameters.Normal = HitResult.ImpactNormal;
+	Payload.CueParameters.Instigator = Payload.EffectContext.GetInstigator();
+	Payload.CueParameters.EffectCauser = Payload.EffectContext.GetEffectCauser();
+	OutPayload = MoveTemp(Payload);
 
 	return true;
 }
@@ -890,6 +1265,12 @@ void UGGYGOGameplayAbility::ActivateAbility(const FGameplayAbilitySpecHandle Han
 
 void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode)
 {
+	if (OriginalTermination.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("AbilitySystem camera mode [%s] asset [%s] rejected during original termination."),
+			*GetPathName(), *GetNameSafe(CameraMode.Get()));
+		return;
+	}
 	// 能力实例是 InstancedPerActor；显式替换时先释放它自己保存的旧接收者请求。
 	ClearCameraMode();
 
@@ -932,6 +1313,11 @@ void UGGYGOGameplayAbility::ClearCameraMode()
 
 void UGGYGOGameplayAbility::ApplyCameraOffset(const FGGYGOCameraOffset& Offset)
 {
+	if (OriginalTermination.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("AbilitySystem camera offset [%s] rejected during original termination."), *GetPathName());
+		return;
+	}
 	// Offset 是相机组件的单槽资源；替换时只撤销本能力持有的旧 token。
 	ClearCameraOffset();
 
@@ -958,6 +1344,107 @@ void UGGYGOGameplayAbility::ClearCameraOffset()
 	AppliedCameraOffsetHandle = FGGYGOCameraOffsetHandle();
 }
 
+void UGGYGOGameplayAbility::CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context)
+{
+	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (!Record.IsValid() || !Record->Context.GetOriginalTermination().HasSameTermination(Context.GetOriginalTermination()))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem original camera cleanup [%s] rejected: termination source mismatch."), *GetPathName());
+		return;
+	}
+	// Detach only matching original members before calling their original receivers.
+	if (AppliedCameraOffsetComponent == Record->CameraOffsetComponent && AppliedCameraOffsetHandle == Record->CameraOffsetHandle)
+	{
+		AppliedCameraOffsetComponent.Reset();
+		AppliedCameraOffsetHandle = {};
+	}
+	if (AppliedCameraModeHeroComponent == Record->CameraModeHero && AppliedCameraModeSpecHandle == Record->CameraModeSpec
+		&& AppliedCameraModeRequestGeneration == Record->CameraModeGeneration)
+	{
+		AppliedCameraModeHeroComponent.Reset();
+		AppliedCameraModeSpecHandle = {};
+		AppliedCameraModeRequestGeneration = 0;
+		ActiveCameraMode = nullptr;
+	}
+	if (UGGYGOCameraComponent* Camera = Record->CameraOffsetComponent.Get())
+	{
+		Camera->ClearCameraOffset(Record->CameraOffsetHandle);
+	}
+	if (Record->CameraModeGeneration != 0)
+	{
+		if (UGGYGOHeroComponent* Hero = Record->CameraModeHero.Get())
+		{
+			Hero->ClearAbilityCameraMode(Record->CameraModeSpec, Record->CameraModeGeneration);
+		}
+	}
+}
+
+void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility)
+{
+	check(IsInGameThread());
+	TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (!Record.IsValid())
+	{
+		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
+		if (!Original.HasActivation())
+		{
+			if (CurrentControlledActivation.HasActivation())
+			{
+				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem native Cancel [%s] Spec [%s] rejected: issued controlled source is invalid or still ending."),
+					*GetPathName(), *Handle.ToString());
+				return;
+			}
+			// Transitional native entry: preserves untracked GAS behavior, issues no protocol completion.
+			UE_LOG(LogGGYGOAbilitySystem, Verbose, TEXT("AbilitySystem native Cancel [%s] Spec [%s] has no controlled source; termination protocol unsupported."),
+				*GetPathName(), *Handle.ToString());
+			Super::CancelAbility(Handle, ActorInfo, ActivationInfo, bReplicateCancelAbility);
+			return;
+		}
+		if (Handle != CurrentSpecHandle || ActorInfo != CurrentActorInfo
+			|| ActivationInfo.GetActivationPredictionKey() != CurrentActivationInfo.GetActivationPredictionKey())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem native Cancel [%s] Spec [%s] rejected: original source mismatch."),
+				*GetPathName(), *Handle.ToString());
+			return;
+		}
+		FGGYGOAbilityTerminationResult Result;
+		Record = BeginOriginalTermination(Original, EGGYGOAbilityTerminationRequestKind::Cancel,
+			bReplicateCancelAbility, true, Result);
+		if (!Record.IsValid())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("AbilitySystem native Cancel [%s] Spec [%s] rejected: reason=%d."),
+				*GetPathName(), *Handle.ToString(), static_cast<int32>(Result.Reason));
+			return;
+		}
+		// The entry adapter holds Busy over the full inner virtual dispatch/native Cancel return.
+		++Record->OpenDispatches;
+		ResumeOriginalTermination(Record);
+		if (Record->OpenTryCalls == 0 && !Record->bContinuationQueued && !Record->bContinuationReady
+			&& Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
+		{
+			// This synchronous raw entry cannot witness its own full virtual return. Typed callers
+			// or a later native continuation have an outer dispatcher; a related Try has an exit
+			// witness. Do not publish from this adapter's epilogue without either boundary.
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::UnsupportedEntry);
+		}
+		--Record->OpenDispatches;
+		TryCompleteOriginalTermination(Record);
+		return;
+	}
+	if (!Record->bDriving || Record->bCancelEntered || Record->bSealed
+		|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed
+		|| Record->Context.GetRequestKind() != EGGYGOAbilityTerminationRequestKind::Cancel
+		|| Record->SpecHandle != Handle || Record->ActorInfo.Pin().Get() != ActorInfo
+		|| Record->ActivationInfo.GetActivationPredictionKey() != ActivationInfo.GetActivationPredictionKey())
+	{
+		return; // Reentry cannot broadcast a second Cancel or replace the first request.
+	}
+	Record->bCancelEntered = true;
+	Super::CancelAbility(Handle, ActorInfo, Record->ActivationInfo, Record->Context.GetReplicateCancelAbility());
+	Record->bCancelReturned = true;
+}
+
 void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
 {
 	if (!IsEndAbilityValid(Handle, ActorInfo))
@@ -966,9 +1453,70 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 	}
 
 	FScopedControlledActivationEnd OriginalEndScope(this);
-	// 先清相机再交给父类：父类会清理 ActorInfo，之后就拿不到 Avatar 了。
-	// 被组仲裁取消、被死亡取消、Avatar 销毁这些路径都会走到这里，
-	// 所以镜头不会永久停在演出视角。
+	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (Record.IsValid())
+	{
+		const FGameplayAbilitySpec* Spec = Record->ASC.IsValid()
+			? Record->ASC->FindAbilitySpecFromHandle(Record->SpecHandle) : nullptr;
+		if (!Record->bDriving && !Record->bNativeEndStarted && !Record->bSealed
+			&& Record->ASC.IsValid() && (!Spec || Spec->PendingRemove)
+			&& ValidateCurrentControlledActivation(true, false).HasSameActivation(Record->Context.GetOriginalActivation())
+			&& Record->SpecHandle == Handle && Record->ActorInfo.Pin().Get() == ActorInfo
+			&& ActorInfo && ActorInfo->AbilitySystemComponent.Get() == Record->ASC.Get()
+			&& Record->ActivationInfo.GetActivationPredictionKey() == ActivationInfo.GetActivationPredictionKey())
+		{
+			// Native OnRemove must still tear down the exact original GAS resources. Removal
+			// invalidates this protocol record; it can never turn that teardown into Completed.
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility);
+			if (!Record->bCleanupStarted)
+			{
+				Record->bCleanupStarted = true;
+				CleanupAbilityResourcesForTermination(Record->Context);
+			}
+			if (!Record->Ability.IsValid()) { return; }
+			if (!ValidateCurrentControlledActivation(true, false).HasSameActivation(Record->Context.GetOriginalActivation())) { return; }
+			if (ScopeLockCount > 0)
+			{
+				// GAS teardown of a removed, still locked instance has no supported return proof.
+				// Release original camera resources, fail visibly, and add no second native delegate.
+				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem original removal [%s] Spec [%s] is scope locked; native teardown return is unsupported."),
+					*GetPathName(), *Handle.ToString());
+				return;
+			}
+			Record->bNativeEndStarted = true;
+			Super::EndAbility(Handle, ActorInfo, Record->ActivationInfo,
+				Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+			Record->bNativeEndReturned = true;
+			return;
+		}
+		if (!Record->bDriving || Record->bNativeEndStarted || Record->bSealed
+			|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed) { return; }
+		if (Record->SpecHandle != Handle || Record->ActorInfo.Pin().Get() != ActorInfo
+			|| Record->ActivationInfo.GetActivationPredictionKey() != ActivationInfo.GetActivationPredictionKey())
+		{
+			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::ActivationChanged);
+			return;
+		}
+		if (ScopeLockCount > 0) { DeferOriginalTermination(Record); return; }
+		EGGYGOAbilityTerminationReason SourceReason = CheckOriginalTerminationSource(*Record);
+		if (SourceReason != EGGYGOAbilityTerminationReason::None) { FailOriginalTermination(Record, SourceReason); return; }
+		Record->bNativeEndStarted = true;
+		if (!Record->bCleanupStarted)
+		{
+			Record->bCleanupStarted = true;
+			CleanupAbilityResourcesForTermination(Record->Context);
+		}
+		// The hook may call external code. Never continue native End against a replacement source.
+		if (!Record->Ability.IsValid()) { FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility); return; }
+		SourceReason = CheckOriginalTerminationSource(*Record);
+		if (SourceReason != EGGYGOAbilityTerminationReason::None) { FailOriginalTermination(Record, SourceReason); return; }
+		Super::EndAbility(Handle, ActorInfo, Record->ActivationInfo,
+			Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+		Record->bNativeEndReturned = true;
+		return; // Dispatcher witnesses the remaining derived End/Cancel return.
+	}
+	// Legacy direct derived End has no pre-cleanup/full-return proof. Preserve its native path;
+	// it cannot publish protocol Completed until those overrides/callers are migrated.
 	ClearCameraOffset();
 	ClearCameraMode();
 

@@ -5,6 +5,7 @@
 #include "Player/GGYGOPlayerController.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Camera/GGYGOPlayerCameraManager.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Engine/Level.h"
 #include "Engine/Player.h"
@@ -94,6 +95,7 @@ namespace
 AGGYGOPlayerController::AGGYGOPlayerController(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
+	PlayerCameraManagerClass = AGGYGOPlayerCameraManager::StaticClass();
 }
 
 void AGGYGOPlayerController::InitInputSystem()

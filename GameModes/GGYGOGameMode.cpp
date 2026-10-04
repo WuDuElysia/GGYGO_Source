@@ -8,6 +8,7 @@
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
+#include "Components/SceneComponent.h"
 #include "CoreGlobals.h"
 #include "Engine/GameInstance.h"
 #include "Engine/LocalPlayer.h"
@@ -500,6 +501,95 @@ void AGGYGOGameMode::CloseGameFeatureSession()
 	// No member reset after Close: a reentrant hook sees the original resource already moved.
 }
 
+void AGGYGOGameMode::Logout(AController* Exiting)
+{
+	const TWeakObjectPtr<AGGYGOGameMode> OriginalLogoutCreator(IsInGameThread() ? this : nullptr);
+	const TWeakObjectPtr<APlayerController> OriginalLogoutController(
+		IsInGameThread() && IsValid(Exiting) ? Cast<APlayerController>(Exiting) : nullptr);
+	const auto CloseOriginalSquad = [this, Exiting, &OriginalLogoutCreator, &OriginalLogoutController]()
+	{
+		if (!IsInGameThread())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.Logout] Creator=%s Controller=%s Stage=Entry Reason=GameThreadRequired: Squad cleanup rejected; native Logout remains forwarded."),
+				*GetPathNameSafe(this), *GetPathNameSafe(Exiting));
+			return;
+		}
+		if (IsValid(Exiting) && !Exiting->IsA<APlayerController>())
+		{
+			return; // Non-player Controllers retain the native Logout path.
+		}
+		const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(OriginalLogoutCreator);
+		const TWeakObjectPtr<APlayerController> OriginalController(OriginalLogoutController);
+		const TWeakObjectPtr<AGGYGOPlayerState> OriginalPlayerState(
+			OriginalController.IsValid() ? OriginalController->GetPlayerState<AGGYGOPlayerState>() : nullptr);
+		const TWeakObjectPtr<UGGYGOSquadComponent> OriginalSquad(
+			OriginalPlayerState.IsValid() ? OriginalPlayerState->GetSquadComponent() : nullptr);
+		const TWeakObjectPtr<UWorld> OriginalWorld(
+			OriginalCreator.IsValid() ? OriginalCreator->GetWorld() : nullptr);
+		const FString CreatorPath = GetPathNameSafe(OriginalCreator.Get());
+		const FString ControllerPath = GetPathNameSafe(OriginalController.Get());
+		const FString PlayerStatePath = GetPathNameSafe(OriginalPlayerState.Get());
+		const FString SquadPath = GetPathNameSafe(OriginalSquad.Get());
+		const FString WorldPath = GetPathNameSafe(OriginalWorld.Get());
+		AGGYGOGameMode* Creator = OriginalCreator.Get();
+		APlayerController* Controller = OriginalController.Get();
+		AGGYGOPlayerState* PlayerState = OriginalPlayerState.Get();
+		UGGYGOSquadComponent* Squad = OriginalSquad.Get();
+		UWorld* World = OriginalWorld.Get();
+		const TCHAR* Reason = nullptr;
+		if (!Creator || !World)
+		{
+			Reason = TEXT("original Creator/World is invalid");
+		}
+		else if (!Creator->HasAuthority() || Creator->GetWorld() != World || World->GetAuthGameMode() != Creator)
+		{
+			Reason = TEXT("original Creator is not the authoritative GameMode of the captured World");
+		}
+		else if (!Controller || !Controller->HasAuthority() || Controller->GetWorld() != World)
+		{
+			Reason = TEXT("original exiting PlayerController is invalid, non-authoritative or in another World");
+		}
+		else if (!PlayerState || !PlayerState->HasAuthority() || PlayerState->GetWorld() != World)
+		{
+			Reason = TEXT("original PlayerState is invalid, non-authoritative or in another World");
+		}
+		else if (!Squad || Squad->GetWorld() != World)
+		{
+			Reason = TEXT("original Squad is invalid or in another World");
+		}
+		else if (OriginalCreator.Get() != Creator || OriginalWorld.Get() != World
+			|| OriginalController.Get() != Controller || OriginalPlayerState.Get() != PlayerState
+			|| OriginalSquad.Get() != Squad || Controller->GetPlayerState<AGGYGOPlayerState>() != PlayerState
+			|| PlayerState->GetOwner() != Controller || PlayerState->GetSquadComponent() != Squad
+			|| Squad->GetOwner() != PlayerState)
+		{
+			Reason = TEXT("captured original identity/Controller-PlayerState-Squad ownership changed");
+		}
+		if (Reason)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.Logout] Creator=%s Controller=%s PlayerState=%s Squad=%s World=%s Stage=BeforeSquadClose Reason=%s: original Squad cleanup rejected; native Logout remains forwarded."),
+				*CreatorPath, *ControllerPath, *PlayerStatePath, *SquadPath, *WorldPath, Reason);
+			return;
+		}
+		// A destroying PC is the normal native Logout caller, not a new-work admission failure.
+		// Squad retires its original accepted-resource ledger before its callbacks and Actor.Destroy calls.
+		Squad->DestroySquad();
+	};
+	AGGYGOGameMode* Creator = OriginalLogoutCreator.Get();
+	if (IsInGameThread() && Creator && !OriginalLogoutController.IsExplicitlyNull())
+	{
+		Creator->ConsumeUntransferredSquadActors(false, &OriginalLogoutController, CloseOriginalSquad);
+	}
+	else
+	{
+		CloseOriginalSquad();
+	}
+	// Preserve native public notifications once per invocation, including failed Teams qualification.
+	Super::Logout(Exiting);
+}
+
 void AGGYGOGameMode::Destroyed()
 {
 	if (!IsInGameThread())
@@ -513,7 +603,7 @@ void AGGYGOGameMode::Destroyed()
 	CloseGameFeatureSession();
 	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
 	{
-		Creator->ConsumeUntransferredSquadActors(true);
+		Creator->ConsumeUntransferredSquadActors(true, nullptr, []() {});
 	}
 	Super::Destroyed();
 }
@@ -530,7 +620,7 @@ void AGGYGOGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
 	CloseGameFeatureSession();
 	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
 	{
-		Creator->ConsumeUntransferredSquadActors(true);
+		Creator->ConsumeUntransferredSquadActors(true, nullptr, []() {});
 	}
 	// Super::Destroyed may route here; the shared consumer cannot release the moved resource twice.
 	Super::EndPlay(EndPlayReason);
@@ -643,24 +733,64 @@ bool AGGYGOGameMode::FinishUntransferredSquadActors(TArray<FUntransferredSquadAc
 	return bRequestsRetired; // Request obligations only, not Host/native physical cleanup success.
 }
 
-void AGGYGOGameMode::ConsumeUntransferredSquadActors(bool bFinalDestruction)
+void AGGYGOGameMode::ConsumeUntransferredSquadActors(bool bFinalDestruction,
+	const TWeakObjectPtr<APlayerController>* OriginalController, TFunctionRef<void()> BeforeActorDestroy)
 {
 	check(IsInGameThread());
-	bFinalSquadCreatorDestructionRequested |= bFinalDestruction;
-	if (bConsumingUntransferredSquadActors)
+	const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(this);
+	const FString CreatorPath = GetPathName();
+	const bool bControllerScope = OriginalController != nullptr;
+	if (bFinalDestruction == bControllerScope
+		|| (bControllerScope && OriginalController->IsExplicitlyNull()))
 	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams.CreatorClose] Creator=%s Stage=SelectOriginals Reason=invalid close mode or explicitly null original Controller selector: retained Actor cleanup rejected."),
+			*CreatorPath);
+		BeforeActorDestroy(); // Preserve the original Logout Squad-close hook even when selection fails.
+		return;
+	}
+	const bool bOwnsConsumerGuard = !bConsumingUntransferredSquadActors;
+	const bool bFirstFinalClose = bFinalDestruction && !bFinalSquadCreatorDestructionRequested;
+	bFinalSquadCreatorDestructionRequested |= bFinalDestruction;
+	if (!bControllerScope && !bFirstFinalClose)
+	{
+		// The original overall close already started; later Destroyed/EndPlay callbacks must not retry refusals.
+		BeforeActorDestroy();
 		return;
 	}
 	bConsumingUntransferredSquadActors = true;
-	const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(this);
-	const FString CreatorPath = GetPathName();
-	TArray<FUntransferredSquadActors> OriginalActors = MoveTemp(UntransferredSquadActors);
-	UntransferredSquadActors.Reset();
-	FinishUntransferredSquadActors(OriginalActors, OriginalCreator, CreatorPath,
-		bFinalSquadCreatorDestructionRequested);
-	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
+	TArray<FUntransferredSquadActors> OriginalActors;
+	if (bControllerScope)
 	{
-		Creator->bConsumingUntransferredSquadActors = false;
+		const TWeakObjectPtr<APlayerController> ControllerIdentity(*OriginalController);
+		for (int32 Index = 0; Index < UntransferredSquadActors.Num();)
+		{
+			if (UntransferredSquadActors[Index].Controller.HasSameIndexAndSerialNumber(ControllerIdentity))
+			{
+				OriginalActors.Add(MoveTemp(UntransferredSquadActors[Index]));
+				UntransferredSquadActors.RemoveAt(Index, 1, EAllowShrinking::No);
+			}
+			else
+			{
+				++Index;
+			}
+		}
+	}
+	else
+	{
+		// First overall close can take only the ledger still here, never an outer frame's original batch.
+		OriginalActors = MoveTemp(UntransferredSquadActors);
+		UntransferredSquadActors.Reset();
+	}
+	// Extract before all cleanup callouts. Newly retained originals remain in the main ledger.
+	BeforeActorDestroy();
+	FinishUntransferredSquadActors(OriginalActors, OriginalCreator, CreatorPath, bFinalDestruction);
+	if (bOwnsConsumerGuard)
+	{
+		if (AGGYGOGameMode* Creator = OriginalCreator.Get())
+		{
+			Creator->bConsumingUntransferredSquadActors = false;
+		}
 	}
 }
 
@@ -826,17 +956,75 @@ void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 		ReportClosedContext(TEXT("ChoosePlayerStart"));
 		return;
 	}
-	if (StartSpot && (!IsValid(StartSpot) || StartSpot->IsActorBeingDestroyed() || StartSpot->GetWorld() != Context.World.Get()))
+	const TWeakObjectPtr<const AActor> OriginalStartSpot(StartSpot);
+	const AActor* CapturedStartSpot = OriginalStartSpot.Get();
+	const TWeakObjectPtr<const USceneComponent> OriginalStartRoot(
+		CapturedStartSpot ? CapturedStartSpot->GetRootComponent() : nullptr);
+	const FString StartSpotPath = GetPathNameSafe(CapturedStartSpot);
+	const FString StartRootPath = GetPathNameSafe(OriginalStartRoot.Get());
+	const auto StartSpotIsCurrent = [&Context, &ContextIsCurrent, &ControllerPath,
+		&OriginalStartSpot, &OriginalStartRoot, &StartSpotPath, &StartRootPath](const TCHAR* Stage)
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("[Teams] Creator=%s Controller=%s: ChoosePlayerStart returned an invalid/different-World Actor; creation stopped."),
-			*Context.CreatorPath, *ControllerPath);
+		const AActor* OriginalActor = OriginalStartSpot.Get();
+		const USceneComponent* OriginalRoot = OriginalStartRoot.Get();
+		const TCHAR* Reason = nullptr;
+		if (!ContextIsCurrent())
+		{
+			Reason = TEXT("original creation Context/World qualification lost");
+		}
+		else if (!OriginalActor)
+		{
+			Reason = TEXT("ChoosePlayerStart Actor is null or no longer valid");
+		}
+		else if (OriginalActor->IsActorBeingDestroyed())
+		{
+			Reason = TEXT("original StartSpot is being destroyed");
+		}
+		else if (OriginalActor->GetWorld() != Context.World.Get())
+		{
+			Reason = TEXT("original StartSpot belongs to a different World");
+		}
+		else if (!OriginalRoot)
+		{
+			Reason = TEXT("original StartSpot Root is missing or no longer valid");
+		}
+		else if (OriginalRoot->IsBeingDestroyed())
+		{
+			Reason = TEXT("original StartSpot Root is being destroyed");
+		}
+		else if (OriginalActor->GetRootComponent() != OriginalRoot)
+		{
+			Reason = TEXT("original StartSpot Root was replaced");
+		}
+		else if (!ContextIsCurrent())
+		{
+			Reason = TEXT("original creation Context/World qualification lost during StartSpot validation");
+		}
+		if (Reason)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.StartSpot] Creator=%s Controller=%s Start=%s Root=%s Stage=%s Reason=%s: request stopped before Actor creation."),
+				*Context.CreatorPath, *ControllerPath, *StartSpotPath, *StartRootPath, Stage, Reason);
+		}
+		return Reason == nullptr;
+	};
+	if (!StartSpotIsCurrent(TEXT("BeforeTransformSnapshot")))
+	{
 		return;
 	}
-	// The existing null StartSpot -> Identity policy remains for its separately scheduled correction.
-	const FTransform SpawnTransform = StartSpot
-		? StartSpot->GetActorTransform()
-		: FTransform::Identity;
+	// Use the original Root's actual world transform; a real world-origin Identity is valid.
+	const FTransform SpawnTransform = OriginalStartRoot->GetComponentTransform();
+	if (!StartSpotIsCurrent(TEXT("AfterTransformSnapshot")))
+	{
+		return;
+	}
+	if (!SpawnTransform.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams.StartSpot] Creator=%s Controller=%s Start=%s Root=%s Stage=TransformValidation Reason=actual Root world Transform is non-finite or rotation is not normalized Transform=%s: request stopped before Actor creation."),
+			*Context.CreatorPath, *ControllerPath, *StartSpotPath, *StartRootPath, *SpawnTransform.ToString());
+		return;
+	}
 
 	CreatorActors.Reserve(SelectedPawnData.Num());
 	int32 FailedItems = 0;

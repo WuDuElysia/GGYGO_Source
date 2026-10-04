@@ -35,6 +35,10 @@ public:
 #endif
 
 protected:
+	virtual bool CanActivateAbilityAdditional(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags,
+		FGameplayTagContainer* OptionalRelevantTags) const override;
+	virtual void NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const override;
 	virtual void ActivateAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 	virtual void EndAbility(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
@@ -69,8 +73,9 @@ protected:
 	float InputBufferSeconds = 0.35f;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	TSubclassOf<UGameplayEffect> DamageEffect;
-	/** 仅DamageEffect为空时选择共享预载GE；默认false保留旧空值无伤害、仍播放命中Cue。
-	 *  非空DamageEffect始终优先；启用后共享不可用则诊断，仍走无GE的命中Cue路径。 */
+	/** 仅DamageEffect为空时选择共享预载GE；默认false为明确无GE、仍播放命中Cue的模式。
+	 *  非空DamageEffect始终优先；必需GE在准入或提交前不可用/非法时拒绝激活。
+	 *  命中期间的依赖失败传播仍待后继迁移。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	bool bUseSharedDamageEffectWhenUnset = false;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (Categories = "GameplayCue.Hit"))
@@ -78,6 +83,8 @@ protected:
 
 private:
 	friend struct FGGYGOPlayerComboLifecycleFixture;
+	/** 仅验证本次选择的GE依赖，不加载、重试、缓存或记录激活状态。 */
+	bool ValidateDamageEffectDependency(FString& OutError) const;
 
 	UPROPERTY(Transient)
 	TObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> MontageTask;

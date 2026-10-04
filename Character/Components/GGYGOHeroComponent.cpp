@@ -7,12 +7,14 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Camera/GGYGOCameraComponent.h"
+#include "Camera/GGYGOPlayerCameraManager.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedPlayerInput.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Character.h"
@@ -450,6 +452,107 @@ bool UGGYGOHeroComponent::CanChangeInitState(UGameFrameworkComponentManager* Man
 	return false;
 }
 
+bool UGGYGOHeroComponent::ConsumeLocalCameraProviderReady(APawn* ExpectedPawn, const TCHAR* NativeEntry)
+{
+	const TWeakObjectPtr<UGGYGOHeroComponent> OriginalHero(this);
+	const TWeakObjectPtr<APawn> OriginalPawn(ExpectedPawn);
+	const uint64 OriginalInputGeneration = InputSessionGeneration;
+	if (bEndingPlay || IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| !OriginalPawn.IsValid() || ExpectedPawn->IsActorBeingDestroyed() || GetOwner() != ExpectedPawn)
+	{
+		return false;
+	}
+	APlayerController* PC = Cast<APlayerController>(ExpectedPawn->GetController());
+	if (!ExpectedPawn->IsLocallyControlled() || !PC || !PC->IsLocalController())
+	{
+		return true; // This native entry has no local player camera provider.
+	}
+	// BeginPlay installs the existing mode provider before its native init-state continuation.
+	// Setup/input may arrive earlier; do not evaluate an uninstalled provider or poll for it.
+	if (!HasBegunPlay()) { return true; }
+	const TWeakObjectPtr<APlayerController> OriginalPC(PC);
+	const TWeakObjectPtr<UWorld> OriginalWorld(GetWorld());
+	const TWeakObjectPtr<ULocalPlayer> OriginalPlayer(PC->GetLocalPlayer());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension =
+		UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(ExpectedPawn);
+	const UGGYGOPawnData* PawnData = OriginalExtension.IsValid()
+		? OriginalExtension->GetPawnData<UGGYGOPawnData>() : nullptr;
+	const TWeakObjectPtr<const UGGYGOPawnData> OriginalData(PawnData);
+	if (OriginalExtension.IsValid() && !PawnData)
+	{
+		return true; // Actual PawnData has not arrived; the existing data transition consumes it later.
+	}
+	const TWeakObjectPtr<UGGYGOCameraComponent> OriginalCamera =
+		UGGYGOCameraComponent::FindCameraComponent(ExpectedPawn);
+	const TWeakObjectPtr<AGGYGOPlayerCameraManager> OriginalManager =
+		Cast<AGGYGOPlayerCameraManager>(PC->PlayerCameraManager);
+	const FString Context = FString::Printf(
+		TEXT("[Camera/Hero] Entry='%s' Hero='%s' Pawn='%s' Controller='%s' World='%s' LocalPlayer='%s' Extension='%s' PawnData='%s' Manager='%s' Camera='%s'"),
+		NativeEntry, *GetPathName(), *GetPathNameSafe(ExpectedPawn), *GetPathNameSafe(PC),
+		*GetPathNameSafe(OriginalWorld.Get()), *GetPathNameSafe(OriginalPlayer.Get()),
+		*GetPathNameSafe(OriginalExtension.Get()), *GetPathNameSafe(OriginalData.Get()),
+		*GetPathNameSafe(OriginalManager.Get()), *GetPathNameSafe(OriginalCamera.Get()));
+	const auto Report = [&Context](const TCHAR* Field, const TCHAR* Reason)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s Field='%s' Reason='%s'."), *Context, Field, Reason);
+	};
+	if (!OriginalPC.IsValid() || PC->IsActorBeingDestroyed() || !OriginalWorld.IsValid()
+		|| ExpectedPawn->GetWorld() != OriginalWorld.Get() || PC->GetWorld() != OriginalWorld.Get()
+		|| PC->GetPawn() != ExpectedPawn || !OriginalPlayer.IsValid()
+		|| OriginalPlayer->PlayerController.Get() != PC)
+	{
+		Report(TEXT("Provider.Context"), TEXT("original-local-pawn-controller-world-player-association-invalid"));
+		return false;
+	}
+	if (!OriginalExtension.IsValid() || OriginalExtension->IsBeingDestroyed()
+		|| OriginalExtension->GetOwner() != ExpectedPawn || !OriginalData.IsValid())
+	{
+		Report(TEXT("Provider.PawnData"), TEXT("original-pawn-extension-data-source-invalid"));
+		return true; // Report the camera dependency; keep the original input initialization independent.
+	}
+	if (!OriginalCamera.IsValid() || OriginalCamera->GetOwner() != ExpectedPawn
+		|| OriginalCamera->GetWorld() != OriginalWorld.Get() || !OriginalManager.IsValid()
+		|| OriginalManager->PCOwner != PC || OriginalManager->GetWorld() != OriginalWorld.Get())
+	{
+		Report(TEXT("Provider.CameraManager"), TEXT("original-project-camera-or-manager-association-invalid"));
+		return true;
+	}
+	const FGGYGOCameraEvaluationResult Result =
+		OriginalManager->ActivateCameraEvaluation(ExpectedPawn, OriginalCamera.Get());
+	UGGYGOHeroComponent* Hero = OriginalHero.Get();
+	const bool bOriginalContextCurrent = Hero && !Hero->bEndingPlay && !Hero->IsBeingDestroyed()
+		&& !Hero->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& Hero->InputSessionGeneration == OriginalInputGeneration
+		&& OriginalPawn.IsValid() && !OriginalPawn->IsActorBeingDestroyed() && Hero->GetOwner() == OriginalPawn.Get()
+		&& OriginalPC.IsValid() && !OriginalPC->IsActorBeingDestroyed()
+		&& OriginalPawn->GetController() == OriginalPC.Get() && OriginalPC->GetPawn() == OriginalPawn.Get()
+		&& OriginalPC->IsLocalController() && OriginalPawn->IsLocallyControlled()
+		&& OriginalWorld.IsValid() && Hero->GetWorld() == OriginalWorld.Get()
+		&& OriginalPawn->GetWorld() == OriginalWorld.Get() && OriginalPC->GetWorld() == OriginalWorld.Get()
+		&& OriginalPlayer.IsValid() && OriginalPC->GetLocalPlayer() == OriginalPlayer.Get()
+		&& OriginalPlayer->PlayerController.Get() == OriginalPC.Get()
+		&& OriginalExtension.IsValid() && !OriginalExtension->IsBeingDestroyed()
+		&& OriginalExtension->GetOwner() == OriginalPawn.Get()
+		&& UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(OriginalPawn.Get()) == OriginalExtension.Get()
+		&& OriginalData.IsValid() && OriginalExtension->GetPawnData<UGGYGOPawnData>() == OriginalData.Get()
+		&& OriginalCamera.IsValid() && OriginalCamera->GetOwner() == OriginalPawn.Get()
+		&& OriginalCamera->GetWorld() == OriginalWorld.Get()
+		&& UGGYGOCameraComponent::FindCameraComponent(OriginalPawn.Get()) == OriginalCamera.Get()
+		&& OriginalManager.IsValid() && OriginalPC->PlayerCameraManager == OriginalManager.Get()
+		&& OriginalManager->PCOwner == OriginalPC.Get() && OriginalManager->GetWorld() == OriginalWorld.Get()
+		&& (!Result.IsSuccess() || OriginalManager->GetViewTarget() == OriginalPawn.Get());
+	if (!Result.IsSuccess())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s Field='%s' Reason='%s' Mode='%s' ModeClass='%s'."),
+			*Context, *Result.Field.ToString(), *Result.Reason, *Result.ModePath, *Result.ModeClassPath);
+	}
+	if (!bOriginalContextCurrent)
+	{
+		Report(TEXT("Provider.Context"), TEXT("original-identities-changed-during-activation; old-native-init-tail-stopped"));
+	}
+	return bOriginalContextCurrent;
+}
+
 void UGGYGOHeroComponent::HandleChangeInitState(UGameFrameworkComponentManager* Manager, FGameplayTag CurrentState, FGameplayTag DesiredState)
 {
 	if (CurrentState != GGYGOGameplayTags::InitState_DataAvailable || DesiredState != GGYGOGameplayTags::InitState_DataInitialized)
@@ -458,6 +561,7 @@ void UGGYGOHeroComponent::HandleChangeInitState(UGameFrameworkComponentManager* 
 	}
 
 	APawn* Pawn = GetPawn<APawn>();
+	if (!ConsumeLocalCameraProviderReady(Pawn, TEXT("DataInitialized"))) { return; }
 	if (!Pawn || Pawn->InputComponent == nullptr)
 	{
 		// 输入组件还没建立。它由引擎在附身流程里创建，随后 Pawn 会调
@@ -497,6 +601,7 @@ void UGGYGOHeroComponent::InitializePlayerInput(UInputComponent* PlayerInputComp
 	{
 		return;
 	}
+	if (!ConsumeLocalCameraProviderReady(GetPawn<APawn>(), TEXT("InitializePlayerInput"))) { return; }
 	const uint64 ExpectedGeneration = InputSessionGeneration == MAX_uint64 ? MAX_uint64 : InputSessionGeneration + 1;
 	ReleasePlayerInput();
 	// 释放 IMC 的同步回调可以建立后继会话；旧初始化不能接着覆盖它。

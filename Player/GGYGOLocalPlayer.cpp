@@ -4,9 +4,12 @@
  */
 #include "Player/GGYGOLocalPlayer.h"
 
+#include "Camera/GGYGOPlayerCameraManager.h"
 #include "Engine/GameInstance.h"
+#include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "Input/GGYGOMovementInputOriginResource.h"
+#include "SceneView.h"
 #include "Teams/GGYGOSquadPresets.h"
 #include "Templates/UnrealTemplate.h"
 #include "UObject/Class.h"
@@ -16,6 +19,119 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOLocalPlayerOrigin, Log, All);
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOLocalPlayerSquad, Log, All);
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOLocalPlayerProjection, Log, All);
+
+bool UGGYGOLocalPlayer::GetProjectionData(FViewport* Viewport, FSceneViewProjectionData& OutProjectionData,
+	int32 StereoViewIndex) const
+{
+	// Do not read UObject associations or mutate the per-host diagnostic flag off the game thread.
+	if (!ensureMsgf(IsInGameThread(), TEXT("[Camera.LocalPlayerProjection] LocalPlayer=%p Reason=ProjectionRequiresGameThread"),
+		static_cast<const void*>(this)))
+	{
+		return false;
+	}
+	const auto IsLive = [](const UObject* Object)
+	{
+		return IsValid(Object) && !Object->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
+	};
+	if (!IsLive(this) || IsTemplate())
+	{
+		return false;
+	}
+
+	const TStrongObjectPtr<const UGGYGOLocalPlayer> HostLifetime(this);
+	const TWeakObjectPtr<const UGGYGOLocalPlayer> OriginalPlayer(this);
+	const TWeakObjectPtr<APlayerController> OriginalController(PlayerController.Get());
+	const TWeakObjectPtr<UWorld> OriginalWorld(GetWorld());
+	APlayerController* const Controller = OriginalController.Get();
+	UWorld* const World = OriginalWorld.Get();
+	if (!IsLive(Controller) || !IsLive(World))
+	{
+		// A host without its live controller/world has no projection yet.
+		return false;
+	}
+	APlayerCameraManager* const ActualManager = Controller->PlayerCameraManager.Get();
+	if (!IsLive(ActualManager))
+	{
+		return false;
+	}
+	const TWeakObjectPtr<APlayerCameraManager> OriginalManager(ActualManager);
+	const auto RejectAssociation = [&](const TCHAR* Stage, const TCHAR* Reason) -> bool
+	{
+		if (!bReportedCameraProjectionFailure)
+		{
+			bReportedCameraProjectionFailure = true;
+			APlayerController* const CurrentController = PlayerController.Get();
+			APlayerCameraManager* const CurrentManager = IsLive(CurrentController)
+				? CurrentController->PlayerCameraManager.Get() : nullptr;
+			APlayerController* const CurrentOwner = IsLive(CurrentManager)
+				? CurrentManager->APlayerCameraManager::GetOwningPlayerController() : nullptr;
+			UE_LOG(LogGGYGOLocalPlayerProjection, Error,
+				TEXT("[Camera.LocalPlayerProjection] LocalPlayer=%s OriginalPC=%s(%p) OriginalWorld=%s(%p) OriginalManager=%s(%p) ExpectedManagerClass=%s CurrentPC=%s CurrentWorld=%s CurrentManager=%s CurrentManagerClass=%s PCOwner=%s Stage=%s Reason=%s"),
+				*GetPathNameSafe(this), *GetPathNameSafe(OriginalController.Get()), static_cast<const void*>(Controller),
+				*GetPathNameSafe(OriginalWorld.Get()), static_cast<const void*>(World),
+				*GetPathNameSafe(OriginalManager.Get()), static_cast<const void*>(ActualManager),
+				*GetPathNameSafe(AGGYGOPlayerCameraManager::StaticClass()),
+				*GetPathNameSafe(CurrentController), *GetPathNameSafe(GetWorld()),
+				*GetPathNameSafe(CurrentManager), *GetPathNameSafe(IsLive(CurrentManager) ? CurrentManager->GetClass() : nullptr),
+				*GetPathNameSafe(CurrentOwner), Stage, Reason);
+		}
+		return false;
+	};
+	const auto CheckOriginalAssociation = [&]() -> const TCHAR*
+	{
+		if (OriginalPlayer.Get() != this || !IsLive(this)
+			|| OriginalController.Get() != Controller || !IsLive(Controller)
+			|| OriginalWorld.Get() != World || !IsLive(World)
+			|| OriginalManager.Get() != ActualManager || !IsLive(ActualManager))
+		{
+			return TEXT("OriginalAssociationUnavailable");
+		}
+		if (PlayerController.Get() != Controller || Controller->GetLocalPlayer() != this)
+		{
+			return TEXT("OriginalLocalPlayerControllerMismatch");
+		}
+		if (GetWorld() != World || Controller->GetWorld() != World || ActualManager->GetWorld() != World)
+		{
+			return TEXT("OriginalWorldMismatch");
+		}
+		// Qualify the actual native PCOwner, without a virtual override substituting another owner.
+		if (Controller->PlayerCameraManager.Get() != ActualManager
+			|| ActualManager->APlayerCameraManager::GetOwningPlayerController() != Controller)
+		{
+			return TEXT("OriginalManagerSlotOrOwnerMismatch");
+		}
+		return nullptr;
+	};
+	if (const TCHAR* Reason = CheckOriginalAssociation())
+	{
+		return RejectAssociation(TEXT("BeforeSuper"), Reason);
+	}
+	AGGYGOPlayerCameraManager* const CameraManager = Cast<AGGYGOPlayerCameraManager>(ActualManager);
+	if (!CameraManager)
+	{
+		return RejectAssociation(TEXT("BeforeSuper"), TEXT("WrongCameraManagerClass"));
+	}
+	if (!CameraManager->HasConfirmedNativeCameraView())
+	{
+		// Initialization seeds are not admitted; Stopped with a confirmed view remains admissible.
+		return false;
+	}
+
+	FSceneViewProjectionData ProjectionScratch;
+	const bool bProjected = Super::GetProjectionData(Viewport, ProjectionScratch, StereoViewIndex);
+	if (const TCHAR* Reason = CheckOriginalAssociation())
+	{
+		return RejectAssociation(TEXT("AfterSuper"), Reason);
+	}
+	if (!CameraManager->HasConfirmedNativeCameraView() || !bProjected)
+	{
+		return false;
+	}
+	// Native callbacks may have changed the association; only this validated result reaches the caller.
+	OutProjectionData = ProjectionScratch;
+	return true;
+}
 
 bool UGGYGOLocalPlayer::TryGetSquadPresets(UGGYGOSquadPresets*& OutPresets, FString& OutError) const
 {

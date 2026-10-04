@@ -14,10 +14,12 @@
 #pragma once
 
 #include "GameFramework/GameModeBase.h"
+#include "Templates/Function.h"
 #include "Templates/SharedPointer.h"
 
 #include "GGYGOGameMode.generated.h"
 
+class AController;
 class APlayerController;
 class AGGYGOCharacterBase;
 class AGGYGOCharacterSlot;
@@ -44,6 +46,9 @@ public:
 	/** 本局的玩法定义。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|GameMode")
 	const UGGYGOExperienceDefinition* GetExperience() const { return Experience; }
+
+	/** Close the captured original Squad before native public Logout notifications. */
+	virtual void Logout(AController* Exiting) override;
 
 protected:
 	virtual void InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage) override;
@@ -122,7 +127,9 @@ private:
 	static bool FinishUntransferredSquadActors(TArray<FUntransferredSquadActors>& OriginalActors,
 		const TWeakObjectPtr<AGGYGOGameMode>& OriginalCreator, const FString& CreatorPath,
 		bool bFinalDestruction);
-	void ConsumeUntransferredSquadActors(bool bFinalDestruction);
+	/** Explicit original-Controller exit or whole-creator close; callback and Actor requests stay synchronous. */
+	void ConsumeUntransferredSquadActors(bool bFinalDestruction,
+		const TWeakObjectPtr<APlayerController>* OriginalController, TFunctionRef<void()> BeforeActorDestroy);
 
 	/** Rejected live originals only; no roster, binding, current Avatar or completion state. */
 	TArray<FUntransferredSquadActors> UntransferredSquadActors;

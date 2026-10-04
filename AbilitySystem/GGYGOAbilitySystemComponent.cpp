@@ -745,6 +745,79 @@ UGGYGOAbilitySystemComponent::FScopedControlledAbilityActivationCall::~FScopedCo
 		check(OriginalASC->ControlledAbilityActivationCall == Call);
 		OriginalASC->ControlledAbilityActivationCall = Call->Previous;
 	}
+	// Native Try has returned and its stack link is gone before any completion dispatch.
+	TArray<TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>> Dependencies =
+		MoveTemp(Call->TerminationExitDependencies);
+	for (const auto& Record : Dependencies)
+	{
+		check(Record->OpenTryCalls > 0);
+		--Record->OpenTryCalls;
+		if (!ASC.IsValid())
+		{
+			UGGYGOGameplayAbility::FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidASC);
+		}
+		UGGYGOGameplayAbility::TryCompleteOriginalTermination(Record);
+	}
+}
+
+void UGGYGOAbilitySystemComponent::RegisterOriginalTerminationTryDependencies(
+	const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record)
+{
+	check(IsInGameThread());
+	check(Record.IsValid() && Record->ASC.Get() == this);
+	for (FControlledAbilityActivationCall* Call = ControlledAbilityActivationCall; Call; Call = Call->Previous)
+	{
+		if (!Call->OriginalActivation.HasSameActivation(Record->Context.GetOriginalActivation())) { continue; }
+		check(!Call->TerminationExitDependencies.Contains(Record));
+		if (!Call->OriginalTerminationCompleted.IsValid())
+		{
+			Call->OriginalTerminationCompleted = MakeShared<FGGYGOAbilityTerminationCompletedNotice>();
+		}
+		Call->TerminationExitDependencies.Add(Record);
+		Record->TryCompletionSlots.Add(Call->OriginalTerminationCompleted);
+		++Record->OpenTryCalls;
+	}
+}
+
+FGGYGOAbilityTerminationCompletedEvent& UGGYGOAbilitySystemComponent::OnAbilityTerminationCompleted()
+{
+	return AbilityTerminationCompletedEvent;
+}
+
+void UGGYGOAbilitySystemComponent::TryPublishOriginalTerminationCompleted(
+	const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record)
+{
+	check(IsInGameThread());
+	if (!Record.IsValid() || Record->bSealed || Record->ASC.Get() != this
+		|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed
+		|| Record->OpenDispatches != 0 || Record->OpenTryCalls != 0 || Record->bContinuationQueued || Record->bContinuationReady
+		|| !Record->bNativeEndObserved || !Record->bNativeEndReturned || !Record->bFullEndReturned
+		|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelReturned))
+	{
+		return;
+	}
+	FGGYGOAbilityTerminationCompletedNotice Notice;
+	Notice.Original = Record->Context;
+	Notice.Outcome = EGGYGOAbilityTerminationOutcome::Completed;
+	Notice.Reason = EGGYGOAbilityTerminationReason::None;
+	Record->Outcome = Notice.Outcome;
+	Record->Reason = Notice.Reason;
+	Record->bSealed = true;
+	// Seal synchronous original result slots before listeners can start a successor.
+	for (const auto& WeakSlot : Record->TryCompletionSlots)
+	{
+		if (const auto Slot = WeakSlot.Pin()) { *Slot = Notice; }
+	}
+	Record->TryCompletionSlots.Reset();
+	if (UGGYGOGameplayAbility* Ability = Record->Ability.Get())
+	{
+		if (Ability->CurrentControlledActivation.HasSameActivation(Record->Context.GetOriginalActivation()))
+		{
+			Ability->RetireControlledActivation();
+		}
+		if (Ability->OriginalTermination == Record) { Ability->OriginalTermination.Reset(); }
+	}
+	AbilityTerminationCompletedEvent.Broadcast(Notice); // No original state writes after callbacks.
 }
 
 EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControlledAbilityActivationStart(
@@ -839,6 +912,10 @@ FGGYGOAbilityActivationRequestResult UGGYGOAbilitySystemComponent::TryActivateAb
 			Result.bNativeAccepted = Super::TryActivateAbility(Handle, bAllowRemoteActivation);
 		}
 		Result.OriginalActivation = Call.OriginalActivation;
+		if (Call.OriginalTerminationCompleted.IsValid())
+		{
+			Result.OriginalTerminationCompleted = *Call.OriginalTerminationCompleted;
+		}
 	}
 	if (Call.Failure != EReason::None)
 	{
@@ -856,7 +933,7 @@ FGGYGOAbilityActivationRequestResult UGGYGOAbilitySystemComponent::TryActivateAb
 	}
 	Result.Outcome = Result.bNativeAccepted ? EOutcome::Accepted : EOutcome::Rejected;
 	Result.Reason = Result.bNativeAccepted ? EReason::None : EReason::NativeActivationRejected;
-	// T1 observes activation history only. No synthetic Completed from early OnAbilityEnded.
+	// Result contains sealed original history; never reread current GA after completion callbacks.
 	return Result;
 }
 
@@ -909,6 +986,7 @@ void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
 	FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability)
 {
 	// Every real new activation invalidates the previous provenance, including untouched legacy paths.
+	Ability->InvalidateOriginalTerminationForActivation();
 	Ability->RetireControlledActivation();
 	FControlledAbilityActivationCall* Call = ControlledAbilityActivationCall;
 	if (!Call || Call->Handle != Handle || Call->bLocalWitnessSeen)
@@ -917,7 +995,7 @@ void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
 	}
 	if (!Call->bCanAdmitted || Call->Failure != EGGYGOAbilityActivationRequestReason::None)
 	{
-		// T1c has not connected the native Can bridge yet (or source reentry was untracked).
+		// Source reentry was untracked or the exact Can bridge did not admit this witness.
 		// A local native witness cannot be presented as remote-only accepted history.
 		Call->bLocalWitnessSeen = true;
 		if (Call->Failure == EGGYGOAbilityActivationRequestReason::None)
@@ -1534,7 +1612,7 @@ void UGGYGOAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGa
 		bool bActivated = false;
 		{
 			FScopedAbilityInputActivation InputScope(this, Handle, Origin);
-			bActivated = TryActivateAbility(Handle);
+			bActivated = TryActivateAbilityWithTerminationBoundary(Handle).bNativeAccepted;
 		}
 		if (!CanContinue()) { return; }
 		if (bActivated) { ConsumeSuccessfulAbilityInputRequests(CurrentSources); }
@@ -2192,7 +2270,11 @@ void UGGYGOAbilitySystemComponent::NotifyAbilityFailed(const FGameplayAbilitySpe
 void UGGYGOAbilitySystemComponent::NotifyAbilityEnded(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled)
 {
 	UGGYGOGameplayAbility* GGYGOAbility = Cast<UGGYGOGameplayAbility>(Ability);
-	if (GGYGOAbility) { GGYGOAbility->RetireControlledActivationForNativeEnd(Handle); }
+	if (GGYGOAbility)
+	{
+		GGYGOAbility->ObserveOriginalNativeEnd(this, Handle);
+		GGYGOAbility->RetireControlledActivationForNativeEnd(Handle);
+	}
 	const FGameplayTag GroupTag = GGYGOAbility ? GGYGOAbility->GetGroupTag() : FGameplayTag();
 	const bool bRemovedLastAbilityInGroup = GGYGOAbility
 		? RemoveAbilityFromActivationGroup(GGYGOAbility, /*bBroadcastGroupFreed=*/false)

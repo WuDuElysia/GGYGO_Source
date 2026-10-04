@@ -91,6 +91,73 @@ EDataValidationResult UGGYGOPlayerComboAbility::IsDataValid(FDataValidationConte
 }
 #endif
 
+bool UGGYGOPlayerComboAbility::ValidateDamageEffectDependency(FString& OutError) const
+{
+	OutError.Reset();
+	// Read the configured class before TSubclassOf's type filter can turn an invalid selection into null.
+	TSubclassOf<UGameplayEffect> ConfiguredEffect = DamageEffect;
+	const UClass* ConfiguredClass = ConfiguredEffect.GetGCPtr().Get();
+	const auto IsChosenClassValid = [&OutError](const UClass* Class, const TCHAR* Mode, const TCHAR* Configuration)
+	{
+		if (!IsValid(Class) || !Class->IsChildOf(UGameplayEffect::StaticClass()))
+		{
+			OutError = FString::Printf(TEXT("模式=%s，配置=%s [%s]：已选GE类失效或不是GameplayEffect。"),
+				Mode, Configuration, *GetPathNameSafe(Class));
+			return false;
+		}
+		if (Class->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated | CLASS_NewerVersionExists))
+		{
+			OutError = FString::Printf(TEXT("模式=%s，配置=%s [%s]：已选GE类为抽象、已弃用或已被新版本替换。"),
+				Mode, Configuration, *GetPathNameSafe(Class));
+			return false;
+		}
+		return true;
+	};
+	if (ConfiguredClass && !IsChosenClassValid(ConfiguredClass, TEXT("Override"), TEXT("DamageEffect")))
+	{
+		return false; // An invalid explicit selection cannot enable shared or no-GE playback.
+	}
+
+	TSubclassOf<UGameplayEffect> ResolvedEffect = UGGYGOGameData::ResolveDamageGameplayEffect(
+		ConfiguredEffect, bUseSharedDamageEffectWhenUnset);
+	if (!ConfiguredClass && !bUseSharedDamageEffectWhenUnset)
+	{
+		return true; // Explicitly selected no-GE mode; no required damage dependency.
+	}
+	const UClass* ResolvedClass = ResolvedEffect.GetGCPtr().Get();
+	if (!ResolvedClass)
+	{
+		OutError = TEXT("模式=Shared，配置=GameData.DamageGameplayEffect_SetByCaller：必需的共享预载GE不可用。");
+		return false;
+	}
+	return IsChosenClassValid(ResolvedClass, ConfiguredClass ? TEXT("Override") : TEXT("Shared"),
+		ConfiguredClass ? TEXT("DamageEffect") : TEXT("GameData.DamageGameplayEffect_SetByCaller"));
+}
+
+bool UGGYGOPlayerComboAbility::CanActivateAbilityAdditional(FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags,
+	const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const
+{
+	if (!Super::CanActivateAbilityAdditional(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags))
+	{
+		return false;
+	}
+	FString Error;
+	return ValidateDamageEffectDependency(Error);
+}
+
+void UGGYGOPlayerComboAbility::NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const
+{
+	FString Error;
+	if (!ValidateDamageEffectDependency(Error))
+	{
+		// This is an actual failed request; repeated pure CanActivate queries never log.
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时伤害GE依赖无效：%s"),
+			*GetPathNameSafe(this), *Error);
+	}
+	Super::NativeOnAbilityFailedToActivate(FailedReason);
+}
+
 void UGGYGOPlayerComboAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle,
 	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
 	const FGameplayEventData* TriggerEventData)
@@ -117,6 +184,15 @@ void UGGYGOPlayerComboAbility::ActivateAbility(FGameplayAbilitySpecHandle Handle
 
 	Super::ActivateAbility(Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (!IsActivationCurrent(ThisGeneration)) { return; }
+
+	FString DamageDependencyError;
+	if (!ValidateDamageEffectDependency(DamageDependencyError))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前拒绝激活：%s"),
+			*GetPathNameSafe(this), *DamageDependencyError);
+		EndAbility(Handle, ActorInfo, ActivationInfo, true, true);
+		return;
+	}
 
 	ACharacter* Character = GetCharacterFromActorInfo();
 	ActiveMesh = Character ? Character->GetMesh() : nullptr;

@@ -33,6 +33,7 @@
 
 namespace EEndPlayReason { enum Type : int; }
 
+class APawn;
 class UGameFrameworkComponentManager;
 class UEnhancedInputLocalPlayerSubsystem;
 class UEnhancedPlayerInput;
@@ -168,6 +169,10 @@ protected:
 	void HandleAbilityGroupFreed(FGameplayTag GroupTag);
 
 private:
+	/** Consumes actual local provider readiness; returns whether this original native init may continue.
+	 *  Camera failure is reported separately and does not become an input readiness gate. */
+	bool ConsumeLocalCameraProviderReady(APawn* ExpectedPawn, const TCHAR* NativeEntry);
+
 	/** 仍处于激活状态的能力相机覆盖，最后一项优先级最高。 */
 	UPROPERTY(Transient)
 	TArray<FGGYGOAbilityCameraModeOverride> AbilityCameraModeOverrides;

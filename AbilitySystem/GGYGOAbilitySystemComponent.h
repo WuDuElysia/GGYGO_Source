@@ -738,6 +738,9 @@ private:
 		bool bLocalWitnessSeen = false;
 		EGGYGOAbilityActivationRequestReason Failure = EGGYGOAbilityActivationRequestReason::None;
 		FGGYGOAbilityActivationHandle OriginalActivation{};
+		// References to GA's one original record; no ASC execution state or deferred queue.
+		TArray<TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>> TerminationExitDependencies;
+		TSharedPtr<FGGYGOAbilityTerminationCompletedNotice> OriginalTerminationCompleted;
 	};
 
 	class FScopedControlledAbilityActivationCall
@@ -760,7 +763,12 @@ private:
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo);
 	bool CompleteControlledAbilityActivationEvaluation(uint64 EvaluationSerial, bool bNativeRulesPassed);
 	void ObserveControlledAbilityActivation(FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability);
+	void RegisterOriginalTerminationTryDependencies(
+		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record);
+	void TryPublishOriginalTerminationCompleted(
+		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record);
 	FControlledAbilityActivationCall* ControlledAbilityActivationCall = nullptr;
+	FGGYGOAbilityTerminationCompletedEvent AbilityTerminationCompletedEvent;
 
 	/** One pending identity receipt. It owns no predicate, callback, queue or native phase. */
 	struct FAvatarBindingIdentityOperation

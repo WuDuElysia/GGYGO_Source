@@ -59,8 +59,8 @@ struct FGameplayAbilityTargetDataHandle;
 struct FHitResult;
 
 /**
- * T1a defines GA provenance issuance/capture; ASC witness integration is still pending.
- * Termination requests/cleanup/completion remain declarations; values do not own GAS Active/spec state.
+ * GA issues provenance and owns each original termination; ASC supplies native exit witnesses.
+ * These values do not own GAS Active/spec state.
  * Handles share immutable issuer-created history. Empty/copy/equality never prove liveness.
  */
 class GGYGO_API FGGYGOAbilityActivationHandle
@@ -258,8 +258,8 @@ struct GGYGO_API FGGYGOAbilityTerminationResult
  * 一次命中共享的 GAS 载荷。
  *
  * Context、GE Spec 与 Cue 参数必须从同一次命中构造，避免不同能力各自拼装后
- * 丢失 Origin、物理材质 Tag 或目标当前 Tag。EffectSpec 在未配置伤害 GE、
- * 或 Spec 创建失败时可以无效；EffectContext 与 CueParameters 仍用于命中表现。
+ * 丢失 Origin、物理材质 Tag 或目标当前 Tag。成功载荷中，EffectSpec 仅在显式
+ * 未配置伤害 GE 时可以无效；非空 GE 的 Spec 构造失败不得作为 Cue 载荷返回。
  */
 struct FGGYGOHitEffectPayload
 {
@@ -293,7 +293,7 @@ class GGYGO_API UGGYGOGameplayAbility : public UGameplayAbility
 public:
 	UGGYGOGameplayAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-	// ===== Controlled activation identity; request/core wiring follows separate stages =====
+	// ===== Controlled activation identity and original termination =====
 
 	/** Copy this controlled activation's issued identity; empty is untracked, never a guessed source. */
 	FGGYGOAbilityActivationHandle CaptureCurrentActivation() const;
@@ -413,7 +413,9 @@ protected:
 	 *
 	 * Origin 由调用者在命中回调时显式提供并固化到 Context。物理材质 Tag 同时进入
 	 * GE 的目标 Spec Tag 与 Cue 的目标 Tag；目标 ASC 的当前 Tag 也只在这里汇入 Cue。
-	 * 即使没有 DamageEffect 或 Spec 创建失败，仍返回可执行的命中 Cue 载荷。
+	 * DamageEffectClass 为空是正常的无 GE 碰撞 Cue 模式。非空时必须构造有效 Spec，
+	 * 包括能力级 Spec 扩展返回后的有效性；失败诊断并返回 false，OutPayload 清空。
+	 * 成功返回后，GE 实际应用的免疫／拒绝结果及碰撞 Cue 政策仍由调用方处理。
 	 */
 	bool BuildHitEffectPayload(UAbilitySystemComponent* TargetAbilitySystemComponent,
 		TSubclassOf<UGameplayEffect> DamageEffectClass, float EffectLevel,
@@ -478,6 +480,7 @@ protected:
 	 * 相机会永久停在演出视角。
 	 */
 	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override;
+	virtual void CancelAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility) override;
 
 	/**
 	 * 激活时接管的相机模式。留空表示不换模式。
@@ -529,6 +532,10 @@ protected:
 	void K2_OnPawnAvatarSet();
 
 protected:
+	/** Once per authenticated original termination, before native End. Overrides call Super.
+	 * Task playback execution remains owned by the task. Legacy End overrides still require migration. */
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context);
+
 	/** 何时尝试激活。默认输入触发。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Ability Activation")
 	EGGYGOAbilityActivationPolicy ActivationPolicy;
@@ -570,8 +577,11 @@ private:
 		EGGYGOAbilityActivationRequestReason& OutReason);
 	void RetireControlledActivation();
 	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle);
+	FGGYGOAbilityActivationHandle ValidateCurrentControlledActivation(bool bRequireActive = true,
+		bool bRequireSpec = true) const;
 
-	/** Actual End stack span only; no termination record, deferred executor or completion dispatch. */
+	struct FOriginalTerminationRecord;
+	/** Actual base End stack span; full virtual return is witnessed by the original dispatcher. */
 	class FScopedControlledActivationEnd
 	{
 	public:
@@ -584,6 +594,7 @@ private:
 		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
 		FScopedControlledActivationEnd* Previous = nullptr;
 		FGGYGOAbilityActivationHandle Original;
+		TSharedPtr<FOriginalTerminationRecord> Termination;
 		friend class UGGYGOGameplayAbility;
 	};
 
@@ -591,6 +602,54 @@ private:
 	uint64 LastControlledActivationSerial = 0;
 	FGGYGOAbilityActivationHandle CurrentControlledActivation{};
 	FScopedControlledActivationEnd* ControlledActivationEndScope = nullptr;
+
+	/** One original resource/return obligation. GAS alone owns Active, counts and task execution.
+	 * Open counters describe actual native call spans, never another activation/ending state. */
+	struct FOriginalTerminationRecord
+	{
+		FGGYGOAbilityTerminationContext Context;
+		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		TWeakPtr<const FGameplayAbilityActorInfo> ActorInfo;
+		FGameplayAbilitySpecHandle SpecHandle;
+		FGameplayAbilityActivationInfo ActivationInfo;
+		TWeakObjectPtr<UGGYGOCameraComponent> CameraOffsetComponent;
+		FGGYGOCameraOffsetHandle CameraOffsetHandle;
+		TWeakObjectPtr<UGGYGOHeroComponent> CameraModeHero;
+		FGameplayAbilitySpecHandle CameraModeSpec;
+		uint64 CameraModeGeneration = 0;
+		uint32 OpenDispatches = 0;
+		uint32 OpenTryCalls = 0;
+		bool bContinuationUsed = false;
+		bool bContinuationQueued = false;
+		bool bContinuationReady = false;
+		bool bDriving = false;
+		bool bCancelEntered = false;
+		bool bCancelReturned = false;
+		bool bCleanupStarted = false;
+		bool bNativeEndStarted = false;
+		bool bNativeEndObserved = false;
+		bool bNativeEndReturned = false;
+		bool bFullEndReturned = false;
+		bool bSealed = false;
+		EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Accepted;
+		EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::None;
+		TArray<TWeakPtr<FGGYGOAbilityTerminationCompletedNotice>> TryCompletionSlots;
+	};
+	TSharedPtr<FOriginalTerminationRecord> BeginOriginalTermination(
+		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
+		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult);
+	void ResumeOriginalTermination(TSharedPtr<FOriginalTerminationRecord> Record);
+	void DeferOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record);
+	EGGYGOAbilityTerminationReason CheckOriginalTerminationSource(const FOriginalTerminationRecord& Record) const;
+	void ObserveOriginalNativeEnd(UGGYGOAbilitySystemComponent* OriginalASC, FGameplayAbilitySpecHandle Handle);
+	void InvalidateOriginalTerminationForActivation();
+	static void FailOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record,
+		EGGYGOAbilityTerminationReason Reason);
+	static void TryCompleteOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record);
+	static FGGYGOAbilityTerminationResult GetOriginalTerminationResult(const FOriginalTerminationRecord& Record);
+	uint64 LastOriginalTerminationSerial = 0;
+	TSharedPtr<FOriginalTerminationRecord> OriginalTermination;
 
 	/** 镜头微调凭证及申请时的相机接收者。 */
 	TWeakObjectPtr<UGGYGOCameraComponent> AppliedCameraOffsetComponent;

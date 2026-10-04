@@ -36,6 +36,10 @@ class GGYGO_API UGGYGOLocalPlayer : public ULocalPlayer
 	GENERATED_BODY()
 
 public:
+	/** Native projection is published only for the original association's confirmed manager view. */
+	virtual bool GetProjectionData(FViewport* Viewport, FSceneViewProjectionData& OutProjectionData,
+		int32 StereoViewIndex = INDEX_NONE) const override;
+
 	/**
 	 * 唯一缓存的原生取得入口；首次加载及缓存返回均校验原主玩家、GI、用户和槽位关联。
 	 * 失败清空输出并提供原因；失效原缓存保留，不重读、换新或排队同步重入。
@@ -89,4 +93,7 @@ private:
 
 	/** True only inside a synchronous access scope; never queues or retries a request. */
 	mutable bool bSquadPresetsAccessBusy = false;
+
+	/** Diagnostic only; never grants or caches camera publication eligibility. */
+	mutable bool bReportedCameraProjectionFailure = false;
 };
