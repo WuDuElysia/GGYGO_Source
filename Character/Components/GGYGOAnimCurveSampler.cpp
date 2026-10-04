@@ -48,27 +48,6 @@ namespace
 	}
 }
 
-void FGGYGOAnimCurveMotion::Reset()
-{
-	Speed = 0.0f;
-	YawDeltaDegrees = 0.0f;
-	YawTotalDegrees = 0.0f;
-	PositionDelta = FVector::ZeroVector;
-	Velocity = FVector::ZeroVector;
-	Direction = FVector::ZeroVector;
-	DirectionAngle = 0.0f;
-	ClipLength = 0.0f;
-	bLoopClip = false;
-	bHasAuthoredDirection = false;
-	bHasPositionDelta = false;
-	bHasCurveSource = false;
-}
-
-bool FGGYGOAnimCurveMotion::HasUsableSpeed() const
-{
-	return bHasCurveSource && Speed > KINDA_SMALL_NUMBER;
-}
-
 void FGGYGOAnimCurveSampler::ResetBaseline()
 {
 	PreviousPosX = 0.0f;

@@ -23,8 +23,14 @@ struct FZZZAnimSnapshot
 {
 	// ---- Locomotion ----
 
-	/** 当前步态（None/Walk/Run）。步态判定与 GaitBlendY 目标值的唯一来源。 */
+	/** 当前步态（None/Walk/Run），保留给诊断与既有表现查询。 */
 	EGGYGOGait Gait = EGGYGOGait::None;
+
+	/** Movement 权威的 WalkRun 混合值：0 = Walk，1 = Run。 */
+	float WalkRunBlendAlpha = 0.f;
+
+	/** Movement 权威的停止动作语义，由兼容层映射到旧 Stop Select 索引。 */
+	EGGYGOStopMotionType StopMotionType = EGGYGOStopMotionType::None;
 
 	/**
 	 * 本帧是否有移动意图。
@@ -35,7 +41,7 @@ struct FZZZAnimSnapshot
 	bool bShouldMove = false;
 
 	/**
-	 * 相对 Actor 当前水平朝向的移动方向 X（右）和 Y（前）。
+	 * 兼容表现分量 X（右）和 Y（前），由标准 CMC 局部轴在快照适配处交换得到。
 	 *
 	 * 目前无人消费：走跑混合是一维的、由步态混合值驱动，方向靠 Actor 转向解决。
 	 * 等有了侧向/后退的移动循环动画换成二维 BlendSpace 后才会接上。
@@ -73,7 +79,7 @@ struct FZZZAnimSnapshot
 	/** 角色实际水平速度的世界空间单位方向。 */
 	FVector ActualVelocityDirection = FVector::ZeroVector;
 
-	/** 实际速度相对 Actor 的 BlendSpace 分量：X=右，Y=前。 */
+	/** 旧 AnimBP 表现轴分量：X=右，Y=前。 */
 	float ActualVelocityBlendX = 0.f;
 	float ActualVelocityBlendY = 0.f;
 

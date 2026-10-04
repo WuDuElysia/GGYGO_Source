@@ -22,10 +22,14 @@ void FZZZAnimSnapshotCapture::Capture(
 	OutSnap.VelocityLength = InState.HorizontalSpeed;
 	OutSnap.ActualVelocityDirection = InState.WorldVelocityDirection;
 	OutSnap.ActualVelocityAngle = InState.LocalVelocityAngle;
-	OutSnap.ActualVelocityBlendX = InState.LocalVelocityBlend.X;
-	OutSnap.ActualVelocityBlendY = InState.LocalVelocityBlend.Y;
-	OutSnap.AnimBlendX = InState.LocalVelocityBlend.X;
-	OutSnap.AnimBlendY = InState.LocalVelocityBlend.Y;
+	// Movement/CMC uses the standard local axes (X=Forward, Y=Right); the existing
+	// Pyrios presentation fields retain their established (X=Right, Y=Forward) layout.
+	OutSnap.ActualVelocityBlendX = InState.LocalVelocityBlend.Y;
+	OutSnap.ActualVelocityBlendY = InState.LocalVelocityBlend.X;
+	OutSnap.AnimBlendX = OutSnap.ActualVelocityBlendX;
+	OutSnap.AnimBlendY = OutSnap.ActualVelocityBlendY;
+	OutSnap.WalkRunBlendAlpha = InState.WalkRunBlendAlpha;
+	OutSnap.StopMotionType = InState.StopMotionType;
 	OutSnap.TurnBackPhase = InState.TurnBackPhase;
 	OutSnap.bTurnBackRunOut = InState.bTurnBackRunOut;
 

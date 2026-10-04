@@ -6,8 +6,10 @@
 
 #include "AbilitySystem/Attributes/GGYGOCombatSet.h"
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
+#include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOAbilitySourceInterface.h"
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
+#include "AbilitySystemComponent.h"
 #include "GameFramework/Actor.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
 #include "System/GGYGOGameplayTags.h"
@@ -69,25 +71,69 @@ void UGGYGODamageExecution::Execute_Implementation(const FGameplayEffectCustomEx
 	EvaluateParameters.SourceTags = Spec.CapturedSourceTags.GetAggregatedTags();
 	EvaluateParameters.TargetTags = Spec.CapturedTargetTags.GetAggregatedTags();
 
-	float BaseDamage = 0.0f;
-	ExecutionParams.AttemptCalculateCapturedAttributeMagnitude(DamageStatics().BaseDamageDef, EvaluateParameters, BaseDamage);
-
-	float BasePoiseDamage = 0.0f;
-	ExecutionParams.AttemptCalculateCapturedAttributeMagnitude(DamageStatics().BasePoiseDamageDef, EvaluateParameters, BasePoiseDamage);
-
-	// SetByCaller 允许单次攻击覆盖基础值，用于同一个 GE 服务多段连招
-	// （每段伤害不同却共用一份 GE 配置）。没设置时取属性值。
-	const float CallerDamage = Spec.GetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_Damage, /*WarnIfNotFound=*/false, -1.0f);
-	if (CallerDamage >= 0.0f)
+	// 键存在就是明确覆盖；缺键才要求捕获，不能用负数哨兵把非法覆盖混成缺键。
+	struct FBaseInputResult
 	{
-		BaseDamage = CallerDamage;
-	}
-
-	const float CallerPoiseDamage = Spec.GetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_PoiseDamage, /*WarnIfNotFound=*/false, -1.0f);
-	if (CallerPoiseDamage >= 0.0f)
+		float Value = 0.0f;
+		const TCHAR* Source = TEXT("CapturedAttribute");
+		const TCHAR* Reason = TEXT("capture-failed");
+		bool bHasValue = false;
+		bool bValid = false;
+	};
+	auto ResolveBaseInput = [&Spec, &ExecutionParams, &EvaluateParameters](const FGameplayTag& OverrideTag,
+		const FGameplayEffectAttributeCaptureDefinition& CaptureDefinition)
 	{
-		BasePoiseDamage = CallerPoiseDamage;
+		FBaseInputResult Result;
+		if (const float* OverrideValue = Spec.SetByCallerTagMagnitudes.Find(OverrideTag))
+		{
+			Result.Source = TEXT("SetByCallerTag");
+			Result.Value = *OverrideValue;
+			Result.bHasValue = true;
+			if (!FMath::IsFinite(Result.Value))
+			{
+				Result.Reason = TEXT("non-finite");
+				return Result;
+			}
+			if (Result.Value < 0.0f)
+			{
+				Result.Reason = TEXT("negative-override");
+				return Result;
+			}
+		}
+		else
+		{
+			if (!ExecutionParams.AttemptCalculateCapturedAttributeMagnitude(CaptureDefinition, EvaluateParameters, Result.Value))
+			{
+				return Result;
+			}
+			Result.bHasValue = true;
+			if (!FMath::IsFinite(Result.Value))
+			{
+				Result.Reason = TEXT("non-finite");
+				return Result;
+			}
+			// 有限负捕获值仍交给既有最终非负公式，不在这里新增属性值域规则。
+		}
+		Result.Reason = TEXT("valid");
+		Result.bValid = true;
+		return Result;
+	};
+	const FBaseInputResult DamageInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_Damage, DamageStatics().BaseDamageDef);
+	const FBaseInputResult PoiseInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_PoiseDamage, DamageStatics().BasePoiseDamageDef);
+	if (!DamageInput.bValid || !PoiseInput.bValid)
+	{
+		const FString DamageValue = DamageInput.bHasValue ? FString::Printf(TEXT("%.9g"), static_cast<double>(DamageInput.Value)) : TEXT("unavailable");
+		const FString PoiseValue = PoiseInput.bHasValue ? FString::Printf(TEXT("%.9g"), static_cast<double>(PoiseInput.Value)) : TEXT("unavailable");
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("DamageExecution [%s] 拒绝基础输入：GE=%s SourceASC=%s TargetASC=%s BaseDamage{Source=%s Reason=%s Value=%s} BasePoiseDamage{Source=%s Reason=%s Value=%s}；本Execution不新增Modifier。"),
+			*GetPathName(), *GetPathNameSafe(Spec.Def.Get()),
+			*GetPathNameSafe(ExecutionParams.GetSourceAbilitySystemComponent()), *GetPathNameSafe(ExecutionParams.GetTargetAbilitySystemComponent()),
+			DamageInput.Source, DamageInput.Reason, *DamageValue, PoiseInput.Source, PoiseInput.Reason, *PoiseValue);
+		// 原生Execute没有GE应用失败返回值；不改写Spec，也不清除调用方已有输出。
+		return;
 	}
+	const float BaseDamage = DamageInput.Value;
+	const float BasePoiseDamage = PoiseInput.Value;
 
 	// 距离与材质衰减。
 	//
@@ -108,15 +154,9 @@ void UGGYGODamageExecution::Execute_Implementation(const FGameplayEffectCustomEx
 				Attenuation *= AbilitySource->GetPhysicalMaterialAttenuation(PhysicalMaterial, SourceTags, TargetTags);
 			}
 
-			// 命中位置与施加者的距离。没有命中信息时按 0 处理 ——
+			// 攻击来源与命中点的距离。没有显式来源或命中信息时按 0 处理 ——
 			// 那通常是范围伤害或状态伤害，距离衰减对它们没有意义。
-			float Distance = 0.0f;
-			if (GGYGOContext->HasOrigin())
-			{
-				Distance = FVector::Dist(GGYGOContext->GetOrigin(), Spec.GetContext().GetEffectCauser()
-					? Spec.GetContext().GetEffectCauser()->GetActorLocation()
-					: GGYGOContext->GetOrigin());
-			}
+			const float Distance = GGYGOContext->GetDistanceFromOriginToHitResult();
 
 			Attenuation *= AbilitySource->GetDistanceAttenuation(Distance, SourceTags, TargetTags);
 		}

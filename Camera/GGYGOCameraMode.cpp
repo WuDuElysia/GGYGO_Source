@@ -6,8 +6,111 @@
 
 #include "Camera/GGYGOCameraComponent.h"
 #include "GameFramework/Actor.h"
+#include "UObject/StrongObjectPtr.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCameraMode)
+
+FGGYGOCameraEvaluationResult FGGYGOCameraEvaluationResult::Success()
+{
+	FGGYGOCameraEvaluationResult Result;
+	Result.Status = EGGYGOCameraEvaluationStatus::Success;
+	return Result;
+}
+
+FGGYGOCameraEvaluationResult FGGYGOCameraEvaluationResult::Failure(
+	const UGGYGOCameraMode* OriginalMode, FName InvalidField, const TCHAR* InvalidReason)
+{
+	FGGYGOCameraEvaluationResult Result;
+	// Weak provenance is identity only; configuration validation never mutates the const source.
+	Result.Mode = const_cast<UGGYGOCameraMode*>(OriginalMode);
+	Result.ModePath = GetPathNameSafe(OriginalMode);
+	Result.ModeClassPath = GetPathNameSafe(OriginalMode ? OriginalMode->GetClass() : nullptr);
+	Result.Field = InvalidField;
+	Result.Reason = InvalidReason;
+	return Result;
+}
+
+namespace
+{
+	struct FCameraFiniteField
+	{
+		double Value;
+		const TCHAR* Name;
+	};
+
+	FGGYGOCameraEvaluationResult ValidateCameraView(
+		UGGYGOCameraMode* OriginalMode, const FGGYGOCameraModeView& View)
+	{
+		const FCameraFiniteField Fields[] =
+		{
+			{ View.Location.X, TEXT("View.Location.X") },
+			{ View.Location.Y, TEXT("View.Location.Y") },
+			{ View.Location.Z, TEXT("View.Location.Z") },
+			{ View.Rotation.Pitch, TEXT("View.Rotation.Pitch") },
+			{ View.Rotation.Yaw, TEXT("View.Rotation.Yaw") },
+			{ View.Rotation.Roll, TEXT("View.Rotation.Roll") },
+			{ View.ControlRotation.Pitch, TEXT("View.ControlRotation.Pitch") },
+			{ View.ControlRotation.Yaw, TEXT("View.ControlRotation.Yaw") },
+			{ View.ControlRotation.Roll, TEXT("View.ControlRotation.Roll") },
+			{ View.FieldOfView, TEXT("View.FieldOfView") }
+		};
+		for (const FCameraFiniteField& Field : Fields)
+		{
+			if (!FMath::IsFinite(Field.Value))
+			{
+				return FGGYGOCameraEvaluationResult::Failure(OriginalMode, FName(Field.Name), TEXT("non-finite"));
+			}
+		}
+		return FGGYGOCameraEvaluationResult::Success();
+	}
+
+	FGGYGOCameraEvaluationResult ValidateCameraBlendArithmetic(
+		UGGYGOCameraMode* OriginalMode, const FGGYGOCameraModeView& Base,
+		const FGGYGOCameraModeView& Other, float Weight)
+	{
+		// Check scalars before FVector/FRotator diagnostics can replace a non-finite result.
+		const auto IsFiniteLerp = [Weight](auto A, auto B)
+		{
+			const auto Difference = B - A;
+			const auto WeightedDifference = Weight * Difference;
+			return FMath::IsFinite(Difference) && FMath::IsFinite(WeightedDifference)
+				&& FMath::IsFinite(A + WeightedDifference);
+		};
+		if (!IsFiniteLerp(Base.Location.X, Other.Location.X))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(OriginalMode, TEXT("View.Location.X"), TEXT("non-finite-blend-arithmetic"));
+		}
+		if (!IsFiniteLerp(Base.Location.Y, Other.Location.Y))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(OriginalMode, TEXT("View.Location.Y"), TEXT("non-finite-blend-arithmetic"));
+		}
+		if (!IsFiniteLerp(Base.Location.Z, Other.Location.Z))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(OriginalMode, TEXT("View.Location.Z"), TEXT("non-finite-blend-arithmetic"));
+		}
+		const FCameraFiniteField RotationDifferences[] =
+		{
+			{ Other.Rotation.Pitch - Base.Rotation.Pitch, TEXT("View.Rotation.Pitch") },
+			{ Other.Rotation.Yaw - Base.Rotation.Yaw, TEXT("View.Rotation.Yaw") },
+			{ Other.Rotation.Roll - Base.Rotation.Roll, TEXT("View.Rotation.Roll") },
+			{ Other.ControlRotation.Pitch - Base.ControlRotation.Pitch, TEXT("View.ControlRotation.Pitch") },
+			{ Other.ControlRotation.Yaw - Base.ControlRotation.Yaw, TEXT("View.ControlRotation.Yaw") },
+			{ Other.ControlRotation.Roll - Base.ControlRotation.Roll, TEXT("View.ControlRotation.Roll") }
+		};
+		for (const FCameraFiniteField& Field : RotationDifferences)
+		{
+			if (!FMath::IsFinite(Field.Value))
+			{
+				return FGGYGOCameraEvaluationResult::Failure(OriginalMode, FName(Field.Name), TEXT("non-finite-blend-arithmetic"));
+			}
+		}
+		if (!IsFiniteLerp(Base.FieldOfView, Other.FieldOfView))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(OriginalMode, TEXT("View.FieldOfView"), TEXT("non-finite-blend-arithmetic"));
+		}
+		return FGGYGOCameraEvaluationResult::Success();
+	}
+}
 
 // ============================================================================
 // FGGYGOCameraModeView
@@ -117,77 +220,164 @@ void UGGYGOCameraMode::UpdateView(float DeltaTime)
 	View.FieldOfView = FieldOfView;
 }
 
-void UGGYGOCameraMode::SetBlendWeight(float Weight)
+FGGYGOCameraEvaluationResult UGGYGOCameraMode::ValidateConfiguration() const
 {
-	BlendWeight = FMath::Clamp(Weight, 0.0f, 1.0f);
-
-	// 从权重反解出线性进度，这样后续推进能从当前视觉状态接着走。
-	// 指数取倒数是上面 BlendWeight 计算的逆运算。
-	const float InvExponent = (BlendExponent > SMALL_NUMBER) ? (1.0f / BlendExponent) : 1.0f;
-
+	if (!FMath::IsFinite(BlendTime) || BlendTime < 0.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendTime"),
+			FMath::IsFinite(BlendTime) ? TEXT("negative") : TEXT("non-finite"));
+	}
 	switch (BlendFunction)
 	{
 	case EGGYGOCameraModeBlendFunction::Linear:
-		BlendAlpha = BlendWeight;
-		break;
-
+		break; // Linear does not use an exponent.
 	case EGGYGOCameraModeBlendFunction::EaseIn:
-		BlendAlpha = FMath::InterpEaseIn(0.0f, 1.0f, BlendWeight, InvExponent);
-		break;
-
 	case EGGYGOCameraModeBlendFunction::EaseOut:
-		BlendAlpha = FMath::InterpEaseOut(0.0f, 1.0f, BlendWeight, InvExponent);
-		break;
-
 	case EGGYGOCameraModeBlendFunction::EaseInOut:
-		BlendAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, BlendWeight, InvExponent);
+		if (!FMath::IsFinite(BlendExponent) || BlendExponent <= 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendExponent"),
+				FMath::IsFinite(BlendExponent) ? TEXT("not-positive") : TEXT("non-finite"));
+		}
+		if (!FMath::IsFinite(1.0f / BlendExponent))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendExponent"), TEXT("non-finite-reciprocal"));
+		}
 		break;
-
 	default:
-		BlendAlpha = BlendWeight;
-		break;
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendFunction"), TEXT("unknown-enum"));
 	}
+	if (!FMath::IsFinite(FieldOfView) || FieldOfView < 5.0f || FieldOfView > 170.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("FieldOfView"),
+			FMath::IsFinite(FieldOfView) ? TEXT("outside-[5,170]") : TEXT("non-finite"));
+	}
+	if (!FMath::IsFinite(ViewPitchMin) || ViewPitchMin < -89.9f || ViewPitchMin > 89.9f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("ViewPitchMin"),
+			FMath::IsFinite(ViewPitchMin) ? TEXT("outside-[-89.9,89.9]") : TEXT("non-finite"));
+	}
+	if (!FMath::IsFinite(ViewPitchMax) || ViewPitchMax < -89.9f || ViewPitchMax > 89.9f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("ViewPitchMax"),
+			FMath::IsFinite(ViewPitchMax) ? TEXT("outside-[-89.9,89.9]") : TEXT("non-finite"));
+	}
+	if (ViewPitchMin > ViewPitchMax)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("ViewPitchMin/ViewPitchMax"), TEXT("unordered-limits"));
+	}
+	return ValidateModeConfiguration();
 }
 
-void UGGYGOCameraMode::UpdateCameraMode(float DeltaTime)
+FGGYGOCameraEvaluationResult UGGYGOCameraMode::ValidateModeConfiguration() const
 {
-	UpdateView(DeltaTime);
+	return FGGYGOCameraEvaluationResult::Success();
+}
 
-	// 推进线性进度。BlendTime 为 0 时直接满权重，避免除零。
-	if (BlendTime > 0.0f)
+FGGYGOCameraEvaluationResult UGGYGOCameraMode::SetBlendWeight(float Weight)
+{
+	if (!FMath::IsFinite(Weight) || Weight < 0.0f || Weight > 1.0f)
 	{
-		BlendAlpha += (DeltaTime / BlendTime);
-		BlendAlpha = FMath::Min(BlendAlpha, 1.0f);
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendWeight"),
+			FMath::IsFinite(Weight) ? TEXT("outside-[0,1]") : TEXT("non-finite"));
 	}
-	else
+	FGGYGOCameraEvaluationResult Result = ValidateConfiguration();
+	if (!Result.IsSuccess())
 	{
-		BlendAlpha = 1.0f;
+		return Result;
 	}
 
-	const float Exponent = (BlendExponent > 0.0f) ? BlendExponent : 1.0f;
-
+	float CandidateAlpha;
 	switch (BlendFunction)
 	{
 	case EGGYGOCameraModeBlendFunction::Linear:
-		BlendWeight = BlendAlpha;
+		CandidateAlpha = Weight;
 		break;
-
 	case EGGYGOCameraModeBlendFunction::EaseIn:
-		BlendWeight = FMath::InterpEaseIn(0.0f, 1.0f, BlendAlpha, Exponent);
+		CandidateAlpha = FMath::InterpEaseIn(0.0f, 1.0f, Weight, 1.0f / BlendExponent);
 		break;
-
 	case EGGYGOCameraModeBlendFunction::EaseOut:
-		BlendWeight = FMath::InterpEaseOut(0.0f, 1.0f, BlendAlpha, Exponent);
+		CandidateAlpha = FMath::InterpEaseOut(0.0f, 1.0f, Weight, 1.0f / BlendExponent);
 		break;
-
 	case EGGYGOCameraModeBlendFunction::EaseInOut:
-		BlendWeight = FMath::InterpEaseInOut(0.0f, 1.0f, BlendAlpha, Exponent);
+		CandidateAlpha = FMath::InterpEaseInOut(0.0f, 1.0f, Weight, 1.0f / BlendExponent);
 		break;
-
 	default:
-		BlendWeight = BlendAlpha;
-		break;
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendFunction"), TEXT("unknown-enum"));
 	}
+	if (!FMath::IsFinite(CandidateAlpha) || CandidateAlpha < 0.0f || CandidateAlpha > 1.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendAlpha"), TEXT("invalid-inverse-blend-result"));
+	}
+	BlendWeight = Weight;
+	BlendAlpha = CandidateAlpha;
+	return FGGYGOCameraEvaluationResult::Success();
+}
+
+FGGYGOCameraEvaluationResult UGGYGOCameraMode::UpdateCameraMode(float DeltaTime)
+{
+	if (!FMath::IsFinite(DeltaTime) || DeltaTime < 0.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("DeltaTime"),
+			FMath::IsFinite(DeltaTime) ? TEXT("negative") : TEXT("non-finite"));
+	}
+	FGGYGOCameraEvaluationResult Result = ValidateConfiguration();
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+	if (!FMath::IsFinite(BlendAlpha) || BlendAlpha < 0.0f || BlendAlpha > 1.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendAlpha"), TEXT("invalid-runtime-alpha"));
+	}
+	if (!FMath::IsFinite(BlendWeight) || BlendWeight < 0.0f || BlendWeight > 1.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendWeight"), TEXT("invalid-runtime-weight"));
+	}
+
+	CameraPenetrationRequest = FGGYGOCameraPenetrationRequest();
+	UpdateView(DeltaTime);
+	// A subclass callback cannot bypass common admission by changing configuration during UpdateView.
+	Result = ValidateConfiguration();
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+	Result = ValidateCameraView(this, View);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+
+	// Valid positive time advances and saturates at the endpoint; legal zero time is an instant cut.
+	const float CandidateAlpha = BlendTime > 0.0f
+		? FMath::Min(BlendAlpha + DeltaTime / BlendTime, 1.0f)
+		: 1.0f;
+	float CandidateWeight;
+	switch (BlendFunction)
+	{
+	case EGGYGOCameraModeBlendFunction::Linear:
+		CandidateWeight = CandidateAlpha;
+		break;
+	case EGGYGOCameraModeBlendFunction::EaseIn:
+		CandidateWeight = FMath::InterpEaseIn(0.0f, 1.0f, CandidateAlpha, BlendExponent);
+		break;
+	case EGGYGOCameraModeBlendFunction::EaseOut:
+		CandidateWeight = FMath::InterpEaseOut(0.0f, 1.0f, CandidateAlpha, BlendExponent);
+		break;
+	case EGGYGOCameraModeBlendFunction::EaseInOut:
+		CandidateWeight = FMath::InterpEaseInOut(0.0f, 1.0f, CandidateAlpha, BlendExponent);
+		break;
+	default:
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendFunction"), TEXT("unknown-enum"));
+	}
+	if (!FMath::IsFinite(CandidateWeight) || CandidateWeight < 0.0f || CandidateWeight > 1.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("BlendWeight"), TEXT("invalid-forward-blend-result"));
+	}
+	BlendAlpha = CandidateAlpha;
+	BlendWeight = CandidateWeight;
+	return FGGYGOCameraEvaluationResult::Success();
 }
 
 // ============================================================================
@@ -213,139 +403,384 @@ void UGGYGOCameraModeStack::ClearStack()
 
 UGGYGOCameraMode* UGGYGOCameraModeStack::GetCameraModeInstance(TSubclassOf<UGGYGOCameraMode> CameraModeClass)
 {
-	check(CameraModeClass);
-
+	UClass* OriginalClass = CameraModeClass.GetGCPtr().Get();
+	if (!IsValid(OriginalClass) || !OriginalClass->IsChildOf(UGGYGOCameraMode::StaticClass())
+		|| OriginalClass->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists))
+	{
+		return nullptr;
+	}
 	for (const TObjectPtr<UGGYGOCameraMode>& Mode : CameraModeInstances)
 	{
-		if (Mode && Mode->GetClass() == CameraModeClass)
+		if (Mode && Mode->GetClass() == OriginalClass)
 		{
 			return Mode;
 		}
 	}
-
-	// 池里没有才创建。复用实例是有意的：模式可能持有平滑状态
-	// （如上一帧的臂长），每次推入都新建会丢掉那些状态并产生跳变。
-	UGGYGOCameraMode* NewMode = NewObject<UGGYGOCameraMode>(this, CameraModeClass, NAME_None, RF_NoFlags);
-	check(NewMode);
-
-	CameraModeInstances.Add(NewMode);
-
-	return NewMode;
+	// Push admits the new candidate before adding it to the unique instance pool.
+	return NewObject<UGGYGOCameraMode>(this, OriginalClass, NAME_None, RF_NoFlags);
 }
 
-void UGGYGOCameraModeStack::PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass)
+FGGYGOCameraEvaluationResult UGGYGOCameraModeStack::PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass)
 {
-	if (!CameraModeClass)
+	UClass* OriginalClass = CameraModeClass.GetGCPtr().Get();
+	const auto ClassFailure = [OriginalClass](const TCHAR* Reason)
 	{
-		return;
+		FGGYGOCameraEvaluationResult Result = FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("CameraModeClass"), Reason);
+		Result.ModeClassPath = GetPathNameSafe(OriginalClass);
+		return Result;
+	};
+	if (!IsValid(OriginalClass))
+	{
+		return ClassFailure(TEXT("missing-or-invalid-class"));
+	}
+	if (!OriginalClass->IsChildOf(UGGYGOCameraMode::StaticClass()))
+	{
+		return ClassFailure(TEXT("wrong-base-class"));
+	}
+	if (OriginalClass->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists))
+	{
+		return ClassFailure(TEXT("abstract-or-obsolete-class"));
+	}
+	const UGGYGOCameraMode* Defaults = OriginalClass->GetDefaultObject<UGGYGOCameraMode>();
+	if (!IsValid(Defaults))
+	{
+		return ClassFailure(TEXT("invalid-class-default-object"));
+	}
+	FGGYGOCameraEvaluationResult Result = Defaults->ValidateConfiguration();
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+
+	const int32 StackSize = CameraModeStack.Num();
+	int32 ExistingStackIndex = INDEX_NONE;
+	float ExistingStackContribution = 1.0f;
+	for (int32 StackIndex = 0; StackIndex < StackSize; ++StackIndex)
+	{
+		UGGYGOCameraMode* ExistingMode = CameraModeStack[StackIndex];
+		if (!IsValid(ExistingMode))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(ExistingMode, TEXT("Mode"), TEXT("invalid-mode"));
+		}
+		const float Weight = ExistingMode->GetBlendWeight();
+		if (!FMath::IsFinite(Weight) || Weight < 0.0f || Weight > 1.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(ExistingMode, TEXT("BlendWeight"),
+				FMath::IsFinite(Weight) ? TEXT("outside-[0,1]") : TEXT("non-finite"));
+		}
+		if (ExistingStackIndex == INDEX_NONE)
+		{
+			if (ExistingMode->GetClass() == OriginalClass)
+			{
+				ExistingStackIndex = StackIndex;
+				ExistingStackContribution *= Weight;
+			}
+			else
+			{
+				ExistingStackContribution *= (1.0f - Weight);
+			}
+		}
+	}
+	if (!FMath::IsFinite(ExistingStackContribution)
+		|| ExistingStackContribution < 0.0f || ExistingStackContribution > 1.0f)
+	{
+		return ClassFailure(TEXT("invalid-existing-contribution"));
 	}
 
 	UGGYGOCameraMode* CameraMode = GetCameraModeInstance(CameraModeClass);
-	check(CameraMode);
-
-	const int32 StackSize = CameraModeStack.Num();
-
+	if (!IsValid(CameraMode))
+	{
+		return ClassFailure(TEXT("instance-creation-failed"));
+	}
+	// The candidate stays alive across virtual admission without becoming a pooled or active mode.
+	TStrongObjectPtr<UGGYGOCameraMode> CandidateLifetime(CameraMode);
+	Result = CameraMode->ValidateConfiguration();
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
 	if (StackSize > 0 && CameraModeStack[0] == CameraMode)
 	{
-		// 已经在栈顶，无需处理。
-		return;
+		return FGGYGOCameraEvaluationResult::Success();
 	}
 
-	// 若已在栈中，取出它并记住当前权重 —— 重新从 0 混合会产生可见跳变。
-	int32 ExistingStackIndex = INDEX_NONE;
-	float ExistingStackContribution = 1.0f;
-
-	for (int32 StackIndex = 0; StackIndex < StackSize; ++StackIndex)
+	const bool bIsBottomMode = StackSize == 0;
+	Result = CameraMode->SetBlendWeight(bIsBottomMode ? 1.0f
+		: (ExistingStackIndex == INDEX_NONE ? 0.0f : ExistingStackContribution));
+	if (!Result.IsSuccess())
 	{
-		if (CameraModeStack[StackIndex] == CameraMode)
-		{
-			ExistingStackIndex = StackIndex;
-			ExistingStackContribution *= CameraMode->GetBlendWeight();
-			break;
-		}
-
-		ExistingStackContribution *= (1.0f - CameraModeStack[StackIndex]->GetBlendWeight());
+		return Result;
 	}
-
+	CameraModeInstances.AddUnique(CameraMode);
 	if (ExistingStackIndex != INDEX_NONE)
 	{
 		CameraModeStack.RemoveAt(ExistingStackIndex);
 	}
-	else
-	{
-		ExistingStackContribution = 0.0f;
-	}
-
 	CameraModeStack.Insert(CameraMode, 0);
-
-	// 栈底模式必须满权重：它是最终视角的基准，权重不满会让画面
-	// 混进未初始化的值。
-	const bool bIsBottomMode = (CameraModeStack.Num() == 1);
-	CameraMode->SetBlendWeight(bIsBottomMode ? 1.0f : ExistingStackContribution);
-
 	if (ExistingStackIndex == INDEX_NONE)
 	{
 		CameraMode->OnActivation();
 	}
+	return CameraMode->ValidateConfiguration();
 }
 
-void UGGYGOCameraModeStack::UpdateStack(float DeltaTime)
+FGGYGOCameraEvaluationResult UGGYGOCameraModeStack::UpdateStack(float DeltaTime)
 {
+	if (!FMath::IsFinite(DeltaTime) || DeltaTime < 0.0f)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("DeltaTime"),
+			FMath::IsFinite(DeltaTime) ? TEXT("negative") : TEXT("non-finite"));
+	}
 	const int32 StackSize = CameraModeStack.Num();
 	if (StackSize == 0)
 	{
-		return;
+		return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("ModeStack"), TEXT("empty-stack"));
+	}
+	for (UGGYGOCameraMode* CameraMode : CameraModeStack)
+	{
+		if (!IsValid(CameraMode))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("Mode"), TEXT("invalid-mode"));
+		}
 	}
 
 	int32 RemoveIndex = INDEX_NONE;
 	int32 RemoveCount = 0;
-
 	for (int32 StackIndex = 0; StackIndex < StackSize; ++StackIndex)
 	{
 		UGGYGOCameraMode* CameraMode = CameraModeStack[StackIndex];
-		CameraMode->UpdateCameraMode(DeltaTime);
-
+		FGGYGOCameraEvaluationResult Result = CameraMode->UpdateCameraMode(DeltaTime);
+		if (!Result.IsSuccess())
+		{
+			return Result;
+		}
 		if (CameraMode->GetBlendWeight() >= 1.0f)
 		{
-			// 该模式已完全遮盖下层，下层再算也看不见。
 			RemoveIndex = StackIndex + 1;
 			RemoveCount = StackSize - RemoveIndex;
 			break;
 		}
 	}
-
 	if (RemoveCount > 0)
 	{
 		for (int32 StackIndex = RemoveIndex; StackIndex < StackSize; ++StackIndex)
 		{
 			CameraModeStack[StackIndex]->OnDeactivation();
 		}
-
 		CameraModeStack.RemoveAt(RemoveIndex, RemoveCount);
 	}
+	return FGGYGOCameraEvaluationResult::Success();
 }
 
-void UGGYGOCameraModeStack::BlendStack(FGGYGOCameraModeView& OutCameraModeView) const
+FGGYGOCameraEvaluationResult UGGYGOCameraModeStack::BlendStack(FGGYGOCameraModeView& OutCameraModeView) const
 {
 	const int32 StackSize = CameraModeStack.Num();
 	if (StackSize == 0)
 	{
-		return;
+		return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("ModeStack"), TEXT("empty-stack"));
 	}
 
-	// 从栈底开始：它是基准，权重视为 1。
-	OutCameraModeView = CameraModeStack[StackSize - 1]->GetCameraModeView();
+	// Keep the established bottom-to-top blend and validate before committing its output.
+	UGGYGOCameraMode* BottomMode = CameraModeStack[StackSize - 1];
+	if (!IsValid(BottomMode))
+	{
+		return FGGYGOCameraEvaluationResult::Failure(BottomMode, TEXT("Mode"), TEXT("invalid-mode"));
+	}
+	FGGYGOCameraModeView CandidateView = BottomMode->GetCameraModeView();
+	FGGYGOCameraEvaluationResult Result = ValidateCameraView(BottomMode, CandidateView);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
 
-	// 往栈顶方向逐层混合。上层权重越高，遮盖下层越彻底。
 	for (int32 StackIndex = StackSize - 2; StackIndex >= 0; --StackIndex)
 	{
-		const UGGYGOCameraMode* CameraMode = CameraModeStack[StackIndex];
-		OutCameraModeView.Blend(CameraMode->GetCameraModeView(), CameraMode->GetBlendWeight());
+		UGGYGOCameraMode* CameraMode = CameraModeStack[StackIndex];
+		if (!IsValid(CameraMode))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("Mode"), TEXT("invalid-mode"));
+		}
+		const float Weight = CameraMode->GetBlendWeight();
+		if (!FMath::IsFinite(Weight) || Weight < 0.0f || Weight > 1.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("BlendWeight"),
+				FMath::IsFinite(Weight) ? TEXT("outside-[0,1]") : TEXT("non-finite"));
+		}
+		if (Weight == 0.0f)
+		{
+			continue;
+		}
+
+		const FGGYGOCameraModeView& ModeView = CameraMode->GetCameraModeView();
+		Result = ValidateCameraView(CameraMode, ModeView);
+		if (!Result.IsSuccess())
+		{
+			return Result;
+		}
+		if (Weight < 1.0f)
+		{
+			Result = ValidateCameraBlendArithmetic(CameraMode, CandidateView, ModeView, Weight);
+			if (!Result.IsSuccess())
+			{
+				return Result;
+			}
+		}
+		CandidateView.Blend(ModeView, Weight);
+		Result = ValidateCameraView(CameraMode, CandidateView);
+		if (!Result.IsSuccess())
+		{
+			return Result;
+		}
 	}
+
+	OutCameraModeView = CandidateView;
+	return FGGYGOCameraEvaluationResult::Success();
 }
 
-void UGGYGOCameraModeStack::EvaluateStack(float DeltaTime, FGGYGOCameraModeView& OutCameraModeView)
+FGGYGOCameraEvaluationResult UGGYGOCameraModeStack::BlendPenetrationRequests(
+	FGGYGOCameraPenetrationRequest& OutPenetrationRequest) const
 {
-	UpdateStack(DeltaTime);
-	BlendStack(OutCameraModeView);
+	const int32 StackSize = CameraModeStack.Num();
+	if (StackSize == 0)
+	{
+		return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("ModeStack"), TEXT("empty-stack"));
+	}
+
+	FGGYGOCameraPenetrationRequest CandidateRequest;
+	float RemainingContribution = 1.0f;
+	float TotalRequestContribution = 0.0f;
+	FVector WeightedPivot = FVector::ZeroVector;
+	float MaxProbeRadius = 0.0f;
+	float SlowestRecoverySpeed = 0.0f;
+	bool bHasPositiveRecoverySpeed = false;
+
+	for (int32 StackIndex = 0; StackIndex < StackSize; ++StackIndex)
+	{
+		UGGYGOCameraMode* CameraMode = CameraModeStack[StackIndex];
+		if (!IsValid(CameraMode))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("Mode"), TEXT("invalid-mode"));
+		}
+		const float BlendWeight = CameraMode->GetBlendWeight();
+		if (!FMath::IsFinite(BlendWeight) || BlendWeight < 0.0f || BlendWeight > 1.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("BlendWeight"),
+				FMath::IsFinite(BlendWeight) ? TEXT("outside-[0,1]") : TEXT("non-finite"));
+		}
+		const bool bIsBottomMode = (StackIndex == StackSize - 1);
+		const float Contribution = bIsBottomMode ? RemainingContribution : RemainingContribution * BlendWeight;
+		if (!FMath::IsFinite(Contribution) || Contribution < 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("Contribution"), TEXT("invalid-blend-arithmetic"));
+		}
+		if (!bIsBottomMode)
+		{
+			RemainingContribution *= (1.0f - BlendWeight);
+			if (!FMath::IsFinite(RemainingContribution) || RemainingContribution < 0.0f)
+			{
+				return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("RemainingContribution"), TEXT("invalid-blend-arithmetic"));
+			}
+		}
+
+		// An invisible mode or an explicitly disabled request contributes no protection policy.
+		const FGGYGOCameraPenetrationRequest& Request = CameraMode->GetCameraPenetrationRequest();
+		if (Contribution == 0.0f || !Request.bEnabled)
+		{
+			continue;
+		}
+		if (!FMath::IsFinite(Request.PivotLocation.X)
+			|| !FMath::IsFinite(Request.PivotLocation.Y) || !FMath::IsFinite(Request.PivotLocation.Z))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("PivotLocation"), TEXT("non-finite"));
+		}
+		if (!FMath::IsFinite(Request.ProbeRadius) || Request.ProbeRadius < 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("ProbeRadius"),
+				FMath::IsFinite(Request.ProbeRadius) ? TEXT("negative") : TEXT("non-finite"));
+		}
+		if (!FMath::IsFinite(Request.RecoverySpeed) || Request.RecoverySpeed < 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("RecoverySpeed"),
+				FMath::IsFinite(Request.RecoverySpeed) ? TEXT("negative") : TEXT("non-finite"));
+		}
+
+		const double WeightedX = WeightedPivot.X + Request.PivotLocation.X * Contribution;
+		const double WeightedY = WeightedPivot.Y + Request.PivotLocation.Y * Contribution;
+		const double WeightedZ = WeightedPivot.Z + Request.PivotLocation.Z * Contribution;
+		const float NewTotalContribution = TotalRequestContribution + Contribution;
+		if (!FMath::IsFinite(WeightedX) || !FMath::IsFinite(WeightedY) || !FMath::IsFinite(WeightedZ))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("WeightedPivot"), TEXT("non-finite-aggregate-arithmetic"));
+		}
+		if (!FMath::IsFinite(NewTotalContribution) || NewTotalContribution <= 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("TotalRequestContribution"), TEXT("invalid-aggregate-arithmetic"));
+		}
+		WeightedPivot = FVector(WeightedX, WeightedY, WeightedZ);
+		TotalRequestContribution = NewTotalContribution;
+		CandidateRequest.bEnabled = true;
+		MaxProbeRadius = FMath::Max(MaxProbeRadius, Request.ProbeRadius);
+		if (Request.RecoverySpeed > 0.0f
+			&& (!bHasPositiveRecoverySpeed || Request.RecoverySpeed < SlowestRecoverySpeed))
+		{
+			SlowestRecoverySpeed = Request.RecoverySpeed;
+			bHasPositiveRecoverySpeed = true;
+		}
+	}
+
+	if (CandidateRequest.bEnabled)
+	{
+		const double InverseContribution = 1.0 / static_cast<double>(TotalRequestContribution);
+		const double PivotX = WeightedPivot.X * InverseContribution;
+		const double PivotY = WeightedPivot.Y * InverseContribution;
+		const double PivotZ = WeightedPivot.Z * InverseContribution;
+		if (!FMath::IsFinite(InverseContribution)
+			|| !FMath::IsFinite(PivotX) || !FMath::IsFinite(PivotY) || !FMath::IsFinite(PivotZ))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("PivotLocation"), TEXT("non-finite-aggregate-normalization"));
+		}
+		CandidateRequest.PivotLocation = FVector(PivotX, PivotY, PivotZ);
+		CandidateRequest.ProbeRadius = MaxProbeRadius;
+		// Zero is the selected legal policy only when every contributing speed is zero.
+		CandidateRequest.RecoverySpeed = bHasPositiveRecoverySpeed ? SlowestRecoverySpeed : 0.0f;
+	}
+	OutPenetrationRequest = CandidateRequest;
+	return FGGYGOCameraEvaluationResult::Success();
+}
+
+FGGYGOCameraEvaluationResult UGGYGOCameraModeStack::EvaluateStack(float DeltaTime,
+	FGGYGOCameraModeView& OutCameraModeView, FGGYGOCameraPenetrationRequest& OutPenetrationRequest)
+{
+	if (CameraModeStack.IsEmpty())
+	{
+		return FGGYGOCameraEvaluationResult::Failure(nullptr, TEXT("ModeStack"), TEXT("empty-stack"));
+	}
+	for (UGGYGOCameraMode* CameraMode : CameraModeStack)
+	{
+		if (!IsValid(CameraMode))
+		{
+			return FGGYGOCameraEvaluationResult::Failure(CameraMode, TEXT("Mode"), TEXT("invalid-mode"));
+		}
+	}
+
+	FGGYGOCameraEvaluationResult Result = UpdateStack(DeltaTime);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+	FGGYGOCameraModeView CandidateView;
+	FGGYGOCameraPenetrationRequest CandidateRequest;
+	Result = BlendPenetrationRequests(CandidateRequest);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+	Result = BlendStack(CandidateView);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
+	OutCameraModeView = CandidateView;
+	OutPenetrationRequest = CandidateRequest;
+	return FGGYGOCameraEvaluationResult::Success();
 }

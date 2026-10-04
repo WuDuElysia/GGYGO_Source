@@ -15,7 +15,7 @@
  * ## 四种结束路径的区别
  * | 委托 | 触发时机 | 能力通常该做什么 |
  * |---|---|---|
- * | `OnCompleted`   | 播到自然结尾 | 正常收尾，结束能力 |
+ * | `OnCompleted`   | 原实例播到自然结尾 | 调用方验证原能力生命周期后正常收尾 |
  * | `OnBlendOut`    | 开始混出（还没播完） | 提前允许下一个动作衔接 |
  * | `OnInterrupted` | 被别的 Montage 顶掉 | 中断收尾，不结算未完成的判定 |
  * | `OnCancelled`   | 能力自身被取消 | 同上，且要清理已施加的状态 |
@@ -26,13 +26,21 @@
 #pragma once
 
 #include "Abilities/Tasks/AbilityTask.h"
+#include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "GameplayTagContainer.h"
 
 #include "GGYGOAbilityTask_PlayMontageAndWaitForEvent.generated.h"
 
 class UAnimMontage;
+class UAnimInstance;
+class AActor;
+class ACharacter;
+class UAbilitySystemComponent;
 class UGameplayAbility;
+class USkeletalMeshComponent;
 class UObject;
+struct FAnimMontageInstance;
+struct FGameplayAbilityActorInfo;
 struct FGameplayEventData;
 
 /**
@@ -53,6 +61,10 @@ class GGYGO_API UGGYGOAbilityTask_PlayMontageAndWaitForEvent : public UAbilityTa
 
 public:
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent(const FObjectInitializer& ObjectInitializer);
+	/** 统一计算 Montage Task 速率快照：TaskRate 只含一次全局缩放，EffectiveRate 再乘资产 RateScale。 */
+	static bool ResolvePlayRate(const UAnimMontage* Montage, float RequestedRate, float& OutTaskPlayRate, float& OutEffectivePlayRate);
+	/** 返回此任务准备播放的有效速率快照，供同一次播放的 watchdog 使用。 */
+	float GetEffectivePlayRate() const { return EffectivePlayRate; }
 
 	virtual void Activate() override;
 	virtual void ExternalCancel() override;
@@ -83,7 +95,7 @@ public:
 		bool bStopWhenAbilityEnds = true,
 		float AnimRootMotionTranslationScale = 1.0f);
 
-	/** 播到自然结尾。 */
+	/** 原实例播到自然结尾的事实；不证明它仍为 ASC 当前播放，也不授予结束后继 GA 的权力。 */
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOPlayMontageAndWaitForEventBPDelegate OnCompleted;
 
@@ -104,14 +116,35 @@ public:
 	FGGYGOPlayMontageAndWaitForEventBPDelegate EventReceived;
 
 private:
+	friend class FGGYGOMontageTaskLifecycleTest;
+	struct FInFlightMontagePlayCleanup;
+
 	/** 当前 Montage 是否仍由本任务驱动。 */
 	bool IsNotifyValid() const;
+	/** 原 Task/Ability/ASC 关联及 ActorInfo 分配、Owner、Avatar、Mesh、AnimInstance 是否仍一致。 */
+	bool IsActivatedActorInfoCurrent() const;
+	/** 排队的实例委托仍对应本任务保存的原 Guard 身份；不查询 ASC 当前播放。 */
+	bool MatchesOriginalMontageCallback(const FGGYGOMontagePlayGuardIdentity& Original) const;
+	/** 按捕获的 AnimInstance 和 instance ID 取本任务的播放实例。 */
+	FAnimMontageInstance* GetTaskMontageInstance() const;
+	/** 只解除属于本 Task 的实例委托。 */
+	void UnbindTaskMontageDelegates(FAnimMontageInstance* Instance);
+	/** 只记录本次外调返回后须清理原实例的义务，不发行播放身份。 */
+	void RequestInFlightMontageStop();
+	/** 可定位失败后只取消并结束本 Task；外调返回时重检原 Task。 */
+	void FailAndEndTask(const TCHAR* Reason, const FGGYGOAbilityMontagePlaybackResult* Result = nullptr);
+	/** 释放本任务持有的 root motion scale token。 */
+	void ReleaseRootMotionScaleLease();
 
 	/** Montage 混出回调。 */
 	void OnMontageBlendingOut(UAnimMontage* Montage, bool bInterrupted);
+	void OnMontageBlendingOutForInstance(UAnimMontage* Montage, bool bInterrupted,
+		FGGYGOMontagePlayGuardIdentity Original);
 
 	/** Montage 结束回调。 */
 	void OnMontageEnded(UAnimMontage* Montage, bool bInterrupted);
+	void OnMontageEndedForInstance(UAnimMontage* Montage, bool bInterrupted,
+		FGGYGOMontagePlayGuardIdentity Original);
 
 	/** 能力被取消回调。 */
 	void OnAbilityCancelled();
@@ -133,6 +166,13 @@ private:
 	/** 播放速率。 */
 	UPROPERTY()
 	float Rate;
+
+	/** Montage RateScale 参与计算后的同次播放速率快照。 */
+	UPROPERTY()
+	float EffectivePlayRate = 1.0f;
+
+	/** 工厂已验证播放配置；无效时 Activate 会取消并结束任务。 */
+	bool bHasValidConfiguration = false;
 
 	/** 起始 Section。 */
 	UPROPERTY()
@@ -161,4 +201,19 @@ private:
 	int32 MontageInstanceId = INDEX_NONE;
 	bool bEndingTask = false;
 	bool bBlendingOut = false;
+	/** 本 Task 的取消通知只执行一次，阻止 BP 回调重入重复释放/广播。 */
+	bool bCancellationRequested = false;
+	FGGYGOAbilityMontagePlaybackHandle OriginalPlayback;
+	FGGYGOMontagePlayGuardIdentity OriginalGuardIdentity;
+	/** 与调用栈共持停止义务，Task 被结束/销毁也不丢失；完整播放返回后释放。 */
+	TSharedPtr<FInFlightMontagePlayCleanup> InFlightMontagePlayCleanup;
+	TWeakPtr<FGameplayAbilityActorInfo> ActivatedActorInfo;
+	TWeakObjectPtr<UGameplayAbility> ActivatedAbility;
+	TWeakObjectPtr<AActor> ActivatedOwnerActor;
+	TWeakObjectPtr<USkeletalMeshComponent> ActivatedMesh;
+	TWeakObjectPtr<AActor> ActivatedAvatarActor;
+	TWeakObjectPtr<ACharacter> ActivatedCharacter;
+	TWeakObjectPtr<UAnimInstance> ActivatedAnimInstance;
+	TWeakObjectPtr<UAbilitySystemComponent> ActivatedASC;
+	uint64 RootMotionScaleLeaseToken = 0;
 };

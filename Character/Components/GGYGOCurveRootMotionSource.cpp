@@ -1,6 +1,7 @@
 #include "Character/Components/GGYGOCurveRootMotionSource.h"
 
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
+#include "Character/Data/GGYGOMovementSet.h"
 #include "GameFramework/Character.h"
 
 FRootMotionSource_GGYGOCurve::FRootMotionSource_GGYGOCurve()
@@ -36,6 +37,10 @@ bool FRootMotionSource_GGYGOCurve::Matches(const FRootMotionSource* Other) const
 
 	// 基类已经保证 ScriptStruct 相同，可以安全 static_cast。
 	const FRootMotionSource_GGYGOCurve* OtherCast = static_cast<const FRootMotionSource_GGYGOCurve*>(Other);
+	if ((Origin.IsValid() || OtherCast->Origin.IsValid()) && Origin != OtherCast->Origin)
+	{
+		return false;
+	}
 
 	return FMath::IsNearlyEqual(BaseYaw, OtherCast->BaseYaw, 0.1f)
 		&& FMath::IsNearlyEqual(SpeedScale, OtherCast->SpeedScale, UE_SMALL_NUMBER)
@@ -44,13 +49,14 @@ bool FRootMotionSource_GGYGOCurve::Matches(const FRootMotionSource* Other) const
 
 bool FRootMotionSource_GGYGOCurve::MatchesAndHasSameState(const FRootMotionSource* Other) const
 {
-	// 本类型没有独立的运行状态：每帧的速度与方向都是从组件现取的，
-	// 时间由基类维护。所以基类的检查已经足够。
-	return FRootMotionSource::MatchesAndHasSameState(Other);
+	return Matches(Other) && FRootMotionSource::MatchesAndHasSameState(Other);
 }
 
 bool FRootMotionSource_GGYGOCurve::UpdateStateFrom(const FRootMotionSource* SourceToTakeStateFrom, bool bMarkForSimulatedCatchup)
 {
+	if (!SourceToTakeStateFrom || SourceToTakeStateFrom->GetScriptStruct() != GetScriptStruct()) return false;
+	const FRootMotionSource_GGYGOCurve* Other = static_cast<const FRootMotionSource_GGYGOCurve*>(SourceToTakeStateFrom);
+	if ((Origin.IsValid() || Other->Origin.IsValid()) && Origin != Other->Origin) return false;
 	return FRootMotionSource::UpdateStateFrom(SourceToTakeStateFrom, bMarkForSimulatedCatchup);
 }
 
@@ -61,81 +67,70 @@ void FRootMotionSource_GGYGOCurve::PrepareRootMotion(
 	const UCharacterMovementComponent& MoveComponent)
 {
 	RootMotionParams.Clear();
-
-	const UGGYGOCharacterMovementComponent* CurveMoveComp = Cast<UGGYGOCharacterMovementComponent>(&MoveComponent);
-
-	// 退场帧必须把当前速度原样输出，不能置 Finished 就直接返回。
-	//
-	// 引擎在 `FRootMotionSourceGroup::PrepareRootMotion` 里遍历**所有**有效源
-	// （不看 Finished 也不看 MarkedForRemoval），并在调用完 `PrepareRootMotion`
-	// 之后无条件置 `bHasOverrideSources`。也就是说置了 Finished 的这一帧
-	// Override 照样生效，而 `RootMotionParams` 空着时 translation 是零 ——
-	// 水平速度会被硬清一帧。踏空时的表现就是原地竖直下落。
-	//
-	// 原样输出当前速度让这一帧的 Override 成为空操作，动量得以保留；
-	// 引擎下一帧的 `CleanUpInvalidRootMotion` 会把源摘掉，`CalcVelocity` 随即恢复。
-	const auto FinishPreservingMomentum = [&]()
+	UGGYGOCharacterMovementComponent* OriginalOwner = Origin.IsValid() ? Origin->Owner.Get() : nullptr;
+	if (!OriginalOwner || OriginalOwner != Character.GetCharacterMovement()
+		|| static_cast<const UCharacterMovementComponent*>(OriginalOwner) != &MoveComponent)
 	{
-		RootMotionParams.Set(FTransform(MoveComponent.Velocity));
-		Status.SetFlag(ERootMotionSourceStatusFlags::Finished);
-		SetTime(GetTime() + SimulationTime);
-	};
-
-	// 离地必须退场。`PhysFalling` 与 `PhysWalking` 用同一个判据跳过 `CalcVelocity`，
-	// 也就是说 Override source 在空中会连重力一起顶掉，角色会沿曲线方向平飘出去。
-	if (!CurveMoveComp || !MoveComponent.IsMovingOnGround())
-	{
-		FinishPreservingMomentum();
-		return;
-	}
-
-	const FGGYGOAnimCurveMotion& Motion = CurveMoveComp->GetCurveMotion();
-	const float Speed = Motion.Speed * SpeedScale;
-	const bool bNoSpeed = !Motion.HasUsableSpeed() || Speed <= UE_KINDA_SMALL_NUMBER;
-
-	if (bNoSpeed)
-	{
-		if (bEndOnZeroSpeed)
+		// A retired/unproven contribution must not override a successor or independent action.
+		RootMotionParams.Set(FTransform::Identity);
+		AccumulateMode = ERootMotionAccumulateMode::Additive;
+		Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+		Prepared.Reset();
+		if (!bOriginDiagnosticReported)
 		{
-			FinishPreservingMomentum();
-			return;
+			bOriginDiagnosticReported = true;
+			UE_LOG(LogTemp, Error,
+				TEXT("Movement CurveRMS rejected: Character='%s', Source='%s', OriginalCMC='%s', Reason='missing or mismatched local Origin; imported NetSerialize origins are not supported'."),
+				*Character.GetPathName(), *InstanceName.ToString(), *GetPathNameSafe(OriginalOwner));
 		}
-
-		// 留场但输出零速度。动画这几帧确实原地不动，退场会让 `CalcVelocity`
-		// 用玩家输入把角色推走。
-		RootMotionParams.Set(FTransform(FVector::ZeroVector));
-		SetTime(GetTime() + SimulationTime);
 		return;
 	}
 
-	FVector LocalDirection(Motion.Direction.X, Motion.Direction.Y, 0.0f);
-	if (LocalDirection.IsNearlyZero())
+	TSharedPtr<const FGGYGOCurveRootMotionPrepared> Result;
+	FString Error;
+	const EGGYGOCurveRootMotionPrepareResult Disposition =
+		OriginalOwner->PrepareLocomotionCurveRootMotion(*this, SimulationTime, MovementTickTime, Result, Error);
+	if (Disposition == EGGYGOCurveRootMotionPrepareResult::Prepared
+		|| Disposition == EGGYGOCurveRootMotionPrepareResult::Finished)
 	{
-		// 有速度但没方向时沿基准朝向直行。让速度作废会让角色在刹车段原地不动，
-		// 那比方向略有偏差更糟。
-		LocalDirection = FVector::ForwardVector;
+		check(Result.IsValid());
+		Prepared = Result;
+		RootMotionParams.Set(FTransform(Result->OverrideVelocity));
+		SetTime(Result->NativeEndTime);
+		if (Disposition == EGGYGOCurveRootMotionPrepareResult::Finished)
+		{
+			Status.SetFlag(ERootMotionSourceStatusFlags::Finished);
+		}
+		return;
 	}
 
-	const FVector WorldVelocity =
-		FRotator(0.0f, BaseYaw, 0.0f).RotateVector(LocalDirection.GetSafeNormal2D()) * Speed;
-
-	// RootMotionParams 的 translation 是**速度**（cm/s），不是本帧位移 ——
-	// 引擎在 `AccumulateRootMotionVelocityFromSource` 里直接把它赋给 Velocity。
-	FTransform NewTransform(WorldVelocity);
-
-	// 服务器追帧时一个 tick 要补算多段模拟时间。位移是 `MovementTickTime * Velocity`，
-	// 要凑出 `Speed * SimulationTime` 的位移就得按这个比例放大速度。
-	// 正常帧两者相等，系数为 1。
-	const float Multiplier = (MovementTickTime > UE_SMALL_NUMBER) ? (SimulationTime / MovementTickTime) : 1.0f;
-	NewTransform.ScaleTranslation(Multiplier);
-
-	RootMotionParams.Set(NewTransform);
-
-	SetTime(GetTime() + SimulationTime);
+	Prepared.Reset();
+	RootMotionParams.Set(FTransform::Identity);
+	Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+	if (Disposition != EGGYGOCurveRootMotionPrepareResult::Failed)
+	{
+		// Native traversal still accumulates removed sources. Additive identity is retirement,
+		// not a replacement movement mode, and cannot zero a later request's Override.
+		AccumulateMode = ERootMotionAccumulateMode::Additive;
+	}
+	if (!Error.IsEmpty() && !bOriginDiagnosticReported)
+	{
+		bOriginDiagnosticReported = true;
+		UE_LOG(LogTemp, Error,
+			TEXT("Movement CurveRMS rejected: Character='%s', Source='%s', CMC='%s', ExecutionRequest=%llu, MovementSet='%s', Reason='%s'."),
+			*Character.GetPathName(), *InstanceName.ToString(), *OriginalOwner->GetPathName(),
+			static_cast<unsigned long long>(Origin->ExecutionRequestSerial),
+			*GetPathNameSafe(Origin->MovementSet.Get()), *Error);
+	}
 }
-
 bool FRootMotionSource_GGYGOCurve::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
 {
+	if (Ar.IsLoading())
+	{
+		Origin.Reset();
+		Prepared.Reset();
+		bOriginDiagnosticReported = false;
+	}
 	if (!FRootMotionSource::NetSerialize(Ar, Map, bOutSuccess))
 	{
 		return false;

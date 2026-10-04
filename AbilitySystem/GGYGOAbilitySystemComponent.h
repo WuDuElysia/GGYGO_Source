@@ -4,14 +4,11 @@
  *
  * 在 GAS 原生 ASC 之上加三块能力：
  *
- * ## 1. 输入三阶段缓存
- * GAS 原生没有"按住持续尝试激活"的概念，也没有把输入与 Ability 解耦的机制。
- * 这里用 InputTag 精确匹配 AbilitySpec 的动态源标签（由 `UGGYGOAbilitySet` 授予时写入），
- * 把输入分成 pressed / held / released 三个缓存，每帧由 `ProcessAbilityInput` 统一消费。
- *
- * 分三阶段而不是按下就激活的原因：如果 held 先激活了能力，随后 pressed 又把同一次按下
- * 当成输入事件发给刚创建的实例，能力会收到一次它不该收到的 InputPressed。
- * 所以 held 和 pressed 只收集句柄，第三阶段才统一 `TryActivateAbility`。
+ * ## 1. 原输入请求与有序聚合缓存
+ * ASC发行输入请求身份，首次精确匹配InputTag并固定Spec集合与原截止/Actor/World。
+ * 同Spec任一原来源held即保持；只缓存首按/末真实释放边沿，Invalidated不伪造释放。
+ * ProcessAbilityInput沿边沿顺序消费，再处理精确retry与held，每帧每Spec最多一次Try。
+ * Pressed只送给原本已活跃的Spec，不把刚由同一按下激活的实例再当成第二次按下。
  *
  * ## 2. 组仲裁（表驱动）
  * 用 `ActiveAbilitiesByGroup` 按组 Tag 索引正在运行的能力，替代 Lyra 的三元素计数数组。
@@ -29,33 +26,129 @@
  * 仲裁只做"拒绝"，不做"排队"。`SingleInstanceQueued` 被拒时返回
  * `GroupOccupiedQueued` 原因，重试由意图层的输入缓冲负责，
  * 或订阅 `OnAbilityGroupFreed` 在组空出瞬间重试。
- * ASC 内不设第二个队列 —— 两个队列会在"哪个才是真实待激活列表"上产生歧义。
+ * ASC 只暂存意图层提交给下一次输入消费的 retry 请求，不维护第二套组排队状态。
  *
  * ## 3. Tag 关系扩展
  * 把 `UGGYGOAbilityTagRelationshipMapping` 的查询结果接进 GAS 的阻断/取消判定。
  *
  * ## 谁来调用 ProcessAbilityInput
- * 目前**没有调用方**，输入链路因此是断的。
- * 它需要每帧被驱动，归属是 `UGGYGOHeroComponent` 或 PlayerController 的 Tick，
- * 而那两处都还没有建立。这是已知边界，不是漏实现。
+ * PlayerController 的 PostProcessInput 是唯一帧末驱动；Hero 负责物理输入与重试意图。
  */
 #pragma once
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
+#include "AbilitySystem/GGYGOAvatarBindingTypes.h"
+#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
+#include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
 #include "NativeGameplayTags.h"
+#include "Templates/SharedPointer.h"
 
 #include "GGYGOAbilitySystemComponent.generated.h"
 
 class AActor;
+class APlayerController;
+class UAnimInstance;
+class UMovementComponent;
+class USkeletalMeshComponent;
 class UGameplayAbility;
 class UGGYGOAbilityGroupConfig;
 class UGGYGOAbilityTagRelationshipMapping;
 class UObject;
+class UWorld;
 struct FFrame;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOAbilityGroupRule;
+struct FGGYGOMontagePlayGuardResult;
+
+/**
+ * Subscriber-only view of immutable original termination history.
+ * As with K4, private inheritance prevents callers from reaching native Broadcast/Clear;
+ * only ASC may dispatch. Subscription/removal does not grant completion or restart authority.
+ */
+class FGGYGOAbilityTerminationCompletedEvent : private TMulticastDelegate<
+	void(const FGGYGOAbilityTerminationCompletedNotice&)>
+{
+	using FBase = TMulticastDelegate<void(const FGGYGOAbilityTerminationCompletedNotice&)>;
+
+public:
+	using FDelegate = FBase::FDelegate;
+	using FBase::Add;
+	using FBase::AddLambda;
+	using FBase::AddWeakLambda;
+	using FBase::AddUObject;
+	using FBase::AddSP;
+	using FBase::AddStatic;
+	using FBase::Remove;
+	using FBase::RemoveAll;
+	using FBase::IsBound;
+	using FBase::IsBoundToObject;
+
+	FGGYGOAbilityTerminationCompletedEvent() = default;
+	FGGYGOAbilityTerminationCompletedEvent(const FGGYGOAbilityTerminationCompletedEvent&) = delete;
+	FGGYGOAbilityTerminationCompletedEvent& operator=(const FGGYGOAbilityTerminationCompletedEvent&) = delete;
+
+private:
+	friend class UGGYGOAbilitySystemComponent;
+};
+
+/**
+ * Copyable ASC-created publication evidence; not a current binding or publication permission.
+ * Default construction is empty. Copies share immutable history without retaining actors,
+ * caller queries or ActorInfo allocations. Only ASC can create and install the private proof.
+ */
+class GGYGO_API FGGYGOAvatarBindingPublicationReceipt final
+{
+public:
+	FGGYGOAvatarBindingPublicationReceipt() = default;
+
+	/**
+	 * Game thread only. Reset both independent caller outputs before reading.
+	 * Empty returns false with default Rejected/InvalidRequest and Invalid notice.
+	 * True only means historical copies exist; it does not validate current state or readiness.
+	 * Writable output copies cannot modify the stored proof or authorize publication.
+	 */
+	bool TryGetCommittedEvidence(FGGYGOAvatarBindingResult& OutResult,
+		FGGYGOAvatarBindingNotice& OutNotice) const;
+
+private:
+	struct FCommitPublicationProof;
+	TSharedPtr<const FCommitPublicationProof> Proof{};
+
+	friend class UGGYGOAbilitySystemComponent;
+};
+
+/**
+ * UE5.8 DECLARE_EVENT does not restrict Broadcast. This native subscriber view does.
+ * Only ASC can dispatch; receivers still validate the receipt and their own resource.
+ */
+class FGGYGOAvatarBindingNoticeEvent final : private TMulticastDelegate<
+	void(const FGGYGOAvatarBindingPublicationReceipt&, const FGGYGOAvatarBindingNotice&)>
+{
+	using FBase = TMulticastDelegate<
+		void(const FGGYGOAvatarBindingPublicationReceipt&, const FGGYGOAvatarBindingNotice&)>;
+
+public:
+	using FDelegate = FBase::FDelegate;
+	using FBase::Add;
+	using FBase::AddLambda;
+	using FBase::AddWeakLambda;
+	using FBase::AddUObject;
+	using FBase::AddSP;
+	using FBase::AddStatic;
+	using FBase::Remove;
+	using FBase::RemoveAll;
+	using FBase::IsBound;
+	using FBase::IsBoundToObject;
+
+	FGGYGOAvatarBindingNoticeEvent() = default;
+	FGGYGOAvatarBindingNoticeEvent(const FGGYGOAvatarBindingNoticeEvent&) = delete;
+	FGGYGOAvatarBindingNoticeEvent& operator=(const FGGYGOAvatarBindingNoticeEvent&) = delete;
+
+private:
+	friend class UGGYGOAbilitySystemComponent;
+};
 
 /**
  * 持有此 Tag 时整帧 Ability 输入被屏蔽。
@@ -73,16 +166,12 @@ GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_GGYGO_Gameplay_AbilityInputBlocked)
 DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityGroupFreed, FGameplayTag /*GroupTag*/);
 
 /**
- * 某个 InputTag 的激活请求被拒但值得重试。
- *
- * 只在失败原因是"组内已有实例且该组严格先来后到"时广播 ——
- * 冷却、资源不足这类原因重试也不会成功。
- *
- * 参数是 InputTag 而不是能力句柄：意图层缓冲的是"玩家按了什么键"，
- * 重试时应当重新走一遍完整的输入处理（那期间可能有更高优先级的能力
- * 变得可用），而不是死盯着当初那一个句柄。
+ * A real B0 Queued failure for this exact ASC-issued request.
+ * Initial press and finite retry both carry the original finite deadline.
+ * Subscribers own only copied IDs/deadlines; no Tag inference or new window.
  */
-DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityInputRetryable, FGameplayTag /*InputTag*/);
+DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityInputRetryable,
+	const FGGYGOAbilityInputRetryRequest& /*OriginalRequest*/);
 
 UCLASS()
 class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
@@ -92,13 +181,157 @@ class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
 public:
 	UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
+	/**
+	 * Identity-only APIs; game thread only. No native binding or write-window execution.
+	 * The getter returns the last committed value, including a revoked value.
+	 * Query success proves current recorded identity/fields, never binding execution or authority.
+	 * OutReason is reset on entry. Output arguments must be independent caller-stack values.
+	 */
+	FGGYGOAvatarBindingContext GetAvatarBindingContext() const;
+	EGGYGOAvatarBindingOutcome CheckAvatarBindingIdentity(
+		const FGGYGOAvatarBindingIdentity& Expected, EGGYGOAvatarBindingReason& OutReason) const;
+	EGGYGOAvatarBindingOutcome CheckAvatarBindingContext(
+		const FGGYGOAvatarBindingContext& Expected, EGGYGOAvatarBindingReason& OutReason) const;
+	/**
+	 * Original committed-resource cleanup only, including a still allocated destroying actor.
+	 * Exact revoked provenance may authorize cleanup; this never grants binding/Ready admission.
+	 * Real ActorInfo writes retire the old snapshot. No mutation or callback in this query.
+	 */
+	EGGYGOAvatarBindingOutcome CheckAvatarBindingCleanupContext(
+		const FGGYGOAvatarBindingContext& Expected, EGGYGOAvatarBindingReason& OutReason) const;
+	/**
+	 * Revoke only the exact committed context; never revoke an operation which refers to it.
+	 * LifecycleClosed/ActorInfoMismatch/OperationInvalidated/RequestContextExpired are valid reasons.
+	 * Repeated matching revocation is idempotent. No ActorInfo writes, callbacks or native cleanup.
+	 */
+	bool InvalidateAvatarBinding(const FGGYGOAvatarBindingContext& Expected,
+		EGGYGOAvatarBindingReason Reason, EGGYGOAvatarBindingReason& OutRejectionReason);
+
+	/**
+	 * ActorInfo transactions; game thread only. Reset the independent caller-stack
+	 * OutPublication on entry; only this operation's commit creates historical evidence.
+	 * Init/Clear/Refresh use the real native write window and qualified Super calls.
+	 * Ordinary, never-committed Bootstrap and exact revoked-context replacement are
+	 * distinct admissions. Clear consumes committed cleanup provenance and keeps its explicit mode;
+	 * PreserveOwner rejects a closing Owner/ASC host. Commit is not Host publication or readiness.
+	 */
+	FGGYGOAvatarBindingResult TryExecuteAvatarActorInfoTransaction(
+		const FGGYGOAvatarBindingRequest& Request,
+		FGGYGOAvatarBindingPublicationReceipt& OutPublication);
+	FGGYGOAvatarBindingResult TryBootstrapAvatarActorInfoTransaction(
+		const FGGYGOAvatarBindingRequest& Request,
+		FGGYGOAvatarBindingPublicationReceipt& OutPublication);
+	FGGYGOAvatarBindingResult TryReplaceRevokedAvatarActorInfoTransaction(
+		const FGGYGOAvatarBindingRequest& Request,
+		FGGYGOAvatarBindingPublicationReceipt& OutPublication);
+	/**
+	 * Consume only the stored actual write of an original returned, never-committed failed Init.
+	 * Required pure cleanup-scope query runs only inside the synchronous native write window.
+	 * No rollback, binding commit, Receipt, Notice or Ready; the original Init remains failed.
+	 * Later actual ActorInfo writers retire this resource. No source is inferred on cleanup entry.
+	 */
+	FGGYGOAvatarBindingResult TryCleanupFailedAvatarActorInfoInit(
+		const FGGYGOAvatarBindingOperationIdentity& OriginalOperation,
+		TFunction<bool()> IsOriginalCallerCurrent);
+
+	/**
+	 * Cancel in the exact original context under one synchronous native Busy window.
+	 * Required pure caller query is invoked only inside that window and never retained.
+	 * Snapshot both tag values and null modes: null WithTags matches all; empty matches none.
+	 * Uses committed cleanup provenance, including Destroy/revoked originals; never new-work admission.
+	 * Success means native return with original ownership, not that every ability has ended.
+	 * Close matching publication permission only; no binding commit, Receipt or Notice.
+	 */
+	FGGYGOAvatarBindingResult TryCancelAvatarBindingAbilities(
+		const FGGYGOAvatarBindingContext& Expected,
+		const FGameplayTagContainer* WithTags,
+		const FGameplayTagContainer* WithoutTags,
+		TFunction<bool()> IsOriginalCallerCurrent);
+
+	/**
+	 * Remove native Cues in the exact original context under one synchronous Busy window.
+	 * Required pure caller query proves its original cleanup scope independently of Ready.
+	 * Uses committed cleanup provenance, including Destroy/revoked originals; never new-work admission.
+	 * Preserve native Active cue tag, authority/prediction and deferred Notify semantics.
+	 * Success proves synchronous return with original ownership; no binding commit or Notice.
+	 */
+	FGGYGOAvatarBindingResult TryRemoveAvatarBindingGameplayCues(
+		const FGGYGOAvatarBindingContext& Expected,
+		TFunction<bool()> IsOriginalCallerCurrent);
+
+	/** Real native stack window; independent of the I1 identity slot. No automatic queue. */
+	bool IsAvatarBindingNativeWriteBusy() const;
+
+	/**
+	 * Publish the exact current ASC-created proof after caller publication.
+	 * The required pure game-thread query lives only for this synchronous call.
+	 * Historical commit remains true on later publication failure; no rollback or replay.
+	 */
+	FGGYGOAvatarBindingResult PublishAvatarBindingNotice(
+		const FGGYGOAvatarBindingPublicationReceipt& Publication,
+		TFunction<bool()> IsPublicationContextCurrent);
+	/** Only the exact real Dispatching proof qualifies; history and Pending never do. */
+	bool IsAvatarBindingNoticeDispatching(
+		const FGGYGOAvatarBindingPublicationReceipt& Publication) const;
+	/** Current Dispatching/successful Consumed publication only; not global Ready. */
+	bool IsAvatarBindingPublicationContextCurrent(
+		const FGGYGOAvatarBindingContext& Expected) const;
+	/** Native subscriptions only; external code cannot Broadcast. Game thread only. */
+	FGGYGOAvatarBindingNoticeEvent& OnAvatarBindingNotice();
+
 	//~UAbilitySystemComponent interface
 	/**
 	 * Owner / Avatar 绑定或切换时调用。
 	 * 检测到**新的 Pawn Avatar** 时通知所有能力实例，并按 OnSpawn 策略尝试激活。
 	 */
 	virtual void InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor) override;
+	/** Legacy native clear: window-guarded; revoke exact evidence before any write. */
+	virtual void ClearActorInfo() override;
+	/**
+	 * Shadows the nonvirtual base method for project-typed callers; NOT an override.
+	 * Base-typed or qualified base calls cannot be intercepted by this entry.
+	 */
+	void RefreshAbilityActorInfo();
+	/** Guard Anim 使用受保护入口；非 Guard 保留唯一原生调用，明确不提供重入保护。 */
+	virtual float PlayMontage(UGameplayAbility* InAnimatingAbility, FGameplayAbilityActivationInfo ActivationInfo,
+		UAnimMontage* NewAnimMontage, float InPlayRate, FName StartSectionName = NAME_None,
+		float StartTimeSeconds = 0.0f) override;
 	//~End of UAbilitySystemComponent interface
+
+	/**
+	 * 仅供 C++ 消费的受保护播放；非 Guard 返回 Unsupported/0，绝不回退原生调用。
+	 * 固定以本 ASC 协调，scope 覆盖完整 GAS Super 调用。OutResult 是本次结果副本，
+	 * 调用方应使用栈上输出，不能绑定同步回调中可能已结束对象的成员。
+	 * AdditionalQuery 可为空；非空时必须是无副作用的游戏线程查询，捕获引用须活过调用。
+	 * 需要有效的原 ActorInfo/Avatar/Mesh/Anim 及活跃的已授予能力实例。
+	 */
+	float PlayMontageWithGuard(UGameplayAbility* InAnimatingAbility, FGameplayAbilityActivationInfo ActivationInfo,
+		UAnimMontage* NewAnimMontage, float InPlayRate, FName StartSectionName, float StartTimeSeconds,
+		FGGYGOMontagePlayGuardResult& OutResult, TFunction<bool()> IsAdditionalCallerContextCurrent);
+
+	/** Guarded play; missing caller query/unsupported Guard never falls back to legacy play. */
+	FGGYGOAbilityMontagePlaybackResult TryPlayMontageWithOwnership(UGameplayAbility* Ability,
+		FGameplayAbilityActivationInfo ActivationInfo, UAnimMontage* Montage, float PlayRate,
+		FName StartSection, float StartTimeSeconds, TFunction<bool()> IsOriginalCallerCurrent);
+	/** Pure original-write ownership, including a stopped/removed engine instance. */
+	FGGYGOAbilityMontageOwnershipCheck CheckMontagePlaybackOwnership(
+		const FGGYGOAbilityMontagePlaybackHandle& Original) const;
+	/** Capture only an existing authenticated record; no identity inferred from GA or asset. */
+	FGGYGOAbilityMontageOwnershipCheck CaptureMontagePlaybackOwnership(UGameplayAbility* OriginalAbility,
+		FGameplayAbilitySpecHandle OriginalSpecHandle, FGameplayAbilityActivationInfo OriginalActivationInfo) const;
+	/** Clear only this authenticated native write, at the caller's original blend-out boundary. */
+	FGGYGOAbilityMontageClearResult TryClearMontageAnimatingAbility(
+		const FGGYGOAbilityMontagePlaybackHandle& Original);
+	/** Observe real legacy/native mutation; these entries create no authenticated handle. */
+	virtual void ClearAnimatingAbility(UGameplayAbility* Ability) override;
+	virtual float PlayMontageSimulated(UAnimMontage* Montage, float PlayRate,
+		FName StartSectionName = NAME_None) override;
+	virtual UAnimMontage* PlaySlotAnimationAsDynamicMontage_WithFractionalLoops(UGameplayAbility* Ability,
+		FGameplayAbilityActivationInfo ActivationInfo, UAnimSequenceBase* AnimAsset, FName SlotName,
+		float BlendInTime, float BlendOutTime, float PlayRate = 1.0f,
+		float StartTimeSeconds = 0.0f, float PlayCount = 1.0f) override;
+	virtual void OnRep_ReplicatedAnimMontage() override;
+	virtual void OnUnregister() override;
 
 	/** 取消谓词。返回 true 表示该实例应被取消。 */
 	typedef TFunctionRef<bool(const UGGYGOGameplayAbility* Ability, FGameplayAbilitySpecHandle Handle)> TShouldCancelAbilityFunc;
@@ -112,22 +345,33 @@ public:
 	/** 取消所有由输入激活的能力（`OnInputTriggered` 与 `WhileInputActive`）。 */
 	void CancelInputActivatedAbilities(bool bReplicateCancelAbility);
 
-	/** 服务器拒绝后续普攻请求时，纠正拥有者的预测段；只匹配同一次激活。 */
+	/** 服务器纠正拥有者本次激活的能力状态；目标数据解释由具体能力负责。 */
 	UFUNCTION(Client, Reliable)
-	void ClientCorrectComboStep(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey ActivationKey,
-		int32 Revision, int32 RequestId, int32 ServerStep, float MontagePosition,
-		bool bWindowOpen, bool bWindowClosed, bool bAccepted);
+	void ClientCorrectAbilityState(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey ActivationKey,
+		const FGameplayAbilityTargetDataHandle& Correction);
 
-	/** 输入按下。把匹配该 InputTag 的 Spec 放进 pressed 与 held 缓存，不立即激活。 */
-	void AbilityInputTagPressed(const FGameplayTag& InputTag);
+	/**
+	 * Empty PreviousIdentity starts a real request; an assigned value only revalidates that request.
+	 * Freeze first matching Specs, original Owner/Avatar/World and absolute retry deadline.
+	 * Expiring a retry deadline never releases held input. No legacy Tag-to-ID adapter.
+	 */
+	FGGYGOAbilityInputRequestResult ReceiveAbilityInputRequest(const FGameplayTag& InputTag,
+		const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline);
 
-	/** 输入释放。放进 released 缓存并从 held 移除。 */
-	void AbilityInputTagReleased(const FGameplayTag& InputTag);
+	/** Exact retirement. Released retains a finite tap; Invalidated never emits InputReleased. */
+	FGGYGOAbilityInputRequestResult EndAbilityInputRequest(const FGGYGOAbilityInputRequestIdentity& Identity,
+		EGGYGOAbilityInputRequestEndKind EndKind);
+
+	/** Queue only an exact original request with real B0 Queued admission; never writes held. */
+	FGGYGOAbilityInputRequestResult QueueAbilityInputRetry(const FGGYGOAbilityInputRetryRequest& Request);
+
+	/** Invalid deadline sentinel only; never accepted as an initial or retry request deadline. */
+	static constexpr double NoAbilityInputRetryDeadline = -1.0;
 
 	/** 每帧消费输入缓存。需要外部驱动，见文件头说明。 */
 	void ProcessAbilityInput(float DeltaTime, bool bGamePaused);
 
-	/** 清空全部输入缓存（含 held）。切换 Pawn、屏蔽输入或重置时调用。 */
+	/** 清空全部输入缓存（含 held 与 retry），并使正在消费的旧快照失效。 */
 	void ClearAbilityInput();
 
 	/**
@@ -135,6 +379,21 @@ public:
 	 * Tag、Cooldown、Cost 与组仲裁，不在 BT 里拷贝第二套规则。
 	 */
 	bool CanActivateAbilityByHandle(FGameplayAbilitySpecHandle Handle, FGameplayTagContainer& OutFailureTags) const;
+
+	// ===== T1b controlled Try; T1c Can bridge/completion publisher remain pending =====
+
+	/**
+	 * Project entry covering one complete native Try call; not an override/interceptor of
+	 * nonvirtual native Try/InternalTry/CallActivate. Reject active same-instance automatic
+	 * Retrigger and termination Busy explicitly; no automatic restart/queue or alternate path.
+	 * Native acceptance can be remote-only. Returned local/completed history stays original
+	 * across synchronous callbacks. QueryOnly and existing B0 input-origin ownership remain separate.
+	 */
+	FGGYGOAbilityActivationRequestResult TryActivateAbilityWithTerminationBoundary(
+		FGameplayAbilitySpecHandle Handle, bool bAllowRemoteActivation = true);
+
+	/** Subscribable C++ event; only ASC may publish original completion after proven exits. */
+	FGGYGOAbilityTerminationCompletedEvent& OnAbilityTerminationCompleted();
 
 	// ===== 组仲裁 =====
 
@@ -157,14 +416,14 @@ public:
 	 */
 	bool IsActivationBlockedByGroup(const UGGYGOGameplayAbility* Ability, EGGYGOAbilityGroupBlockReason& OutReason) const;
 
-	/**
-	 * 能力激活成功后登记到组，并取消被它顶掉的能力。
-	 * 由 `NotifyAbilityActivated` 调用，不要手动调。
-	 */
+	/** PreActivate 中登记本次准入预留；只由 `NotifyAbilityActivated` 调用。 */
 	void AddAbilityToActivationGroup(UGGYGOGameplayAbility* Ability);
 
-	/** 能力结束后从组中摘除；组变空时广播 `OnAbilityGroupFreed`。由 `NotifyAbilityEnded` 调用。 */
-	void RemoveAbilityFromActivationGroup(UGGYGOGameplayAbility* Ability);
+	/** 在 GAS 增加 Spec.ActiveCount 后执行最终组裁决；由项目 GA 的 ActivateAbility 入口调用。 */
+	bool FinalizeAbilityGroupAdmission(UGGYGOGameplayAbility* Ability, uint64 AdmissionSequence);
+
+	/** 能力结束后从组中摘除；组变空时可选择广播 `OnAbilityGroupFreed`。由 `NotifyAbilityEnded` 调用。 */
+	bool RemoveAbilityFromActivationGroup(UGGYGOGameplayAbility* Ability, bool bBroadcastGroupFreed = true);
 
 	/**
 	 * 注入组规则配置表。传 nullptr 清除，之后降级为内置默认规则。
@@ -214,7 +473,7 @@ protected:
 	virtual void NotifyAbilityActivated(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability) override;
 
 	/** 激活失败后把原因送到正确的一端处理。 */
-	virtual void NotifyAbilityFailed(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, const FGameplayTagContainer& FailureReason) override;
+	virtual void NotifyAbilityFailed(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, const FGameplayTagContainer& FailureReason) override final;
 
 	/** 结束后从组中摘除。 */
 	virtual void NotifyAbilityEnded(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled) override;
@@ -256,15 +515,6 @@ protected:
 	UPROPERTY()
 	TObjectPtr<const UGGYGOAbilityGroupConfig> AbilityGroupConfig;
 
-	/** 本帧按下的句柄。`ProcessAbilityInput` 处理后清空。 */
-	TArray<FGameplayAbilitySpecHandle> InputPressedSpecHandles;
-
-	/** 本帧释放的句柄。处理后清空。 */
-	TArray<FGameplayAbilitySpecHandle> InputReleasedSpecHandles;
-
-	/** 仍在按住的句柄。**跨帧保留**，`WhileInputActive` 能力从这里持续尝试激活。 */
-	TArray<FGameplayAbilitySpecHandle> InputHeldSpecHandles;
-
 	/**
 	 * 按组 Tag 索引的正在运行能力。
 	 *
@@ -275,4 +525,394 @@ protected:
 	 * 而弱引用本身也不需要 GC 保护。
 	 */
 	TMap<FGameplayTag, TArray<TWeakObjectPtr<UGGYGOGameplayAbility>>> ActiveAbilitiesByGroup;
+
+	/** 复核取消回调后已登记权威组状态中的活跃实例，并复用同一取消谓词。 */
+	bool HasActiveAbilityMatching(TShouldCancelAbilityFunc ShouldCancelFunc) const;
+
+	/** 仅当组当前仍为空时广播，允许同步回调先登记新的激活。 */
+	void BroadcastAbilityGroupFreedIfEmpty(FGameplayTag GroupTag);
+
+private:
+	/** Derived from live ASC request records only; deadline expiry does not release held. */
+	TArray<FGameplayAbilitySpecHandle> InputHeldSpecHandles;
+
+	/** Sole request/held authority; specs are fixed at first acceptance. */
+	struct FAbilityInputRequestRecord
+	{
+		FGGYGOAbilityInputRetryRequest Request;
+		TWeakObjectPtr<AActor> OwnerActor;
+		TWeakObjectPtr<AActor> AvatarActor;
+		TWeakObjectPtr<UWorld> World;
+		TArray<FGameplayAbilitySpecHandle> SpecHandles;
+		TArray<FGameplayAbilitySpecHandle> RetryableSpecHandles;
+		bool bHeld = true;
+	};
+
+	/** Ordered aggregate facts, not another held authority or frame dispatcher. */
+	struct FAbilityInputEdge
+	{
+		FGameplayAbilitySpecHandle Handle;
+		uint64 InputRevision = 0;
+		bool bPressed = false;
+		TWeakObjectPtr<AActor> OwnerActor;
+		TWeakObjectPtr<AActor> AvatarActor;
+		TWeakObjectPtr<UWorld> World;
+		TArray<FGGYGOAbilityInputRequestIdentity> Sources;
+	};
+
+	FGGYGOAbilityInputRequestResult MakeAbilityInputRequestFailure(
+		EGGYGOAbilityInputRequestOutcome Outcome, EGGYGOAbilityInputRequestReason Reason,
+		const FGGYGOAbilityInputRequestIdentity& Identity, FGameplayTag Tag, double Deadline) const;
+	const FAbilityInputRequestRecord* FindAbilityInputRequest(
+		const FGGYGOAbilityInputRequestIdentity& Identity) const;
+	bool IsAbilityInputContextCurrent(const TWeakObjectPtr<AActor>& Owner,
+		const TWeakObjectPtr<AActor>& Avatar, const TWeakObjectPtr<UWorld>& World) const;
+	bool IsAbilityInputRequestCurrent(const FGGYGOAbilityInputRetryRequest& Request,
+		FGameplayAbilitySpecHandle Handle, bool bRequireDeadline, bool bRequireQueued, bool bRequireHeld) const;
+	bool IsAbilityInputEdgeCurrent(const FAbilityInputEdge& Edge) const;
+	void RebuildAbilityInputHeldHandles();
+	void PruneAbilityInputRequests();
+	void ConsumeSuccessfulAbilityInputRequests(const TArray<FGGYGOAbilityInputRetryRequest>& Requests);
+
+	TMap<uint64, FAbilityInputRequestRecord> AbilityInputRequests;
+	uint64 LastAbilityInputRequestSerial = 0; // Never reset or borrowed from evaluation serials.
+	TArray<FAbilityInputEdge> PendingAbilityInputEdges;
+	TArray<FGGYGOAbilityInputRetryRequest> PendingAbilityInputRetries;
+
+	enum class EAbilityActivationInputOrigin : uint8
+	{
+		None,
+		InitialPress,
+		FiniteRetry
+	};
+
+	struct FAbilityActivationFailureOrigin
+	{
+		EAbilityActivationInputOrigin Kind = EAbilityActivationInputOrigin::None;
+		FGameplayAbilitySpecHandle Handle;
+		TArray<FGGYGOAbilityInputRetryRequest> Requests;
+		TWeakObjectPtr<AActor> OwnerActor;
+	};
+
+	struct FAbilityActivationEvaluationToken
+	{
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> Issuer{};
+		uint64 Serial = 0;
+		uint64 ParentSerial = 0;
+		uint64 InputAttemptSerial = 0;
+		TWeakObjectPtr<const UGGYGOGameplayAbility> Ability{};
+		FGameplayAbilitySpecHandle Handle{};
+		FAbilityActivationFailureOrigin Origin{};
+	};
+
+	struct FAbilityInputActivationAttempt
+	{
+		uint64 Serial = 0;
+		uint64 ParentEvaluationSerial = 0;
+		uint32 QueryDepth = 0;
+		FGameplayAbilitySpecHandle Handle{};
+		FAbilityActivationFailureOrigin Origin{};
+		bool bClaimed = false;
+	};
+
+	/** Scope metadata only. Never restore a consumed input permit or completed result. */
+	class FScopedAbilityInputActivation final
+	{
+	public:
+		FScopedAbilityInputActivation(UGGYGOAbilitySystemComponent* InASC,
+			FGameplayAbilitySpecHandle Handle, const FAbilityActivationFailureOrigin& Origin);
+		~FScopedAbilityInputActivation();
+		FScopedAbilityInputActivation(const FScopedAbilityInputActivation&) = delete;
+		FScopedAbilityInputActivation& operator=(const FScopedAbilityInputActivation&) = delete;
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
+		uint64 Serial = 0;
+	};
+
+	class FScopedAbilityActivationEvaluation final
+	{
+	public:
+		FScopedAbilityActivationEvaluation(UGGYGOAbilitySystemComponent* InASC,
+			const UGGYGOGameplayAbility* Ability, FGameplayAbilitySpecHandle Handle,
+			const FGameplayAbilityActorInfo* ActorInfo);
+		~FScopedAbilityActivationEvaluation();
+		void Complete(bool bCanActivate);
+		FScopedAbilityActivationEvaluation(const FScopedAbilityActivationEvaluation&) = delete;
+		FScopedAbilityActivationEvaluation& operator=(const FScopedAbilityActivationEvaluation&) = delete;
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
+		FAbilityActivationEvaluationToken Token{};
+		bool bFinished = false;
+	};
+
+	class FScopedAbilityActivationQuery final
+	{
+	public:
+		explicit FScopedAbilityActivationQuery(const UGGYGOAbilitySystemComponent* InASC);
+		~FScopedAbilityActivationQuery();
+		FScopedAbilityActivationQuery(const FScopedAbilityActivationQuery&) = delete;
+		FScopedAbilityActivationQuery& operator=(const FScopedAbilityActivationQuery&) = delete;
+	private:
+		TWeakObjectPtr<const UGGYGOAbilitySystemComponent> ASC{};
+		uint32 Depth = 0;
+	};
+
+	bool BeginAbilityActivationEvaluation(const UGGYGOGameplayAbility* Ability,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FAbilityActivationEvaluationToken& OutToken);
+	void FinishAbilityActivationEvaluation(const FAbilityActivationEvaluationToken& Token, bool bCanActivate);
+	void AbortAbilityActivationEvaluation(const FAbilityActivationEvaluationToken& Token);
+	bool ConsumeAbilityActivationFailureOrigin(FGameplayAbilitySpecHandle Handle,
+		const UGameplayAbility* Ability, FAbilityActivationFailureOrigin& OutOrigin);
+	bool IsAbilityActivationFailureOriginCurrent(const FAbilityActivationFailureOrigin& Origin) const;
+	uint64 AllocateAbilityActivationOriginSerial();
+
+	friend class UGGYGOGameplayAbility;
+	uint64 LastAbilityActivationOriginSerial = 0;
+	FAbilityInputActivationAttempt AbilityInputActivationAttempt{};
+	TArray<FAbilityActivationEvaluationToken> AbilityActivationEvaluations;
+	mutable FAbilityActivationEvaluationToken PendingAbilityActivationFailure{};
+	mutable uint32 AbilityActivationQueryDepth = 0;
+	uint64 AbilityInputRevision = 0;
+	bool bProcessingAbilityInput = false;
+
+	/** 为本 ASC 的每次 PreActivate 分配跨实例唯一且单调递增的准入序号；0 保留为无效值。 */
+	uint64 AllocateAbilityGroupAdmissionSequence();
+	uint64 NextAbilityGroupAdmissionSequence = 0;
+
+	/** Metadata validity only; not an Avatar authority, native phase or gameplay lifecycle. */
+	enum class EAvatarBindingIdentityState : uint8
+	{
+		Unissued,
+		Current,
+		Revoked
+	};
+
+	enum class EAvatarBindingIdentityAdmission : uint8
+	{
+		Invalid = 0,
+		MatchCurrentContext,
+		MatchCommittedCleanupContext,
+		BootstrapNeverCommitted,
+		ReplaceRevokedContext
+	};
+
+	enum class EAvatarBindingSnapshotPurpose : uint8
+	{
+		WorkingBinding,
+		CommittedCleanup
+	};
+
+	/** Read-only proof. Logical revocation retains cleanup provenance; real writes retire it. */
+	struct FActualAvatarBindingActorInfoSnapshot
+	{
+		TSharedPtr<const FGameplayAbilityActorInfo> Allocation;
+		TWeakObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
+		TWeakObjectPtr<AActor> OwnerActor;
+		TWeakObjectPtr<AActor> AvatarActor;
+		TWeakObjectPtr<APlayerController> PlayerController;
+		TWeakObjectPtr<USkeletalMeshComponent> SkeletalMeshComponent;
+		TWeakObjectPtr<UMovementComponent> MovementComponent;
+		TWeakObjectPtr<UAnimInstance> ActorInfoAnimInstance;
+		TWeakObjectPtr<UAnimInstance> ActualAnimInstance;
+		TWeakObjectPtr<AActor> CachedOwnerActor;
+		TWeakObjectPtr<AActor> CachedAvatarActor;
+		FName ActorInfoAffectedAnimInstanceTag = NAME_None;
+		FName ASCAffectedAnimInstanceTag = NAME_None;
+	};
+
+	/** One stack-local native Try request. This is provenance, never another GAS activation state. */
+	struct FControlledAbilityActivationCall
+	{
+		FControlledAbilityActivationCall* Previous = nullptr;
+		FGameplayAbilitySpecHandle Handle;
+		TWeakObjectPtr<UGameplayAbility> SpecAbility;
+		TWeakObjectPtr<UGameplayAbility> EvaluationAbility;
+		FActualAvatarBindingActorInfoSnapshot OriginalActual;
+		FGGYGOAvatarBindingContext OriginalContext;
+		uint64 ParentEvaluationSerial = 0;
+		uint32 QueryDepth = 0;
+		uint64 EvaluationSerial = 0;
+		bool bEvaluationClaimed = false;
+		bool bCanAdmitted = false;
+		bool bLocalWitnessSeen = false;
+		EGGYGOAbilityActivationRequestReason Failure = EGGYGOAbilityActivationRequestReason::None;
+		FGGYGOAbilityActivationHandle OriginalActivation{};
+	};
+
+	class FScopedControlledAbilityActivationCall
+	{
+	public:
+		FScopedControlledAbilityActivationCall(UGGYGOAbilitySystemComponent* InASC,
+			FControlledAbilityActivationCall& InCall);
+		~FScopedControlledAbilityActivationCall();
+		FScopedControlledAbilityActivationCall(const FScopedControlledAbilityActivationCall&) = delete;
+		FScopedControlledAbilityActivationCall& operator=(const FScopedControlledAbilityActivationCall&) = delete;
+
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		FControlledAbilityActivationCall* Call = nullptr;
+	};
+
+	EGGYGOAbilityActivationRequestReason CheckControlledAbilityActivationStart(
+		const FControlledAbilityActivationCall& Call) const;
+	uint64 BeginControlledAbilityActivationEvaluation(const UGGYGOGameplayAbility* Ability,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo);
+	bool CompleteControlledAbilityActivationEvaluation(uint64 EvaluationSerial, bool bNativeRulesPassed);
+	void ObserveControlledAbilityActivation(FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability);
+	FControlledAbilityActivationCall* ControlledAbilityActivationCall = nullptr;
+
+	/** One pending identity receipt. It owns no predicate, callback, queue or native phase. */
+	struct FAvatarBindingIdentityOperation
+	{
+		FGGYGOAvatarBindingOperationIdentity Identity;
+		EGGYGOAvatarBindingKind Kind = EGGYGOAvatarBindingKind::Invalid;
+		EGGYGOAvatarBindingClearMode ClearMode = EGGYGOAvatarBindingClearMode::None;
+		EAvatarBindingIdentityAdmission Admission = EAvatarBindingIdentityAdmission::Invalid;
+		FGGYGOAvatarBindingContext BeforeContext;
+		FActualAvatarBindingActorInfoSnapshot BeforeActual;
+		TWeakObjectPtr<AActor> ExpectedOwnerActor;
+		TWeakObjectPtr<AActor> ExpectedAvatarActor;
+	};
+
+	/**
+	 * Game-thread identity helpers; the execution layer owns native calls and caller queries.
+	 * All outputs reset on entry and must be independent stack values.
+	 * Reserve validates shape/predicate presence, but never invokes or retains the predicate.
+	 * Reserve success is only a receipt. Commit requires full native return and
+	 * caller-context revalidation by the execution layer; it performs neither itself.
+	 */
+	bool TryReserveAvatarBindingIdentityOperation(const FGGYGOAvatarBindingRequest& Request,
+		EAvatarBindingIdentityAdmission Admission, FGGYGOAvatarBindingOperationIdentity& OutOperation,
+		EGGYGOAvatarBindingReason& OutReason);
+	bool TryCommitAvatarBindingActorInfoIdentity(const FGGYGOAvatarBindingOperationIdentity& Operation,
+		FGGYGOAvatarBindingContext& OutCommittedContext, EGGYGOAvatarBindingReason& OutReason);
+	bool TryCompleteAvatarBindingIdentityOperation(const FGGYGOAvatarBindingOperationIdentity& Operation,
+		EGGYGOAvatarBindingReason& OutReason);
+	bool InvalidateAvatarBindingIdentityOperation(const FGGYGOAvatarBindingOperationIdentity& ExpectedOperation,
+		EGGYGOAvatarBindingReason Reason);
+
+	bool CaptureAvatarBindingActualSnapshot(FActualAvatarBindingActorInfoSnapshot& OutSnapshot,
+		EGGYGOAvatarBindingReason& OutReason) const;
+	bool ValidateAvatarBindingActualSnapshot(const FActualAvatarBindingActorInfoSnapshot& Snapshot,
+		EGGYGOAvatarBindingReason& OutReason) const;
+	bool ValidateAvatarBindingActualSnapshotForPurpose(const FActualAvatarBindingActorInfoSnapshot& Snapshot,
+		EAvatarBindingSnapshotPurpose Purpose, EGGYGOAvatarBindingReason& OutReason) const;
+	bool IsAvatarBindingNewWorkLifecycleOpen(EGGYGOAvatarBindingReason& OutReason) const;
+
+	/** Immutable actual-write provenance; owns no native phase, callback, retry or binding identity. */
+	struct FFailedAvatarActorInfoInitCleanupProof
+	{
+		FGGYGOAvatarBindingOperationIdentity OriginalOperation;
+		FGGYGOAvatarBindingContext Before;
+		FActualAvatarBindingActorInfoSnapshot WrittenActual;
+	};
+	TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof> FailedAvatarActorInfoInitCleanupProof;
+	TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof> CaptureReturnedAvatarActorInfoInitCleanup(
+		const FAvatarBindingIdentityOperation& Original, EGGYGOAvatarBindingReason& OutReason) const;
+	bool ValidateFailedAvatarActorInfoInitCleanupSource(
+		const TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof>& Original,
+		EGGYGOAvatarBindingReason& OutReason) const;
+	bool RetainFailedAvatarActorInfoInitCleanup(
+		const TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof>& Original,
+		EGGYGOAvatarBindingReason& OutReason);
+	void RetireFailedAvatarActorInfoInitCleanup();
+	bool HasSameAvatarBindingActualSnapshot(const FActualAvatarBindingActorInfoSnapshot& First,
+		const FActualAvatarBindingActorInfoSnapshot& Second) const;
+	void DiscardActiveAvatarBindingIdentityOperation(bool bRevokeBeforeContext);
+
+	/** One provenance resource for the current native Local write, not playback execution state. */
+	struct FMontagePlaybackProvenance
+	{
+		FGGYGOAbilityMontagePlaybackHandle Playback;
+		FActualAvatarBindingActorInfoSnapshot ActorInfo;
+	};
+	FMontagePlaybackProvenance MontagePlaybackProvenance;
+	float ExecuteMontagePlayWithGuard(UGameplayAbility* Ability, FGameplayAbilityActivationInfo ActivationInfo,
+		UAnimMontage* Montage, float PlayRate, FName StartSectionName, float StartTimeSeconds,
+		FGGYGOMontagePlayGuardResult& OutResult, TFunction<bool()> IsAdditionalCallerContextCurrent,
+		FGGYGOAbilityMontagePlaybackHandle* OutPlayback, EGGYGOAbilityMontagePlaybackReason* OutOwnershipReason);
+	void RetireMontagePlaybackOwnership();
+	void ReconcileMontagePlaybackOwnership();
+
+	enum class EAvatarBindingPublicationPhase : uint8
+	{
+		None = 0,
+		Pending,
+		Dispatching,
+		Consumed,
+		Closed
+	};
+
+	/** One publication resource; Context is derived from its commit, never binding authority. */
+	struct FAvatarBindingPublicationRecord
+	{
+		FGGYGOAvatarBindingPublicationReceipt Publication;
+		FGGYGOAvatarBindingContext Context;
+		EAvatarBindingPublicationPhase Phase = EAvatarBindingPublicationPhase::None;
+	};
+
+	/** Failure closes only this stack's exact Pending/Dispatching proof, never a successor. */
+	class FScopedAvatarBindingPublication final
+	{
+	public:
+		FScopedAvatarBindingPublication(UGGYGOAbilitySystemComponent* InASC,
+			const FGGYGOAvatarBindingPublicationReceipt& InPublication);
+		~FScopedAvatarBindingPublication();
+		FScopedAvatarBindingPublication(const FScopedAvatarBindingPublication&) = delete;
+		FScopedAvatarBindingPublication& operator=(const FScopedAvatarBindingPublication&) = delete;
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
+		FGGYGOAvatarBindingPublicationReceipt Publication;
+	};
+
+	/** One native stack window, shared by typed execution and legacy entry points. */
+	class FScopedAvatarBindingNativeWrite final
+	{
+	public:
+		FScopedAvatarBindingNativeWrite(UGGYGOAbilitySystemComponent* InASC,
+			const FGGYGOAvatarBindingOperationIdentity& InOperation = {});
+		~FScopedAvatarBindingNativeWrite();
+		FScopedAvatarBindingNativeWrite(const FScopedAvatarBindingNativeWrite&) = delete;
+		FScopedAvatarBindingNativeWrite& operator=(const FScopedAvatarBindingNativeWrite&) = delete;
+		bool HasEntered() const { return bEntered; }
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
+		FGGYGOAvatarBindingOperationIdentity Operation{};
+		bool bEntered = false;
+	};
+
+	FGGYGOAvatarBindingResult ExecuteAvatarActorInfoTransaction(
+		const FGGYGOAvatarBindingRequest& Request, EAvatarBindingIdentityAdmission Admission,
+		FGGYGOAvatarBindingPublicationReceipt& OutPublication);
+	bool RecheckAvatarBindingExecutionOperation(
+		const FGGYGOAvatarBindingOperationIdentity& Operation, bool bCheckBeforeActual,
+		EGGYGOAvatarBindingReason& OutReason) const;
+	/** Value-only failure mapping; does not require a live issuer after an external call. */
+	static FGGYGOAvatarBindingResult MakeAvatarBindingExecutionFailure(
+		FGGYGOAvatarBindingResult Result, EGGYGOAvatarBindingReason Reason);
+	bool IsValidAvatarBindingPublicationProof(
+		const FGGYGOAvatarBindingPublicationReceipt& Publication,
+		EGGYGOAvatarBindingReason& OutReason) const;
+	bool RecheckAvatarBindingPublication(
+		const FGGYGOAvatarBindingPublicationReceipt& Publication,
+		EAvatarBindingPublicationPhase ExpectedPhase, EGGYGOAvatarBindingReason& OutReason) const;
+	void CloseAvatarBindingPublicationIfMatching(
+		const FGGYGOAvatarBindingPublicationReceipt& Publication);
+	void InvalidateAvatarBindingForLegacyActorInfoWrite();
+	void ReleaseAvatarBindingPublicationForContext(const FGGYGOAvatarBindingContext& Expected);
+	void LogLegacyAvatarActorInfoWriteRejected(const TCHAR* Entry,
+		EGGYGOAvatarBindingReason Reason) const;
+
+	bool bAvatarBindingNativeWriteBusy = false;
+	/** One current reference plus exact consumption metadata; no history table or caller query. */
+	FAvatarBindingPublicationRecord AvatarBindingPublicationRecord;
+	FGGYGOAvatarBindingNoticeEvent AvatarBindingNoticeEvent;
+
+	/** Binding and operation identities share this issuer; zero is invalid, exhaustion never wraps. */
+	uint64 LastIssuedAvatarBindingSerial = 0;
+	FGGYGOAvatarBindingContext AvatarBindingContext;
+	EAvatarBindingIdentityState AvatarBindingIdentityState = EAvatarBindingIdentityState::Unissued;
+	FActualAvatarBindingActorInfoSnapshot AvatarBindingActorInfoSnapshot;
+	FAvatarBindingIdentityOperation ActiveAvatarBindingIdentityOperation;
 };

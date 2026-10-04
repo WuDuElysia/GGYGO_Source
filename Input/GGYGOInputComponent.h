@@ -34,9 +34,10 @@ public:
 	 * @param bLogIfNotFound 配置里找不到该 Tag 时是否报错。
 	 *                       移动、视角这类必需输入应当为 true；
 	 *                       可选输入（某些角色才有）传 false 以免刷错误日志。
+	 * @param BindHandles 可选输出。仅追加成功创建的绑定句柄，不清空已有记录。
 	 */
 	template <class UserClass, typename FuncType>
-	void BindNativeAction(const UGGYGOInputConfig* InputConfig, const FGameplayTag& InputTag, ETriggerEvent TriggerEvent, UserClass* Object, FuncType Func, bool bLogIfNotFound);
+	void BindNativeAction(const UGGYGOInputConfig* InputConfig, const FGameplayTag& InputTag, ETriggerEvent TriggerEvent, UserClass* Object, FuncType Func, bool bLogIfNotFound, TArray<uint32>* BindHandles = nullptr);
 
 	/**
 	 * 批量绑定所有 Ability 输入。
@@ -54,13 +55,17 @@ public:
 };
 
 template <class UserClass, typename FuncType>
-void UGGYGOInputComponent::BindNativeAction(const UGGYGOInputConfig* InputConfig, const FGameplayTag& InputTag, ETriggerEvent TriggerEvent, UserClass* Object, FuncType Func, bool bLogIfNotFound)
+void UGGYGOInputComponent::BindNativeAction(const UGGYGOInputConfig* InputConfig, const FGameplayTag& InputTag, ETriggerEvent TriggerEvent, UserClass* Object, FuncType Func, bool bLogIfNotFound, TArray<uint32>* BindHandles)
 {
 	check(InputConfig);
 
 	if (const UInputAction* InputAction = InputConfig->FindNativeInputActionForTag(InputTag, bLogIfNotFound))
 	{
-		BindAction(InputAction, TriggerEvent, Object, Func);
+		const uint32 BindHandle = BindAction(InputAction, TriggerEvent, Object, Func).GetHandle();
+		if (BindHandles)
+		{
+			BindHandles->Add(BindHandle);
+		}
 	}
 }
 

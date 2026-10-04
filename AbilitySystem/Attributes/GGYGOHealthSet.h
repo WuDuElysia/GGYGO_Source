@@ -9,15 +9,15 @@
  * ## 为什么用元属性中转
  * 如果 GE 直接改 Health，伤害就无法被拦截、修正或观察。走元属性后：
  *   - `PreGameplayEffectExecute` 可以按免疫 Tag 直接否掉这次伤害
- *   - `PostGameplayEffectExecute` 可以在扣血前广播消息、在扣血后判定死亡
- *   - 同一次 GE 里削韧和扣血能在一个回调内一起处理
+ *   - 每个 GE Modifier 分别进入 Pre/Post；Health 和 Poise 不是同一 GE 内的一次原子事务
+ *   - meta 值按各自 Modifier 的实际写入贡献消费，属性 Clamp 与边沿在同步属性回调内落地
  *
- * `Health` 和 `Damage` 都标了 `HideFromModifiers`，防止有人用普通 Modifier 绕过这条链路。
+ * `HideFromModifiers` 是编辑器属性列表的过滤元数据，不是运行时权限控制。
+ * HealthSet 仍会处理直接 Health/Poise Modifier 的 Clamp 与真实边沿。
  *
  * ## 韧性为什么并进这里而不是单独一个 Set
- * 削韧和扣血在同一次命中里同时发生，放同一个 Set 可以在一次
- * `PostGameplayEffectExecute` 里处理完；拆成两个 Set 会变成跨 Set 读写，
- * 且 Execution 要多捕获一组属性。
+ * 削韧和扣血的规则都归 HealthSet；Execution 可以输出多个 Modifier，GAS 会逐个
+ * 执行它们的 Pre/Apply/Post，因此这不构成同一次原子结算。
  *
  * ## 两条不同的回调路径
  *   - **服务器**：GE 执行 → Pre/PostGameplayEffectExecute，能拿到完整 EffectSpec 与来源 Actor
@@ -44,13 +44,13 @@ public:
 	UGGYGOHealthSet();
 
 	// ===== 生命 =====
-	/** 当前生命值。上界受 MaxHealth 约束，只能由 Execution 经元属性修改。 */
+	/** 当前生命值。所有写入都会 Clamp 到 [0, MaxHealth]；伤害执行通常经 Damage 元属性结算。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, Health);
 	/** 生命上限。可被 GE 修改；下调时会同步压低当前 Health。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, MaxHealth);
 
 	// ===== 韧性 =====
-	/** 当前韧性。被削到 0 触发破韧硬直；恢复由周期性 GE 负责，不在本类里做。 */
+	/** 当前韧性。正值变为 0 触发破韧边沿；meta 削韧与直接 Poise GE 都由本类 Clamp。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, Poise);
 	/** 韧性上限。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, MaxPoise);
@@ -72,7 +72,7 @@ public:
 
 	/** 韧性实际变化后广播。用于韧性条 UI。 */
 	mutable FGGYGOAttributeEvent OnPoiseChanged;
-	/** 韧性跨过 0 时**只广播一次**。破韧演出与硬直 GE 由监听方（通常是战斗组件）发起。 */
+	/** 韧性跨过 0 时**只广播一次**。具体后续能力接入由玩法层处理。 */
 	mutable FGGYGOAttributeEvent OnPoiseBroken;
 
 protected:
@@ -91,13 +91,13 @@ protected:
 	/**
 	 * GE 的 modifier 即将写入属性前调用。
 	 * @return false 表示否掉这次修改（免疫命中时）。
-	 * 本实现还负责保存变更前快照，供 Post 阶段计算真实变化量。
+	 * 本实现捕获 Modifier 来源与原始幅度；属性实际 Old/New 由 PostAttributeChange 捕获。
 	 */
 	virtual bool PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data) override;
 
 	/**
 	 * GE 的 modifier 已写入后调用。
-	 * 消费三个元属性、执行 Clamp、广播消息与委托、维护死亡与破韧边沿。
+	 * 消费三个元属性并结算属性；边沿由 PostAttributeChange 同步提交，结果在 root Modifier 退出后同步发布。
 	 */
 	virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
 
@@ -107,12 +107,44 @@ protected:
 	virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
 	/** 变更完成后的联动：上限下调时压低当前值，值恢复时清除边沿锁存。 */
 	virtual void PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue) override;
+	/** 本次 RepNotify 内迟到创建聚合器时，只记录匹配未判定帧的阶段。 */
+	virtual void OnAttributeAggregatorCreated(const FGameplayAttribute& Attribute, FAggregator* NewAggregator) const override;
 
 	/** 集中定义各属性边界。被两个 PreAttribute 入口共用。 */
 	void ClampAttribute(const FGameplayAttribute& Attribute, float& NewValue) const;
 
 private:
-	/** 当前生命值。HideFromModifiers 强制伤害走元属性链路。 */
+	struct FModifierFrame;
+	struct FQueuedResult;
+	struct FExpectedAttributeChange;
+	struct FRepNotifyFrame;
+	enum class EQueuedResultType : uint8;
+
+	/** 只在当前同步 GE Modifier 调用栈非空；嵌套时以回调数据地址配对 Pre/Post。 */
+	TArray<TSharedPtr<FModifierFrame>> ModifierFrames;
+	/** 根 Modifier 仍在运行时暂存的逐次结果，根栈退出后 swap 到局部数组并同步发布。 */
+	TArray<TSharedPtr<FQueuedResult>> PendingResults;
+	/** 标记 HealthSet 自己发起的单次属性写入，避免把原生委托中的后续重入归给旧 Modifier。 */
+	TArray<TSharedPtr<FExpectedAttributeChange>> ExpectedAttributeChanges;
+	/** 记录 RepNotify 的调用阶段、弱来源及最终聚合值，仅存活于该同步宏调用期间。 */
+	TArray<TSharedPtr<FRepNotifyFrame>> RepNotifyFrames;
+	/** 将 PostAttributeChange 内部的联动写入一起完成后再发布同步结果。 */
+	int32 AttributeChangeDepth = 0;
+
+	TSharedPtr<FModifierFrame> FindFrame(const FGameplayEffectModCallbackData& Data) const;
+	TSharedPtr<FModifierFrame> FindAwaitingFrame(const FGameplayAttribute& Attribute) const;
+	TSharedPtr<FRepNotifyFrame> BeginRepNotifyFrame(const FGameplayAttribute& Attribute);
+	void EndRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame);
+	bool CanClassifyRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame) const;
+	TSharedPtr<FRepNotifyFrame> FindRepNotifyFrame(const FGameplayAttribute& Attribute) const;
+	void PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute);
+	void PopExpectedAttributeChange();
+	TSharedPtr<FModifierFrame> ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute);
+	void QueueAttributeResult(EQueuedResultType ResultType, const TSharedPtr<FModifierFrame>& Frame, float Magnitude, float OldValue, float NewValue);
+	void QueueMessageResult(const FGameplayTag& Verb, const TSharedPtr<FModifierFrame>& Frame, float Magnitude);
+	void FlushPendingResults();
+	void ApplyModifierMinimumHealth(const FGameplayAttribute& Attribute, float& NewValue) const;
+	/** 当前生命值。HideFromModifiers 只影响编辑器属性列表；运行时直接 GE 仍经 Clamp 与边沿处理。 */
 	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Health, Category = "GGYGO|Health", Meta = (HideFromModifiers, AllowPrivateAccess = true))
 	FGameplayAttributeData Health;
 
@@ -120,7 +152,7 @@ private:
 	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_MaxHealth, Category = "GGYGO|Health", Meta = (AllowPrivateAccess = true))
 	FGameplayAttributeData MaxHealth;
 
-	/** 当前韧性。同样禁止普通 Modifier 直接修改。 */
+	/** 当前韧性。HideFromModifiers 只影响编辑器属性列表；运行时直接 GE 仍经 Clamp 与边沿处理。 */
 	UPROPERTY(BlueprintReadOnly, ReplicatedUsing = OnRep_Poise, Category = "GGYGO|Poise", Meta = (HideFromModifiers, AllowPrivateAccess = true))
 	FGameplayAttributeData Poise;
 
@@ -133,11 +165,6 @@ private:
 
 	/** 破韧边沿锁存。韧性回到正值后由 PostAttributeChange 清除。 */
 	bool bPoiseBroken;
-
-	/** Pre 阶段保存的快照，供 Post 阶段判断是否真实变化并提供委托的 OldValue。 */
-	float HealthBeforeAttributeChange;
-	float MaxHealthBeforeAttributeChange;
-	float PoiseBeforeAttributeChange;
 
 	// -------------------------------------------------------------------
 	// 以下是元属性：一次性输入，不是持久状态，不复制，消费后必须清零

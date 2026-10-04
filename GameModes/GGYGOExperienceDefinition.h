@@ -23,16 +23,45 @@
  * ## 与 GameFeature 的关系
  * `GameFeaturesToEnable` 列出本局要激活的插件。插件可以在不改动主模块的前提下
  * 往场景里注入组件、能力、输入映射 —— 这是"新角色作为独立插件交付"的基础，
- * 也让未启用的内容完全不参与加载。
+ * 来源配置须覆盖完整 GameFeature 依赖闭包；同一 GI 的 Loaded 保留与本局 Active
+ * 是不同生命周期，来源声明本身不代表加载或激活成功。
  */
 #pragma once
 
 #include "Engine/DataAsset.h"
+#include "GameModes/GGYGOGameFeatureClosureResolver.h"
 
 #include "GGYGOExperienceDefinition.generated.h"
 
 class UGGYGOPawnData;
 class UObject;
+
+/** Stored configuration only; runtime admission remains with the GameFeature subsystem. */
+UENUM(BlueprintType)
+enum class EGGYGOGameFeatureSource : uint8
+{
+	Unspecified,
+	ProjectNativeManaged,
+	ExplicitExternalBorrow
+};
+
+/** One explicit declaration for a root or dependency GFP. No ownership is inferred. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOGameFeatureSourceDeclaration
+{
+	GENERATED_BODY()
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Game Features")
+	FString PluginName;
+
+	/** Unspecified is invalid when this entry is configured; it never defaults to Managed. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Game Features")
+	EGGYGOGameFeatureSource Source = EGGYGOGameFeatureSource::Unspecified;
+
+	/** Required for Borrow and empty for Managed. A label does not prove protection. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Game Features")
+	FString ExternalOwnerLabel;
+};
 
 UCLASS(BlueprintType, Const, meta = (DisplayName = "GGYGO Experience Definition", ShortTooltip = "一局游戏的玩法定义"))
 class GGYGO_API UGGYGOExperienceDefinition : public UPrimaryDataAsset
@@ -41,6 +70,15 @@ class GGYGO_API UGGYGOExperienceDefinition : public UPrimaryDataAsset
 
 public:
 	UGGYGOExperienceDefinition(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	/**
+	 * Synchronously validates configuration shape and copies values; no native/plugin operations.
+	 * Both arrays empty are the normal no-GF mode. On failure OutInput is empty and OutErrors
+	 * identifies this asset, field and original index. Closure/URL/admission checks remain with GI.
+	 */
+	bool TryBuildGameFeatureInput(
+		FGGYGOGameFeatureClosureResolver::FInput& OutInput,
+		TArray<FString>& OutErrors) const;
 
 #if WITH_EDITOR
 	/** 编辑期校验。配置错误在这里暴露，而不是等到运行时角色生成失败。 */
@@ -54,6 +92,15 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Game Features")
 	TArray<FString> GameFeaturesToEnable;
+
+	/**
+	 * Explicit sources for every GFP in the complete root/dependency closure, including dependencies
+	 * with bShouldActivate=false. Missing sources are errors; root sources are never inherited.
+	 * Borrow declarations are configuration only: the current GI admission rejects Borrowed nodes.
+	 * Empty together with GameFeaturesToEnable is a normal no-GF mode.
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Game Features", meta = (TitleProperty = "PluginName"))
+	TArray<FGGYGOGameFeatureSourceDeclaration> GameFeatureSources;
 
 	/**
 	 * **默认编队**：玩家没有做过编成时用的成员配置，按出场顺序排列。

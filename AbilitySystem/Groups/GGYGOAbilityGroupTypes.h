@@ -98,7 +98,10 @@ enum class EGGYGOAbilityGroupBlockReason : uint8
 	 * 与 `LowerPriority` 的区别：这里**不比较优先级**，也**不取消**已有实例，
 	 * 是严格的先来后到。连段就靠它实现。
 	 */
-	GroupOccupiedQueued
+	GroupOccupiedQueued,
+
+	/** 同组旧实例声明不可取消，优先级无法取代它。 */
+	UncancelableActive
 };
 
 /** 一个组的并发规则配置。由 `UGGYGOAbilityGroupConfig` 按 GroupTag 索引。 */

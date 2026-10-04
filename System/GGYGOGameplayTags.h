@@ -118,6 +118,8 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction);
 	/** 阶段 C 的近战竖切动作。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction_Attack_Melee);
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction_Attack_Melee_Ice01);
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(BossAction_Attack_Melee_Ice02);
 
 	// ============================================================
 	// 三、AbilityGroup —— 组仲裁的组身份

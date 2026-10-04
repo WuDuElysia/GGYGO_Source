@@ -11,6 +11,8 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOMeleeTraceComponent)
 
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMeleeTrace, Log, All);
+
 UGGYGOMeleeTraceComponent::UGGYGOMeleeTraceComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -23,29 +25,58 @@ UGGYGOMeleeTraceComponent::UGGYGOMeleeTraceComponent(const FObjectInitializer& O
 
 void UGGYGOMeleeTraceComponent::BeginTraceWindow(FName InStartSocket, FName InEndSocket, float InTraceRadius)
 {
+	EndTraceWindow();
+	// EndTraceWindow 已统一使上一窗口失效并清空命中去重与采样基线。
+	USkeletalMeshComponent* Mesh = GetTraceMesh();
+	if (!Mesh || InStartSocket.IsNone() || InEndSocket.IsNone()
+		|| !Mesh->DoesSocketExist(InStartSocket) || !Mesh->DoesSocketExist(InEndSocket)
+		|| !FMath::IsFinite(InTraceRadius) || InTraceRadius < 1.0f || MaxTraceSegments < 1 || MaxTraceSegments > 512)
+	{
+		UE_LOG(LogGGYGOMeleeTrace, Warning, TEXT("MeleeTrace [%s] 拒绝无效 Mesh/Socket/半径/采样上限 [%s -> %s, R=%.2f]。"),
+			*GetNameSafe(GetOwner()), *InStartSocket.ToString(), *InEndSocket.ToString(), InTraceRadius);
+		return;
+	}
 	StartSocket = InStartSocket;
 	EndSocket = InEndSocket;
 	TraceRadius = FMath::Max(InTraceRadius, 1.0f);
 
 	bIsTracing = true;
 
-	// 清空已命中记录：连招的每一段都是独立的一次攻击，
-	// 同一个敌人应当能被每段各命中一次。
-	HitActorsThisWindow.Reset();
-
-	// 丢弃上一帧端点。窗口刚开启时武器可能已经移动了一段距离，
-	// 沿用旧端点会扫出一条不属于本次攻击的长路径，命中身后的敌人。
-	bHasPreviousTransform = false;
-
 	SetComponentTickEnabled(true);
 }
 
 void UGGYGOMeleeTraceComponent::EndTraceWindow()
 {
+	// 只有活动窗口需要使当前扫掠的快照失效；重复清理保持幂等。
+	if (bIsTracing)
+	{
+		++WindowSerial;
+	}
 	bIsTracing = false;
+	PreviousStart = FVector::ZeroVector;
+	PreviousEnd = FVector::ZeroVector;
 	bHasPreviousTransform = false;
+	HitActorsThisWindow.Reset();
 
 	SetComponentTickEnabled(false);
+}
+
+void UGGYGOMeleeTraceComponent::OnUnregister()
+{
+	EndTraceWindow();
+	Super::OnUnregister();
+}
+
+void UGGYGOMeleeTraceComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	EndTraceWindow();
+	Super::EndPlay(EndPlayReason);
+}
+
+void UGGYGOMeleeTraceComponent::Deactivate()
+{
+	EndTraceWindow();
+	Super::Deactivate();
 }
 
 void UGGYGOMeleeTraceComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
@@ -58,42 +89,45 @@ void UGGYGOMeleeTraceComponent::TickComponent(float DeltaTime, ELevelTick TickTy
 	}
 }
 
-FVector UGGYGOMeleeTraceComponent::GetSocketLocation(const USkeletalMeshComponent* Mesh, FName SocketName) const
+USkeletalMeshComponent* UGGYGOMeleeTraceComponent::GetTraceMesh() const
 {
-	if (!Mesh)
-	{
-		return FVector::ZeroVector;
-	}
-
-	// DoesSocketExist 同时覆盖 socket 与骨骼名，所以武器挂点用哪种都行。
-	if (SocketName.IsNone() || !Mesh->DoesSocketExist(SocketName))
-	{
-		// 回退到组件原点而不是返回零向量：零向量会让扫掠从世界原点开始，
-		// 扫过整张地图。
-		return Mesh->GetComponentLocation();
-	}
-
-	return Mesh->GetSocketLocation(SocketName);
+	const ACharacter* Character = Cast<ACharacter>(GetOwner());
+	return Character ? Character->GetMesh() : nullptr;
 }
 
 void UGGYGOMeleeTraceComponent::PerformTrace()
 {
 	const AActor* Owner = GetOwner();
 	const UWorld* World = GetWorld();
-	if (!Owner || !World)
+	if (!Owner || !World || !bIsTracing)
 	{
 		return;
 	}
 
-	const ACharacter* OwnerCharacter = Cast<ACharacter>(Owner);
-	const USkeletalMeshComponent* Mesh = OwnerCharacter ? OwnerCharacter->GetMesh() : nullptr;
-	if (!Mesh)
+	const USkeletalMeshComponent* Mesh = GetTraceMesh();
+	if (!Mesh || !Mesh->DoesSocketExist(StartSocket) || !Mesh->DoesSocketExist(EndSocket))
 	{
+		EndTraceWindow();
 		return;
 	}
 
-	const FVector CurrentStart = GetSocketLocation(Mesh, StartSocket);
-	const FVector CurrentEnd = GetSocketLocation(Mesh, EndSocket);
+	const uint32 TraceSerial = WindowSerial;
+	const FVector CurrentStart = Mesh->GetSocketLocation(StartSocket);
+	const FVector CurrentEnd = Mesh->GetSocketLocation(EndSocket);
+	if (CurrentStart.ContainsNaN() || CurrentEnd.ContainsNaN()) { EndTraceWindow(); return; }
+	const double MaxLength = FMath::Max(FVector::Distance(CurrentStart, CurrentEnd),
+		bHasPreviousTransform ? FVector::Distance(PreviousStart, PreviousEnd) : 0.0);
+	// 采样间距不超过半径，长武器不会因固定等分数在长度方向留下空洞。
+	const double RequiredSegments = FMath::Max(1.0, FMath::CeilToDouble(MaxLength / TraceRadius));
+	if (RequiredSegments > MaxTraceSegments)
+	{
+		UE_LOG(LogGGYGOMeleeTrace, Warning,
+			TEXT("MeleeTrace [%s] 所需分段 %.0f 超过上限 %d；长度 %.1f、半径 %.1f，关闭窗口。"),
+			*GetNameSafe(GetOwner()), RequiredSegments, MaxTraceSegments, MaxLength, TraceRadius);
+		EndTraceWindow();
+		return;
+	}
+	const int32 SegmentCount = static_cast<int32>(RequiredSegments);
 
 	if (!bHasPreviousTransform)
 	{
@@ -106,14 +140,12 @@ void UGGYGOMeleeTraceComponent::PerformTrace()
 
 	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(GGYGOMeleeTrace), /*bTraceComplex=*/false);
 	QueryParams.AddIgnoredActor(Owner);
+	QueryParams.bReturnPhysicalMaterial = true;
 
 	// 沿武器长度分段扫掠。
 	//
-	// 只扫一条"武器根到武器尖"的胶囊是不够的：那样只能检测垂直于武器的接触，
-	// 而挥砍时是武器的**侧面**扫过敌人。分段后每段各自做一次从上一帧位置到
-	// 本帧位置的扫掠，合起来覆盖了武器扫过的整个面。
-	constexpr int32 SegmentCount = 4;
-
+	// 每个采样点从上帧位置扫到本帧位置；离散帧之间按直线近似，
+	// 大角度旋转时仍不能声称还原了武器的真实弧形运动。
 	TArray<FHitResult> Hits;
 
 	for (int32 SegmentIndex = 0; SegmentIndex <= SegmentCount; ++SegmentIndex)
@@ -156,6 +188,7 @@ void UGGYGOMeleeTraceComponent::PerformTrace()
 			HitActorsThisWindow.Add(HitActor);
 
 			OnMeleeHit.Broadcast(HitActor, Hit);
+			if (!bIsTracing || WindowSerial != TraceSerial) { return; }
 		}
 	}
 

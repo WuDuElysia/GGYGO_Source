@@ -65,13 +65,26 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
 	const UGGYGOPawnData* GetPawnData() const { return PawnData; }
 
+	/**
+	 * 仅供服务器查询 PawnData 是否已设置且原能力授予循环已完成。
+	 * 不保证全部 GA/GE 配置有效，也不代表客户端 GameplayReady。
+	 */
+	bool IsPawnDataInitializationComplete() const { return PawnData != nullptr && bAbilitiesGranted; }
+
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/** 本位置装的角色定义。复制给客户端用于 UI 与表现。 */
-	UPROPERTY(Replicated)
+	UPROPERTY(ReplicatedUsing = OnRep_PawnData)
 	TObjectPtr<const UGGYGOPawnData> PawnData;
 
 	/** 能力是否已授予。防止 `InitializeForPawnData` 被重复调用时重复授予。 */
 	bool bAbilitiesGranted = false;
+
+	UFUNCTION()
+	void OnRep_PawnData();
+
+private:
+	/** 将 PawnData 中的组规则与 Tag 关系应用到 ASC；可由初始化与复制回调重复调用。 */
+	void ApplyAbilitySystemConfiguration();
 };

@@ -27,7 +27,7 @@ struct FZZZAnimTuning
 	UPROPERTY(EditAnywhere, Category = "Blend")
 	float OneShotBlendOut = 0.15f;
 
-	/** GaitBlendY 向目标值收敛的速率（1/秒）；面板钳制只约束输入，运行期仍按规则层容错规则解析 */
-	UPROPERTY(EditAnywhere, Category = "Gait", meta = (ClampMin = "0.1", ClampMax = "50.0"))
+	/** 旧 ABP 序列化兼容字段。运行时改读 MovementSet.WalkRunBlendInterpSpeed。 */
+	UPROPERTY(EditAnywhere, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Move this value to MovementSet.WalkRunBlendInterpSpeed."))
 	float GaitBlendInterpSpeed = 6.f;
 };

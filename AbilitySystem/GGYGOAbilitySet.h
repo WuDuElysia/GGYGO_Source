@@ -36,6 +36,9 @@ class UGameplayEffect;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOGameplayAbility;
 class UObject;
+#if WITH_EDITOR
+class FDataValidationContext;
+#endif
 
 /** 一条能力配置。 */
 USTRUCT(BlueprintType)
@@ -130,6 +133,11 @@ class GGYGO_API UGGYGOAbilitySet : public UPrimaryDataAsset
 
 public:
 	UGGYGOAbilitySet(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+#if WITH_EDITOR
+	/** 只校验本资产的属性集类与存储冲突；不校验运行ASC已有实例或GA/GE配置。 */
+	virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
+#endif
 
 	/**
 	 * 把本资产的内容授予给 ASC。仅服务器有效。

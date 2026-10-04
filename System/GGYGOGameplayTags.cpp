@@ -41,6 +41,8 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Intent_SwitchCharacter, "Intent.SwitchCharacter");
 	UE_DEFINE_GAMEPLAY_TAG(BossAction, "BossAction");
 	UE_DEFINE_GAMEPLAY_TAG(BossAction_Attack_Melee, "BossAction.Attack.Melee");
+	UE_DEFINE_GAMEPLAY_TAG(BossAction_Attack_Melee_Ice01, "BossAction.Attack.Melee.Ice01");
+	UE_DEFINE_GAMEPLAY_TAG(BossAction_Attack_Melee_Ice02, "BossAction.Attack.Melee.Ice02");
 
 	// ===== 三、AbilityGroup =====
 	UE_DEFINE_GAMEPLAY_TAG(AbilityGroup_Attack, "AbilityGroup.Attack");

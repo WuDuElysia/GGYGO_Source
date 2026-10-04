@@ -36,14 +36,15 @@
  *
  * ## 蓝图当前读取面
  * 过渡图读取 `AnimationState.bHasMoveInput` 与两个通用语义查询；状态图读取
- * `StateMemory.GaitBlendY`、`StateMemory.StopValue`，以及两个查表函数。
+ * `StateMemory.GaitBlendY`（旧序列化名，显示为 Walk Run Blend Alpha）、
+ * `StateMemory.StopValue`，以及两个查表函数。
  * 其余暴露出去的属性（`AnimBlend*`、`ActualVelocity*`、`bTurnBackRunOut`）
  * 目前**没有**任何 AnimGraph 节点消费，保留它们是为了给表现层留钩子；
  * 逐个属性的现状见各自的注释。
  *
- * 本类不维护状态机循环，也不解算步态：步态由移动层给出，动画层只消费快照、
- * 推进 GaitBlendY 与 StopValue。EnterMove 早停计时仍由
- * `FZZZLocomotionEvents` 每帧维护，待后续还给 AnimBP。
+ * 本类不维护状态机循环，也不解算步态：Movement 在只读帧中发布走跑混合与停止语义，
+ * 动画层只把它们映射到现有 GaitBlendY 序列化存储和 StopValue。动画层不再插值走跑值，
+ * 也不再计时选择停止分支。
  */
 #pragma once
 
@@ -167,9 +168,12 @@ protected:
 	/** 迁移期表现快照（游戏线程写入，表现记忆只读）。 */
 	FZZZAnimSnapshot Snap;
 
+	/** 清理本实例在 Pawn 生命周期之间持有的兼容表现状态。 */
+	virtual void OnAnimationLifecycleReset() override;
+
 private:
-	/** 通用语义帧适配成旧快照 → 注入兼容上下文 → 推进旧表现记忆。 */
-	void RefreshDecisionContext(float DeltaSeconds);
+	/** 通用语义帧适配成旧快照，再映射到现有 AnimBP 表现存储。 */
+	void RefreshDecisionContext();
 
 	/** 把通用 AnimationStateFrame 转成现有 AnimBP 仍在使用的旧快照。 */
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;

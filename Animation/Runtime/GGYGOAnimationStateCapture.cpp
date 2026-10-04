@@ -45,10 +45,12 @@ void FGGYGOAnimationStateCapture::Capture(
 	OutState.HorizontalSpeed = MoveComp->GetHorizontalSpeed();
 	OutState.WorldVelocityDirection = MoveComp->GetHorizontalVelocityDirection();
 	OutState.LocalVelocityAngle = MoveComp->GetLocalVelocityAngle();
-	float LocalBlendX = 0.0f;
-	float LocalBlendY = 0.0f;
-	MoveComp->GetLocalVelocityBlend(LocalBlendX, LocalBlendY);
-	OutState.LocalVelocityBlend = FVector2D(LocalBlendX, LocalBlendY);
+	float LocalForward = 0.0f;
+	float LocalRight = 0.0f;
+	MoveComp->GetLocalVelocityAxes(LocalForward, LocalRight);
+	OutState.LocalVelocityBlend = FVector2D(LocalForward, LocalRight);
+	OutState.WalkRunBlendAlpha = MoveComp->GetWalkRunBlendAlpha();
+	OutState.StopMotionType = MoveComp->GetStopMotionType();
 
 	OutState.Gait = MoveComp->GetResolvedGait();
 	OutState.MovementMode = MoveComp->MovementMode;
@@ -69,7 +71,7 @@ void FGGYGOAnimationStateCapture::Capture(
 			1.0f);
 	}
 
-	const FGGYGOAnimCurveMotion& CurveMotion = MoveComp->GetCurveMotion();
+	const FGGYGOLocomotionCurveSample& CurveMotion = MoveComp->GetCurveMotion();
 	OutDebug.CurveVelocity = CurveMotion.Velocity;
 	OutDebug.CurveVelocityDirection = CurveMotion.Direction;
 	OutDebug.CurveVelocityAngle = CurveMotion.DirectionAngle;

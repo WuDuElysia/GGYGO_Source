@@ -29,6 +29,199 @@
 UE_DEFINE_GAMEPLAY_TAG(TAG_GGYGO_Ability_SimpleFailureMessage, "Ability.UserFacingSimpleActivateFail.Message");
 UE_DEFINE_GAMEPLAY_TAG(TAG_GGYGO_Ability_PlayMontageFailureMessage, "Ability.PlayMontageOnActivateFail.Message");
 
+namespace
+{
+void AppendPhysicalMaterialTags(const FHitResult& HitResult, FGameplayTagContainer& OutTags)
+{
+	if (const UGGYGOPhysicalMaterialWithTags* PhysMatWithTags =
+		Cast<const UGGYGOPhysicalMaterialWithTags>(HitResult.PhysMaterial.Get()))
+	{
+		OutTags.AppendTags(PhysMatWithTags->Tags);
+	}
+}
+}
+
+/** Immutable original source, with weak allocation/objects; never an Active or spec-count cache. */
+struct FGGYGOAbilityActivationHandle::FActivationProof
+{
+	TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	uint64 Serial = 0;
+	FGameplayAbilitySpecHandle SpecHandle;
+	FPredictionKey ActivationKey; // Native coherence only; Serial/proof is the activation identity.
+	FGGYGOAvatarBindingContext BindingContext;
+	TWeakPtr<const FGameplayAbilityActorInfo> Allocation;
+	TWeakObjectPtr<UAbilitySystemComponent> ActorInfoASC;
+	TWeakObjectPtr<AActor> OwnerActor;
+	TWeakObjectPtr<AActor> AvatarActor;
+	TWeakObjectPtr<APlayerController> PlayerController;
+	TWeakObjectPtr<USkeletalMeshComponent> SkeletalMeshComponent;
+	TWeakObjectPtr<UMovementComponent> MovementComponent;
+	TWeakObjectPtr<UAnimInstance> ActorInfoAnimInstance;
+	TWeakObjectPtr<UAnimInstance> ActualAnimInstance;
+	TWeakObjectPtr<AActor> CachedOwnerActor;
+	TWeakObjectPtr<AActor> CachedAvatarActor;
+	FName ActorInfoAffectedAnimInstanceTag = NAME_None;
+	FName ASCAffectedAnimInstanceTag = NAME_None;
+};
+
+FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
+	UGGYGOAbilitySystemComponent* OriginalASC, FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, EGGYGOAbilityActivationRequestReason& OutReason)
+{
+	check(IsInGameThread());
+	OutReason = EGGYGOAbilityActivationRequestReason::InvalidAbility;
+	if (!IsValid(this) || !IsInstantiated() || !IsActive() || !IsValid(OriginalASC)
+		|| CurrentSpecHandle != Handle || CurrentActorInfo != ActorInfo)
+	{
+		return {};
+	}
+	if (LastControlledActivationSerial == MAX_uint64)
+	{
+		OutReason = EGGYGOAbilityActivationRequestReason::IdentityExhausted;
+		return {};
+	}
+	const FGameplayAbilitySpec* Spec = OriginalASC->FindAbilitySpecFromHandle(Handle);
+	if (!Spec || !Spec->GetAbilityInstances().Contains(this))
+	{
+		OutReason = EGGYGOAbilityActivationRequestReason::InvalidSpec;
+		return {};
+	}
+	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Snapshot;
+	EGGYGOAvatarBindingReason SnapshotReason;
+	if (!OriginalASC->CaptureAvatarBindingActualSnapshot(Snapshot, SnapshotReason)
+		|| Snapshot.Allocation.Get() != ActorInfo
+		|| !OriginalASC->ValidateAvatarBindingActualSnapshot(Snapshot, SnapshotReason))
+	{
+		OutReason = EGGYGOAbilityActivationRequestReason::InvalidActorInfo;
+		return {};
+	}
+	TSharedRef<FGGYGOAbilityActivationHandle::FActivationProof> Proof =
+		MakeShared<FGGYGOAbilityActivationHandle::FActivationProof>();
+	Proof->Ability = this;
+	Proof->ASC = OriginalASC;
+	Proof->Serial = ++LastControlledActivationSerial;
+	Proof->SpecHandle = Handle;
+	Proof->ActivationKey = CurrentActivationInfo.GetActivationPredictionKey();
+	Proof->BindingContext = OriginalASC->GetAvatarBindingContext();
+	Proof->Allocation = Snapshot.Allocation;
+	Proof->ActorInfoASC = Snapshot.AbilitySystemComponent;
+	Proof->OwnerActor = Snapshot.OwnerActor;
+	Proof->AvatarActor = Snapshot.AvatarActor;
+	Proof->PlayerController = Snapshot.PlayerController;
+	Proof->SkeletalMeshComponent = Snapshot.SkeletalMeshComponent;
+	Proof->MovementComponent = Snapshot.MovementComponent;
+	Proof->ActorInfoAnimInstance = Snapshot.ActorInfoAnimInstance;
+	Proof->ActualAnimInstance = Snapshot.ActualAnimInstance;
+	Proof->CachedOwnerActor = Snapshot.CachedOwnerActor;
+	Proof->CachedAvatarActor = Snapshot.CachedAvatarActor;
+	Proof->ActorInfoAffectedAnimInstanceTag = Snapshot.ActorInfoAffectedAnimInstanceTag;
+	Proof->ASCAffectedAnimInstanceTag = Snapshot.ASCAffectedAnimInstanceTag;
+	CurrentControlledActivation.Proof = Proof;
+	OutReason = EGGYGOAbilityActivationRequestReason::None;
+	return CurrentControlledActivation;
+}
+
+FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivation() const
+{
+	check(IsInGameThread());
+	if (!IsValid(this) || !IsInstantiated() || !IsActive()
+		|| IsControlledActivationTerminationBusy() || !CurrentControlledActivation.Proof.IsValid())
+	{
+		return {};
+	}
+	const auto& Proof = *CurrentControlledActivation.Proof;
+	UGGYGOAbilitySystemComponent* ASC = Proof.ASC.Get();
+	if (!IsValid(ASC) || Proof.Ability.Get() != this || Proof.Serial == 0
+		|| Proof.Serial != LastControlledActivationSerial || CurrentSpecHandle != Proof.SpecHandle
+		|| CurrentActivationInfo.GetActivationPredictionKey() != Proof.ActivationKey)
+	{
+		return {};
+	}
+	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Proof.SpecHandle);
+	if (!Spec || !Spec->GetAbilityInstances().Contains(this))
+	{
+		return {};
+	}
+	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Original;
+	Original.Allocation = Proof.Allocation.Pin();
+	Original.AbilitySystemComponent = Proof.ActorInfoASC;
+	Original.OwnerActor = Proof.OwnerActor;
+	Original.AvatarActor = Proof.AvatarActor;
+	Original.PlayerController = Proof.PlayerController;
+	Original.SkeletalMeshComponent = Proof.SkeletalMeshComponent;
+	Original.MovementComponent = Proof.MovementComponent;
+	Original.ActorInfoAnimInstance = Proof.ActorInfoAnimInstance;
+	Original.ActualAnimInstance = Proof.ActualAnimInstance;
+	Original.CachedOwnerActor = Proof.CachedOwnerActor;
+	Original.CachedAvatarActor = Proof.CachedAvatarActor;
+	Original.ActorInfoAffectedAnimInstanceTag = Proof.ActorInfoAffectedAnimInstanceTag;
+	Original.ASCAffectedAnimInstanceTag = Proof.ASCAffectedAnimInstanceTag;
+	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Actual;
+	EGGYGOAvatarBindingReason SnapshotReason;
+	const FGGYGOAvatarBindingContext Context = ASC->GetAvatarBindingContext();
+	if (!Original.Allocation.IsValid() || Original.Allocation.Get() != CurrentActorInfo
+		|| Context.Binding.Serial != Proof.BindingContext.Binding.Serial
+		|| !Context.Binding.Issuer.HasSameIndexAndSerialNumber(Proof.BindingContext.Binding.Issuer)
+		|| Context.LastActorInfoWrite.Serial != Proof.BindingContext.LastActorInfoWrite.Serial
+		|| !Context.LastActorInfoWrite.Issuer.HasSameIndexAndSerialNumber(Proof.BindingContext.LastActorInfoWrite.Issuer)
+		|| !ASC->CaptureAvatarBindingActualSnapshot(Actual, SnapshotReason)
+		|| !ASC->ValidateAvatarBindingActualSnapshot(Actual, SnapshotReason)
+		|| !ASC->HasSameAvatarBindingActualSnapshot(Original, Actual))
+	{
+		return {};
+	}
+	return CurrentControlledActivation;
+}
+
+void UGGYGOGameplayAbility::RetireControlledActivation()
+{
+	CurrentControlledActivation = {};
+}
+
+void UGGYGOGameplayAbility::RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle)
+{
+	// A qualified/uncontrolled End cannot authenticate history: retire provenance, never infer completion.
+	if (!ControlledActivationEndScope)
+	{
+		RetireControlledActivation();
+		return;
+	}
+	const FGGYGOAbilityActivationHandle& Original = ControlledActivationEndScope->Original;
+	if (Original.Proof.IsValid() && Original.Proof->SpecHandle == Handle
+		&& CurrentControlledActivation.HasSameActivation(Original))
+	{
+		RetireControlledActivation();
+	}
+}
+
+UGGYGOGameplayAbility::FScopedControlledActivationEnd::FScopedControlledActivationEnd(
+	UGGYGOGameplayAbility* InAbility)
+	: Ability(InAbility), Previous(InAbility->ControlledActivationEndScope),
+	  Original(InAbility->CurrentControlledActivation)
+{
+	check(IsInGameThread());
+	InAbility->ControlledActivationEndScope = this;
+}
+
+UGGYGOGameplayAbility::FScopedControlledActivationEnd::~FScopedControlledActivationEnd()
+{
+	if (UGGYGOGameplayAbility* OriginalAbility = Ability.Get())
+	{
+		check(OriginalAbility->ControlledActivationEndScope == this);
+		if (!OriginalAbility->IsActive() && OriginalAbility->CurrentControlledActivation.HasSameActivation(Original))
+		{
+			OriginalAbility->RetireControlledActivationForNativeEnd(OriginalAbility->CurrentSpecHandle);
+		}
+		OriginalAbility->ControlledActivationEndScope = Previous;
+	}
+}
+
+bool UGGYGOGameplayAbility::IsControlledActivationTerminationBusy() const
+{
+	return ControlledActivationEndScope != nullptr || bIsAbilityEnding;
+}
+
 UGGYGOGameplayAbility::UGGYGOGameplayAbility(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -142,36 +335,67 @@ void UGGYGOGameplayAbility::NativeOnAbilityFailedToActivate(const FGameplayTagCo
 
 bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const
 {
-	if (!ActorInfo || !ActorInfo->AbilitySystemComponent.IsValid())
+	UGGYGOAbilitySystemComponent* EvaluationASC = ActorInfo
+		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()) : nullptr;
+	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalEvaluationASC(EvaluationASC);
+	const bool bHadProjectEvaluationASC = EvaluationASC != nullptr;
+	UGGYGOAbilitySystemComponent::FScopedAbilityActivationEvaluation Evaluation(
+		EvaluationASC, this, Handle, ActorInfo);
+	const uint64 ControlledEvaluationSerial = EvaluationASC
+		? EvaluationASC->BeginControlledAbilityActivationEvaluation(this, Handle, ActorInfo) : 0;
+	bool bCanActivate = [&]() -> bool
 	{
-		return false;
-	}
-
-	// 父类先做冷却、消耗、Tag 需求等通用检查。
-	if (!Super::CanActivateAbility(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags))
-	{
-		return false;
-	}
-
-	// 再做组仲裁。用 Cast 而不是 CastChecked：Ability 可能被授予到非项目 ASC 上
-	// （例如测试用的裸 ASC），那种情况下跳过组检查而不是崩掉。
-	if (const UGGYGOAbilitySystemComponent* GGYGOASC = Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()))
-	{
-		EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
-		if (GGYGOASC->IsActivationBlockedByGroup(this, BlockReason))
+		if (!ActorInfo || !ActorInfo->AbilitySystemComponent.IsValid())
 		{
-			if (OptionalRelevantTags)
-			{
-				// 把"该不该重试"编码进失败 Tag，意图层不必反查配置表就能决定
-				// 把请求留在缓冲里还是丢弃。
-				OptionalRelevantTags->AddTag(BlockReason == EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued
-					? GGYGOGameplayTags::Ability_ActivateFail_ActivationGroupQueued
-					: GGYGOGameplayTags::Ability_ActivateFail_ActivationGroup);
-			}
 			return false;
 		}
-	}
 
+		// 父类先做冷却、消耗、Tag 需求等通用检查。
+		if (!Super::CanActivateAbility(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags))
+		{
+			return false;
+		}
+
+		// 再做组仲裁。用 Cast 而不是 CastChecked：Ability 可能被授予到非项目 ASC 上
+		// （例如测试用的裸 ASC），那种情况下跳过组检查而不是崩掉。
+		// Native/BP/cost callbacks may invalidate or replace the receiver. Reacquire only the original ASC.
+		if (const UGGYGOAbilitySystemComponent* GGYGOASC = OriginalEvaluationASC.Get())
+		{
+			EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
+			if (GGYGOASC->IsActivationBlockedByGroup(this, BlockReason))
+			{
+				if (OptionalRelevantTags)
+				{
+					// 把"该不该重试"编码进失败 Tag，意图层不必反查配置表就能决定
+					// 把请求留在缓冲里还是丢弃。
+					OptionalRelevantTags->AddTag(BlockReason == EGGYGOAbilityGroupBlockReason::GroupOccupiedQueued
+						? GGYGOGameplayTags::Ability_ActivateFail_ActivationGroupQueued
+						: GGYGOGameplayTags::Ability_ActivateFail_ActivationGroup);
+				}
+				return false;
+			}
+		}
+		else if (bHadProjectEvaluationASC)
+		{
+			return false;
+		}
+
+		return CanActivateAbilityAdditional(Handle, ActorInfo, SourceTags, TargetTags, OptionalRelevantTags);
+	}();
+	if (ControlledEvaluationSerial != 0)
+	{
+		UGGYGOAbilitySystemComponent* OriginalASC = OriginalEvaluationASC.Get();
+		bCanActivate = OriginalASC
+			? OriginalASC->CompleteControlledAbilityActivationEvaluation(ControlledEvaluationSerial, bCanActivate)
+			: false;
+	}
+	Evaluation.Complete(bCanActivate);
+	return bCanActivate;
+}
+
+bool UGGYGOGameplayAbility::CanActivateAbilityAdditional(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const
+{
+	// 明确的默认模式：没有附加准入条件；核心检查由 final 入口先完成。
 	return true;
 }
 
@@ -325,11 +549,80 @@ void UGGYGOGameplayAbility::ApplyAbilityTagsToGameplayEffectSpec(FGameplayEffect
 	// 把命中表面的 Tag 并进目标 Tag，让 Cue 能按材质分流、Execution 能按材质减伤。
 	if (const FHitResult* HitResult = Spec.GetContext().GetHitResult())
 	{
-		if (const UGGYGOPhysicalMaterialWithTags* PhysMatWithTags = Cast<const UGGYGOPhysicalMaterialWithTags>(HitResult->PhysMaterial.Get()))
+		AppendPhysicalMaterialTags(*HitResult, Spec.CapturedTargetTags.GetSpecTags());
+	}
+}
+
+bool UGGYGOGameplayAbility::BuildHitEffectPayload(UAbilitySystemComponent* TargetAbilitySystemComponent,
+	TSubclassOf<UGameplayEffect> DamageEffectClass, float EffectLevel,
+	const FHitResult& HitResult, const FVector& Origin,
+	FGGYGOHitEffectPayload& OutPayload) const
+{
+	OutPayload = FGGYGOHitEffectPayload();
+
+	if (!CurrentActorInfo || !TargetAbilitySystemComponent)
+	{
+		return false;
+	}
+
+	UAbilitySystemComponent* SourceAbilitySystemComponent = GetAbilitySystemComponentFromActorInfo();
+	if (!SourceAbilitySystemComponent)
+	{
+		return false;
+	}
+
+	OutPayload.EffectContext = MakeEffectContext(CurrentSpecHandle, CurrentActorInfo);
+	if (!OutPayload.EffectContext.IsValid())
+	{
+		return false;
+	}
+
+	// AddHitResult(reset=true) 会用 TraceStart 改写 Origin，所以显式 Origin 必须最后写入。
+	OutPayload.EffectContext.AddHitResult(HitResult, /*bReset=*/true);
+	FGGYGOGameplayEffectContext* GGYGOContext =
+		FGGYGOGameplayEffectContext::ExtractEffectContext(OutPayload.EffectContext);
+	check(GGYGOContext);
+	GGYGOContext->SetSourceOriginSnapshot(Origin);
+
+	if (DamageEffectClass)
+	{
+		OutPayload.EffectSpec = SourceAbilitySystemComponent->MakeOutgoingSpec(
+			DamageEffectClass, EffectLevel, OutPayload.EffectContext);
+
+		if (OutPayload.EffectSpec.IsValid())
 		{
-			Spec.CapturedTargetTags.GetSpecTags().AppendTags(PhysMatWithTags->Tags);
+			FGameplayAbilitySpec* AbilitySpec = SourceAbilitySystemComponent->FindAbilitySpecFromHandle(CurrentSpecHandle);
+			ApplyAbilityTagsToGameplayEffectSpec(*OutPayload.EffectSpec.Data.Get(), AbilitySpec);
+
+			// 与 UGameplayAbility::MakeOutgoingGameplayEffectSpec 保持同一套能力级 Spec 扩展。
+			if (AbilitySpec)
+			{
+				OutPayload.EffectSpec.Data->SetByCallerTagMagnitudes = AbilitySpec->SetByCallerTagMagnitudes;
+			}
+			BP_EditSpecValues(OutPayload.EffectSpec);
+
+			UAbilitySystemGlobals::Get().InitGameplayCueParameters_GESpec(
+				OutPayload.CueParameters, *OutPayload.EffectSpec.Data.Get());
 		}
 	}
+
+	if (!OutPayload.EffectSpec.IsValid())
+	{
+		UAbilitySystemGlobals::Get().InitGameplayCueParameters(
+			OutPayload.CueParameters, OutPayload.EffectContext);
+	}
+
+	// 带输出参数的 GetOwnedGameplayTags 会先 Reset 容器；这里读取 const 集合后追加，
+	// 才不会覆盖 GESpec 已聚合的 Tag。物理材质最后追加，保证有/无 GE 两条路径一致。
+	OutPayload.CueParameters.AggregatedTargetTags.AppendTags(
+		TargetAbilitySystemComponent->GetOwnedGameplayTags());
+	AppendPhysicalMaterialTags(HitResult, OutPayload.CueParameters.AggregatedTargetTags);
+	OutPayload.CueParameters.Location = HitResult.ImpactPoint;
+	OutPayload.CueParameters.Normal = HitResult.ImpactNormal;
+	OutPayload.CueParameters.Instigator = OutPayload.EffectContext.GetInstigator();
+	OutPayload.CueParameters.EffectCauser = OutPayload.EffectContext.GetEffectCauser();
+
+	return true;
 }
 
 bool UGGYGOGameplayAbility::DoesAbilitySatisfyTagRequirements(const UAbilitySystemComponent& AbilitySystemComponent, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, OUT FGameplayTagContainer* OptionalRelevantTags) const
@@ -441,6 +734,77 @@ void UGGYGOGameplayAbility::OnPawnAvatarSet()
 	K2_OnPawnAvatarSet();
 }
 
+void UGGYGOGameplayAbility::ReceiveAbilityCorrection(const FGameplayAbilityTargetDataHandle& Correction)
+{
+	// 默认基类只提供安全分发入口；业务载荷由派生能力解释。
+}
+
+uint64 UGGYGOGameplayAbility::BeginAbilityGroupAdmissionAttempt(uint64 AdmissionSequence)
+{
+	// ASC 分配的序号跨实例单调递增；0 表示分配失败，按拒绝处理。
+	FAbilityGroupAdmissionAttempt& Attempt = AbilityGroupAdmissionAttempts.AddDefaulted_GetRef();
+	Attempt.Sequence = AdmissionSequence;
+	Attempt.bRejected = AdmissionSequence == 0;
+	return Attempt.Sequence;
+}
+
+uint64 UGGYGOGameplayAbility::GetCurrentAbilityGroupAdmissionSequence() const
+{
+	return AbilityGroupAdmissionAttempts.IsEmpty() ? 0 : AbilityGroupAdmissionAttempts.Last().Sequence;
+}
+
+void UGGYGOGameplayAbility::RejectCurrentAbilityGroupAdmission()
+{
+	RejectAbilityGroupAdmission(GetCurrentAbilityGroupAdmissionSequence());
+}
+
+void UGGYGOGameplayAbility::RejectAbilityGroupAdmission(uint64 AdmissionSequence)
+{
+	if (FAbilityGroupAdmissionAttempt* Attempt = AbilityGroupAdmissionAttempts.FindByPredicate(
+		[AdmissionSequence](const FAbilityGroupAdmissionAttempt& Candidate) { return Candidate.Sequence == AdmissionSequence; }))
+	{
+		Attempt->bRejected = true;
+	}
+}
+
+bool UGGYGOGameplayAbility::IsCurrentAbilityGroupAdmissionRejected() const
+{
+	return !AbilityGroupAdmissionAttempts.IsEmpty() && AbilityGroupAdmissionAttempts.Last().bRejected;
+}
+
+bool UGGYGOGameplayAbility::IsAbilityGroupAdmissionRejected(uint64 AdmissionSequence) const
+{
+	const FAbilityGroupAdmissionAttempt* Attempt = AbilityGroupAdmissionAttempts.FindByPredicate(
+		[AdmissionSequence](const FAbilityGroupAdmissionAttempt& Candidate) { return Candidate.Sequence == AdmissionSequence; });
+	return Attempt && Attempt->bRejected;
+}
+
+bool UGGYGOGameplayAbility::IsAbilityGroupAdmissionPending(uint64 AdmissionSequence) const
+{
+	return AbilityGroupAdmissionAttempts.ContainsByPredicate(
+		[AdmissionSequence](const FAbilityGroupAdmissionAttempt& Candidate) { return Candidate.Sequence == AdmissionSequence; });
+}
+
+bool UGGYGOGameplayAbility::ConsumeAbilityGroupAdmissionRejection(uint64 AdmissionSequence)
+{
+	FAbilityGroupAdmissionAttempt* Attempt = AbilityGroupAdmissionAttempts.FindByPredicate(
+		[AdmissionSequence](const FAbilityGroupAdmissionAttempt& Candidate) { return Candidate.Sequence == AdmissionSequence; });
+	const bool bRejected = Attempt && Attempt->bRejected;
+	if (Attempt)
+	{
+		Attempt->bRejected = false;
+	}
+	return bRejected;
+}
+
+void UGGYGOGameplayAbility::CompleteAbilityGroupAdmissionAttempt(uint64 AdmissionSequence)
+{
+	AbilityGroupAdmissionAttempts.RemoveAll([AdmissionSequence](const FAbilityGroupAdmissionAttempt& Attempt)
+	{
+		return Attempt.Sequence == AdmissionSequence;
+	});
+}
+
 void UGGYGOGameplayAbility::GetAbilitySource(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, float& OutSourceLevel, const IGGYGOAbilitySourceInterface*& OutAbilitySource, AActor*& OutEffectCauser) const
 {
 	// 先给确定的默认值，避免调用方读到未初始化数据。
@@ -483,6 +847,32 @@ void UGGYGOGameplayAbility::TryActivateAbilityOnSpawn(const FGameplayAbilityActo
 
 void UGGYGOGameplayAbility::ActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
 {
+	const uint64 AdmissionSequence = GetCurrentAbilityGroupAdmissionSequence();
+	// Current instance may already have been rejected by a newer attempt in a PreActivate callback.
+	// In that case it must not run its own resolver and cancel any more abilities.
+	const bool bRejectedBeforeFinalization = IsAbilityGroupAdmissionRejected(AdmissionSequence);
+	bool bResolverAdmitted = true;
+	UGGYGOAbilitySystemComponent* GGYGOASC = ActorInfo
+		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get())
+		: nullptr;
+	if (!bRejectedBeforeFinalization && GGYGOASC && AdmissionSequence != 0)
+	{
+		bResolverAdmitted = GGYGOASC->FinalizeAbilityGroupAdmission(this, AdmissionSequence);
+	}
+	// A recursive newer attempt may reject this one while the resolver cancels competitors.
+	const bool bRejectedAfterFinalization = ConsumeAbilityGroupAdmissionRejection(AdmissionSequence);
+	const bool bAdmissionRejected = bRejectedBeforeFinalization || !bResolverAdmitted || bRejectedAfterFinalization;
+
+	// Keep pending set throughout Resolve/Consume so recursive cancellation only marks this attempt.
+	CompleteAbilityGroupAdmissionAttempt(AdmissionSequence);
+	if (bAdmissionRejected)
+	{
+		// PreActivate 尚不能 End（Spec.ActiveCount 未增加）；进入这里时 GAS 已完成递增，
+		// 因此可安全结束并阻止镜头与蓝图业务启动。
+		EndAbility(Handle, ActorInfo, ActivationInfo, /*bReplicateEndAbility=*/true, /*bWasCancelled=*/true);
+		return;
+	}
+
 	// 先应用相机配置再调父类。父类会触发蓝图的激活事件，
 	// 蓝图里可能立刻用 SetCameraMode 覆盖成别的模式，那应当赢。
 	if (AbilityCameraMode)
@@ -500,6 +890,9 @@ void UGGYGOGameplayAbility::ActivateAbility(const FGameplayAbilitySpecHandle Han
 
 void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode)
 {
+	// 能力实例是 InstancedPerActor；显式替换时先释放它自己保存的旧接收者请求。
+	ClearCameraMode();
+
 	if (!CameraMode)
 	{
 		return;
@@ -509,43 +902,70 @@ void UGGYGOGameplayAbility::SetCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMo
 	// 再读取这个结果，因此能力不需要自己每帧重复 Push。
 	if (UGGYGOHeroComponent* HeroComponent = UGGYGOHeroComponent::FindHeroComponent(GetAvatarActorFromActorInfo()))
 	{
-		HeroComponent->SetAbilityCameraMode(CameraMode, CurrentSpecHandle);
-		ActiveCameraMode = CameraMode;
+		const uint64 RequestGeneration = HeroComponent->SetAbilityCameraMode(CameraMode, CurrentSpecHandle);
+		if (RequestGeneration != 0)
+		{
+			AppliedCameraModeHeroComponent = HeroComponent;
+			AppliedCameraModeSpecHandle = CurrentSpecHandle;
+			AppliedCameraModeRequestGeneration = RequestGeneration;
+			ActiveCameraMode = CameraMode;
+		}
 	}
 }
 
 void UGGYGOGameplayAbility::ClearCameraMode()
 {
-	if (ActiveCameraMode)
+	if (AppliedCameraModeRequestGeneration != 0)
 	{
-		if (UGGYGOHeroComponent* HeroComponent = UGGYGOHeroComponent::FindHeroComponent(GetAvatarActorFromActorInfo()))
+		if (UGGYGOHeroComponent* HeroComponent = AppliedCameraModeHeroComponent.Get())
 		{
-			HeroComponent->ClearAbilityCameraMode(CurrentSpecHandle);
+			HeroComponent->ClearAbilityCameraMode(AppliedCameraModeSpecHandle, AppliedCameraModeRequestGeneration);
 		}
-
-		// 无论 Avatar 是否仍存在，都要清掉能力实例自己的运行时标记。
-		ActiveCameraMode = nullptr;
 	}
+
+	// 不按当前 Avatar 重新查找接收者。Avatar 变化后旧请求不转移到新 Pawn。
+	AppliedCameraModeHeroComponent.Reset();
+	AppliedCameraModeSpecHandle = FGameplayAbilitySpecHandle();
+	AppliedCameraModeRequestGeneration = 0;
+	ActiveCameraMode = nullptr;
 }
 
 void UGGYGOGameplayAbility::ApplyCameraOffset(const FGGYGOCameraOffset& Offset)
 {
+	// Offset 是相机组件的单槽资源；替换时只撤销本能力持有的旧 token。
+	ClearCameraOffset();
+
 	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
 	{
-		CameraComponent->SetCameraOffset(Offset);
+		const FGGYGOCameraOffsetHandle Handle = CameraComponent->SetCameraOffset(Offset);
+		if (Handle.IsValid())
+		{
+			AppliedCameraOffsetHandle = Handle;
+			AppliedCameraOffsetComponent = CameraComponent;
+		}
 	}
 }
 
 void UGGYGOGameplayAbility::ClearCameraOffset()
 {
-	if (UGGYGOCameraComponent* CameraComponent = UGGYGOCameraComponent::FindCameraComponent(GetAvatarActorFromActorInfo()))
+	if (UGGYGOCameraComponent* CameraComponent = AppliedCameraOffsetComponent.Get())
 	{
-		CameraComponent->ClearCameraOffset();
+		CameraComponent->ClearCameraOffset(AppliedCameraOffsetHandle);
 	}
+
+	// 清理只归还申请时保存的相机与 token；当前 Avatar 不参与资源查找。
+	AppliedCameraOffsetComponent.Reset();
+	AppliedCameraOffsetHandle = FGGYGOCameraOffsetHandle();
 }
 
 void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
 {
+	if (!IsEndAbilityValid(Handle, ActorInfo))
+	{
+		return;
+	}
+
+	FScopedControlledActivationEnd OriginalEndScope(this);
 	// 先清相机再交给父类：父类会清理 ActorInfo，之后就拿不到 Avatar 了。
 	// 被组仲裁取消、被死亡取消、Avatar 销毁这些路径都会走到这里，
 	// 所以镜头不会永久停在演出视角。

@@ -40,66 +40,12 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Character/Data/GGYGOMovementTypes.h"
 
 class UAnimInstance;
 
-/** 一帧的曲线运动量。位移与方向分量处于动画段起点坐标系，轴序为 UE 局部空间（X 前、Y 右）。 */
-struct FGGYGOAnimCurveMotion
-{
-	/** 本帧速度（cm/s）。非负。 */
-	float Speed = 0.0f;
-
-	/** 本帧转角增量（度）。可正可负。 */
-	float YawDeltaDegrees = 0.0f;
-
-	/**
-	 * 从动画段起点累计的转角（度），即曲线原始值。
-	 *
-	 * 与 `YawDeltaDegrees` 同时需要：差分判断"转角是否已停止变化"，
-	 * 累计值判断"到底转过没有"。只看差分会把动画段刚切换、基线尚未建立的那一帧
-	 * （差分恒为 0）误判成"已经转完了"。
-	 */
-	float YawTotalDegrees = 0.0f;
-
-	/** 本帧位移量。 */
-	FVector PositionDelta = FVector::ZeroVector;
-
-	/** 位移量除以 DeltaTime 得到的速度向量。 */
-	FVector Velocity = FVector::ZeroVector;
-
-	/** 归一化的速度方向。 */
-	FVector Direction = FVector::ZeroVector;
-
-	/** 速度方向角（度）：0 为段起点的正前方，+90 为其右侧。 */
-	float DirectionAngle = 0.0f;
-
-	/** 动画的规范化有效时长（秒）。循环动画的循环周期就是这个值，不是资产时长。 */
-	float ClipLength = 0.0f;
-
-	/** 动画是循环的。循环动画的累计位移与路程会在循环点回绕到 0。 */
-	bool bLoopClip = false;
-
-	/** 方向来自烘焙曲线（而非位移差分）。烘焙值更稳，低速时尤其明显。 */
-	bool bHasAuthoredDirection = false;
-
-	/** 本帧有非零位移。 */
-	bool bHasPositionDelta = false;
-
-	/**
-	 * 当前动画确实带曲线数据。
-	 *
-	 * 为 false 表示当前播放的动画没有烘焙曲线，此时不该用曲线速度 ——
-	 * 与"曲线存在但这一帧速度恰好是 0"（例如起步的第一帧、或刹停动画的收尾段）
-	 * 是两种不同情况，后者应该让角色停住，前者应该回退到配置的固定速度。
-	 */
-	bool bHasCurveSource = false;
-
-	/** 全部归零。 */
-	void Reset();
-
-	/** 是否有可用于驱动移动的速度。 */
-	bool HasUsableSpeed() const;
-};
+/** 旧采样器只为历史工具保留；运行时 Locomotion 使用 Movement Profile。 */
+using FGGYGOAnimCurveMotion = FGGYGOLocomotionCurveSample;
 
 /**
  * 曲线采样器。

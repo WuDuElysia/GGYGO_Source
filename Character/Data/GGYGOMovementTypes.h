@@ -37,6 +37,56 @@ enum class EGGYGOGait : uint8
 	Run
 };
 
+/** Movement 拥有的 Locomotion 段。名称描述动作语义，不绑定某个 AnimBP 状态名。 */
+UENUM(BlueprintType)
+enum class EGGYGOLocomotionMotionType : uint8
+{
+	None,
+	WalkStart,
+	WalkRun,
+	StartStop,
+	WalkStop,
+	RunStop,
+	TurnBack
+};
+
+/** 停步姿态语义。动画兼容层再把它映射到现有 Select 的 0/1/2。 */
+UENUM(BlueprintType)
+enum class EGGYGOStopMotionType : uint8
+{
+	None,
+	StartStop,
+	WalkStop,
+	RunStop
+};
+
+/** Movement Profile 对一个模拟区间的纯求值结果，轴序为 X 前、Y 右。 */
+struct FGGYGOLocomotionCurveSample
+{
+	float Speed = 0.0f;
+	float YawDeltaDegrees = 0.0f;
+	float YawTotalDegrees = 0.0f;
+	FVector PositionDelta = FVector::ZeroVector;
+	FVector Velocity = FVector::ZeroVector;
+	FVector Direction = FVector::ZeroVector;
+	float DirectionAngle = 0.0f;
+	float ClipLength = 0.0f;
+	bool bLoopClip = false;
+	bool bHasAuthoredDirection = false;
+	bool bHasPositionDelta = false;
+	bool bHasCurveSource = false;
+
+	void Reset()
+	{
+		*this = FGGYGOLocomotionCurveSample();
+	}
+
+	bool HasUsableSpeed() const
+	{
+		return bHasCurveSource && Speed > KINDA_SMALL_NUMBER;
+	}
+};
+
 /**
  * 急停转身（TurnBack）的相位。
  *

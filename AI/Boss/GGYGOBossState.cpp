@@ -59,10 +59,7 @@ bool AGGYGOBossState::InitializeFromDefinition(const UGGYGOBossDefinition* InDef
 	}
 
 	BossDefinition = InDefinition;
-
-	// 组规则与 Tag 关系由初始形态 PawnData 提供。阶段 E 若允许形态间不同，需先定义合并规则。
-	AbilitySystemComponent->SetAbilityGroupConfig(InitialForm->AvatarPawnData->AbilityGroupConfig);
-	AbilitySystemComponent->SetTagRelationshipMapping(InitialForm->AvatarPawnData->TagRelationshipMapping);
+	ApplyAbilitySystemConfiguration();
 
 	TSet<const UGGYGOAbilitySet*> GrantedSets;
 	auto GrantSetOnce = [this, InDefinition, &GrantedSets](const UGGYGOAbilitySet* AbilitySet)
@@ -115,6 +112,24 @@ void AGGYGOBossState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 	DOREPLIFETIME(AGGYGOBossState, BossDefinition);
 	DOREPLIFETIME(AGGYGOBossState, CurrentFormTag);
 	DOREPLIFETIME(AGGYGOBossState, CurrentPhaseTag);
+}
+
+void AGGYGOBossState::OnRep_BossDefinition()
+{
+	ApplyAbilitySystemConfiguration();
+}
+
+void AGGYGOBossState::ApplyAbilitySystemConfiguration()
+{
+	const UGGYGOPawnData* InitialPawnData = GetInitialPawnData();
+	if (!InitialPawnData || !AbilitySystemComponent)
+	{
+		return;
+	}
+
+	// 组规则与 Tag 关系由初始形态 PawnData 提供。阶段 E 若允许形态间不同，需先定义合并规则。
+	AbilitySystemComponent->SetAbilityGroupConfig(InitialPawnData->AbilityGroupConfig);
+	AbilitySystemComponent->SetTagRelationshipMapping(InitialPawnData->TagRelationshipMapping);
 }
 
 void AGGYGOBossState::SetReplicatedStateTag(FGameplayTag& CurrentTag, FGameplayTag NewTag)

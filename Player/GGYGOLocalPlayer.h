@@ -2,30 +2,32 @@
  * @file GGYGOLocalPlayer.h
  * @brief 本地玩家 —— 跨关卡存活的玩家级数据宿主
  *
- * 存在的理由只有一个：给编队预设这类"每个本地玩家一份、跨关卡不变"的存档
- * 提供一个缓存点。
+ * 保有主本地玩家的唯一编队预设缓存，以及Input层的原生输入出生资格资源。
+ * 输入资格规则归OriginResource；本类只保有原对象并转发生命周期，不观察物理输入。
  *
  * ## 为什么需要缓存而不是每次读盘
- * `ULocalPlayerSaveGame::LoadOrCreateSaveGameForLocalPlayer` 每次调用都返回
- * **一个新对象**。编成面板与装配流程各调一次就会拿到两份互不相干的副本：
+ * 单次加载工厂不会持有缓存。编成面板与装配流程各自加载会拿到两份互不相干的副本：
  * 面板改完存盘，装配那边读到的却是自己那份旧数据，
  * 表现为"编好的队进关卡不生效"，而且不报任何错。
  *
  * 缓存在 LocalPlayer 上而不是 PlayerState 或 GameInstance：
  * PlayerState 每次关卡切换都重建；GameInstance 只有一份，
- * 分屏时两个玩家的编队会互相覆盖。LocalPlayer 正好是
- * "一个本地玩家，跨关卡存活"这个粒度。
+ * 本项目保留固定存档槽位，仅主本地玩家可持久化，次级玩家明确拒绝。
+ * LocalPlayer 提供跨关卡存活的宿主；原缓存失效时拒绝使用，不自动换新。
  *
  * 配置在 `DefaultEngine.ini` 的 `LocalPlayerClassName`。没配时引擎用
- * 基类 `ULocalPlayer`，编队存档会退化成每次读盘的无缓存行为。
+ * 基类 `ULocalPlayer`，现有取得入口会明确拒绝错误宿主配置。
  */
 #pragma once
 
 #include "Engine/LocalPlayer.h"
+#include "UObject/WeakObjectPtrTemplates.h"
 
 #include "GGYGOLocalPlayer.generated.h"
 
+class UGameInstance;
 class UGGYGOSquadPresets;
+class UGGYGOMovementInputOriginResource;
 class UObject;
 
 UCLASS(Transient)
@@ -35,14 +37,37 @@ class GGYGO_API UGGYGOLocalPlayer : public ULocalPlayer
 
 public:
 	/**
-	 * 本玩家保存的编队预设。首次调用时同步读盘，之后返回同一份对象。
-	 *
-	 * 编成面板与装配流程都经这里取，才能保证两边看到的是同一份数据。
+	 * 唯一缓存的原生取得入口；首次加载及缓存返回均校验原主玩家、GI、用户和槽位关联。
+	 * 失败清空输出并提供原因；失效原缓存保留，不重读、换新或排队同步重入。
 	 */
+	bool TryGetSquadPresets(UGGYGOSquadPresets*& OutPresets, FString& OutError) const;
+
+	/** 蓝图兼容入口，只委托 TryGetSquadPresets；失败记录诊断并返回 nullptr。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Player")
 	UGGYGOSquadPresets* GetSquadPresets() const;
 
+	/** Pure read: real PlayerAdded alone creates the resource; removal retains it retired. */
+	UGGYGOMovementInputOriginResource* GetMovementInputOriginResource() const;
+
+	virtual void PlayerAdded(UGameViewportClient* InViewportClient, int32 InControllerID) override;
+	virtual void PlayerAdded(UGameViewportClient* InViewportClient, FPlatformUserId InUserId) override;
+	virtual void PlayerRemoved() override;
+	virtual void ReceivedPlayerController(APlayerController* NewController) override;
+	virtual bool SpawnPlayActor(const FString& URL, FString& OutError, UWorld* InWorld) override;
+	virtual void BeginDestroy() override;
+
 private:
+	UGGYGOMovementInputOriginResource* PrepareMovementInputOriginForPlayerAdded();
+	void FinishMovementInputOriginPlayerAdded(
+		const TWeakObjectPtr<UGGYGOMovementInputOriginResource>& OriginalResource,
+		TWeakObjectPtr<APlayerController> BeforeSuper);
+	void ReportMovementInputOriginFailure(FName Reason,
+		const UGGYGOMovementInputOriginResource* Resource) const;
+
+	/** One original resource, including after Removed; never reset to recover qualification. */
+	UPROPERTY(Transient)
+	TObjectPtr<UGGYGOMovementInputOriginResource> MovementInputOriginResource;
+
 	/**
 	 * 编队预设缓存。
 	 *
@@ -51,4 +76,17 @@ private:
 	 */
 	UPROPERTY(Transient)
 	mutable TObjectPtr<UGGYGOSquadPresets> SquadPresets;
+
+	/** Read-only provenance of the original publication, not another cache or readiness state. */
+	mutable TWeakObjectPtr<UGGYGOSquadPresets> SquadPresetsSourceObject;
+	mutable TWeakObjectPtr<const ULocalPlayer> SquadPresetsSourceLocalPlayer;
+	mutable TWeakObjectPtr<UGameInstance> SquadPresetsSourceGameInstance;
+	mutable FPlatformUserId SquadPresetsSourcePlatformUserId = PLATFORMUSERID_NONE;
+	mutable int32 SquadPresetsSourcePlatformUserIndex = INDEX_NONE;
+	mutable FString SquadPresetsSourceSlotName;
+	mutable FString SquadPresetsSourceGameInstancePath;
+	mutable FString SquadPresetsSourceObjectPath;
+
+	/** True only inside a synchronous access scope; never queues or retries a request. */
+	mutable bool bSquadPresetsAccessBusy = false;
 };

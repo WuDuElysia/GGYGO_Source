@@ -42,9 +42,17 @@ struct FGGYGOAnimationStateFrame
 	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
 	float LocalVelocityAngle = 0.0f;
 
-	/** 实际水平速度的 AnimBP 分量：X 为右，Y 为前。 */
+	/** CMC 标准局部速度轴：X 为前，Y 为右；兼容 AnimBP 的轴交换在旧快照适配处完成。 */
 	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
 	FVector2D LocalVelocityBlend = FVector2D::ZeroVector;
+
+	/** Movement 权威的 WalkRun BlendSpace 混合值：0 = Walk，1 = Run。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
+	float WalkRunBlendAlpha = 0.0f;
+
+	/** Movement 权威的停止动作语义，供旧 AnimBP 分支索引适配。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
+	EGGYGOStopMotionType StopMotionType = EGGYGOStopMotionType::None;
 
 	/** CMC 已解算的步态。 */
 	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")

@@ -27,13 +27,15 @@
 #include "GameFramework/RootMotionSource.h"
 #include "GGYGOCurveRootMotionSource.generated.h"
 
+struct FGGYGOCurveRootMotionOrigin;
+struct FGGYGOCurveRootMotionPrepared;
+
 /**
  * 曲线驱动的位移源。
  *
- * 速度与方向每帧从 `UGGYGOCharacterMovementComponent::GetCurveMotion()` 现取，
- * 不在本结构里缓存。这样曲线只有一个真值来源；移动回放时
- * `FSavedMove_GGYGO::PrepMoveFor` 已经把 `CurveMotion` 还原成当时的值，
- * 所以现取反而比自己存一份更不容易与回放失配。
+ * 每次 PrepareRootMotion 将原发行引用和实际原生区间交给原 CMC 求值。
+ * 不选择 Profile、不推进 CMC 语义时钟；Clone 保留原引用及区间派生结果。
+ * 本地来源不在 NetSerialize 中传输，网络导入来源尚未接入本消费契约。
  */
 USTRUCT()
 struct FRootMotionSource_GGYGOCurve : public FRootMotionSource
@@ -74,6 +76,12 @@ struct FRootMotionSource_GGYGOCurve : public FRootMotionSource
 	 */
 	UPROPERTY()
 	bool bEndOnZeroSpeed = true;
+
+	/** Issued only by the original CMC; shared ownership preserves clone provenance, not its validity. */
+	TSharedPtr<const FGGYGOCurveRootMotionOrigin> Origin;
+	TSharedPtr<const FGGYGOCurveRootMotionPrepared> Prepared;
+	/** Diagnostic de-duplication only; request failure remains in CMC. */
+	bool bOriginDiagnosticReported = false;
 
 	GGYGO_API virtual FRootMotionSource* Clone() const override;
 

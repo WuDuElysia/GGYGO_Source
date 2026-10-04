@@ -25,7 +25,7 @@ class IGGYGOAbilitySourceInterface;
 class UObject;
 class UPhysicalMaterial;
 
-/** GGYGO 的 EffectContext。字段布局与父类兼容，只增加来源对象与命中序号。 */
+/** GGYGO 的 EffectContext。沿用父类网络格式，增加服务器侧来源对象、命中序号与来源快照标志。 */
 USTRUCT()
 struct FGGYGOGameplayEffectContext : public FGameplayEffectContext
 {
@@ -65,16 +65,39 @@ struct FGGYGOGameplayEffectContext : public FGameplayEffectContext
 	const IGGYGOAbilitySourceInterface* GetAbilitySource() const;
 
 	/**
+	 * 记录调用方在命中时明确提供的来源位置快照。
+	 *
+	 * 不能只看父类 HasOrigin：FGameplayEffectContext::AddHitResult 会在没有 Origin 时
+	 * 自动把 TraceStart 写成 Origin。距离衰减只接受此入口记录的来源快照。
+	 */
+	void SetSourceOriginSnapshot(const FVector& InOrigin);
+
+	/** 是否持有调用方明确提供、且父类 Origin 仍有效的来源位置快照。 */
+	bool HasSourceOriginSnapshot() const { return bHasSourceOriginSnapshot && HasOrigin(); }
+
+	/** 重置命中时同时失效旧的显式来源快照；AddHitResult 自带的 TraceStart 不算来源快照。 */
+	virtual void AddHitResult(const FHitResult& InHitResult, bool bReset = false) override;
+
+	/**
 	 * 深拷贝上下文。GAS 在把 Spec 复制给多个目标时调用。
 	 * HitResult 必须深拷贝，否则源上下文析构后新上下文会持有悬空命中数据。
 	 */
 	virtual FGameplayEffectContext* Duplicate() const override
 	{
+		// 重加命中数据后恢复显式攻击 Origin。共享 builder 按约定在 AddHitResult 后设置 Origin，
+		// 深拷贝必须保留该值。
+		const bool bHadSourceOriginSnapshot = HasSourceOriginSnapshot();
+		const FVector SourceOriginSnapshot = bHadSourceOriginSnapshot ? GetOrigin() : FVector::ZeroVector;
+
 		FGGYGOGameplayEffectContext* NewContext = new FGGYGOGameplayEffectContext();
 		*NewContext = *this;
 		if (GetHitResult())
 		{
 			NewContext->AddHitResult(*GetHitResult(), /*bReset=*/true);
+		}
+		if (bHadSourceOriginSnapshot)
+		{
+			NewContext->SetSourceOriginSnapshot(SourceOriginSnapshot);
 		}
 		return NewContext;
 	}
@@ -87,13 +110,16 @@ struct FGGYGOGameplayEffectContext : public FGameplayEffectContext
 
 	/**
 	 * 网络序列化。当前只转发父类，扩展字段一律不上网：
-	 * `HitID` 属于本地/TargetData 路径，`AbilitySourceObject` 只在服务器结算时使用。
+	 * `HitID` 属于本地/TargetData 路径，`AbilitySourceObject` 与来源快照标志只在服务器结算时使用。
 	 * 若以后要复制扩展字段，必须同时实现自定义 Iris NetSerializer（见 .cpp 末尾的转发宏说明）。
 	 */
 	virtual bool NetSerialize(FArchive& Ar, class UPackageMap* Map, bool& bOutSuccess) override;
 
 	/** 从 HitResult 取物理材质。没有命中或材质缺失时返回 nullptr。 */
 	const UPhysicalMaterial* GetPhysicalMaterial() const;
+
+	/** 显式来源快照到 ImpactPoint 的距离。只有父类隐式 TraceStart Origin 时返回 0。 */
+	float GetDistanceFromOriginToHitResult() const;
 
 public:
 	/**
@@ -112,6 +138,10 @@ protected:
 	 */
 	UPROPERTY()
 	TWeakObjectPtr<const UObject> AbilitySourceObject;
+
+	/** 区分调用方来源快照与 AddHitResult 自动写入的 TraceStart Origin；不参与网络复制。 */
+	UPROPERTY()
+	bool bHasSourceOriginSnapshot = false;
 };
 
 /** 告知 GAS 本结构自带网络序列化且支持值拷贝，否则 Duplicate 与容器复制会丢掉扩展字段。 */

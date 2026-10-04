@@ -23,7 +23,10 @@ class GGYGO_API AGGYGOBossEncounter : public AActor
 public:
 	AGGYGOBossEncounter(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-	/** 仅服务器、仅一次。成功后三个实例都可通过下方访问器取得。 */
+	/** 仅服务器；已有对象、装配/清理中或 EndPlay 后拒绝。
+	 * 成功取得原三个实例；非空配置树须在原初始 Possess 中同步真实启动，失败统一回滚。
+	 * 配置树为空是正常的仅装配模式，不启动备用树或等待重试。
+	 */
 	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Boss")
 	bool SpawnBoss();
 
@@ -38,6 +41,10 @@ public:
 
 protected:
 	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+
+	/** 停止关联并回收显式创建记录；生成失败和 EndPlay 共用，重复调用安全。 */
+	void CleanupCreatedBoss();
 
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Boss")
 	TObjectPtr<USceneComponent> SceneRoot;
@@ -60,4 +67,15 @@ protected:
 
 	UPROPERTY(Transient, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
 	TObjectPtr<AGGYGOBossCharacter> BossAvatar;
+
+private:
+	// 创建责任独立于当前关联和 Actor Owner；换成外部 Avatar 不会转移回收责任。
+	TWeakObjectPtr<AGGYGOBossState> CreatedBossState;
+	TWeakObjectPtr<AGGYGOBossAIController> CreatedBossController;
+	TWeakObjectPtr<AGGYGOBossCharacter> CreatedBossAvatar;
+
+	// 仅保护同步生命周期回调；不参与 Boss 阶段或动作规则。
+	bool bSpawningBoss = false;
+	bool bCleaningUpBoss = false;
+	bool bEndingPlay = false;
 };

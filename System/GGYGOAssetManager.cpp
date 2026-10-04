@@ -4,111 +4,183 @@
  */
 #include "System/GGYGOAssetManager.h"
 
-#include "AbilitySystem/GGYGOAbilitySystemLog.h"
-#include "Misc/ScopeLock.h"
+#include "Engine/Engine.h"
+#include "GameplayEffect.h"
 #include "System/GGYGOGameData.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAssetManager)
+
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOSystem, Log, All);
+
+namespace
+{
+	// 只由启动预载调用；每项独立记录结果，不写回GameData配置。
+	TSubclassOf<UGameplayEffect> PreloadSharedGameplayEffect(
+		const TSoftClassPtr<UGameplayEffect>& EffectPath, const TCHAR* FieldName,
+		EGGYGOSharedAssetLoadState& OutState)
+	{
+		if (EffectPath.IsNull())
+		{
+			OutState = EGGYGOSharedAssetLoadState::NotConfigured;
+			UE_LOG(LogGGYGOSystem, Warning, TEXT("共享GE [%s] 未配置。"), FieldName);
+			return nullptr;
+		}
+
+		UClass* EffectClass = EffectPath.LoadSynchronous();
+		// TSoftClassPtr的加载接口已校验UGameplayEffect继承关系。
+		if (!EffectClass)
+		{
+			OutState = EGGYGOSharedAssetLoadState::LoadFailed;
+			UE_LOG(LogGGYGOSystem, Warning, TEXT("共享GE [%s] 加载失败或类型不符，路径 [%s]。"),
+				FieldName, *EffectPath.ToString());
+			return nullptr;
+		}
+
+		OutState = EGGYGOSharedAssetLoadState::Ready;
+		UE_LOG(LogGGYGOSystem, Log, TEXT("共享GE [%s] 预载就绪，路径 [%s]。"), FieldName, *EffectPath.ToString());
+		return EffectClass;
+	}
+}
 
 UGGYGOAssetManager::UGGYGOAssetManager()
 {
 }
 
-UGGYGOAssetManager& UGGYGOAssetManager::Get()
+UGGYGOAssetManager* UGGYGOAssetManager::TryGet()
 {
-	if (GEngine)
+	if (!IsInGameThread())
 	{
-		if (UGGYGOAssetManager* Singleton = Cast<UGGYGOAssetManager>(GEngine->AssetManager))
-		{
-			return *Singleton;
-		}
+		UE_LOG(LogGGYGOSystem, Error, TEXT("TryGet: 仅允许游戏线程读取AssetManager，返回空。"));
+		return nullptr;
 	}
 
-	// 引擎用的不是本类 —— `DefaultEngine.ini` 里的 `AssetManagerClassName`
-	// 没配或拼错了。
-	//
-	// 用 Error 而不是 Fatal：中止运行会让编辑器直接起不来，
-	// 而这是一个在编辑器里就能改好的配置问题，把工具链堵死代价太大。
-	// 兜底实例让引擎能继续跑，依赖共享资产的功能会各自报错。
-	UE_LOG(LogGGYGOAbilitySystem, Error,
-		TEXT("AssetManagerClassName 未设为 GGYGOAssetManager，共享资产不可用。请检查 DefaultEngine.ini 的 [/Script/Engine.Engine] 段。"));
-
-	// 兜底实例要活到进程结束，所以 AddToRoot 防止被 GC。
-	static UGGYGOAssetManager* FallbackManager = nullptr;
-	if (!FallbackManager)
+	if (!GEngine || !GEngine->AssetManager)
 	{
-		FallbackManager = NewObject<UGGYGOAssetManager>();
-		FallbackManager->AddToRoot();
+		UE_LOG(LogGGYGOSystem, Error,
+			TEXT("TryGet: 引擎或 AssetManager 尚未就绪，返回空；调用方必须处理共享资产不可用。"));
+		return nullptr;
 	}
 
-	return *FallbackManager;
+	if (UGGYGOAssetManager* Manager = Cast<UGGYGOAssetManager>(GEngine->AssetManager))
+	{
+		return Manager;
+	}
+
+	UE_LOG(LogGGYGOSystem, Error,
+		TEXT("TryGet: 引擎实际持有的 AssetManager 类型 [%s] 不是 GGYGOAssetManager，返回空；调用方必须处理共享资产不可用。请检查 DefaultEngine.ini 的 [/Script/Engine.Engine] AssetManagerClassName。"),
+		*GetNameSafe(GEngine->AssetManager->GetClass()));
+	return nullptr;
 }
 
 void UGGYGOAssetManager::StartInitialLoading()
 {
-	// 必须先调父类：它会扫描 PrimaryAssetType 并建立资产索引，
-	// 之后才能按类型查找资产。
+	if (!IsInGameThread())
+	{
+		UE_LOG(LogGGYGOSystem, Error, TEXT("StartInitialLoading: 共享资产预载仅允许游戏线程执行。"));
+		return;
+	}
+	if (bSharedAssetsPreloadStarted)
+	{
+		UE_LOG(LogGGYGOSystem, Warning, TEXT("StartInitialLoading: 已开始过共享资产预载，不重入或重试。"));
+		return;
+	}
+	bSharedAssetsPreloadStarted = true;
+
+	// 父类先扫描并建立索引。同步加载仅发生在此启动阶段；Cook规则由配置/资产管理规则决定。
 	Super::StartInitialLoading();
 
-	// 启动时预加载，这样运行时的同步取用总是命中缓存。
-	// 失败不阻塞启动 —— 见 LoadGameDataOfClass 里对缺失资产的处理。
-	GetGameData();
-}
-
-const UGGYGOGameData* UGGYGOAssetManager::GetGameData()
-{
-	return Cast<const UGGYGOGameData>(
-		LoadGameDataOfClass(UGGYGOGameData::StaticClass(), GGYGOGameDataPath, FPrimaryAssetType("GGYGOGameData")));
-}
-
-UPrimaryDataAsset* UGGYGOAssetManager::LoadGameDataOfClass(TSubclassOf<UPrimaryDataAsset> DataClass, const TSoftObjectPtr<UPrimaryDataAsset>& DataClassPath, FPrimaryAssetType PrimaryAssetType)
-{
-	UPrimaryDataAsset* Asset = nullptr;
-
-	if (!DataClass)
+	if (GGYGOGameDataPath.IsNull())
 	{
-		return nullptr;
+		GameDataLoadState = EGGYGOSharedAssetLoadState::NotConfigured;
+		UE_LOG(LogGGYGOSystem, Warning,
+			TEXT("GameData未配置；请在DefaultGame.ini的[/Script/GGYGO.GGYGOAssetManager]配置GGYGOGameDataPath。"));
 	}
-
+	else
 	{
-		FScopeLock Lock(&SyncObject);
-
-		if (TObjectPtr<UPrimaryDataAsset>* Cached = GameDataMap.Find(DataClass))
+		LoadedGameData = GGYGOGameDataPath.LoadSynchronous();
+		GameDataLoadState = LoadedGameData ? EGGYGOSharedAssetLoadState::Ready : EGGYGOSharedAssetLoadState::LoadFailed;
+		if (!LoadedGameData)
 		{
-			return *Cached;
+			UE_LOG(LogGGYGOSystem, Warning, TEXT("GameData加载失败，路径 [%s]。"), *GGYGOGameDataPath.ToString());
+		}
+		else
+		{
+			UE_LOG(LogGGYGOSystem, Log, TEXT("GameData预载就绪，路径 [%s]。"), *GGYGOGameDataPath.ToString());
 		}
 	}
 
-	if (!DataClassPath.IsNull())
+	if (LoadedGameData)
 	{
-		// 同步加载。理由见头文件对 LoadGameDataOfClass 的说明。
-		Asset = DataClassPath.LoadSynchronous();
-
-		if (Asset)
-		{
-			// 加入 AlwaysCook 的 bundle，保证打包时这份资产被包含进去。
-			// 少了这一步，编辑器里正常但打包后资产缺失。
-			LoadPrimaryAssetsWithType(PrimaryAssetType);
-		}
+		SharedDamageGameplayEffect = PreloadSharedGameplayEffect(LoadedGameData->DamageGameplayEffect_SetByCaller,
+			TEXT("DamageGameplayEffect_SetByCaller"), SharedDamageLoadState);
+		SharedHealGameplayEffect = PreloadSharedGameplayEffect(LoadedGameData->HealGameplayEffect_SetByCaller,
+			TEXT("HealGameplayEffect_SetByCaller"), SharedHealLoadState);
+		SharedSelfDestructGameplayEffect = PreloadSharedGameplayEffect(LoadedGameData->SelfDestructGameplayEffect,
+			TEXT("SelfDestructGameplayEffect"), SharedSelfDestructLoadState);
+	}
+	else
+	{
+		SharedDamageLoadState = EGGYGOSharedAssetLoadState::DependencyUnavailable;
+		SharedHealLoadState = EGGYGOSharedAssetLoadState::DependencyUnavailable;
+		SharedSelfDestructLoadState = EGGYGOSharedAssetLoadState::DependencyUnavailable;
+		UE_LOG(LogGGYGOSystem, Warning, TEXT("三项共享GE依赖的GameData不可用，未尝试加载。"));
 	}
 
-	if (!Asset)
-	{
-		// 路径没配或指向了不存在的资产。
-		//
-		// 只警告不中止：这份资产是在编辑器里创建的，而项目早期它往往还不存在。
-		// 若在这里中止，引擎会在能创建资产之前就起不来 —— 一个死循环。
-		// 依赖它的功能各自判空并报错，症状会指向具体功能而不是整个引擎。
-		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("未能加载共享资产 [%s]（路径 [%s]）。依赖它的功能将失效。请创建该资产并在 DefaultGame.ini 的 [/Script/GGYGO.GGYGOAssetManager] 段配置 GGYGOGameDataPath。"),
-			*DataClass->GetName(), *DataClassPath.ToString());
-		return nullptr;
-	}
+	// 发布整次尝试结果（含失败），避免加载期间的回调读到部分快照。
+	bSharedAssetsPreloadCompleted = true;
+}
 
+bool UGGYGOAssetManager::CanReadSharedAssets() const
+{
+	if (!IsInGameThread())
 	{
-		FScopeLock Lock(&SyncObject);
-		GameDataMap.Add(DataClass, Asset);
+		UE_LOG(LogGGYGOSystem, Error, TEXT("共享资产getter仅允许游戏线程读取，返回空/NotReady/false。"));
+		return false;
 	}
+	return bSharedAssetsPreloadCompleted;
+}
 
-	return Asset;
+const UGGYGOGameData* UGGYGOAssetManager::GetGameData() const
+{
+	return CanReadSharedAssets() ? LoadedGameData.Get() : nullptr;
+}
+
+TSubclassOf<UGameplayEffect> UGGYGOAssetManager::GetSharedDamageGameplayEffect() const
+{
+	return CanReadSharedAssets() ? SharedDamageGameplayEffect : TSubclassOf<UGameplayEffect>();
+}
+
+TSubclassOf<UGameplayEffect> UGGYGOAssetManager::GetSharedHealGameplayEffect() const
+{
+	return CanReadSharedAssets() ? SharedHealGameplayEffect : TSubclassOf<UGameplayEffect>();
+}
+
+TSubclassOf<UGameplayEffect> UGGYGOAssetManager::GetSharedSelfDestructGameplayEffect() const
+{
+	return CanReadSharedAssets() ? SharedSelfDestructGameplayEffect : TSubclassOf<UGameplayEffect>();
+}
+
+EGGYGOSharedAssetLoadState UGGYGOAssetManager::GetGameDataLoadState() const
+{
+	return CanReadSharedAssets() ? GameDataLoadState : EGGYGOSharedAssetLoadState::NotReady;
+}
+
+EGGYGOSharedAssetLoadState UGGYGOAssetManager::GetSharedDamageLoadState() const
+{
+	return CanReadSharedAssets() ? SharedDamageLoadState : EGGYGOSharedAssetLoadState::NotReady;
+}
+
+EGGYGOSharedAssetLoadState UGGYGOAssetManager::GetSharedHealLoadState() const
+{
+	return CanReadSharedAssets() ? SharedHealLoadState : EGGYGOSharedAssetLoadState::NotReady;
+}
+
+EGGYGOSharedAssetLoadState UGGYGOAssetManager::GetSharedSelfDestructLoadState() const
+{
+	return CanReadSharedAssets() ? SharedSelfDestructLoadState : EGGYGOSharedAssetLoadState::NotReady;
+}
+
+bool UGGYGOAssetManager::HasCompletedSharedAssetPreload() const
+{
+	return CanReadSharedAssets();
 }

@@ -15,6 +15,61 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterBase)
 
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOCharacterBase, Log, All);
+
+// Only this record owns the original source's returned subscription token.
+struct AGGYGOCharacterBase::FHealthAbilitySystemSubscription
+{
+	FHealthAbilitySystemSubscription(AGGYGOCharacterBase* InCharacter,
+		UGGYGOPawnExtensionComponent* InExtension, UGGYGOHealthComponent* InHealth)
+		: Character(InCharacter), Extension(InExtension), Health(InHealth)
+	{
+	}
+
+	~FHealthAbilitySystemSubscription() { Retire(); }
+	FHealthAbilitySystemSubscription(const FHealthAbilitySystemSubscription&) = delete;
+	FHealthAbilitySystemSubscription& operator=(const FHealthAbilitySystemSubscription&) = delete;
+
+	void AcceptReturnedHandle(FDelegateHandle ReturnedHandle)
+	{
+		check(IsInGameThread());
+		check(!NoticeHandle.IsValid());
+		if (bRetired)
+		{
+			// RegisterAndCall can retire this record before its actual token returns.
+			if (ReturnedHandle.IsValid())
+			{
+				if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
+				{
+					OriginalExtension->UnregisterLocalAbilitySystemNotice(ReturnedHandle);
+				}
+			}
+			return;
+		}
+		NoticeHandle = ReturnedHandle;
+	}
+
+	void Retire()
+	{
+		bRetired = true;
+		const FDelegateHandle OriginalHandle = NoticeHandle;
+		NoticeHandle.Reset();
+		if (OriginalHandle.IsValid())
+		{
+			if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
+			{
+				OriginalExtension->UnregisterLocalAbilitySystemNotice(OriginalHandle);
+			}
+		}
+	}
+
+	const TWeakObjectPtr<AGGYGOCharacterBase> Character;
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
+	const TWeakObjectPtr<UGGYGOHealthComponent> Health;
+	FDelegateHandle NoticeHandle{};
+	bool bRetired = false;
+};
+
 AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitializer)
 	// 把 ACharacter 自带的 CMC 换成项目 CMC。
 	//
@@ -31,13 +86,6 @@ AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitial
 
 	// ===== 协调者 =====
 	PawnExtComponent = CreateDefaultSubobject<UGGYGOPawnExtensionComponent>(TEXT("PawnExtensionComponent"));
-
-	// 用 RegisterAndCall 而不是普通 Add：本构造函数执行时 ASC 还没 InitAbilityActorInfo，
-	// 但初始化顺序在联机下不固定，用带补发的版本可以避免漏掉已发生的广播。
-	PawnExtComponent->OnAbilitySystemInitialized_RegisterAndCall(
-		FSimpleMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::OnAbilitySystemInitialized));
-	PawnExtComponent->OnAbilitySystemUninitialized_Register(
-		FSimpleMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::OnAbilitySystemUninitialized));
 
 	// ===== 生命 =====
 	HealthComponent = CreateDefaultSubobject<UGGYGOHealthComponent>(TEXT("HealthComponent"));
@@ -77,17 +125,47 @@ void AGGYGOCharacterBase::PostInitializeComponents()
 	// 之所以不能在这里自己建一个再绑：那样属性集只能跟着 Pawn 的初始化流程走，
 	// 而本角色的 HealthComponent 也在同一段流程里初始化，两者先后无法保证。
 	// 属性集现在是 Slot 的默认子对象，Slot 一存在就绪，早于本角色。
+	// 组件实际注册后建立完整订阅；迟到时只回放 Extension 认证的真实 Ready。
+	FString Error;
+	if (!RegisterHealthAbilitySystemSubscription(Error))
+	{
+		UE_LOG(LogGGYGOCharacterBase, Warning, TEXT("%s"), *Error);
+	}
 }
 
 void AGGYGOCharacterBase::BeginPlay()
 {
+	const TWeakObjectPtr<AGGYGOCharacterBase> OriginalCharacter(this);
+	const bool bReopenSubscription = bHealthAbilitySystemSubscriptionClosed
+		&& !HasActorBegunPlay() && !IsActorBeingDestroyed();
 	Super::BeginPlay();
+	AGGYGOCharacterBase* Character = OriginalCharacter.Get();
+	if (bReopenSubscription && Character && !Character->IsActorBeingDestroyed()
+		&& Character->HasActorBegunPlay() && Character->bHealthAbilitySystemSubscriptionClosed)
+	{
+		// 真正的新 Actor 生命周期在所有组件 BeginPlay 完成后重新注册一次。
+		Character->bHealthAbilitySystemSubscriptionClosed = false;
+		FString Error;
+		if (!Character->RegisterHealthAbilitySystemSubscription(Error))
+		{
+			UE_LOG(LogGGYGOCharacterBase, Warning, TEXT("%s"), *Error);
+		}
+	}
 }
 
 void AGGYGOCharacterBase::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// 组件的 EndPlay 会各自清理，这里不重复调用 UninitializeAbilitySystem。
+	bHealthAbilitySystemSubscriptionClosed = true;
+	UnregisterHealthAbilitySystemSubscription();
+	// Health 自身 EndPlay／OnUnregister 归还五个原 token；Base 只退休通知订阅。
 	Super::EndPlay(EndPlayReason);
+}
+
+void AGGYGOCharacterBase::BeginDestroy()
+{
+	bHealthAbilitySystemSubscriptionClosed = true;
+	UnregisterHealthAbilitySystemSubscription();
+	Super::BeginDestroy();
 }
 
 void AGGYGOCharacterBase::PossessedBy(AController* NewController)
@@ -167,32 +245,169 @@ void AGGYGOCharacterBase::FellOutOfWorld(const UDamageType& DmgType)
 	}
 }
 
-void AGGYGOCharacterBase::OnAbilitySystemInitialized()
+bool AGGYGOCharacterBase::RegisterHealthAbilitySystemSubscription(FString& OutError)
 {
-	UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
-	if (!GGYGOASC)
+	check(IsInGameThread());
+	OutError.Reset();
+	const TWeakObjectPtr<AGGYGOCharacterBase> OriginalCharacter(this);
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(PawnExtComponent.Get());
+	const TWeakObjectPtr<UGGYGOHealthComponent> OriginalHealth(HealthComponent.Get());
+	const FString DiagnosticContext = FString::Printf(
+		TEXT("[Character/Base] Character='%s' Extension='%s' Health='%s'"),
+		*GetPathNameSafe(this), *GetPathNameSafe(OriginalExtension.Get()), *GetPathNameSafe(OriginalHealth.Get()));
+	const auto Reject = [&OutError, &DiagnosticContext](const TCHAR* Reason)
 	{
-		// 本回调由协调者在 ASC 注入完成后触发，正常不会为空。
-		// 但 RegisterAndCall 会补发一次已发生的广播，注册方若在注入之前订阅就会走到这里。
-		return;
-	}
-
-	// HealthComponent 在这里而不是自己的 BeginPlay 里初始化：
-	// 它要从 ASC 上取 HealthSet，而 ASC 何时被注入不由 HealthComponent 决定。
-	//
-	// 属性集本身不存在就绪问题 —— 它是队伍位置的默认子对象，随 ASC 一同到达。
-	if (HealthComponent)
+		OutError = FString::Printf(TEXT("%s Reason='%s'."), *DiagnosticContext, Reason);
+		return false;
+	};
+	const auto IsOriginalTargetLive = [&]()
 	{
-		HealthComponent->InitializeWithAbilitySystem(GGYGOASC);
+		const AGGYGOCharacterBase* Character = OriginalCharacter.Get();
+		const UGGYGOPawnExtensionComponent* Extension = OriginalExtension.Get();
+		const UGGYGOHealthComponent* Health = OriginalHealth.Get();
+		return Character && !Character->bHealthAbilitySystemSubscriptionClosed
+			&& !Character->IsActorBeingDestroyed()
+			&& !Character->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& Extension && Extension->IsRegistered() && !Extension->IsBeingDestroyed()
+			&& !Extension->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& Health && Health->IsRegistered() && !Health->IsBeingDestroyed()
+			&& !Health->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& Character->PawnExtComponent.Get() == Extension && Extension->GetOwner() == Character
+			&& Character->HealthComponent.Get() == Health && Health->GetOwner() == Character;
+	};
+	if (!IsOriginalTargetLive())
+	{
+		return Reject(TEXT("LifecycleClosedOrOriginalComponentsNotRegistered"));
 	}
+	if (HealthAbilitySystemSubscription.IsValid())
+	{
+		const TSharedPtr<FHealthAbilitySystemSubscription> Existing = HealthAbilitySystemSubscription;
+		if (!Existing->bRetired && Existing->Character.HasSameIndexAndSerialNumber(OriginalCharacter)
+			&& Existing->Extension.HasSameIndexAndSerialNumber(OriginalExtension)
+			&& Existing->Health.HasSameIndexAndSerialNumber(OriginalHealth))
+		{
+			return Existing->NoticeHandle.IsValid()
+				? true : Reject(TEXT("OriginalSubscriptionTokenHasNotReturned"));
+		}
+		// No implicit source replacement or cleanup of another lifecycle.
+		return Reject(TEXT("OriginalSubscriptionConflict"));
+	}
+	const TSharedPtr<FHealthAbilitySystemSubscription> OriginalSubscription =
+		MakeShared<FHealthAbilitySystemSubscription>(this, OriginalExtension.Get(), OriginalHealth.Get());
+	HealthAbilitySystemSubscription = OriginalSubscription;
+	const TWeakPtr<FHealthAbilitySystemSubscription> WeakSubscription(OriginalSubscription);
+	const FDelegateHandle ReturnedHandle = OriginalExtension.Get()->RegisterLocalAbilitySystemNoticeAndCall(
+		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(this,
+			[WeakSubscription](const FGGYGOPawnASCLocalNotice& Notice)
+			{
+				const TSharedPtr<FHealthAbilitySystemSubscription> Subscription = WeakSubscription.Pin();
+				if (Subscription.IsValid())
+				{
+					if (AGGYGOCharacterBase* Character = Subscription->Character.Get())
+					{
+						Character->ConsumeLocalAbilitySystemNotice(Subscription, Notice);
+					}
+				}
+			}));
+	OriginalSubscription->AcceptReturnedHandle(ReturnedHandle);
+	AGGYGOCharacterBase* Character = OriginalCharacter.Get();
+	if (!ReturnedHandle.IsValid() || !IsOriginalTargetLive() || !Character
+		|| Character->HealthAbilitySystemSubscription != OriginalSubscription || OriginalSubscription->bRetired)
+	{
+		if (Character && Character->HealthAbilitySystemSubscription == OriginalSubscription)
+		{
+			Character->UnregisterHealthAbilitySystemSubscription();
+		}
+		else
+		{
+			OriginalSubscription->Retire();
+		}
+		return Reject(ReturnedHandle.IsValid()
+			? TEXT("OriginalSubscriptionInvalidatedDuringReplay")
+			: TEXT("ExtensionRejectedSubscription"));
+	}
+	// The token proves only registration history; Health operation results are diagnosed at entry.
+	return true;
 }
 
-void AGGYGOCharacterBase::OnAbilitySystemUninitialized()
+void AGGYGOCharacterBase::UnregisterHealthAbilitySystemSubscription()
 {
-	if (HealthComponent)
+	check(IsInGameThread());
+	const TSharedPtr<FHealthAbilitySystemSubscription> OriginalSubscription = HealthAbilitySystemSubscription;
+	if (!OriginalSubscription.IsValid()) { return; }
+	OriginalSubscription->bRetired = true;
+	HealthAbilitySystemSubscription.Reset();
+	OriginalSubscription->Retire();
+	// No Actor or Health writes after removing the original source's token.
+}
+
+void AGGYGOCharacterBase::ConsumeLocalAbilitySystemNotice(
+	const TSharedPtr<FHealthAbilitySystemSubscription>& ExpectedSubscription,
+	const FGGYGOPawnASCLocalNotice& Notice)
+{
+	check(IsInGameThread());
+	const TSharedPtr<FHealthAbilitySystemSubscription> OriginalSubscription = ExpectedSubscription;
+	const FGGYGOPawnASCLocalNotice OwnNotice = Notice;
+	if (!OriginalSubscription.IsValid() || OriginalSubscription->bRetired
+		|| HealthAbilitySystemSubscription != OriginalSubscription)
 	{
-		HealthComponent->UninitializeFromAbilitySystem();
+		return;
 	}
+	const auto Diagnose = [&](const FString& Reason)
+	{
+		const FGGYGOPawnASCResourceIdentity Identity = OwnNotice.Resource.GetIdentity();
+		UE_LOG(LogGGYGOCharacterBase, Warning,
+			TEXT("[Character/Base] Character='%s' Extension='%s' Health='%s' ASC='%s' Pawn='%s' Kind=%u Binding=%llu Write=%llu Reason='%s'."),
+			*GetPathNameSafe(OriginalSubscription->Character.Get()),
+			*GetPathNameSafe(OriginalSubscription->Extension.Get()),
+			*GetPathNameSafe(OriginalSubscription->Health.Get()),
+			*GetPathNameSafe(Identity.ASC.Get()), *GetPathNameSafe(Identity.Pawn.Get()),
+			static_cast<uint32>(OwnNotice.Kind), static_cast<unsigned long long>(Identity.Binding.Serial),
+			static_cast<unsigned long long>(OwnNotice.PublishedContext.LastActorInfoWrite.Serial), *Reason);
+	};
+	AGGYGOCharacterBase* Character = OriginalSubscription->Character.Get();
+	UGGYGOPawnExtensionComponent* Extension = OriginalSubscription->Extension.Get();
+	UGGYGOHealthComponent* Health = OriginalSubscription->Health.Get();
+	if (Character != this || bHealthAbilitySystemSubscriptionClosed || IsActorBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| !Extension || Extension->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| !Health || Health->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| PawnExtComponent.Get() != Extension || Extension->GetOwner() != Character
+		|| HealthComponent.Get() != Health || Health->GetOwner() != Character)
+	{
+		Diagnose(TEXT("OriginalSubscriptionOrObjectsClosed"));
+		return;
+	}
+	if (!OwnNotice.Resource.HasResource())
+	{
+		Diagnose(TEXT("NoticeMissingOriginalResource"));
+		return;
+	}
+	FString Error;
+	bool bSucceeded = false;
+	switch (OwnNotice.Kind)
+	{
+	case EGGYGOPawnASCLocalNoticeKind::Ready:
+		bSucceeded = Health->InitializeWithLocalAbilitySystemResource(
+			Extension, OwnNotice.Resource, OwnNotice.PublishedContext, Error);
+		break;
+	case EGGYGOPawnASCLocalNoticeKind::Refreshed:
+		bSucceeded = Health->RefreshLocalAbilitySystemResource(
+			Extension, OwnNotice.Resource, OwnNotice.PublishedContext, Error);
+		break;
+	case EGGYGOPawnASCLocalNoticeKind::Released:
+		// Withdrawal has already invalidated Ready; only the delivered historical H is released.
+		bSucceeded = Health->UninitializeFromLocalAbilitySystemResource(OwnNotice.Resource, Error);
+		break;
+	default:
+		Diagnose(TEXT("InvalidLocalNoticeKind"));
+		return;
+	}
+	if (!bSucceeded)
+	{
+		Diagnose(Error);
+	}
+	// A callback can synchronously install/refresh a successor. This tail performs no cleanup or adoption.
 }
 
 void AGGYGOCharacterBase::OnDeathStarted(AActor* OwningActor)

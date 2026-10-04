@@ -4,28 +4,22 @@
  */
 
 #include "Animation/zzzAnim/Locomotion/ZZZLocomotionRules.h"
-#include "Animation/zzzAnim/Data/ZZZAnimTuning.h"
 
 namespace ZZZLocomotionRules
 {
-	float ResolveGaitBlendInterpSpeed(const FZZZAnimTuning* InTuning)
+	int32 ResolveStopValue(EGGYGOStopMotionType InStopMotionType)
 	{
-		if (!InTuning)
+		switch (InStopMotionType)
 		{
-			return DefaultGaitBlendInterpSpeed;
+		case EGGYGOStopMotionType::StartStop:
+			return 0;
+		case EGGYGOStopMotionType::WalkStop:
+			return 1;
+		case EGGYGOStopMotionType::RunStop:
+			return 2;
+		case EGGYGOStopMotionType::None:
+		default:
+			return 0;
 		}
-
-		const float ConfiguredSpeed = InTuning->GaitBlendInterpSpeed;
-		if (!FMath::IsFinite(ConfiguredSpeed) || ConfiguredSpeed <= 0.0f)
-		{
-			return 0.0f;
-		}
-
-		return FMath::Min(ConfiguredSpeed, MaxGaitBlendInterpSpeed);
-	}
-
-	float ResolveGaitBlendTarget(EGGYGOGait InSnapshotGait)
-	{
-		return InSnapshotGait == EGGYGOGait::Run ? 1.0f : 0.0f;
 	}
 }

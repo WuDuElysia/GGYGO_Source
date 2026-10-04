@@ -28,7 +28,51 @@
 class AActor;
 class UCanvas;
 class UGGYGOCameraComponent;
+class UGGYGOCameraMode;
+
+/** Native evaluation outcome; consumers must handle Failure before publishing a view. */
+enum class EGGYGOCameraEvaluationStatus : uint8
+{
+	Failure,
+	Success
+};
+
+/** Call-local result and original diagnostic provenance. Does not own camera runtime state. */
+struct GGYGO_API FGGYGOCameraEvaluationResult
+{
+	EGGYGOCameraEvaluationStatus Status = EGGYGOCameraEvaluationStatus::Failure;
+	TWeakObjectPtr<UGGYGOCameraMode> Mode;
+	FString ModePath;
+	FString ModeClassPath;
+	FName Field = NAME_None;
+	FString Reason;
+
+	bool IsSuccess() const { return Status == EGGYGOCameraEvaluationStatus::Success; }
+
+	static FGGYGOCameraEvaluationResult Success();
+	static FGGYGOCameraEvaluationResult Failure(const UGGYGOCameraMode* OriginalMode, FName InvalidField, const TCHAR* InvalidReason);
+};
 class UObject;
+
+/** 单槽镜头微调的所有权凭证。默认值 0 表示无效。 */
+struct FGGYGOCameraOffsetHandle
+{
+	uint64 Value = 0;
+
+	bool IsValid() const { return Value != 0; }
+
+	bool operator==(const FGGYGOCameraOffsetHandle& Other) const { return Value == Other.Value; }
+	bool operator!=(const FGGYGOCameraOffsetHandle& Other) const { return Value != Other.Value; }
+};
+
+/** 相机模式交给 CameraComponent 的最终穿墙查询请求。 */
+struct FGGYGOCameraPenetrationRequest
+{
+	bool bEnabled = false;
+	FVector PivotLocation = FVector::ZeroVector;
+	float ProbeRadius = 0.0f;
+	float RecoverySpeed = 0.0f;
+};
 
 /** 相机模式的混合曲线。 */
 UENUM(BlueprintType)
@@ -92,8 +136,9 @@ struct FGGYGOCameraModeView
  * 叠加在当前模式求值结果之上的镜头微调。
  *
  * 存在的理由是"换模式"对小幅调整来说代价太大：换模式会丢掉当前模式的内部状态
- * （锁定的目标、穿墙规避的臂长恢复进度），而且模式栈的混合是按整份视角做的，
- * 连段中反复换模式会让镜头在两份视角之间来回混合。
+ * （例如锁定目标与构图参数），而且模式栈的混合是按整份视角做的；最终穿透恢复
+ * 状态由 CameraComponent 唯一持有，不属于单个模式。
+ * 连段中反复换模式也会让镜头在两份视角之间来回混合。
  *
  * 微调走这条通道：当前模式照常求值，结果再被本结构偏移一次。
  * 于是"重攻击时收 5 度 FOV"不需要新建一个相机模式类。
@@ -154,6 +199,9 @@ class GGYGO_API UGGYGOCameraMode : public UObject
 public:
 	UGGYGOCameraMode();
 
+	/** Mandatory common admission followed by the subclass configuration check. */
+	FGGYGOCameraEvaluationResult ValidateConfiguration() const;
+
 	/** 拥有本模式的相机组件。 */
 	UGGYGOCameraComponent* GetGGYGOCameraComponent() const;
 
@@ -163,8 +211,11 @@ public:
 	/** 本模式当前算出的视角。 */
 	const FGGYGOCameraModeView& GetCameraModeView() const { return View; }
 
+	/** 本模式本帧输出的最终位置穿透查询请求。 */
+	const FGGYGOCameraPenetrationRequest& GetCameraPenetrationRequest() const { return CameraPenetrationRequest; }
+
 	/** 推进一帧：先更新视角，再推进混合权重。 */
-	void UpdateCameraMode(float DeltaTime);
+	FGGYGOCameraEvaluationResult UpdateCameraMode(float DeltaTime);
 
 	/** 当前混合权重，[0, 1]。 */
 	float GetBlendWeight() const { return BlendWeight; }
@@ -175,7 +226,7 @@ public:
 	 * 用于模式被移出栈时反向退出：把权重强制设为当前值再让它衰减，
 	 * 避免退出动画从 1 开始而产生跳变。
 	 */
-	void SetBlendWeight(float Weight);
+	FGGYGOCameraEvaluationResult SetBlendWeight(float Weight);
 
 	/** 本模式进入栈时调用。 */
 	virtual void OnActivation() {}
@@ -199,6 +250,9 @@ protected:
 	/** 派生类在这里算出 `View`。 */
 	virtual void UpdateView(float DeltaTime);
 
+	/** Subclass-specific data only; the nonvirtual public wrapper always validates common fields. */
+	virtual FGGYGOCameraEvaluationResult ValidateModeConfiguration() const;
+
 	/** 视角的枢轴位置。默认取目标 Actor 的视点。 */
 	virtual FVector GetPivotLocation() const;
 
@@ -207,6 +261,9 @@ protected:
 
 	/** 本模式算出的视角。 */
 	FGGYGOCameraModeView View;
+
+	/** 派生模式本帧输出的穿透请求；每帧求值前由基类清空。 */
+	FGGYGOCameraPenetrationRequest CameraPenetrationRequest;
 
 	/** 视场角（度）。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "View", meta = (UIMin = "5.0", UIMax = "170.0", ClampMin = "5.0", ClampMax = "170.0"))
@@ -254,23 +311,26 @@ public:
 	 * 已在栈中的模式会被移到栈顶并保留当前混合权重 ——
 	 * 重新从 0 开始混合会让"锁定→大招→回到锁定"的最后一步出现明显跳变。
 	 */
-	void PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass);
+	FGGYGOCameraEvaluationResult PushCameraMode(TSubclassOf<UGGYGOCameraMode> CameraModeClass);
 
-	/** 推进所有模式并算出最终视角。 */
-	void EvaluateStack(float DeltaTime, FGGYGOCameraModeView& OutCameraModeView);
+	/** 推进原模式状态并求值；仅完整成功时提交两个外参，失败不回滚已推进的模式状态。 */
+	FGGYGOCameraEvaluationResult EvaluateStack(float DeltaTime, FGGYGOCameraModeView& OutCameraModeView, FGGYGOCameraPenetrationRequest& OutPenetrationRequest);
 
 	/** 栈是否为空。 */
 	bool IsStackActivated() const { return CameraModeStack.Num() > 0; }
 
 protected:
-	/** 取某个类的模式实例，没有则创建。模式实例复用，不每次 new。 */
+	/** 取复用实例或创建候选；新候选仅在 Push 完成准入后登记进实例池。 */
 	UGGYGOCameraMode* GetCameraModeInstance(TSubclassOf<UGGYGOCameraMode> CameraModeClass);
 
 	/** 推进各模式的混合权重，并丢弃被完全遮盖的模式。 */
-	void UpdateStack(float DeltaTime);
+	FGGYGOCameraEvaluationResult UpdateStack(float DeltaTime);
 
 	/** 从栈底往栈顶加权混合。 */
-	void BlendStack(FGGYGOCameraModeView& OutCameraModeView) const;
+	FGGYGOCameraEvaluationResult BlendStack(FGGYGOCameraModeView& OutCameraModeView) const;
+
+	/** 按与视图相同的遮盖权重聚合当前模式的穿透请求。 */
+	FGGYGOCameraEvaluationResult BlendPenetrationRequests(FGGYGOCameraPenetrationRequest& OutPenetrationRequest) const;
 
 	/** 模式实例池。按类复用，避免每次推入都构造新对象。 */
 	UPROPERTY()

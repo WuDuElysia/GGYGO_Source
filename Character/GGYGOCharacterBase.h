@@ -29,6 +29,7 @@
 
 #include "AbilitySystemInterface.h"
 #include "GameFramework/Character.h"
+#include "Templates/SharedPointer.h"
 
 #include "GGYGOCharacterBase.generated.h"
 
@@ -42,6 +43,7 @@ class UGGYGOPawnExtensionComponent;
 class UInputComponent;
 class UObject;
 struct FFrame;
+struct FGGYGOPawnASCLocalNotice;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "新版角色基类，Lyra 风格组件化"))
 class GGYGO_API AGGYGOCharacterBase : public ACharacter, public IAbilitySystemInterface
@@ -88,6 +90,7 @@ protected:
 	virtual void PostInitializeComponents() override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void BeginDestroy() override;
 
 	/** 服务器上被 Controller 附身。 */
 	virtual void PossessedBy(AController* NewController) override;
@@ -107,12 +110,6 @@ protected:
 	/** 掉出世界。转为走正常的自毁伤害链路。 */
 	virtual void FellOutOfWorld(const class UDamageType& DmgType) override;
 	//~End of lifecycle
-
-	/** ASC 就绪回调。在这里把 HealthComponent 接到 ASC 上。 */
-	virtual void OnAbilitySystemInitialized();
-
-	/** ASC 解除回调。 */
-	virtual void OnAbilitySystemUninitialized();
 
 	/** 死亡演出开始：关碰撞、停移动。 */
 	UFUNCTION()
@@ -134,6 +131,18 @@ protected:
 	void UninitAndDestroy();
 
 private:
+	/** 只拥有原对象身份和一个通知 token；Health 独占实际资源。 */
+	struct FHealthAbilitySystemSubscription;
+	bool RegisterHealthAbilitySystemSubscription(FString& OutError);
+	void UnregisterHealthAbilitySystemSubscription();
+	void ConsumeLocalAbilitySystemNotice(
+		const TSharedPtr<FHealthAbilitySystemSubscription>& ExpectedSubscription,
+		const FGGYGOPawnASCLocalNotice& Notice);
+
+	TSharedPtr<FHealthAbilitySystemSubscription> HealthAbilitySystemSubscription{};
+	/** 仅为本 Actor 的订阅生命周期准入，不代表 ASC／Health Ready。 */
+	bool bHealthAbilitySystemSubscriptionClosed = false;
+
 	/** 初始化协调者。必须存在，否则 InitState 链条断裂。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOPawnExtensionComponent> PawnExtComponent;

@@ -2,7 +2,8 @@
  * @file GGYGOCameraMode_ThirdPerson.h
  * @brief 第三人称跟随相机
  *
- * 从角色枢轴沿视线反方向拉开一段距离，并做穿墙规避。
+ * 从角色枢轴沿视线反方向计算期望位置，并输出穿墙查询请求。
+ * 最终碰撞与恢复由 CameraComponent 在模式混合和 Offset 之后统一处理。
  *
  * 不用 `USpringArmComponent` 而自己算，是因为弹簧臂是场景组件、
  * 它的长度是组件状态：多个相机模式要同时存在并混合时，
@@ -27,9 +28,10 @@ public:
 
 protected:
 	virtual void UpdateView(float DeltaTime) override;
+	virtual FGGYGOCameraEvaluationResult ValidateModeConfiguration() const override;
 
 	/**
-	 * 相对枢轴的偏移（角色局部空间）。
+	 * 相对枢轴、按枢轴朝向旋转的偏移（视线局部空间）。
 	 *
 	 * X 为前后（负值把镜头拉到身后），Y 为左右（正值把角色推到画面左侧，
 	 * 动作游戏常用来给主手武器留出视野），Z 为高低。
@@ -58,12 +60,4 @@ protected:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Third Person", meta = (ClampMin = "0.0", EditCondition = "bPreventPenetration"))
 	float PenetrationRecoverySpeed = 4.0f;
-
-private:
-	/**
-	 * 上一帧实际使用的臂长比例，[0, 1]。
-	 *
-	 * 跨帧保留是平滑恢复的前提。这也是模式实例必须复用而不是每次新建的原因。
-	 */
-	float CurrentArmLengthRatio = 1.0f;
 };

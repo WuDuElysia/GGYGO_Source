@@ -23,7 +23,8 @@
  * 用 `FPrimaryAssetId` 而不是 `TSoftObjectPtr` 的理由是它走 AssetManager 索引：
  * 资产改名或移动后仍能解析，且可以在解析前判断"这个角色还存在吗"。
  * 代价是 `GGYGOPawnData` 必须注册为 PrimaryAssetType（见 `DefaultGame.ini`），
- * 没注册时解析结果为空，装配会回落到默认编队。
+ * 未注册、缺失或加载/类型错误明确返回 Invalid；只有合法未配置是正常默认来源模式。
+ * GameMode 的结果消费另步适配，不能把 Invalid 当作空名单或默认来源。
  *
  * ## 编辑接口不自动落盘
  * 改完调用方显式调 `AsyncSaveGameToSlotForLocalPlayer()`。面板上连续调整
@@ -37,13 +38,38 @@
 #pragma once
 
 #include "GameFramework/SaveGame.h"
+#include "Misc/CoreMiscDefines.h"
+#include "UObject/PrimaryAssetId.h"
+#include "UObject/SoftObjectPath.h"
+#include "UObject/StrongObjectPtr.h"
+#include "UObject/WeakObjectPtrTemplates.h"
 
 #include "GGYGOSquadPresets.generated.h"
 
-class APlayerController;
+class UGameInstance;
 class UGGYGOPawnData;
+struct FGGYGOSquadPresetLoadResult;
 class ULocalPlayer;
 class UObject;
+
+/** One synchronous preset parse outcome; no roster, saved state or cached readiness. */
+enum class EGGYGOSquadPresetRosterResolveStatus : uint8
+{
+	Resolved,
+	Unconfigured,
+	Invalid
+};
+
+struct GGYGO_API FGGYGOSquadPresetRosterResolveResult
+{
+	EGGYGOSquadPresetRosterResolveStatus Status = EGGYGOSquadPresetRosterResolveStatus::Invalid;
+	FString Error;
+	FString PresetsPath;
+	int32 PresetIndex = INDEX_NONE;
+	int32 MemberIndex = INDEX_NONE;
+	FPrimaryAssetId MemberId;
+	FSoftObjectPath MemberPath;
+};
 
 /**
  * 一套编队：一个玩家起的名字加一串角色。
@@ -59,7 +85,7 @@ struct FGGYGOSquadPreset
 	UPROPERTY(BlueprintReadWrite, Category = "GGYGO|Squad")
 	FString DisplayName;
 
-	/** 成员角色，按出场顺序。长度不超过 `GGYGO_MAX_SQUAD_SIZE`。 */
+	/** 成员角色，按出场顺序。容量上限为 `GGYGO_MAX_SQUAD_SIZE`；超限旧数据保留但拒绝解析。 */
 	UPROPERTY(BlueprintReadWrite, Category = "GGYGO|Squad")
 	TArray<FPrimaryAssetId> Members;
 
@@ -68,11 +94,11 @@ struct FGGYGOSquadPreset
 };
 
 /**
- * 编队预设的存档。每个本地玩家一份。
+ * 编队预设存档：保留现有固定槽位，仅主本地玩家可加载或新建。
  *
- * 派生 `ULocalPlayerSaveGame` 而不是裸 `USaveGame`：它把"槽位名按玩家区分"、
- * 异步保存、以及版本迁移（`GetLatestDataVersion` + `HandlePostLoad`）都处理好了，
- * 分屏时两个玩家各自的编队不会互相覆盖。
+ * ULocalPlayerSaveGame 提供原生关联、初始化和保存生命周期。
+ * 本类的显式加载入口拒绝已有坏档；唯一持久缓存由 LocalPlayer 宿主持有。
+ * 次级玩家在访问存储前明确拒绝，不自动迁移、重置或覆盖原文件。
  */
 UCLASS(BlueprintType)
 class GGYGO_API UGGYGOSquadPresets : public ULocalPlayerSaveGame
@@ -84,23 +110,15 @@ public:
 	static const FString SaveSlotName;
 
 	/**
-	 * 同步读盘并新建一份编队预设对象。
-	 *
-	 * **每次调用都返回新对象**，所以业务代码不要直连这里 —— 两个调用方各拿一份
-	 * 副本时，一边的修改会被另一边的存盘覆盖。走 `UGGYGOLocalPlayer::GetSquadPresets()`
-	 * 才有缓存。本函数是那个缓存的填充来源。
-	 *
-	 * @return 失败返回 nullptr（LocalPlayer 为空时）。
+	 * 主本地玩家的单次同步加载。仅原生后端明确报告缺档时创建空内存对象。
+	 * 已有档的读取、类型、归档错误或原出战索引错误返回 Invalid，不创建替代对象。
+	 * 结果携带原来源身份及本次作用域强引用；调用方在结果释放前发布到唯一宿主缓存。
+	 * 不保存、迁移或修复存档，也不建立持久缓存。
 	 */
-	static UGGYGOSquadPresets* LoadOrCreateForLocalPlayer(const ULocalPlayer* LocalPlayer);
+	static FGGYGOSquadPresetLoadResult TryLoadForLocalPlayer(const ULocalPlayer* LocalPlayer);
 
-	/**
-	 * 取某个玩家的编队预设，经 `UGGYGOLocalPlayer` 的缓存。
-	 *
-	 * 服务器上的远程玩家没有本地玩家，返回 nullptr —— 他们的编队存在自己的
-	 * 磁盘上，读不到。这是正常路径而不是错误。
-	 */
-	static UGGYGOSquadPresets* GetForPlayerController(const APlayerController* PlayerController);
+	/** 兼容入口，只委托 TryLoadForLocalPlayer；Invalid 返回 nullptr，不创建替代对象。 */
+	static UGGYGOSquadPresets* LoadOrCreateForLocalPlayer(const ULocalPlayer* LocalPlayer);
 
 	/** 编队套数。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
@@ -146,9 +164,9 @@ public:
 	bool RenamePreset(int32 PresetIndex, const FString& NewDisplayName);
 
 	/**
-	 * 替换一套编队的成员。超过 `GGYGO_MAX_SQUAD_SIZE` 的部分被截断。
+	 * 替换一套编队的成员。超过 `GGYGO_MAX_SQUAD_SIZE` 时拒绝，不截断或修改原名单。
 	 *
-	 * @return 是否写入了。越界返回 false。
+	 * @return 是否写入了。编队序号越界或成员数量超限返回 false，原名单保持不变。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SetPresetMembers(int32 PresetIndex, const TArray<FPrimaryAssetId>& NewMembers);
@@ -163,22 +181,24 @@ public:
 	bool SetActivePresetIndex(int32 PresetIndex);
 
 	/**
-	 * 把出战编队解析成可直接喂给 `SetRoster` 的 PawnData 列表。
-	 *
-	 * **同步加载**这一套里的角色资产。放在玩家进入关卡时执行一次，
-	 * 几份资产的同步加载换来的是"装配时名单已就绪"，
-	 * 异步则要让装配等回调，把 GameMode 的生成流程拆成两段。
-	 *
-	 * 解析不出的 Id（角色被删、未注册 PrimaryAssetType）被跳过。
-	 *
-	 * @return 解析出的角色数。为 0 时调用方应回落到默认编队。
+	 * 同步解析出战预设；无预设且选择为 INDEX_NONE，或合法空编队返回 Unconfigured。
+	 * 只默认 FPrimaryAssetId() 是合法空位；非法索引/Id、超限或资产错误返回 Invalid。
+	 * 入口清空 OutRoster，只有全部非空成员成功解析才一次发布完整名单并返回 Resolved。
+	 * 结果只说明本次原输入的解析，不保证 PawnClass/能力配置或角色装配成功。
+	 * 调用方须消费 Status；Invalid 不能使用默认编队或部分名单掩盖。
 	 */
-	int32 ResolveActivePresetRoster(TArray<UGGYGOPawnData*>& OutRoster) const;
+	FGGYGOSquadPresetRosterResolveResult ResolveActivePresetRoster(TArray<UGGYGOPawnData*>& OutRoster) const;
 
-	/** 解析指定编队。面板预览用。 */
-	int32 ResolvePresetRoster(int32 PresetIndex, TArray<UGGYGOPawnData*>& OutRoster) const;
+	/** 解析指定预设；任意越界索引均为 Invalid，包括 INDEX_NONE。输出与失败契约同上。 */
+	FGGYGOSquadPresetRosterResolveResult ResolvePresetRoster(int32 PresetIndex, TArray<UGGYGOPawnData*>& OutRoster) const;
+	//~UObject interface
+	virtual void Serialize(FArchive& Ar) override;
+	//~End of UObject interface
 
 	//~ULocalPlayerSaveGame interface
+	/** Primary native source admission only; true means the native request was accepted, not saved successfully. */
+	virtual bool SaveGameToSlotForLocalPlayer() override;
+	virtual bool AsyncSaveGameToSlotForLocalPlayer() override;
 	virtual int32 GetLatestDataVersion() const override;
 	virtual void HandlePostLoad() override;
 	//~End of ULocalPlayerSaveGame interface
@@ -196,4 +216,39 @@ protected:
 	 */
 	UPROPERTY()
 	int32 ActivePresetIndex = INDEX_NONE;
+
+private:
+	/** Shared synchronous admission for the explicitly requested native save mode; no save state or executor. */
+	bool RequestSaveForOriginalSource(bool bAsync);
+
+	/** 唯一同步解析实现；bResolveActivePreset 仅区分正常无预设与显式非法索引。 */
+	FGGYGOSquadPresetRosterResolveResult ResolvePresetRosterInternal(int32 RequestedPresetIndex,
+		bool bResolveActivePreset, TArray<UGGYGOPawnData*>& OutRoster) const;
+
+	/** Derived facts from the last actual object loading archive; never serialized or used as readiness. */
+	bool bObservedLoadingArchive = false;
+	bool bLoadingArchiveHadError = false;
+};
+
+/** One synchronous load outcome. Only a successful result owns a scoped candidate. */
+enum class EGGYGOSquadPresetLoadStatus : uint8
+{
+	Loaded,
+	CreatedForMissingSlot,
+	Invalid
+};
+
+struct GGYGO_API FGGYGOSquadPresetLoadResult
+{
+	EGGYGOSquadPresetLoadStatus Status = EGGYGOSquadPresetLoadStatus::Invalid;
+	TWeakObjectPtr<const ULocalPlayer> OriginalLocalPlayer;
+	TWeakObjectPtr<UGameInstance> OriginalGameInstance;
+	FPlatformUserId OriginalPlatformUserId = PLATFORMUSERID_NONE;
+	int32 OriginalPlatformUserIndex = INDEX_NONE;
+	FString SlotName;
+	FString LocalPlayerPath;
+	FString GameInstancePath;
+	FString PresetsPath;
+	FString Error;
+	TStrongObjectPtr<UGGYGOSquadPresets> Candidate;
 };

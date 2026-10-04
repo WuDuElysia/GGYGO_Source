@@ -7,6 +7,8 @@
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "GameFramework/Pawn.h"
 #include "GameplayEffect.h"
 #include "GameplayEffectExtension.h"
 #include "GameplayEffectTypes.h"
@@ -18,6 +20,39 @@
 
 class FLifetimeProperty;
 
+struct UGGYGOHealthComponent::FAbilitySystemResource
+{
+	TWeakObjectPtr<UGGYGOHealthComponent> Health{};
+	TWeakObjectPtr<APawn> Pawn{};
+	TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension{};
+	FGGYGOPawnASCResourceHandle Resource{};
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
+	TWeakObjectPtr<const UGGYGOHealthSet> HealthSet{};
+	FGGYGOAvatarBindingContext PublishedContext{};
+	FDelegateHandle HealthChanged{};
+	FDelegateHandle MaxHealthChanged{};
+	FDelegateHandle OutOfHealth{};
+	FDelegateHandle PoiseChanged{};
+	FDelegateHandle PoiseBroken{};
+	bool bRetired = false;
+};
+
+namespace
+{
+	bool RejectHealthResource(FString& OutError, const UGGYGOHealthComponent* Health,
+		const FGGYGOPawnASCResourceHandle& Resource, const FGGYGOAvatarBindingContext& Context,
+		const TCHAR* Reason)
+	{
+		const FGGYGOPawnASCResourceIdentity Identity = Resource.GetIdentity();
+		OutError = FString::Printf(
+			TEXT("[Character/Health] Health='%s' Pawn='%s' ASC='%s' Binding=%llu Write=%llu Reason='%s'."),
+			*GetPathNameSafe(Health), *GetPathNameSafe(Identity.Pawn.Get()), *GetPathNameSafe(Identity.ASC.Get()),
+			static_cast<unsigned long long>(Context.Binding.Serial),
+			static_cast<unsigned long long>(Context.LastActorInfoWrite.Serial), Reason);
+		return false;
+	}
+}
+
 UGGYGOHealthComponent::UGGYGOHealthComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -27,8 +62,6 @@ UGGYGOHealthComponent::UGGYGOHealthComponent(const FObjectInitializer& ObjectIni
 
 	SetIsReplicatedByDefault(true);
 
-	AbilitySystemComponent = nullptr;
-	HealthSet = nullptr;
 	DeathState = EGGYGODeathState::NotDead;
 }
 
@@ -39,201 +72,537 @@ void UGGYGOHealthComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>
 	DOREPLIFETIME(UGGYGOHealthComponent, DeathState);
 }
 
+void UGGYGOHealthComponent::OnRegister()
+{
+	if (IsValid(this) && !IsBeingDestroyed() && !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& IsValid(GetOwner()) && !GetOwner()->IsActorBeingDestroyed())
+	{
+		bResourceAdmissionClosed = false;
+	}
+	Super::OnRegister();
+}
+
+void UGGYGOHealthComponent::BeginPlay()
+{
+	AActor* Owner = GetOwner();
+	if (!HasBegunPlay() && IsRegistered() && IsValid(this) && !IsBeingDestroyed()
+		&& Owner && !Owner->IsActorBeingDestroyed()
+		&& (Owner->IsActorBeginningPlay() || Owner->HasActorBegunPlay()))
+	{
+		bResourceAdmissionClosed = false;
+	}
+	Super::BeginPlay();
+}
+
+void UGGYGOHealthComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	bResourceAdmissionClosed = true;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	RetireOriginalResource(OriginalResource);
+	Super::EndPlay(EndPlayReason);
+}
+
 void UGGYGOHealthComponent::OnUnregister()
 {
-	UninitializeFromAbilitySystem();
-
+	bResourceAdmissionClosed = true;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	RetireOriginalResource(OriginalResource);
 	Super::OnUnregister();
+}
+
+bool UGGYGOHealthComponent::ValidateLocalReadyResource(
+	UGGYGOPawnExtensionComponent* ExpectedExtension,
+	const FGGYGOPawnASCResourceHandle& ExpectedResource,
+	const FGGYGOAvatarBindingContext& PublishedContext,
+	UGGYGOAbilitySystemComponent*& OutASC, const UGGYGOHealthSet*& OutHealthSet, FString& OutError) const
+{
+	OutASC = nullptr;
+	OutHealthSet = nullptr;
+	if (bResourceAdmissionClosed || !IsRegistered() || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return RejectHealthResource(OutError, this, ExpectedResource, PublishedContext, TEXT("LifecycleClosed"));
+	}
+	APawn* Pawn = Cast<APawn>(GetOwner());
+	const FGGYGOPawnASCResourceIdentity Identity = ExpectedResource.GetIdentity();
+	if (!IsValid(Pawn) || Pawn->IsActorBeingDestroyed() || !IsValid(ExpectedExtension)
+		|| ExpectedExtension != UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Pawn)
+		|| ExpectedExtension->GetOwner() != Pawn
+		|| !Identity.Pawn.HasSameIndexAndSerialNumber(TWeakObjectPtr<APawn>(Pawn)))
+	{
+		return RejectHealthResource(OutError, this, ExpectedResource, PublishedContext, TEXT("OwnerOrExtensionMismatch"));
+	}
+	UGGYGOAbilitySystemComponent* ASC = Identity.ASC.Get();
+	if (!ExpectedResource.HasResource() || !PublishedContext.HasIssuedContext()
+		|| !Identity.Binding.HasSameIdentity(PublishedContext.Binding) || !ASC
+		|| !ExpectedExtension->IsLocalAbilitySystemResourceReady(ExpectedResource)
+		|| !ASC->IsAvatarBindingPublicationContextCurrent(PublishedContext))
+	{
+		return RejectHealthResource(OutError, this, ExpectedResource, PublishedContext, TEXT("OriginalResourceNotReady"));
+	}
+	const UGGYGOHealthSet* Set = ASC->GetSet<UGGYGOHealthSet>();
+	if (!IsValid(Set) || Set->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return RejectHealthResource(OutError, this, ExpectedResource, PublishedContext, TEXT("MissingHealthSet"));
+	}
+	OutASC = ASC;
+	OutHealthSet = Set;
+	return true;
+}
+
+bool UGGYGOHealthComponent::IsOriginalResourceCurrent(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext)
+{
+	if (!ExpectedResource.IsValid() || ExpectedResource->bRetired
+		|| !ExpectedResource->PublishedContext.HasSameContext(ExpectedContext)
+		|| !ExpectedResource->HealthChanged.IsValid() || !ExpectedResource->MaxHealthChanged.IsValid()
+		|| !ExpectedResource->OutOfHealth.IsValid() || !ExpectedResource->PoiseChanged.IsValid()
+		|| !ExpectedResource->PoiseBroken.IsValid())
+	{
+		return false;
+	}
+	UGGYGOHealthComponent* Health = ExpectedResource->Health.Get();
+	APawn* Pawn = ExpectedResource->Pawn.Get();
+	UGGYGOPawnExtensionComponent* Extension = ExpectedResource->Extension.Get();
+	UGGYGOAbilitySystemComponent* ASC = ExpectedResource->ASC.Get();
+	const UGGYGOHealthSet* Set = ExpectedResource->HealthSet.Get();
+	const FGGYGOPawnASCResourceIdentity Identity = ExpectedResource->Resource.GetIdentity();
+	return Health && !Health->bResourceAdmissionClosed && Health->IsRegistered()
+		&& !Health->IsBeingDestroyed() && !Health->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& Health->AbilitySystemResource == ExpectedResource
+		&& Pawn && !Pawn->IsActorBeingDestroyed() && Health->GetOwner() == Pawn
+		&& Extension && Extension->GetOwner() == Pawn
+		&& Extension == UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Pawn)
+		&& ASC && Set && !Set->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& Identity.ASC.HasSameIndexAndSerialNumber(ExpectedResource->ASC)
+		&& Identity.Pawn.HasSameIndexAndSerialNumber(ExpectedResource->Pawn)
+		&& Identity.Binding.HasSameIdentity(ExpectedContext.Binding)
+		&& Extension->IsLocalAbilitySystemResourceReady(ExpectedResource->Resource)
+		&& ASC->IsAvatarBindingPublicationContextCurrent(ExpectedContext)
+		&& ASC->GetSet<UGGYGOHealthSet>() == Set;
+}
+
+void UGGYGOHealthComponent::RetireOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource)
+{
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	if (!OriginalResource.IsValid() || OriginalResource->bRetired) { return; }
+	// 先退休并摘自身原槽。此后只操作这份记录及其原 Set/token，不写当前后继。
+	OriginalResource->bRetired = true;
+	if (UGGYGOHealthComponent* Health = OriginalResource->Health.Get();
+		Health && Health->AbilitySystemResource == OriginalResource)
+	{
+		Health->AbilitySystemResource.Reset();
+	}
+	const FDelegateHandle HealthChanged = OriginalResource->HealthChanged;
+	const FDelegateHandle MaxHealthChanged = OriginalResource->MaxHealthChanged;
+	const FDelegateHandle OutOfHealth = OriginalResource->OutOfHealth;
+	const FDelegateHandle PoiseChanged = OriginalResource->PoiseChanged;
+	const FDelegateHandle PoiseBroken = OriginalResource->PoiseBroken;
+	OriginalResource->HealthChanged.Reset();
+	OriginalResource->MaxHealthChanged.Reset();
+	OriginalResource->OutOfHealth.Reset();
+	OriginalResource->PoiseChanged.Reset();
+	OriginalResource->PoiseBroken.Reset();
+	if (const UGGYGOHealthSet* OriginalSet = OriginalResource->HealthSet.Get();
+		OriginalSet && !OriginalSet->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		if (HealthChanged.IsValid()) { OriginalSet->OnHealthChanged.Remove(HealthChanged); }
+		if (MaxHealthChanged.IsValid()) { OriginalSet->OnMaxHealthChanged.Remove(MaxHealthChanged); }
+		if (OutOfHealth.IsValid()) { OriginalSet->OnOutOfHealth.Remove(OutOfHealth); }
+		if (PoiseChanged.IsValid()) { OriginalSet->OnPoiseChanged.Remove(PoiseChanged); }
+		if (PoiseBroken.IsValid()) { OriginalSet->OnPoiseBroken.Remove(PoiseBroken); }
+	}
+	// Set 已失效时只退休这份历史义务，不查找新 Set 或宣称发出了通知。
+}
+
+TSharedPtr<UGGYGOHealthComponent::FAbilitySystemResource> UGGYGOHealthComponent::GetReadyResource() const
+{
+	check(IsInGameThread());
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	return OriginalResource.IsValid()
+		&& IsOriginalResourceCurrent(OriginalResource, OriginalResource->PublishedContext)
+		? OriginalResource : TSharedPtr<FAbilitySystemResource>{};
+}
+
+bool UGGYGOHealthComponent::ProjectDeathStateToOriginalResource(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext)
+{
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return false; }
+	const EGGYGODeathState OriginalDeathState = OriginalResource->Health.Get()->DeathState;
+	UGGYGOAbilitySystemComponent* OriginalASC = OriginalResource->ASC.Get();
+	if (OriginalDeathState >= EGGYGODeathState::DeathStarted)
+	{
+		OriginalASC->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dying, 1);
+		if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return false; }
+	}
+	if (OriginalDeathState >= EGGYGODeathState::DeathFinished)
+	{
+		OriginalASC = OriginalResource->ASC.Get();
+		OriginalASC->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dead, 1);
+		if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return false; }
+	}
+	return true;
+}
+
+bool UGGYGOHealthComponent::InitializeWithLocalAbilitySystemResource(
+	UGGYGOPawnExtensionComponent* ExpectedExtension,
+	const FGGYGOPawnASCResourceHandle& ExpectedResource,
+	const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError)
+{
+	check(IsInGameThread());
+	OutError.Reset();
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(ExpectedExtension);
+	const FGGYGOPawnASCResourceHandle OriginalHandle = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = PublishedContext;
+	UGGYGOAbilitySystemComponent* OriginalASC;
+	const UGGYGOHealthSet* OriginalSet;
+	if (!ValidateLocalReadyResource(OriginalExtension.Get(), OriginalHandle, OriginalContext,
+		OriginalASC, OriginalSet, OutError)) { return false; }
+	const TSharedPtr<FAbilitySystemResource> Existing = AbilitySystemResource;
+	if (Existing.IsValid() && !Existing->bRetired)
+	{
+		if (Existing->Resource.HasSameResource(OriginalHandle))
+		{
+			// 同 H 走同一认证/投影实现，不重复 token 或 UI 初值。
+			return RefreshLocalAbilitySystemResource(OriginalExtension.Get(), OriginalHandle, OriginalContext, OutError);
+		}
+		UGGYGOPawnExtensionComponent* PreviousSource = Existing->Extension.Get();
+		if (PreviousSource && PreviousSource->IsLocalAbilitySystemResourceInstalled(Existing->Resource))
+		{
+			return RejectHealthResource(OutError, this, OriginalHandle, OriginalContext, TEXT("ResourceConflict"));
+		}
+		// 新请求明确指定真实 Ready H；仅退休已失效的旧 Health 自有记录，再复核本请求。
+		RetireOriginalResource(Existing);
+		if (!ValidateLocalReadyResource(OriginalExtension.Get(), OriginalHandle, OriginalContext,
+			OriginalASC, OriginalSet, OutError)) { return false; }
+		if (AbilitySystemResource.IsValid())
+		{
+			return RejectHealthResource(OutError, this, OriginalHandle, OriginalContext, TEXT("CallbackInvalidated"));
+		}
+	}
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = MakeShared<FAbilitySystemResource>();
+	OriginalResource->Health = this;
+	OriginalResource->Pawn = Cast<APawn>(GetOwner());
+	OriginalResource->Extension = OriginalExtension;
+	OriginalResource->Resource = OriginalHandle;
+	OriginalResource->ASC = OriginalASC;
+	OriginalResource->HealthSet = OriginalSet;
+	OriginalResource->PublishedContext = OriginalContext;
+	AbilitySystemResource = OriginalResource;
+	OriginalResource->HealthChanged = OriginalSet->OnHealthChanged.AddLambda(
+		[OriginalResource](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+		{
+			// 局部副本保住本次调用；Context 按事件入口读取，不固定为 Add 时的安装 Context。
+			const TSharedPtr<FAbilitySystemResource> EventResource = OriginalResource;
+			const FGGYGOAvatarBindingContext EventContext = EventResource->PublishedContext;
+			if (UGGYGOHealthComponent* Health = EventResource->Health.Get();
+				Health && IsOriginalResourceCurrent(EventResource, EventContext))
+			{
+				Health->HandleHealthChanged(EventResource, EventContext, Instigator, Causer, Spec, Magnitude, OldValue, NewValue);
+			}
+		});
+	OriginalResource->MaxHealthChanged = OriginalSet->OnMaxHealthChanged.AddLambda(
+		[OriginalResource](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+		{
+			// 局部副本保住本次调用；Context 按事件入口读取，不固定为 Add 时的安装 Context。
+			const TSharedPtr<FAbilitySystemResource> EventResource = OriginalResource;
+			const FGGYGOAvatarBindingContext EventContext = EventResource->PublishedContext;
+			if (UGGYGOHealthComponent* Health = EventResource->Health.Get();
+				Health && IsOriginalResourceCurrent(EventResource, EventContext))
+			{
+				Health->HandleMaxHealthChanged(EventResource, EventContext, Instigator, Causer, Spec, Magnitude, OldValue, NewValue);
+			}
+		});
+	OriginalResource->OutOfHealth = OriginalSet->OnOutOfHealth.AddLambda(
+		[OriginalResource](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+		{
+			// 局部副本保住本次调用；Context 按事件入口读取，不固定为 Add 时的安装 Context。
+			const TSharedPtr<FAbilitySystemResource> EventResource = OriginalResource;
+			const FGGYGOAvatarBindingContext EventContext = EventResource->PublishedContext;
+			if (UGGYGOHealthComponent* Health = EventResource->Health.Get();
+				Health && IsOriginalResourceCurrent(EventResource, EventContext))
+			{
+				Health->HandleOutOfHealth(EventResource, EventContext, Instigator, Causer, Spec, Magnitude, OldValue, NewValue);
+			}
+		});
+	OriginalResource->PoiseChanged = OriginalSet->OnPoiseChanged.AddLambda(
+		[OriginalResource](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+		{
+			// 局部副本保住本次调用；Context 按事件入口读取，不固定为 Add 时的安装 Context。
+			const TSharedPtr<FAbilitySystemResource> EventResource = OriginalResource;
+			const FGGYGOAvatarBindingContext EventContext = EventResource->PublishedContext;
+			if (UGGYGOHealthComponent* Health = EventResource->Health.Get();
+				Health && IsOriginalResourceCurrent(EventResource, EventContext))
+			{
+				Health->HandlePoiseChanged(EventResource, EventContext, Instigator, Causer, Spec, Magnitude, OldValue, NewValue);
+			}
+		});
+	OriginalResource->PoiseBroken = OriginalSet->OnPoiseBroken.AddLambda(
+		[OriginalResource](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+		{
+			// 局部副本保住本次调用；Context 按事件入口读取，不固定为 Add 时的安装 Context。
+			const TSharedPtr<FAbilitySystemResource> EventResource = OriginalResource;
+			const FGGYGOAvatarBindingContext EventContext = EventResource->PublishedContext;
+			if (UGGYGOHealthComponent* Health = EventResource->Health.Get();
+				Health && IsOriginalResourceCurrent(EventResource, EventContext))
+			{
+				Health->HandlePoiseBroken(EventResource, EventContext, Instigator, Causer, Spec, Magnitude, OldValue, NewValue);
+			}
+		});
+	const auto FailOriginalInstall = [&]()
+	{
+		// 后继刷新同记录 Context 或同 H 重建另一记录时，不退休其有效装配。
+		if (!OriginalResource->bRetired && OriginalResource->PublishedContext.HasSameContext(OriginalContext))
+		{
+			RetireOriginalResource(OriginalResource);
+		}
+		return RejectHealthResource(OutError, OriginalResource->Health.Get(), OriginalHandle, OriginalContext,
+			TEXT("OriginalInstallInvalidated"));
+	};
+	if (!ProjectDeathStateToOriginalResource(OriginalResource, OriginalContext)) { return FailOriginalInstall(); }
+
+	// 三次初值来自捕获的原 Set；每次广播后只复核本次记录/H/Set/Context。
+	OriginalSet = OriginalResource->HealthSet.Get();
+	OriginalResource->Health.Get()->OnHealthChanged.Broadcast(
+		OriginalResource->Health.Get(), 0.0f, OriginalSet->GetHealth(), nullptr);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return FailOriginalInstall(); }
+	OriginalSet = OriginalResource->HealthSet.Get();
+	OriginalResource->Health.Get()->OnMaxHealthChanged.Broadcast(
+		OriginalResource->Health.Get(), 0.0f, OriginalSet->GetMaxHealth(), nullptr);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return FailOriginalInstall(); }
+	OriginalSet = OriginalResource->HealthSet.Get();
+	OriginalResource->Health.Get()->OnPoiseChanged.Broadcast(
+		OriginalResource->Health.Get(), 0.0f, OriginalSet->GetPoise(), nullptr);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return FailOriginalInstall(); }
+	return true;
+}
+
+bool UGGYGOHealthComponent::RefreshLocalAbilitySystemResource(
+	UGGYGOPawnExtensionComponent* ExpectedExtension,
+	const FGGYGOPawnASCResourceHandle& ExpectedResource,
+	const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError)
+{
+	check(IsInGameThread());
+	OutError.Reset();
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(ExpectedExtension);
+	const FGGYGOPawnASCResourceHandle OriginalHandle = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = PublishedContext;
+	UGGYGOAbilitySystemComponent* ASC;
+	const UGGYGOHealthSet* Set;
+	if (!ValidateLocalReadyResource(OriginalExtension.Get(), OriginalHandle, OriginalContext,
+		ASC, Set, OutError)) { return false; }
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	if (!OriginalResource.IsValid() || OriginalResource->bRetired
+		|| !OriginalResource->Resource.HasSameResource(OriginalHandle)
+		|| !OriginalResource->Extension.HasSameIndexAndSerialNumber(OriginalExtension)
+		|| OriginalResource->ASC.Get() != ASC || OriginalResource->HealthSet.Get() != Set)
+	{
+		return RejectHealthResource(OutError, this, OriginalHandle, OriginalContext, TEXT("OriginalRecordOrHealthSetMismatch"));
+	}
+	// 更新同记录的认证元数据；五个 lambda 下次调用会取新 Context，不重装或重放初值。
+	OriginalResource->PublishedContext = OriginalContext;
+	if (!ProjectDeathStateToOriginalResource(OriginalResource, OriginalContext))
+	{
+		return RejectHealthResource(OutError, OriginalResource->Health.Get(), OriginalHandle, OriginalContext,
+			TEXT("OriginalRefreshInvalidated"));
+	}
+	return true;
+}
+
+bool UGGYGOHealthComponent::UninitializeFromLocalAbilitySystemResource(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource, FString& OutError)
+{
+	check(IsInGameThread());
+	OutError.Reset();
+	const FGGYGOPawnASCResourceHandle OriginalHandle = ExpectedResource;
+	if (!OriginalHandle.HasResource())
+	{
+		return RejectHealthResource(OutError, this, OriginalHandle, FGGYGOAvatarBindingContext{}, TEXT("MissingOriginalResource"));
+	}
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	if (!OriginalResource.IsValid()) { return true; }
+	if (!OriginalResource->Resource.HasSameResource(OriginalHandle))
+	{
+		return RejectHealthResource(OutError, this, OriginalHandle, OriginalResource->PublishedContext,
+			TEXT("ResourceMismatch"));
+	}
+	RetireOriginalResource(OriginalResource);
+	return true;
 }
 
 void UGGYGOHealthComponent::InitializeWithAbilitySystem(UGGYGOAbilitySystemComponent* InASC)
 {
-	AActor* Owner = GetOwner();
-	check(Owner);
-
-	if (AbilitySystemComponent)
+	check(IsInGameThread());
+	UGGYGOPawnExtensionComponent* Source = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(GetOwner());
+	const FGGYGOPawnASCResourceHandle OriginalHandle =
+		Source ? Source->GetCurrentLocalAbilitySystemResource() : FGGYGOPawnASCResourceHandle{};
+	const FGGYGOPawnASCResourceIdentity Identity = OriginalHandle.GetIdentity();
+	FGGYGOAvatarBindingContext OriginalContext;
+	if (IsValid(InASC) && Identity.ASC.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGGYGOAbilitySystemComponent>(InASC)))
 	{
-		if (AbilitySystemComponent == InASC)
-		{
-			// 幂等：OnAbilitySystemInitialized_RegisterAndCall 有可能补发一次广播，
-			// 加上正常广播就是两次调用，这里必须容忍。
-			return;
-		}
-
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("InitializeWithAbilitySystem: [%s] 已绑定到另一个 ASC，先解绑再重新绑定。"),
-			*GetNameSafe(Owner));
+		OriginalContext = InASC->GetAvatarBindingContext();
+	}
+	FString Error;
+	if (!IsValid(InASC) || Identity.ASC.Get() != InASC)
+	{
+		RejectHealthResource(Error, this, OriginalHandle, OriginalContext, TEXT("ExpectedASCMismatchOrMissingResource"));
+	}
+	else if (InitializeWithLocalAbilitySystemResource(Source, OriginalHandle, OriginalContext, Error))
+	{
 		return;
 	}
-
-	AbilitySystemComponent = InASC;
-	if (!AbilitySystemComponent)
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("InitializeWithAbilitySystem: [%s] 收到空 ASC。"), *GetNameSafe(Owner));
-		return;
-	}
-
-	HealthSet = AbilitySystemComponent->GetSet<UGGYGOHealthSet>();
-	if (!HealthSet)
-	{
-		// 属性集是队伍位置的默认子对象，随 ASC 一同到达，正常不可能缺失。
-		// 走到这里说明传进来的 ASC 不是位置上的那个（例如某处自己建了一个 ASC）。
-		//
-		// 这里**不**把 AbilitySystemComponent 置空：那样本组件会退回"未绑定"状态，
-		// 下一次广播时再走一遍同样的失败，把一次配置错误变成反复出现的噪声，
-		// 反而掩盖了首次失败的位置。保留绑定，让错误只报一次。
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("InitializeWithAbilitySystem: [%s] 的 ASC 上找不到 UGGYGOHealthSet，生命功能失效。"
-				 "该属性集应由 AGGYGOCharacterSlot 以默认子对象持有。"),
-			*GetNameSafe(Owner));
-		return;
-	}
-
-	// 把 AttributeSet 的原生 C++ 委托接到本组件的处理器上。
-	// 委托是 mutable 的，所以 const HealthSet 也能绑定。
-	HealthSet->OnHealthChanged.AddUObject(this, &UGGYGOHealthComponent::HandleHealthChanged);
-	HealthSet->OnMaxHealthChanged.AddUObject(this, &UGGYGOHealthComponent::HandleMaxHealthChanged);
-	HealthSet->OnOutOfHealth.AddUObject(this, &UGGYGOHealthComponent::HandleOutOfHealth);
-	HealthSet->OnPoiseChanged.AddUObject(this, &UGGYGOHealthComponent::HandlePoiseChanged);
-	HealthSet->OnPoiseBroken.AddUObject(this, &UGGYGOHealthComponent::HandlePoiseBroken);
-
-	// 不在这里重置属性初值。见头文件"与 Lyra 的差异"第 2 条。
-
-	ClearGameplayTags();
-
-	// 补发一次当前值。UI 在本组件初始化后才绑定委托，
-	// 不补发的话血条会停在 0 直到第一次受伤。
-	// Instigator 传 nullptr：这不是任何人造成的变化，只是一次状态同步。
-	OnHealthChanged.Broadcast(this, 0.0f, HealthSet->GetHealth(), nullptr);
-	OnMaxHealthChanged.Broadcast(this, 0.0f, HealthSet->GetMaxHealth(), nullptr);
-	OnPoiseChanged.Broadcast(this, 0.0f, HealthSet->GetPoise(), nullptr);
+	UE_LOG(LogGGYGOAbilitySystem, Warning,
+		TEXT("[Character/Health] InitializeWithAbilitySystem RequestedASC='%s': %s"), *GetPathNameSafe(InASC), *Error);
 }
 
 void UGGYGOHealthComponent::UninitializeFromAbilitySystem()
 {
-	ClearGameplayTags();
-
-	if (HealthSet)
+	check(IsInGameThread());
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = AbilitySystemResource;
+	if (!OriginalResource.IsValid()) { return; }
+	FString Error;
+	if (!UninitializeFromLocalAbilitySystemResource(OriginalResource->Resource, Error))
 	{
-		// 必须逐个解绑。ASC 可能被换到别的 Avatar 上继续使用，
-		// 留着悬空绑定会在下次属性变化时访问已销毁的本组件。
-		HealthSet->OnHealthChanged.RemoveAll(this);
-		HealthSet->OnMaxHealthChanged.RemoveAll(this);
-		HealthSet->OnOutOfHealth.RemoveAll(this);
-		HealthSet->OnPoiseChanged.RemoveAll(this);
-		HealthSet->OnPoiseBroken.RemoveAll(this);
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("%s"), *Error);
 	}
-
-	HealthSet = nullptr;
-	AbilitySystemComponent = nullptr;
 }
 
-void UGGYGOHealthComponent::ClearGameplayTags()
+void UGGYGOHealthComponent::ApplyDeathStateToAbilitySystem()
 {
-	if (AbilitySystemComponent)
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	if (OriginalResource.IsValid())
 	{
-		// 用 SetLooseGameplayTagCount(0) 而不是 RemoveLooseGameplayTag：
-		// 后者只减 1，若因某种原因加了两次就清不干净。
-		AbilitySystemComponent->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dying, 0);
-		AbilitySystemComponent->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dead, 0);
+		const FGGYGOAvatarBindingContext OriginalContext = OriginalResource->PublishedContext;
+		ProjectDeathStateToOriginalResource(OriginalResource, OriginalContext);
 	}
 }
 
 float UGGYGOHealthComponent::GetHealth() const
 {
-	return HealthSet ? HealthSet->GetHealth() : 0.0f;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	return OriginalResource.IsValid() ? OriginalResource->HealthSet.Get()->GetHealth() : 0.0f;
 }
 
 float UGGYGOHealthComponent::GetMaxHealth() const
 {
-	return HealthSet ? HealthSet->GetMaxHealth() : 0.0f;
-}
-
-float UGGYGOHealthComponent::GetHealthNormalized() const
-{
-	if (HealthSet)
-	{
-		const float Health = HealthSet->GetHealth();
-		const float MaxHealth = HealthSet->GetMaxHealth();
-
-		return (MaxHealth > 0.0f) ? (Health / MaxHealth) : 0.0f;
-	}
-
-	return 0.0f;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	return OriginalResource.IsValid() ? OriginalResource->HealthSet.Get()->GetMaxHealth() : 0.0f;
 }
 
 float UGGYGOHealthComponent::GetPoise() const
 {
-	return HealthSet ? HealthSet->GetPoise() : 0.0f;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	return OriginalResource.IsValid() ? OriginalResource->HealthSet.Get()->GetPoise() : 0.0f;
 }
 
 float UGGYGOHealthComponent::GetMaxPoise() const
 {
-	return HealthSet ? HealthSet->GetMaxPoise() : 0.0f;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	return OriginalResource.IsValid() ? OriginalResource->HealthSet.Get()->GetMaxPoise() : 0.0f;
+}
+
+float UGGYGOHealthComponent::GetHealthNormalized() const
+{
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	if (!OriginalResource.IsValid()) { return 0.0f; }
+	const UGGYGOHealthSet* OriginalSet = OriginalResource->HealthSet.Get();
+	const float Value = OriginalSet->GetHealth();
+	const float Maximum = OriginalSet->GetMaxHealth();
+	return Maximum > 0.0f ? Value / Maximum : 0.0f;
 }
 
 float UGGYGOHealthComponent::GetPoiseNormalized() const
 {
-	if (HealthSet)
-	{
-		const float Poise = HealthSet->GetPoise();
-		const float MaxPoise = HealthSet->GetMaxPoise();
-
-		return (MaxPoise > 0.0f) ? (Poise / MaxPoise) : 0.0f;
-	}
-
-	return 0.0f;
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	if (!OriginalResource.IsValid()) { return 0.0f; }
+	const UGGYGOHealthSet* OriginalSet = OriginalResource->HealthSet.Get();
+	const float Value = OriginalSet->GetPoise();
+	const float Maximum = OriginalSet->GetMaxPoise();
+	return Maximum > 0.0f ? Value / Maximum : 0.0f;
 }
 
-void UGGYGOHealthComponent::HandleHealthChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+void UGGYGOHealthComponent::HandleHealthChanged(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext,
+	AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
 {
-	OnHealthChanged.Broadcast(this, OldValue, NewValue, Instigator);
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
+		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OnHealthChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
-void UGGYGOHealthComponent::HandleMaxHealthChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+void UGGYGOHealthComponent::HandleMaxHealthChanged(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext,
+	AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
 {
-	OnMaxHealthChanged.Broadcast(this, OldValue, NewValue, Instigator);
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
+		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OnMaxHealthChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
-void UGGYGOHealthComponent::HandlePoiseChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+void UGGYGOHealthComponent::HandlePoiseChanged(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext,
+	AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
 {
-	OnPoiseChanged.Broadcast(this, OldValue, NewValue, Instigator);
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
+		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OnPoiseChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
-void UGGYGOHealthComponent::HandlePoiseBroken(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+void UGGYGOHealthComponent::HandlePoiseBroken(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext,
+	AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
 {
-	// 本组件只转发信号，不施加破韧硬直。
-	// 硬直时长、能否被特定攻击强制破韧、破韧后的受击表现都是战斗设计的一部分，
-	// 应由监听方（战斗组件或破韧 GA）决定。写在这里会把设计参数固化进底层组件。
-	OnPoiseBroken.Broadcast(GetOwner());
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
+		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OnPoiseBroken.Broadcast(OriginalResource->Pawn.Get());
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
-void UGGYGOHealthComponent::HandleOutOfHealth(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+void UGGYGOHealthComponent::HandleOutOfHealth(
+	const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+	const FGGYGOAvatarBindingContext& ExpectedContext,
+	AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
 {
 #if WITH_SERVER_CODE
-	if (!AbilitySystemComponent || !Spec)
-	{
-		return;
-	}
-
-	// 发 GameplayEvent 而不是直接调 StartDeath()。
-	// 死亡是一段有表现的流程（倒地动画、掉落、镜头），应该由一个死亡 GA 承载，
-	// 而 GA 的启动方式在 GAS 里就是 GameplayEvent。
-	// 本组件直接推进状态机会绕过 GA，那些表现就没有地方挂。
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingContext OriginalContext = ExpectedContext;
+	if (!Spec || !OriginalResource.IsValid() || OriginalResource->Health.Get() != this
+		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	UGGYGOAbilitySystemComponent* OriginalASC = OriginalResource->ASC.Get();
+	// 死亡仍只发原 GameplayEvent 给 GA；目标和 ASC来自这次原记录。
 	FGameplayEventData Payload;
 	Payload.EventTag = GGYGOGameplayTags::Event_Death;
 	Payload.Instigator = Instigator;
-	Payload.Target = AbilitySystemComponent->GetAvatarActor();
+	Payload.Target = OriginalResource->Pawn.Get();
 	Payload.OptionalObject = Spec->Def;
 	Payload.ContextHandle = Spec->GetEffectContext();
 	Payload.InstigatorTags = *Spec->CapturedSourceTags.GetAggregatedTags();
 	Payload.TargetTags = *Spec->CapturedTargetTags.GetAggregatedTags();
 	Payload.EventMagnitude = Magnitude;
 
-	// 预测窗口：死亡 GA 可能带客户端预测的表现（受击僵直转倒地）。
-	FScopedPredictionWindow NewScopedWindow(AbilitySystemComponent, true);
-	AbilitySystemComponent->HandleGameplayEvent(Payload.EventTag, &Payload);
+	FScopedPredictionWindow NewScopedWindow(OriginalASC, true);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OriginalASC->HandleGameplayEvent(Payload.EventTag, &Payload);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 #endif // WITH_SERVER_CODE
 }
 
@@ -303,11 +672,7 @@ void UGGYGOHealthComponent::StartDeath()
 	}
 
 	DeathState = EGGYGODeathState::DeathStarted;
-
-	if (AbilitySystemComponent)
-	{
-		AbilitySystemComponent->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dying, 1);
-	}
+	ApplyDeathStateToAbilitySystem();
 
 	AActor* Owner = GetOwner();
 	check(Owner);
@@ -326,13 +691,7 @@ void UGGYGOHealthComponent::FinishDeath()
 	}
 
 	DeathState = EGGYGODeathState::DeathFinished;
-
-	if (AbilitySystemComponent)
-	{
-		// 保留 State.Dying 不清：两个 Tag 同时存在表示"死了且演出已结束"，
-		// 而只有 Dead 没有 Dying 是个不该出现的状态。清掉由 ClearGameplayTags 统一做（复活时）。
-		AbilitySystemComponent->SetLooseGameplayTagCount(GGYGOGameplayTags::State_Dead, 1);
-	}
+	ApplyDeathStateToAbilitySystem();
 
 	AActor* Owner = GetOwner();
 	check(Owner);
@@ -350,21 +709,21 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 		return;
 	}
 
-	if (!AbilitySystemComponent)
+	const TSharedPtr<FAbilitySystemResource> OriginalResource = GetReadyResource();
+	if (!OriginalResource.IsValid())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("DamageSelfDestruct: [%s] 未绑定 ASC。"), *GetNameSafe(GetOwner()));
+			TEXT("DamageSelfDestruct: [%s] 没有经过认证的原 Health Ready 资源。"), *GetNameSafe(GetOwner()));
 		return;
 	}
+	const FGGYGOAvatarBindingContext OriginalContext = OriginalResource->PublishedContext;
+	UGGYGOAbilitySystemComponent* OriginalASC = OriginalResource->ASC.Get();
 
-	// 组件上的覆盖值优先，没配则用项目默认。
+	// 非空覆盖优先；空覆盖只读取启动预载快照，不在自毁路径加载或重试。
 	TSubclassOf<UGameplayEffect> EffectToApply = SelfDestructEffectOverride;
 	if (!EffectToApply)
 	{
-		if (const UGGYGOGameData* GameData = UGGYGOGameData::Get())
-		{
-			EffectToApply = GameData->SelfDestructGameplayEffect.LoadSynchronous();
-		}
+		EffectToApply = UGGYGOGameData::GetSharedSelfDestructGameplayEffect();
 	}
 
 	if (!EffectToApply)
@@ -372,15 +731,18 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 		// 显式报错而不是退化为直接改属性。直接改会绕过免疫判定与元属性消费，
 		// 让"无敌帧内掉出世界"的行为与正常受伤不一致。
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("DamageSelfDestruct: [%s] 既没有 SelfDestructEffectOverride，GameData 里也没配 SelfDestructGameplayEffect。"),
+			TEXT("DamageSelfDestruct: [%s] 未配置SelfDestructEffectOverride，且启动预载的共享自毁GE不可用（Manager/预载未就绪、共享配置缺失或加载失败）；本次不施加自毁伤害。请检查System启动诊断及GameData的SelfDestructGameplayEffect配置。"),
 			*GetNameSafe(GetOwner()));
 		return;
 	}
 
-	FGameplayEffectContextHandle Context = AbilitySystemComponent->MakeEffectContext();
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	FGameplayEffectContextHandle Context = OriginalASC->MakeEffectContext();
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	Context.AddSourceObject(this);
 
-	const FGameplayEffectSpecHandle SpecHandle = AbilitySystemComponent->MakeOutgoingSpec(EffectToApply, 1.0f, Context);
+	const FGameplayEffectSpecHandle SpecHandle = OriginalASC->MakeOutgoingSpec(EffectToApply, 1.0f, Context);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	if (!SpecHandle.IsValid() || !SpecHandle.Data.IsValid())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -406,8 +768,10 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 
 	// 伤害量给足以致死的值。用当前最大生命而不是一个魔数，
 	// 这样上限被 Buff 抬高时也仍然致死。
-	const float DamageAmount = FMath::Max(GetMaxHealth(), 1.0f);
+	const float DamageAmount = FMath::Max(OriginalResource->HealthSet.Get()->GetMaxHealth(), 1.0f);
 	Spec->SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_Damage, DamageAmount);
 
-	AbilitySystemComponent->ApplyGameplayEffectSpecToSelf(*Spec);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
+	OriginalASC->ApplyGameplayEffectSpecToSelf(*Spec);
+	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }

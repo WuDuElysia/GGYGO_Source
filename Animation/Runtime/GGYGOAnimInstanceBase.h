@@ -5,7 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Animation/AnimInstance.h"
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Animation/Debug/GGYGOAnimationDebugFrame.h"
 #include "Animation/Runtime/GGYGOAnimationStateCapture.h"
 #include "Animation/Runtime/GGYGOAnimationStateFrame.h"
@@ -18,12 +18,13 @@ class ACharacter;
  * 不知道任何 AnimBP 状态名或过渡拓扑，只负责游戏线程抓取与只读发布。
  */
 UCLASS(Abstract, BlueprintType, Blueprintable)
-class GGYGO_API UGGYGOAnimInstanceBase : public UAnimInstance
+class GGYGO_API UGGYGOAnimInstanceBase : public UGGYGOMontageGuardAnimInstance
 {
 	GENERATED_BODY()
 
 public:
 	virtual void NativeInitializeAnimation() override;
+	virtual void NativeUninitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
 
 	/** 线程安全地查询本帧是否具有某个 ASC 状态 Tag。 */
@@ -45,12 +46,19 @@ protected:
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "GGYGO|Animation")
 	FGGYGOAnimationStateFrame AnimationState;
 
+	/** 生命周期复位时清理派生 AnimInstance 自己持有的运行时表现状态。 */
+	virtual void OnAnimationLifecycleReset();
+
 	const FGGYGOAnimationDebugFrame& GetAnimationDebugFrame() const { return AnimationDebug; }
 
 private:
+	/** 幂等地清理基类运行时状态并通知派生表现层。 */
+	void ResetAnimationLifecycleState();
 	void RefreshAnimationStateFrame();
 
 	TWeakObjectPtr<ACharacter> CharacterOwner;
+	/** 记录上次绑定过有效 Character，避免弱引用失效后无法识别 nullptr -> nullptr。 */
+	bool bHadCharacterOwner = false;
 	FGGYGOAnimationStateCapture StateCapture;
 	FGGYGOAnimationDebugFrame AnimationDebug;
 };

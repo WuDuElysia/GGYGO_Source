@@ -10,6 +10,7 @@
 #include "Animation/Runtime/GGYGOAnimationStateFrame.h"
 #include "Animation/zzzAnim/Capture/ZZZAnimSnapshotCapture.h"
 #include "Animation/zzzAnim/Data/ZZZAnimSnapshot.h"
+#include "Animation/zzzAnim/Locomotion/ZZZLocomotionRules.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 	FGGYGOAnimationStateFrameCompatibilityTest,
@@ -23,6 +24,8 @@ bool FGGYGOAnimationStateFrameCompatibilityTest::RunTest(const FString& Paramete
 	State.WorldVelocityDirection = FVector(0.0, 1.0, 0.0);
 	State.LocalVelocityAngle = 90.0f;
 	State.LocalVelocityBlend = FVector2D(1.0, 0.25);
+	State.WalkRunBlendAlpha = 0.75f;
+	State.StopMotionType = EGGYGOStopMotionType::RunStop;
 	State.Gait = EGGYGOGait::Run;
 	State.TurnBackPhase = EGGYGOTurnBackPhase::RunOut;
 	State.bHasMoveInput = true;
@@ -47,10 +50,15 @@ bool FGGYGOAnimationStateFrameCompatibilityTest::RunTest(const FString& Paramete
 	TestEqual(TEXT("水平速度"), Snapshot.VelocityLength, State.HorizontalSpeed);
 	TestEqual(TEXT("世界速度方向"), Snapshot.ActualVelocityDirection, State.WorldVelocityDirection);
 	TestEqual(TEXT("局部速度角"), Snapshot.ActualVelocityAngle, State.LocalVelocityAngle);
-	TestEqual(TEXT("局部混合 X"), Snapshot.ActualVelocityBlendX, static_cast<float>(State.LocalVelocityBlend.X));
-	TestEqual(TEXT("局部混合 Y"), Snapshot.ActualVelocityBlendY, static_cast<float>(State.LocalVelocityBlend.Y));
-	TestEqual(TEXT("旧混合 X"), Snapshot.AnimBlendX, static_cast<float>(State.LocalVelocityBlend.X));
-	TestEqual(TEXT("旧混合 Y"), Snapshot.AnimBlendY, static_cast<float>(State.LocalVelocityBlend.Y));
+	TestEqual(TEXT("动画兼容轴 X=Right"), Snapshot.ActualVelocityBlendX, static_cast<float>(State.LocalVelocityBlend.Y));
+	TestEqual(TEXT("动画兼容轴 Y=Forward"), Snapshot.ActualVelocityBlendY, static_cast<float>(State.LocalVelocityBlend.X));
+	TestEqual(TEXT("旧混合 X"), Snapshot.AnimBlendX, static_cast<float>(State.LocalVelocityBlend.Y));
+	TestEqual(TEXT("旧混合 Y"), Snapshot.AnimBlendY, static_cast<float>(State.LocalVelocityBlend.X));
+	TestEqual(TEXT("WalkRun 混合值"), Snapshot.WalkRunBlendAlpha, State.WalkRunBlendAlpha);
+	TestEqual(TEXT("停止语义"), Snapshot.StopMotionType, State.StopMotionType);
+	TestEqual(TEXT("StartStop -> StopValue 0"), ZZZLocomotionRules::ResolveStopValue(EGGYGOStopMotionType::StartStop), 0);
+	TestEqual(TEXT("WalkStop -> StopValue 1"), ZZZLocomotionRules::ResolveStopValue(EGGYGOStopMotionType::WalkStop), 1);
+	TestEqual(TEXT("RunStop -> StopValue 2"), ZZZLocomotionRules::ResolveStopValue(EGGYGOStopMotionType::RunStop), 2);
 	TestEqual(TEXT("转身阶段"), Snapshot.TurnBackPhase, State.TurnBackPhase);
 	TestEqual(TEXT("转身 RunOut"), Snapshot.bTurnBackRunOut, State.bTurnBackRunOut);
 	TestEqual(TEXT("输入点积"), Snapshot.InputForwardDot, Debug.InputForwardDot);

@@ -23,7 +23,10 @@
 #pragma once
 
 #include "Abilities/GameplayAbility.h"
+#include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
+#include "GameplayPrediction.h"
+#include "GameplayAbilitySpecHandle.h"
 // FGGYGOCameraOffset 是值成员，需要完整定义而非前向声明。
 #include "Camera/GGYGOCameraMode.h"
 
@@ -41,13 +44,229 @@ class FText;
 class IGGYGOAbilitySourceInterface;
 class UAnimMontage;
 class UGGYGOAbilityCost;
+class UGGYGOGameplayAbility;
 class UGGYGOAbilitySystemComponent;
+class UGGYGOCameraComponent;
 class UGGYGOCameraMode;
+class UGGYGOHeroComponent;
+class UGameplayEffect;
 class UObject;
 struct FFrame;
 struct FGameplayAbilityActorInfo;
 struct FGameplayEffectSpec;
 struct FGameplayEventData;
+struct FGameplayAbilityTargetDataHandle;
+struct FHitResult;
+
+/**
+ * T1a defines GA provenance issuance/capture; ASC witness integration is still pending.
+ * Termination requests/cleanup/completion remain declarations; values do not own GAS Active/spec state.
+ * Handles share immutable issuer-created history. Empty/copy/equality never prove liveness.
+ */
+class GGYGO_API FGGYGOAbilityActivationHandle
+{
+public:
+	FGGYGOAbilityActivationHandle() = default;
+	bool HasActivation() const { return Proof.IsValid(); }
+	bool HasSameActivation(const FGGYGOAbilityActivationHandle& Other) const
+	{
+		return Proof.IsValid() && Proof == Other.Proof;
+	}
+
+private:
+	// GA-issued nonreused identity for the original ASC/instance/Spec/ActorInfo source.
+	// A zero prediction key is not an identity; this proof must distinguish each activation.
+	struct FActivationProof;
+	TSharedPtr<const FActivationProof> Proof{};
+
+	friend class UGGYGOGameplayAbility;
+};
+
+class GGYGO_API FGGYGOAbilityTerminationHandle
+{
+public:
+	FGGYGOAbilityTerminationHandle() = default;
+	bool HasTermination() const { return Proof.IsValid(); }
+	bool HasSameTermination(const FGGYGOAbilityTerminationHandle& Other) const
+	{
+		return Proof.IsValid() && Proof == Other.Proof;
+	}
+
+private:
+	// GA-issued identity for the first accepted request against one original activation.
+	struct FTerminationProof;
+	TSharedPtr<const FTerminationProof> Proof{};
+
+	friend class UGGYGOGameplayAbility;
+};
+
+enum class EGGYGOAbilityTerminationRequestKind : uint8
+{
+	None = 0,
+	End,
+	Cancel
+};
+
+enum class EGGYGOAbilityActivationRequestOutcome : uint8
+{
+	Rejected = 0,
+	/** Native Try accepted its request; does not imply local activation or Commit success. */
+	Accepted,
+	Busy,
+	Stale,
+	Failed
+};
+
+enum class EGGYGOAbilityActivationRequestReason : uint8
+{
+	InvalidRequest = 0,
+	None,
+	InvalidASC,
+	InvalidSpec,
+	InvalidAbility,
+	InvalidActorInfo,
+	WrongIssuer,
+	IdentityExhausted,
+	MissingActivationBoundary,
+	SameInstanceRetrigger,
+	TerminationInProgress,
+	NativeActivationRejected,
+	UnsupportedEntry
+};
+
+enum class EGGYGOAbilityTerminationOutcome : uint8
+{
+	Rejected = 0,
+	Completed,
+	Accepted,
+	Deferred,
+	AlreadyPending,
+	Busy,
+	Stale,
+	Failed
+};
+
+enum class EGGYGOAbilityTerminationReason : uint8
+{
+	InvalidRequest = 0,
+	None,
+	WrongIssuer,
+	InvalidASC,
+	InvalidAbility,
+	InvalidActorInfo,
+	IdentityExhausted,
+	ActivationChanged,
+	NotActive,
+	NotCancelable,
+	ScopeLocked,
+	TerminationInProgress,
+	ActivationCallInProgress,
+	MontageCaptureFailed,
+	NativeEndNotObserved,
+	UnsupportedEntry
+};
+
+/**
+ * Immutable first-request snapshot, created only by GA; not an alternate execution state.
+ * Capture precedes cancellation broadcast/cleanup. Repeated requests cannot change these
+ * parameters or recapture resources. Deferred resume carries this same original identity.
+ */
+class GGYGO_API FGGYGOAbilityTerminationContext
+{
+public:
+	FGGYGOAbilityTerminationContext() = default;
+
+	const FGGYGOAbilityActivationHandle& GetOriginalActivation() const { return OriginalActivation; }
+	const FGGYGOAbilityTerminationHandle& GetOriginalTermination() const { return OriginalTermination; }
+	EGGYGOAbilityTerminationRequestKind GetRequestKind() const { return RequestKind; }
+	bool GetReplicateEndAbility() const { return bReplicateEndAbility; }
+	bool GetReplicateCancelAbility() const { return bReplicateCancelAbility; }
+	bool WasCancelled() const { return bWasCancelled; }
+	const FGGYGOAbilityMontageOwnershipCheck& GetOriginalMontageCapture() const { return OriginalMontageCapture; }
+
+private:
+	FGGYGOAbilityActivationHandle OriginalActivation{};
+	FGGYGOAbilityTerminationHandle OriginalTermination{};
+	EGGYGOAbilityTerminationRequestKind RequestKind = EGGYGOAbilityTerminationRequestKind::None;
+	// Only the replication flag for RequestKind is an input; the other remains false.
+	bool bReplicateEndAbility = false;
+	bool bReplicateCancelAbility = false;
+	// End preserves its original bWasCancelled argument; Cancel records true.
+	bool bWasCancelled = false;
+	// Default remains K3 Rejected/InvalidRequest. Explicit NoOwnedPlayback is normal;
+	// every other capture failure stays visible and never substitutes current playback.
+	FGGYGOAbilityMontageOwnershipCheck OriginalMontageCapture{};
+
+	friend class UGGYGOGameplayAbility;
+};
+
+/**
+ * ASC-created original-source completion history, never current-idle or restart permission.
+ * Only publish after original native End, outer Cancel and related controlled activation
+ * calls have exited. Retire that original record and release its Busy fence before dispatch.
+ * Receivers match the original activation; a successor cannot replace this copied history.
+ */
+class GGYGO_API FGGYGOAbilityTerminationCompletedNotice
+{
+public:
+	FGGYGOAbilityTerminationCompletedNotice() = default;
+
+	bool HasCompletion() const
+	{
+		return Outcome == EGGYGOAbilityTerminationOutcome::Completed
+			&& Original.GetOriginalActivation().HasActivation()
+			&& Original.GetOriginalTermination().HasTermination();
+	}
+	const FGGYGOAbilityTerminationContext& GetOriginal() const { return Original; }
+	EGGYGOAbilityTerminationOutcome GetOutcome() const { return Outcome; }
+	EGGYGOAbilityTerminationReason GetReason() const { return Reason; }
+
+private:
+	FGGYGOAbilityTerminationContext Original{};
+	EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Rejected;
+	EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::InvalidRequest;
+
+	friend class UGGYGOAbilitySystemComponent;
+};
+
+/** Copied request result. Editing a copy cannot alter issuer history or authorize execution. */
+struct GGYGO_API FGGYGOAbilityActivationRequestResult
+{
+	EGGYGOAbilityActivationRequestOutcome Outcome = EGGYGOAbilityActivationRequestOutcome::Rejected;
+	EGGYGOAbilityActivationRequestReason Reason = EGGYGOAbilityActivationRequestReason::InvalidRequest;
+	// Exact native Try return when entered; false when admission prevented the call.
+	bool bNativeAccepted = false;
+	// Empty for a remote-only request; a nonempty handle is observed local history, not Active.
+	FGGYGOAbilityActivationHandle OriginalActivation{};
+	// Exact original history if it completed synchronously, even if dispatch started a successor.
+	FGGYGOAbilityTerminationCompletedNotice OriginalTerminationCompleted{};
+};
+
+/**
+ * Copied first-request result. Completed requires the original completion boundary;
+ * Deferred uses one original-bound delegate in native WaitingToExecute, not a new queue.
+ * AlreadyPending returns the same first context; Busy never schedules activation/restart.
+ */
+struct GGYGO_API FGGYGOAbilityTerminationResult
+{
+	EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Rejected;
+	EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::InvalidRequest;
+	FGGYGOAbilityTerminationContext Original{};
+};
+
+/**
+ * 一次命中共享的 GAS 载荷。
+ *
+ * Context、GE Spec 与 Cue 参数必须从同一次命中构造，避免不同能力各自拼装后
+ * 丢失 Origin、物理材质 Tag 或目标当前 Tag。EffectSpec 在未配置伤害 GE、
+ * 或 Spec 创建失败时可以无效；EffectContext 与 CueParameters 仍用于命中表现。
+ */
+struct FGGYGOHitEffectPayload
+{
+	FGameplayEffectContextHandle EffectContext;
+	FGameplayEffectSpecHandle EffectSpec;
+	FGameplayCueParameters CueParameters;
+};
 
 /** 能力何时尝试激活。 */
 UENUM(BlueprintType)
@@ -73,6 +292,22 @@ class GGYGO_API UGGYGOGameplayAbility : public UGameplayAbility
 
 public:
 	UGGYGOGameplayAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	// ===== Controlled activation identity; request/core wiring follows separate stages =====
+
+	/** Copy this controlled activation's issued identity; empty is untracked, never a guessed source. */
+	FGGYGOAbilityActivationHandle CaptureCurrentActivation() const;
+
+	/**
+	 * End only the authenticated original activation. First parameters/resources stay fixed;
+	 * stale/invalid sources fail explicitly. Completed is later than native OnAbilityEnded.
+	 */
+	FGGYGOAbilityTerminationResult RequestAbilityEnd(const FGGYGOAbilityActivationHandle& Original,
+		bool bReplicateEndAbility, bool bWasCancelled);
+
+	/** Capture the original before cancellation broadcast; no replacement activation or retry queue. */
+	FGGYGOAbilityTerminationResult RequestAbilityCancel(const FGGYGOAbilityActivationHandle& Original,
+		bool bReplicateCancelAbility);
 
 	// ===== 上下文便利查询（都可能返回 nullptr） =====
 
@@ -130,6 +365,9 @@ public:
 		ScriptOnAbilityFailedToActivate(FailedReason);
 	}
 
+	/** ASC 对当前激活分发的通用纠正数据；具体载荷解释由派生能力实现。 */
+	virtual void ReceiveAbilityCorrection(const FGameplayAbilityTargetDataHandle& Correction);
+
 protected:
 	/** 原生失败反馈：按 Tag 查表，广播文本消息与 Montage 消息。 */
 	virtual void NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const;
@@ -138,9 +376,16 @@ protected:
 	UFUNCTION(BlueprintImplementableEvent)
 	void ScriptOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const;
 
+	/**
+	 * 仅追加业务准入条件；final 入口已完成 ActorInfo、原生/BP 和组规则检查。
+	 * 默认明确没有附加条件。派生只可追加拒绝/失败 tags，不替代核心检查，
+	 * 不用本扩展点掩盖必需配置或依赖缺失。
+	 */
+	virtual bool CanActivateAbilityAdditional(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const;
+
 	//~UGameplayAbility interface
 	/** 在父类检查之后追加组仲裁检查。 */
-	virtual bool CanActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const override;
+	virtual bool CanActivateAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags, const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const override final;
 
 	/** 拒绝让非 Exclusive 的能力变成不可取消（它随时可能被顶掉，必须能取消）。 */
 	virtual void SetCanBeCanceled(bool bCanBeCanceled) override;
@@ -162,6 +407,18 @@ protected:
 
 	/** 把命中的物理材质 Tag 并入 GE 的目标 Tag，供材质分流与减伤使用。 */
 	virtual void ApplyAbilityTagsToGameplayEffectSpec(FGameplayEffectSpec& Spec, FGameplayAbilitySpec* AbilitySpec) const override;
+
+	/**
+	 * 从单次碰撞统一构造 Context、可选 GE Spec 与 Cue 参数。
+	 *
+	 * Origin 由调用者在命中回调时显式提供并固化到 Context。物理材质 Tag 同时进入
+	 * GE 的目标 Spec Tag 与 Cue 的目标 Tag；目标 ASC 的当前 Tag 也只在这里汇入 Cue。
+	 * 即使没有 DamageEffect 或 Spec 创建失败，仍返回可执行的命中 Cue 载荷。
+	 */
+	bool BuildHitEffectPayload(UAbilitySystemComponent* TargetAbilitySystemComponent,
+		TSubclassOf<UGameplayEffect> DamageEffectClass, float EffectLevel,
+		const FHitResult& HitResult, const FVector& Origin,
+		FGGYGOHitEffectPayload& OutPayload) const;
 
 	/** 展开 ASC 的 Tag 关系表后再判定，并把"因死亡而失败"单独标记出来。 */
 	virtual bool DoesAbilitySatisfyTagRequirements(const UAbilitySystemComponent& AbilitySystemComponent, const FGameplayTagContainer* SourceTags = nullptr, const FGameplayTagContainer* TargetTags = nullptr, OUT FGameplayTagContainer* OptionalRelevantTags = nullptr) const override;
@@ -200,8 +457,8 @@ protected:
 	/**
 	 * 施加一份镜头微调，叠加在**当前模式**的求值结果上。
 	 *
-	 * 与 `SetCameraMode` 的区别是它不换模式，因此不会丢掉当前模式的状态
-	 * （锁定的目标、穿墙规避的恢复进度）。攻击的镜头调整绝大多数属于这一类：
+	 * 与 `SetCameraMode` 的区别是它不换模式，因此不会丢掉当前模式的构图或锁定目标；
+	 * 最终穿透恢复状态由 CameraComponent 唯一持有，不属于模式。攻击的镜头调整绝大多数属于这一类：
 	 * 只是想收一点 FOV、拉近一点距离，而不是换一个机位。
 	 *
 	 * 能力结束时自动撤销。运行中途可以再调一次覆盖上一份。
@@ -305,4 +562,64 @@ protected:
 	/** 失败原因 Tag → 失败动画。每个命中的 Tag 各广播一次。 */
 	UPROPERTY(EditDefaultsOnly, Category = "Advanced")
 	TMap<FGameplayTag, TObjectPtr<UAnimMontage>> FailureTagToAnimMontage;
+
+private:
+	/** Provenance only: GAS remains the sole activation/ending authority. */
+	FGGYGOAbilityActivationHandle IssueControlledActivation(UGGYGOAbilitySystemComponent* OriginalASC,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		EGGYGOAbilityActivationRequestReason& OutReason);
+	void RetireControlledActivation();
+	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle);
+
+	/** Actual End stack span only; no termination record, deferred executor or completion dispatch. */
+	class FScopedControlledActivationEnd
+	{
+	public:
+		explicit FScopedControlledActivationEnd(UGGYGOGameplayAbility* InAbility);
+		~FScopedControlledActivationEnd();
+		FScopedControlledActivationEnd(const FScopedControlledActivationEnd&) = delete;
+		FScopedControlledActivationEnd& operator=(const FScopedControlledActivationEnd&) = delete;
+
+	private:
+		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+		FScopedControlledActivationEnd* Previous = nullptr;
+		FGGYGOAbilityActivationHandle Original;
+		friend class UGGYGOGameplayAbility;
+	};
+
+	bool IsControlledActivationTerminationBusy() const;
+	uint64 LastControlledActivationSerial = 0;
+	FGGYGOAbilityActivationHandle CurrentControlledActivation{};
+	FScopedControlledActivationEnd* ControlledActivationEndScope = nullptr;
+
+	/** 镜头微调凭证及申请时的相机接收者。 */
+	TWeakObjectPtr<UGGYGOCameraComponent> AppliedCameraOffsetComponent;
+	FGGYGOCameraOffsetHandle AppliedCameraOffsetHandle;
+
+	/** 模式请求及申请时的 Hero、Spec 与代次。 */
+	TWeakObjectPtr<UGGYGOHeroComponent> AppliedCameraModeHeroComponent;
+	FGameplayAbilitySpecHandle AppliedCameraModeSpecHandle;
+	uint64 AppliedCameraModeRequestGeneration = 0;
+
+	/** ASC 在 PreActivate 期间开始新的准入尝试，并在同步取消回调中标记被取代的尝试。 */
+	uint64 BeginAbilityGroupAdmissionAttempt(uint64 AdmissionSequence);
+	uint64 GetCurrentAbilityGroupAdmissionSequence() const;
+	void RejectCurrentAbilityGroupAdmission();
+	void RejectAbilityGroupAdmission(uint64 AdmissionSequence);
+	bool IsCurrentAbilityGroupAdmissionRejected() const;
+	bool IsAbilityGroupAdmissionPending() const { return !AbilityGroupAdmissionAttempts.IsEmpty(); }
+	bool IsAbilityGroupAdmissionPending(uint64 AdmissionSequence) const;
+	bool IsAbilityGroupAdmissionRejected(uint64 AdmissionSequence) const;
+
+	/** 读取并消费本次拒绝；pending 保持到最终裁决全部完成。 */
+	bool ConsumeAbilityGroupAdmissionRejection(uint64 AdmissionSequence);
+	void CompleteAbilityGroupAdmissionAttempt(uint64 AdmissionSequence);
+
+	/** ASC-assigned sequences preserve attempt order across instances and synchronous reentry. */
+	struct FAbilityGroupAdmissionAttempt
+	{
+		uint64 Sequence = 0;
+		bool bRejected = false;
+	};
+	TArray<FAbilityGroupAdmissionAttempt> AbilityGroupAdmissionAttempts;
 };

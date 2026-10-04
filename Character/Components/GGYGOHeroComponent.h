@@ -24,18 +24,37 @@
 #include "Components/GameFrameworkInitStateInterface.h"
 #include "Components/PawnComponent.h"
 #include "GameplayAbilitySpecHandle.h"
+#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
+// Input-Hero-LocalIdentity includes begin.
+#include "Templates/SharedPointer.h"
+// Input-Hero-LocalIdentity includes end.
 
 #include "GGYGOHeroComponent.generated.h"
 
 namespace EEndPlayReason { enum Type : int; }
 
 class UGameFrameworkComponentManager;
+class UEnhancedInputLocalPlayerSubsystem;
+class UEnhancedPlayerInput;
+class UGGYGOAbilitySystemComponent;
 class UGGYGOCameraMode;
+class UGGYGOCharacterMovementComponent;
+class UGGYGOInputComponent;
+class UGGYGOHeroMovementMappingObserver;
+struct FGGYGOHeroMovementInputScope;
 class UGGYGOInputConfig;
+class UInputAction;
 class UInputComponent;
+class UInputMappingContext;
 class UObject;
+// Input-Hero-LocalIdentity forward declarations begin.
+class UGGYGOPawnExtensionComponent;
+class FGGYGOPawnASCResourceHandle;
+struct FGGYGOPawnASCLocalNotice;
+// Input-Hero-LocalIdentity forward declarations end.
 struct FActorInitStateChangedParams;
 struct FGameplayTag;
+struct FInputActionInstance;
 struct FInputActionValue;
 
 /** 一条仍处于激活状态的能力相机覆盖；数组顺序就是覆盖先后顺序。 */
@@ -48,6 +67,8 @@ struct FGGYGOAbilityCameraModeOverride
 	TSubclassOf<UGGYGOCameraMode> CameraMode;
 
 	FGameplayAbilitySpecHandle OwningSpecHandle;
+	UPROPERTY()
+	uint64 RequestGeneration = 0;
 };
 
 UCLASS(meta = (BlueprintSpawnableComponent))
@@ -79,19 +100,23 @@ public:
 	/** 由拥有者 Pawn 在 `SetupPlayerInputComponent` 里调用。 */
 	void InitializePlayerInput(UInputComponent* PlayerInputComponent);
 
+	/** 幂等退出本组件输入会话；只归还原组件上的绑定和自己增加的 IMC 注册。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	void ReleasePlayerInput();
+
 	/** 返回当前有效的相机模式：能力覆盖优先，否则使用 PawnData 默认模式。 */
 	TSubclassOf<UGGYGOCameraMode> DetermineCameraMode() const;
 
-	/** 由能力登记临时相机模式；同一 Spec 再登记会更新并移到覆盖栈顶。 */
-	void SetAbilityCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode, const FGameplayAbilitySpecHandle& OwningSpecHandle);
+	/** 由能力登记临时相机模式；返回本次请求的单调代次。 */
+	uint64 SetAbilityCameraMode(TSubclassOf<UGGYGOCameraMode> CameraMode, const FGameplayAbilitySpecHandle& OwningSpecHandle);
 
-	/** 移除指定能力的覆盖；若它在栈顶，下一条仍激活的覆盖会自然恢复。 */
-	void ClearAbilityCameraMode(const FGameplayAbilitySpecHandle& OwningSpecHandle);
+	/** 仅移除 Spec 与请求代次都匹配的覆盖。 */
+	bool ClearAbilityCameraMode(const FGameplayAbilitySpecHandle& OwningSpecHandle, uint64 RequestGeneration);
 
 	/**
 	 * 输入缓冲的有效时长（秒）。
 	 *
-	 * 请求被"组内已有实例"拒绝后会被缓冲这么久，期间一旦该组空出就立刻重试。
+	 * 从原 Action 首次 Triggered 起算；请求被组占用拒绝后，只在原窗口内等待组释放重试。
 	 * 这是连段手感的核心参数：太短会让玩家必须精确卡在动画末尾按键，
 	 * 太长会让早按的键在很久之后突然生效，玩家已经不预期它了。
 	 */
@@ -105,9 +130,6 @@ protected:
 
 	// ===== Native 输入处理 =====
 
-	/** 移动。把摇杆的 2D 值按摄像机水平朝向解析成世界方向。 */
-	void Input_Move(const FInputActionValue& InputActionValue);
-
 	/** 强制步行按下/释放；输入状态由 CMC 参与预测。 */
 	void Input_ForceWalkPressed();
 	void Input_ForceWalkReleased();
@@ -120,11 +142,7 @@ protected:
 
 	// ===== Ability 输入处理 =====
 
-	/** 转交给 ASC 的输入缓存，不在这里激活能力。 */
-	void Input_AbilityInputTagPressed(FGameplayTag InputTag);
-
-	/** 同上。 */
-	void Input_AbilityInputTagReleased(FGameplayTag InputTag);
+	// Ability 回调只由下方记录原来源的实例委托进入，不提供无绑定身份的 Tag 入口。
 
 	/**
 	 * 输入映射上下文（IMC）。
@@ -143,8 +161,8 @@ protected:
 	/** 订阅 ASC 的重试通知与组空出通知。ASC 就绪后调用。 */
 	void BindAbilityRetryDelegates();
 
-	/** 缓冲一个被拒的请求。同一个 InputTag 重复缓冲只刷新时间戳。 */
-	void BufferAbilityInput(FGameplayTag InputTag);
+	/** 只缓冲完整原请求；不从 Tag 或失败时刻推测来源。 */
+	void BufferAbilityInput(const FGGYGOAbilityInputRetryRequest& OriginalRequest);
 
 	/** 某个能力组空出，重试缓冲中的请求。 */
 	void HandleAbilityGroupFreed(FGameplayTag GroupTag);
@@ -154,27 +172,112 @@ private:
 	UPROPERTY(Transient)
 	TArray<FGGYGOAbilityCameraModeOverride> AbilityCameraModeOverrides;
 
-	/** 本组件产生的 Ability 输入绑定句柄，用于整批解绑。 */
-	TArray<uint32> AbilityInputBindHandles;
-	TArray<uint32> ForceWalkInputBindHandles;
+	/** 全生命周期单调递增；不随解绑或 EndPlay 重置。0 表示无有效请求。 */
+	uint64 LastAbilityCameraModeRequestGeneration = 0;
 
-	/** 一条被缓冲的输入请求。 */
-	struct FBufferedInput
+	/** 会话资源来源；换 InputComponent/Controller 后仍从原来源释放，不重新查找。 */
+	TWeakObjectPtr<UGGYGOInputComponent> InputSessionComponent;
+	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> InputSessionSubsystem;
+	TWeakObjectPtr<UEnhancedPlayerInput> InputSessionPlayerInput;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> InputSessionMovementComponent;
+	/** Native、Ability 与 ForceWalk 的全部实际绑定句柄。 */
+	TArray<uint32> InputSessionBindHandles;
+
+	struct FRegisteredInputMapping
 	{
-		FGameplayTag InputTag;
-
-		/** 缓冲开始的世界时间。用绝对时间而非倒计时，避免每帧递减。 */
-		float BufferedAtTime = 0.0f;
+		TWeakObjectPtr<const UInputMappingContext> MappingContext;
+		int32 RegisteredPriority = 0;
 	};
+	/** 每项对应一次由本会话实际 Add 的 CountRegistrations 注册。 */
+	TArray<FRegisteredInputMapping> InputSessionMappings;
+	/** 只用于使同步回调中的旧初始化失效；不保存物理输入事实。 */
+	uint64 InputSessionGeneration = 0;
+	bool bEndingPlay = false;
 
-	/**
-	 * 被缓冲的输入请求。
-	 *
-	 * 用数组而不是单个槽位：玩家可能在一段攻击播放期间先按普攻再按闪避，
-	 * 两者属于不同的能力组，各自的空出时机也不同。只留一个槽位会丢掉其中一个。
-	 */
-	TArray<FBufferedInput> BufferedInputs;
+	friend class UGGYGOHeroMovementMappingObserver;
+	/** Own registration/session/binding resources only; Source and CMC remain their authorities. */
+	TSharedPtr<FGGYGOHeroMovementInputScope> MovementInputScope;
+	UPROPERTY(Transient)
+	TObjectPtr<UGGYGOHeroMovementMappingObserver> MovementMappingObserver;
+	bool IsMovementInputScopeCurrent(const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope) const;
+	void HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
+	void Input_Move(const FInputActionInstance& Instance, const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
 
-	/** 委托是否已订阅。ASC 可能多次就绪（换 Avatar），避免重复订阅。 */
-	bool bAbilityRetryDelegatesBound = false;
+	struct FAbilityRetryBinding;
+	bool IsAbilityRetryBindingCurrent(const TSharedPtr<FAbilityRetryBinding>& Binding) const;
+	bool HasValidPlayerInputSession() const;
+	UGGYGOAbilitySystemComponent* GetInputSessionAbilitySystem() const;
+	bool IsInputSessionAbilitySystemCurrent(TWeakObjectPtr<UGGYGOAbilitySystemComponent> ExpectedASC, uint64 ExpectedGeneration, uint64 ExpectedSubscriptionGeneration) const;
+	void UnbindAbilityRetryDelegates();
+	void PruneExpiredInputRequests(double Now);
+	struct FAbilityActionBinding;
+	struct FAbilityInputObservation;
+	bool IsAbilityActionBindingCurrent(const TSharedPtr<FAbilityActionBinding>& Binding) const;
+	void Input_AbilityActionTriggered(const FInputActionInstance& ActionInstance,
+		const TSharedPtr<FAbilityActionBinding>& Binding);
+	void Input_AbilityActionReleased(const FInputActionInstance& ActionInstance,
+		const TSharedPtr<FAbilityActionBinding>& Binding);
+	TSharedPtr<FAbilityInputObservation> FindAbilityInputObservation(
+		const FGGYGOAbilityInputRequestIdentity& Identity) const;
+	void InvalidateAbilityInputObservations(const TArray<TSharedPtr<FAbilityInputObservation>>& Observations);
+	void InvalidateAbilityActionBinding(const TSharedPtr<FAbilityActionBinding>& Binding);
+
+	/** 仅拥有自己在原 ASC 上建立的两个订阅，不用全生命周期 bool 猜测是否已绑定。 */
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> InputSessionAbilitySystem;
+	/** Immutable origin of the existing ASC subscriptions; no Ready or held authority. */
+	TSharedPtr<FAbilityRetryBinding> AbilityRetryBinding;
+	FDelegateHandle AbilityInputRetryableDelegateHandle;
+	FDelegateHandle AbilityGroupFreedDelegateHandle;
+	/** 单独使已移除订阅的在途回调失效，不打断 C 正在建立的 IMC 会话。 */
+	uint64 AbilityInputSubscriptionGeneration = 0;
+
+	/** 原 Action/组件/会话绑定；其观察寿命不随 ASC 订阅重绑重置。 */
+	TArray<TSharedPtr<FAbilityActionBinding>> AbilityActionBindings;
+	/** 本组件原观察关联；活动观察不因 retry 截止过期而被移除。 */
+	TArray<TSharedPtr<FAbilityInputObservation>> AbilityInputObservations;
+	/** 等待组释放的完整原请求；ASC 仍唯一决定 queued/held 与激活。 */
+	TArray<FGGYGOAbilityInputRetryRequest> BufferedInputs;
+
+// Input-Hero-LocalIdentity declarations begin.
+private:
+	struct FLocalAbilitySystemSubscription;
+
+protected:
+	/** Register before replay; Ready associates only an already established input session. */
+	bool PrepareLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
+	/** Derived query of the exact consumed resource; no input or movement permission. */
+	UGGYGOAbilitySystemComponent* GetReadyLocalAbilitySystemComponent() const;
+	/** Retire this original notice record and its own ASC retry subscription. */
+	void ReleaseLocalAbilitySystemSubscription();
+	/** Associate existing input identity with H; exact Released may then retire that original session. */
+	bool AssociateInputSessionWithLocalResource(const FGGYGOPawnASCResourceHandle& ExpectedResource,
+		uint64 ExpectedInputSessionGeneration, FString& OutError);
+
+private:
+	void ConsumeLocalAbilitySystemNotice(
+		const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
+		const FGGYGOPawnASCLocalNotice& Notice);
+	TSharedPtr<FLocalAbilitySystemSubscription> LocalAbilitySystemSubscription;
+// Input-Hero-LocalIdentity declarations end.
+};
+
+/** Original context for the native parameterless dynamic notification; never a movement source. */
+UCLASS(Transient)
+class UGGYGOHeroMovementMappingObserver : public UObject
+{
+	GENERATED_BODY()
+
+public:
+	void Initialize(UGGYGOHeroComponent* Hero, UEnhancedInputLocalPlayerSubsystem* Subsystem,
+		const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope);
+	void Detach();
+	virtual void BeginDestroy() override;
+
+private:
+	UFUNCTION()
+	void OnMappingsRebuilt();
+
+	TWeakObjectPtr<UGGYGOHeroComponent> OriginalHero;
+	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> OriginalSubsystem;
+	TSharedPtr<FGGYGOHeroMovementInputScope> OriginalScope;
 };

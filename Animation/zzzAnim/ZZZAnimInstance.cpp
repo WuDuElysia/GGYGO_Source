@@ -13,10 +13,28 @@
 void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
 	Super::NativeUpdateAnimation(DeltaSeconds);
-	RefreshDecisionContext(DeltaSeconds);
+	RefreshDecisionContext();
 }
 
-void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
+void UZZZAnimInstance::OnAnimationLifecycleReset()
+{
+	StateMemory = {};
+	Snap = {};
+	LocomotionEvents.Reset();
+
+	AnimBlendX = 0.f;
+	AnimBlendY = 0.f;
+	AnimCurveVelocity = FVector::ZeroVector;
+	AnimCurveVelocityDirection = FVector::ZeroVector;
+	AnimCurveVelocityAngle = 0.f;
+	ActualVelocityDirection = FVector::ZeroVector;
+	ActualVelocityBlendX = 0.f;
+	ActualVelocityBlendY = 0.f;
+	ActualVelocityAngle = 0.f;
+	bTurnBackRunOut = false;
+}
+
+void UZZZAnimInstance::RefreshDecisionContext()
 {
 	// 通用基类已在 Super::NativeUpdateAnimation 中完成唯一一次跨层抓取。
 	// 这里只做旧数据面的兼容适配，不再访问 Actor、CMC 或 ASC。
@@ -34,11 +52,10 @@ void UZZZAnimInstance::RefreshDecisionContext(float DeltaSeconds)
 
 	FZZZAnimWriteContext WriteContext;
 	WriteContext.Snap = &Snap;
-	WriteContext.Tuning = &Tuning;
 	WriteContext.Memory = &StateMemory;
 
 	LocomotionEvents.SetContext(WriteContext);
-	LocomotionEvents.AdvanceGaitBlend(DeltaSeconds);
+	LocomotionEvents.MapMovementState();
 
 #if !UE_BUILD_SHIPPING
 	// TurnBack 诊断。全部字段取自快照，不回头读移动层 ——

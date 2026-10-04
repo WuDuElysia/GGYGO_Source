@@ -64,10 +64,7 @@ void AGGYGOCharacterSlot::InitializeForPawnData(const UGGYGOPawnData* InPawnData
 	}
 
 	PawnData = InPawnData;
-
-	// 组仲裁与 Tag 关系表随角色定义走，注入时机不依赖 Pawn。
-	AbilitySystemComponent->SetAbilityGroupConfig(PawnData->AbilityGroupConfig);
-	AbilitySystemComponent->SetTagRelationshipMapping(PawnData->TagRelationshipMapping);
+	ApplyAbilitySystemConfiguration();
 
 	if (bAbilitiesGranted)
 	{
@@ -86,4 +83,21 @@ void AGGYGOCharacterSlot::InitializeForPawnData(const UGGYGOPawnData* InPawnData
 	}
 
 	bAbilitiesGranted = true;
+}
+
+void AGGYGOCharacterSlot::OnRep_PawnData()
+{
+	ApplyAbilitySystemConfiguration();
+}
+
+void AGGYGOCharacterSlot::ApplyAbilitySystemConfiguration()
+{
+	if (!PawnData || !AbilitySystemComponent)
+	{
+		return;
+	}
+
+	// 组仲裁与 Tag 关系表随角色定义走，注入时机不依赖 Pawn。
+	AbilitySystemComponent->SetAbilityGroupConfig(PawnData->AbilityGroupConfig);
+	AbilitySystemComponent->SetTagRelationshipMapping(PawnData->TagRelationshipMapping);
 }

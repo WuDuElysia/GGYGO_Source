@@ -41,14 +41,47 @@ EBTNodeResult::Type UBTTask_GGYGOChooseBossAction::ExecuteTask(
 	UBehaviorTreeComponent& OwnerComp, uint8* NodeMemory)
 {
 	AGGYGOBossAIController* Controller = Cast<AGGYGOBossAIController>(OwnerComp.GetAIOwner());
+	UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
+	if (Controller)
+	{
+		Controller->ClearActionSelection();
+	}
+	if (Blackboard)
+	{
+		Blackboard->ClearValue(SelectedActionKey.SelectedKeyName);
+	}
+
+	const auto Fail = [&Controller, &Blackboard, this]()
+	{
+		if (Controller)
+		{
+			Controller->ClearActionSelection();
+		}
+		if (Blackboard)
+		{
+			Blackboard->ClearValue(SelectedActionKey.SelectedKeyName);
+		}
+		return EBTNodeResult::Failed;
+	};
+
 	AGGYGOBossState* BossState = Controller ? Controller->GetBossState() : nullptr;
 	UGGYGOAbilitySystemComponent* ASC = BossState ? BossState->GetGGYGOAbilitySystemComponent() : nullptr;
+	const FGameplayTag PhaseTag = BossState ? BossState->GetCurrentPhaseTag() : FGameplayTag();
 	const UGGYGOBossActionSet* ActionSet = ResolveCurrentActionSet(BossState);
-	UBlackboardComponent* Blackboard = OwnerComp.GetBlackboardComponent();
 	APawn* Avatar = Controller ? Controller->GetPawn() : nullptr;
-	if (!Controller || !ASC || !ActionSet || !Blackboard || !Avatar)
+	if (!Controller || !ASC || !ActionSet || !Blackboard || !PhaseTag.IsValid() || !IsValid(Avatar) ||
+		ASC->GetAvatarActor() != Avatar)
 	{
-		return EBTNodeResult::Failed;
+		return Fail();
+	}
+
+	FString ValidationError;
+	if (!ActionSet->ValidateConfiguration(ValidationError))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("ChooseBossAction: 拒绝无效 ActionSet [%s]：%s"),
+			*GetNameSafe(ActionSet), *ValidationError);
+		return Fail();
 	}
 
 	AActor* Target = Cast<AActor>(Blackboard->GetValueAsObject(TargetActorKey.SelectedKeyName));
@@ -57,26 +90,17 @@ EBTNodeResult::Type UBTTask_GGYGOChooseBossAction::ExecuteTask(
 
 	struct FCandidate
 	{
-		const FGGYGOBossActionDefinition* Action = nullptr;
-		float Weight = 0.0f;
+		FGameplayTag ActionTag;
+		FGameplayAbilitySpecHandle SpecHandle;
 	};
 	TArray<FCandidate> Candidates;
-	float TotalWeight = 0.0f;
+	TArray<FGameplayTag> EligibleActionTags;
 
 	for (const FGGYGOBossActionDefinition& Action : ActionSet->Actions)
 	{
-		if (!Action.ActionTag.IsValid() || !Action.AbilityClass || Action.BaseWeight <= 0.0f ||
+		if (Action.BaseWeight <= 0.0f ||
 			!OwnedTags.HasAll(Action.RequiredTags) || OwnedTags.HasAny(Action.BlockedTags))
 		{
-			continue;
-		}
-
-		const UGGYGOCombatActionAbility* AbilityCDO = Action.AbilityClass->GetDefaultObject<UGGYGOCombatActionAbility>();
-		if (!AbilityCDO || AbilityCDO->GetActionTag() != Action.ActionTag)
-		{
-			UE_LOG(LogGGYGOAbilitySystem, Warning,
-				TEXT("ChooseBossAction: [%s] 的 ActionTag 与 Ability [%s] 不一致。"),
-				*Action.ActionTag.ToString(), *GetNameSafe(Action.AbilityClass));
 			continue;
 		}
 
@@ -108,41 +132,79 @@ EBTNodeResult::Type UBTTask_GGYGOChooseBossAction::ExecuteTask(
 		}
 
 		const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromClass(Action.AbilityClass);
-		FGameplayTagContainer FailureTags;
-		if (!Spec || !ASC->CanActivateAbilityByHandle(Spec->Handle, FailureTags))
+		if (!Spec)
 		{
 			continue;
 		}
 
-		const float Weight = Controller->GetActionWeight(Action);
-		if (Weight > 0.0f)
+		// The admission query may invoke code that changes the ability list. Keep only the
+		// original handle after this point; never dereference Spec again.
+		const FGameplayTag CandidateTag = Action.ActionTag;
+		const FGameplayAbilitySpecHandle CandidateHandle = Spec->Handle;
+		if (!CandidateHandle.IsValid())
 		{
-			Candidates.Add({ &Action, Weight });
-			TotalWeight += Weight;
+			continue;
 		}
+
+		FGameplayTagContainer FailureTags;
+		if (!ASC->CanActivateAbilityByHandle(CandidateHandle, FailureTags))
+		{
+			continue;
+		}
+
+		Candidates.Add({ CandidateTag, CandidateHandle });
+		EligibleActionTags.Add(CandidateTag);
 	}
 
-	if (Candidates.IsEmpty() || TotalWeight <= 0.0f)
+	if (Candidates.IsEmpty())
 	{
-		Blackboard->ClearValue(SelectedActionKey.SelectedKeyName);
 		return EBTNodeResult::Failed;
 	}
 
-	const float Roll = Controller->DrawActionWeight(TotalWeight);
-	float AccumulatedWeight = 0.0f;
-	const FGGYGOBossActionDefinition* Selected = Candidates.Last().Action;
+	const auto IsSelectionSourceCurrent = [&OwnerComp, Controller, BossState, ASC, ActionSet, Avatar, PhaseTag]()
+	{
+		if (!IsValid(Controller) || Cast<AGGYGOBossAIController>(OwnerComp.GetAIOwner()) != Controller ||
+			!IsValid(BossState) || Controller->GetBossState() != BossState || !IsValid(ASC) ||
+			BossState->GetGGYGOAbilitySystemComponent() != ASC || !IsValid(ActionSet) ||
+			!IsValid(Avatar) || Controller->GetPawn() != Avatar || ASC->GetAvatarActor() != Avatar)
+		{
+			return false;
+		}
+		return BossState->GetCurrentPhaseTag() == PhaseTag &&
+			ResolveCurrentActionSet(BossState) == ActionSet;
+	};
+	if (!IsSelectionSourceCurrent())
+	{
+		return EBTNodeResult::Failed;
+	}
+
+	const FGGYGOBossActionDefinition* Selected = Controller->SelectAction(ActionSet, EligibleActionTags);
+	if (!Selected)
+	{
+		return EBTNodeResult::Failed;
+	}
+	if (!IsSelectionSourceCurrent())
+	{
+		return EBTNodeResult::Failed;
+	}
+
+	FGameplayAbilitySpecHandle SelectedHandle;
 	for (const FCandidate& Candidate : Candidates)
 	{
-		AccumulatedWeight += Candidate.Weight;
-		if (Roll <= AccumulatedWeight)
+		if (Candidate.ActionTag == Selected->ActionTag)
 		{
-			Selected = Candidate.Action;
+			SelectedHandle = Candidate.SpecHandle;
 			break;
 		}
 	}
+	if (!SelectedHandle.IsValid() ||
+		!Controller->StoreActionSelection(ActionSet, PhaseTag,
+			ASC, Selected->ActionTag, SelectedHandle))
+	{
+		return EBTNodeResult::Failed;
+	}
 
 	Blackboard->SetValueAsName(SelectedActionKey.SelectedKeyName, Selected->ActionTag.GetTagName());
-	Controller->RecordActionSelection(ActionSet->Actions, Selected->ActionTag);
 	UE_LOG(LogGGYGOAbilitySystem, Display,
 		TEXT("ChooseBossAction: [%s] 选择 [%s]，候选数 [%d]。"),
 		*GetNameSafe(Controller), *Selected->ActionTag.ToString(), Candidates.Num());

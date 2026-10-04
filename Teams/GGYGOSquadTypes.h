@@ -1,6 +1,6 @@
 /**
  * @file GGYGOSquadTypes.h
- * @brief 队伍层的公共常量
+ * @brief 队伍层的公共常量与无状态容量校验
  */
 #pragma once
 
@@ -17,3 +17,17 @@
  * 而不是变成一份跑起来才发现的网络账单。
  */
 #define GGYGO_MAX_SQUAD_SIZE 4
+
+namespace GGYGOSquad
+{
+
+/**
+ * 只校验成员数量是否在容量范围内，不读取或修改名单。
+ * 0 在容量范围内；是否允许空名单及如何报告失败由调用方决定。
+ */
+constexpr bool IsMemberCountWithinCapacity(int32 MemberCount)
+{
+	return MemberCount >= 0 && MemberCount <= GGYGO_MAX_SQUAD_SIZE;
+}
+
+} // namespace GGYGOSquad

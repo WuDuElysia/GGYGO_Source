@@ -6,13 +6,79 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Engine/World.h"
+#include "GameFramework/Actor.h"
 #include "GameFramework/GameplayMessageSubsystem.h"
 #include "GameplayEffectExtension.h"
 #include "Messages/GGYGOVerbMessage.h"
+#include "Misc/ScopeExit.h"
 #include "Net/UnrealNetwork.h"
 #include "System/GGYGOGameplayTags.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOHealthSet)
+
+enum class UGGYGOHealthSet::EQueuedResultType : uint8
+{
+	HealthChanged,
+	MaxHealthChanged,
+	OutOfHealth,
+	PoiseChanged,
+	PoiseBroken,
+	DamageMessage,
+	PoiseBreakMessage
+};
+
+struct UGGYGOHealthSet::FModifierFrame
+{
+	const FGameplayEffectModCallbackData* CallbackData = nullptr;
+	FGameplayAttribute Attribute;
+	float OriginalMagnitude = 0.0f;
+	float MetaContribution = 0.0f;
+	float MinimumHealth = 0.0f;
+	bool bAwaitingInitialWrite = true;
+	bool bMetaConsumed = false;
+	TSharedPtr<FGameplayEffectSpec> EffectSpec;
+	TWeakObjectPtr<AActor> OriginalInstigator;
+	TWeakObjectPtr<AActor> EffectCauser;
+	TWeakObjectPtr<AActor> Target;
+	FGameplayTagContainer SourceTags;
+	FGameplayTagContainer TargetTags;
+};
+
+struct UGGYGOHealthSet::FExpectedAttributeChange
+{
+	TSharedPtr<FModifierFrame> Frame;
+	FGameplayAttribute Attribute;
+	bool bConsumed = false;
+};
+
+struct UGGYGOHealthSet::FRepNotifyFrame
+{
+	enum class EStage : uint8
+	{
+		Undetermined,
+		AwaitingFinalWrite,
+		RealChanges
+	};
+
+	FGameplayAttribute Attribute;
+	TWeakObjectPtr<AActor> OuterActor;
+	TWeakObjectPtr<UAbilitySystemComponent> OwningASC;
+	EStage Stage = EStage::Undetermined;
+	float EffectiveNewValue = 0.0f;
+	int32 ExplicitBaseChangeCount = 0;
+	bool bEffectiveValueCaptured = false;
+	bool bClassificationEnabled = true;
+};
+
+struct UGGYGOHealthSet::FQueuedResult
+{
+	EQueuedResultType Type = EQueuedResultType::HealthChanged;
+	TSharedPtr<FModifierFrame> Frame;
+	TWeakObjectPtr<AActor> Target;
+	float Magnitude = 0.0f;
+	float OldValue = 0.0f;
+	float NewValue = 0.0f;
+};
 
 UGGYGOHealthSet::UGGYGOHealthSet()
 	: Health(100.0f)
@@ -22,11 +88,258 @@ UGGYGOHealthSet::UGGYGOHealthSet()
 {
 	bOutOfHealth = false;
 	bPoiseBroken = false;
+}
 
-	// 快照先归零；第一次通过 Pre 阶段的 GE 会写入真实旧值。
-	HealthBeforeAttributeChange = 0.0f;
-	MaxHealthBeforeAttributeChange = 0.0f;
-	PoiseBeforeAttributeChange = 0.0f;
+TSharedPtr<UGGYGOHealthSet::FModifierFrame> UGGYGOHealthSet::FindFrame(const FGameplayEffectModCallbackData& Data) const
+{
+	for (int32 Index = ModifierFrames.Num() - 1; Index >= 0; --Index)
+	{
+		if (ModifierFrames[Index].IsValid() && ModifierFrames[Index]->CallbackData == &Data)
+		{
+			return ModifierFrames[Index];
+		}
+	}
+	return nullptr;
+}
+
+TSharedPtr<UGGYGOHealthSet::FModifierFrame> UGGYGOHealthSet::FindAwaitingFrame(const FGameplayAttribute& Attribute) const
+{
+	for (int32 Index = ModifierFrames.Num() - 1; Index >= 0; --Index)
+	{
+		const TSharedPtr<FModifierFrame>& Frame = ModifierFrames[Index];
+		if (Frame.IsValid() && Frame->bAwaitingInitialWrite && Frame->Attribute == Attribute)
+		{
+			return Frame;
+		}
+	}
+	return nullptr;
+}
+
+TSharedPtr<UGGYGOHealthSet::FRepNotifyFrame> UGGYGOHealthSet::BeginRepNotifyFrame(const FGameplayAttribute& Attribute)
+{
+	for (const TSharedPtr<FRepNotifyFrame>& ActiveFrame : RepNotifyFrames)
+	{
+		CanClassifyRepNotifyFrame(ActiveFrame);
+	}
+	TSharedPtr<FRepNotifyFrame> Frame = MakeShared<FRepNotifyFrame>();
+	Frame->Attribute = Attribute;
+	// UAttributeSet's owning-ASC getter CastChecked's Outer to Actor. Validate it first.
+	AActor* OuterActor = Cast<AActor>(GetOuter());
+	if (IsValid(OuterActor))
+	{
+		Frame->OuterActor = OuterActor;
+		UAbilitySystemComponent* OwningASC = GetOwningAbilitySystemComponent();
+		if (IsValid(OwningASC))
+		{
+			Frame->OwningASC = OwningASC;
+		}
+	}
+	CanClassifyRepNotifyFrame(Frame);
+	RepNotifyFrames.Add(Frame);
+	return Frame;
+}
+
+void UGGYGOHealthSet::EndRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame)
+{
+	const int32 FrameIndex = RepNotifyFrames.IndexOfByPredicate([&Frame](const TSharedPtr<FRepNotifyFrame>& Candidate)
+	{
+		return Candidate == Frame;
+	});
+	if (ensureMsgf(FrameIndex != INDEX_NONE, TEXT("HealthSet RepNotify frame disappeared before its macro scope exited.")))
+	{
+		RepNotifyFrames.RemoveAt(FrameIndex, 1, EAllowShrinking::No);
+	}
+}
+
+bool UGGYGOHealthSet::CanClassifyRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame) const
+{
+	if (!Frame.IsValid() || !Frame->bClassificationEnabled)
+	{
+		return false;
+	}
+
+	AActor* OuterActor = Cast<AActor>(GetOuter());
+	if (!IsValid(OuterActor) || Frame->OuterActor.Get() != OuterActor || !Frame->OwningASC.IsValid())
+	{
+		Frame->bClassificationEnabled = false;
+		return false;
+	}
+
+	UAbilitySystemComponent* OwningASC = GetOwningAbilitySystemComponent();
+	if (!IsValid(OwningASC) || Frame->OwningASC.Get() != OwningASC
+		|| OwningASC->GetAttributeSet(Frame->Attribute.GetAttributeSetClass()) != this)
+	{
+		// Once observed, a source/registration mismatch disables this frame until scope exit.
+		Frame->bClassificationEnabled = false;
+		return false;
+	}
+	return true;
+}
+
+TSharedPtr<UGGYGOHealthSet::FRepNotifyFrame> UGGYGOHealthSet::FindRepNotifyFrame(const FGameplayAttribute& Attribute) const
+{
+	TSharedPtr<FRepNotifyFrame> MatchingFrame;
+	for (int32 Index = RepNotifyFrames.Num() - 1; Index >= 0; --Index)
+	{
+		const TSharedPtr<FRepNotifyFrame>& Frame = RepNotifyFrames[Index];
+		// Validate outer frames too; a nested call must not hide an observed source mismatch.
+		if (CanClassifyRepNotifyFrame(Frame) && !MatchingFrame.IsValid() && Frame->Attribute == Attribute)
+		{
+			MatchingFrame = Frame;
+		}
+	}
+	return MatchingFrame;
+}
+
+void UGGYGOHealthSet::OnAttributeAggregatorCreated(const FGameplayAttribute& Attribute, FAggregator* NewAggregator) const
+{
+	Super::OnAttributeAggregatorCreated(Attribute, NewAggregator);
+	for (const TSharedPtr<FRepNotifyFrame>& Frame : RepNotifyFrames)
+	{
+		if (CanClassifyRepNotifyFrame(Frame) && Frame->Attribute == Attribute
+			&& Frame->Stage == FRepNotifyFrame::EStage::Undetermined)
+		{
+			// This macro entered without an aggregator. Its later dirty writes are real changes.
+			// Mark every matching undecided frame, including outer frames of nested OnRep calls.
+			Frame->Stage = FRepNotifyFrame::EStage::RealChanges;
+		}
+	}
+}
+
+void UGGYGOHealthSet::PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute)
+{
+	TSharedPtr<FExpectedAttributeChange> Expected = MakeShared<FExpectedAttributeChange>();
+	Expected->Frame = Frame;
+	Expected->Attribute = Attribute;
+	ExpectedAttributeChanges.Add(MoveTemp(Expected));
+}
+
+void UGGYGOHealthSet::PopExpectedAttributeChange()
+{
+	if (ensureMsgf(ExpectedAttributeChanges.Num() > 0, TEXT("HealthSet expected-attribute stack underflow.")))
+	{
+		ExpectedAttributeChanges.Pop(EAllowShrinking::No);
+	}
+}
+
+TSharedPtr<UGGYGOHealthSet::FModifierFrame> UGGYGOHealthSet::ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute)
+{
+	if (ExpectedAttributeChanges.IsEmpty())
+	{
+		return nullptr;
+	}
+
+	const TSharedPtr<FExpectedAttributeChange> Expected = ExpectedAttributeChanges.Last();
+	if (!Expected.IsValid() || Expected->Attribute != Attribute)
+	{
+		return nullptr;
+	}
+
+	if (Expected->bConsumed)
+	{
+		return nullptr;
+	}
+
+	Expected->bConsumed = true;
+	return Expected->Frame;
+}
+
+void UGGYGOHealthSet::QueueAttributeResult(EQueuedResultType ResultType, const TSharedPtr<FModifierFrame>& Frame,
+	float Magnitude, float OldValue, float NewValue)
+{
+	TSharedPtr<FQueuedResult> Result = MakeShared<FQueuedResult>();
+	Result->Type = ResultType;
+	Result->Frame = Frame;
+	Result->Target = Frame.IsValid() ? Frame->Target : GetOwningActor();
+	Result->Magnitude = Magnitude;
+	Result->OldValue = OldValue;
+	Result->NewValue = NewValue;
+	PendingResults.Add(MoveTemp(Result));
+}
+
+void UGGYGOHealthSet::QueueMessageResult(const FGameplayTag& Verb, const TSharedPtr<FModifierFrame>& Frame, float Magnitude)
+{
+	const EQueuedResultType ResultType = Verb == GGYGOGameplayTags::Message_Damage
+		? EQueuedResultType::DamageMessage : EQueuedResultType::PoiseBreakMessage;
+	QueueAttributeResult(ResultType, Frame, Magnitude, 0.0f, 0.0f);
+}
+
+void UGGYGOHealthSet::FlushPendingResults()
+{
+	if (ModifierFrames.Num() > 0 || AttributeChangeDepth > 0 || PendingResults.IsEmpty())
+	{
+		return;
+	}
+
+	// 清空成员后再发通知。回调引发的新 GE 会取得独立 root frame 与结果缓冲。
+	TArray<TSharedPtr<FQueuedResult>> Results;
+	Swap(Results, PendingResults);
+
+	for (const TSharedPtr<FQueuedResult>& Result : Results)
+	{
+		if (!Result.IsValid())
+		{
+			continue;
+		}
+
+		const FModifierFrame* Frame = Result->Frame.Get();
+		const FGameplayEffectSpec* EffectSpec = Frame && Frame->EffectSpec.IsValid() ? Frame->EffectSpec.Get() : nullptr;
+		AActor* OriginalInstigator = Frame ? Frame->OriginalInstigator.Get() : nullptr;
+		AActor* EffectCauser = Frame ? Frame->EffectCauser.Get() : nullptr;
+
+		switch (Result->Type)
+		{
+		case EQueuedResultType::DamageMessage:
+		case EQueuedResultType::PoiseBreakMessage:
+			if (UWorld* World = GetWorld(); World && UGameplayMessageSubsystem::HasInstance(this))
+			{
+				FGGYGOVerbMessage Message;
+				Message.Verb = Result->Type == EQueuedResultType::DamageMessage
+					? GGYGOGameplayTags::Message_Damage : GGYGOGameplayTags::Message_PoiseBreak;
+				Message.Instigator = EffectCauser;
+				Message.Target = Result->Target.Get();
+				if (Frame)
+				{
+					Message.InstigatorTags = Frame->SourceTags;
+					Message.TargetTags = Frame->TargetTags;
+				}
+				Message.Magnitude = Result->Magnitude;
+				UGameplayMessageSubsystem::Get(World).BroadcastMessage(Message.Verb, Message);
+			}
+			break;
+		case EQueuedResultType::HealthChanged:
+			OnHealthChanged.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
+			break;
+		case EQueuedResultType::MaxHealthChanged:
+			OnMaxHealthChanged.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
+			break;
+		case EQueuedResultType::OutOfHealth:
+			OnOutOfHealth.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
+			break;
+		case EQueuedResultType::PoiseChanged:
+			OnPoiseChanged.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
+			break;
+		case EQueuedResultType::PoiseBroken:
+			OnPoiseBroken.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
+			break;
+		default:
+			break;
+		}
+	}
+}
+
+void UGGYGOHealthSet::ApplyModifierMinimumHealth(const FGameplayAttribute& Attribute, float& NewValue) const
+{
+	if (Attribute != GetHealthAttribute())
+	{
+		return;
+	}
+
+	const TSharedPtr<FModifierFrame> Frame = FindAwaitingFrame(Attribute);
+	if (Frame.IsValid())
+	{
+		NewValue = FMath::Clamp(NewValue, Frame->MinimumHealth, GetMaxHealth());
+	}
 }
 
 void UGGYGOHealthSet::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -43,53 +356,85 @@ void UGGYGOHealthSet::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutL
 
 void UGGYGOHealthSet::OnRep_Health(const FGameplayAttributeData& OldValue)
 {
-	// 必须先交回 GAS 处理复制值与聚合器，否则属性状态会不同步。
-	GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, Health, OldValue);
+	const float IncomingValue = GetHealth();
+	const bool bWasOutOfHealth = bOutOfHealth;
+	// No-aggregator 路径不会调用 PostAttributeChange，因此先提交 incoming 锁存；
+	// 已有聚合器的临时回退不动锁存，最终重算会在原生委托前修正它。
+	bOutOfHealth = IncomingValue <= 0.0f;
+	const TSharedPtr<FRepNotifyFrame> RepFrame = BeginRepNotifyFrame(GetHealthAttribute());
+	{
+		ON_SCOPE_EXIT { EndRepNotifyFrame(RepFrame); };
+		// Avoid the macro's checked owning-ASC lookup when the property has no live Actor/ASC source.
+		if (RepFrame->OuterActor.IsValid() && RepFrame->OwningASC.IsValid())
+		{
+			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, Health, OldValue);
+		}
+	}
+	const float EffectiveHealth = RepFrame->bEffectiveValueCaptured ? RepFrame->EffectiveNewValue : IncomingValue;
 
-	const float CurrentHealth = GetHealth();
-
-	// 这是网络快照差值，不等于某一次 GE 的原始幅度（两帧之间可能发生多次修改）。
-	const float EstimatedMagnitude = CurrentHealth - OldValue.GetCurrentValue();
+	// OnRep 的旧值/新值是一对本次复制事实；宏内任何 GE 重入已经按各自属性回调提交状态。
+	const float ReplicatedDelta = EffectiveHealth - OldValue.GetCurrentValue();
 
 	// 客户端没有 EffectSpec，来源三参数只能传 nullptr。监听方必须判空。
-	OnHealthChanged.Broadcast(nullptr, nullptr, nullptr, EstimatedMagnitude, OldValue.GetCurrentValue(), CurrentHealth);
+	OnHealthChanged.Broadcast(nullptr, nullptr, nullptr, ReplicatedDelta, OldValue.GetCurrentValue(), EffectiveHealth);
 
-	if (!bOutOfHealth && CurrentHealth <= 0.0f)
+	if (!bWasOutOfHealth && OldValue.GetCurrentValue() > 0.0f && EffectiveHealth <= 0.0f)
 	{
-		OnOutOfHealth.Broadcast(nullptr, nullptr, nullptr, EstimatedMagnitude, OldValue.GetCurrentValue(), CurrentHealth);
+		OnOutOfHealth.Broadcast(nullptr, nullptr, nullptr, ReplicatedDelta, OldValue.GetCurrentValue(), EffectiveHealth);
 	}
-
-	// 广播之后再更新边沿，保证同一次跨零只触发一次。
-	bOutOfHealth = (CurrentHealth <= 0.0f);
 }
 
 void UGGYGOHealthSet::OnRep_MaxHealth(const FGameplayAttributeData& OldValue)
 {
-	GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxHealth, OldValue);
+	const float IncomingValue = GetMaxHealth();
+	const TSharedPtr<FRepNotifyFrame> RepFrame = BeginRepNotifyFrame(GetMaxHealthAttribute());
+	{
+		ON_SCOPE_EXIT { EndRepNotifyFrame(RepFrame); };
+		if (RepFrame->OuterActor.IsValid() && RepFrame->OwningASC.IsValid())
+		{
+			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxHealth, OldValue);
+		}
+	}
+	const float EffectiveMaxHealth = RepFrame->bEffectiveValueCaptured ? RepFrame->EffectiveNewValue : IncomingValue;
 
-	OnMaxHealthChanged.Broadcast(nullptr, nullptr, nullptr, GetMaxHealth() - OldValue.GetCurrentValue(), OldValue.GetCurrentValue(), GetMaxHealth());
+	OnMaxHealthChanged.Broadcast(nullptr, nullptr, nullptr, EffectiveMaxHealth - OldValue.GetCurrentValue(), OldValue.GetCurrentValue(), EffectiveMaxHealth);
 }
 
 void UGGYGOHealthSet::OnRep_Poise(const FGameplayAttributeData& OldValue)
 {
-	GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, Poise, OldValue);
-
-	const float CurrentPoise = GetPoise();
-	const float EstimatedMagnitude = CurrentPoise - OldValue.GetCurrentValue();
-
-	OnPoiseChanged.Broadcast(nullptr, nullptr, nullptr, EstimatedMagnitude, OldValue.GetCurrentValue(), CurrentPoise);
-
-	if (!bPoiseBroken && CurrentPoise <= 0.0f)
+	const float IncomingValue = GetPoise();
+	const bool bWasPoiseBroken = bPoiseBroken;
+	bPoiseBroken = IncomingValue <= 0.0f;
+	const TSharedPtr<FRepNotifyFrame> RepFrame = BeginRepNotifyFrame(GetPoiseAttribute());
 	{
-		OnPoiseBroken.Broadcast(nullptr, nullptr, nullptr, EstimatedMagnitude, OldValue.GetCurrentValue(), CurrentPoise);
+		ON_SCOPE_EXIT { EndRepNotifyFrame(RepFrame); };
+		if (RepFrame->OuterActor.IsValid() && RepFrame->OwningASC.IsValid())
+		{
+			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, Poise, OldValue);
+		}
 	}
+	const float EffectivePoise = RepFrame->bEffectiveValueCaptured ? RepFrame->EffectiveNewValue : IncomingValue;
 
-	bPoiseBroken = (CurrentPoise <= 0.0f);
+	const float ReplicatedDelta = EffectivePoise - OldValue.GetCurrentValue();
+
+	OnPoiseChanged.Broadcast(nullptr, nullptr, nullptr, ReplicatedDelta, OldValue.GetCurrentValue(), EffectivePoise);
+
+	if (!bWasPoiseBroken && OldValue.GetCurrentValue() > 0.0f && EffectivePoise <= 0.0f)
+	{
+		OnPoiseBroken.Broadcast(nullptr, nullptr, nullptr, ReplicatedDelta, OldValue.GetCurrentValue(), EffectivePoise);
+	}
 }
 
 void UGGYGOHealthSet::OnRep_MaxPoise(const FGameplayAttributeData& OldValue)
 {
-	GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxPoise, OldValue);
+	const TSharedPtr<FRepNotifyFrame> RepFrame = BeginRepNotifyFrame(GetMaxPoiseAttribute());
+	{
+		ON_SCOPE_EXIT { EndRepNotifyFrame(RepFrame); };
+		if (RepFrame->OuterActor.IsValid() && RepFrame->OwningASC.IsValid())
+		{
+			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxPoise, OldValue);
+		}
+	}
 }
 
 bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data)
@@ -99,12 +444,12 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 		return false;
 	}
 
-	// 只拦截正向伤害。负值不当作"伤害"处理，避免用负伤害绕过免疫来治疗。
-	if (Data.EvaluatedData.Attribute == GetDamageAttribute() && Data.EvaluatedData.Magnitude > 0.0f)
-	{
-		// 自毁/处死类伤害绕过免疫与开发期保命规则。
-		const bool bIsDamageFromSelfDestruct = Data.EffectSpec.GetDynamicAssetTags().HasTagExact(GGYGOGameplayTags::Gameplay_Damage_SelfDestruct);
+	const FGameplayAttribute Attribute = Data.EvaluatedData.Attribute;
+	const bool bIsDamageFromSelfDestruct = Data.EffectSpec.GetDynamicAssetTags().HasTagExact(GGYGOGameplayTags::Gameplay_Damage_SelfDestruct);
 
+	// 只拦截正向伤害。负值不当作"伤害"处理，避免用负伤害绕过免疫来治疗。
+	if (Attribute == GetDamageAttribute() && Data.EvaluatedData.Magnitude > 0.0f)
+	{
 		// 闪避无敌帧就是靠这个 Tag 生效的。
 		if (Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Gameplay_Damage_Immunity) && !bIsDamageFromSelfDestruct)
 		{
@@ -122,7 +467,7 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 	}
 
 	// 削韧同样受免疫约束：无敌帧期间不该被削韧。
-	if (Data.EvaluatedData.Attribute == GetPoiseDamageAttribute() && Data.EvaluatedData.Magnitude > 0.0f)
+	if (Attribute == GetPoiseDamageAttribute() && Data.EvaluatedData.Magnitude > 0.0f)
 	{
 		if (Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Gameplay_Damage_Immunity))
 		{
@@ -131,10 +476,35 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 		}
 	}
 
-	// 只有确定要应用的 GE 才存快照。
-	HealthBeforeAttributeChange = GetHealth();
-	MaxHealthBeforeAttributeChange = GetMaxHealth();
-	PoiseBeforeAttributeChange = GetPoise();
+	TSharedPtr<FModifierFrame> Frame = MakeShared<FModifierFrame>();
+	Frame->CallbackData = &Data;
+	Frame->Attribute = Attribute;
+	Frame->OriginalMagnitude = Data.EvaluatedData.Magnitude;
+	Frame->EffectSpec = MakeShared<FGameplayEffectSpec>(Data.EffectSpec);
+	Frame->Target = GetOwningActor();
+
+	const FGameplayEffectContextHandle& EffectContext = Data.EffectSpec.GetEffectContext();
+	Frame->OriginalInstigator = EffectContext.GetOriginalInstigator();
+	Frame->EffectCauser = EffectContext.GetEffectCauser();
+	if (const FGameplayTagContainer* SourceTags = Data.EffectSpec.CapturedSourceTags.GetAggregatedTags())
+	{
+		Frame->SourceTags = *SourceTags;
+	}
+	if (const FGameplayTagContainer* TargetTags = Data.EffectSpec.CapturedTargetTags.GetAggregatedTags())
+	{
+		Frame->TargetTags = *TargetTags;
+	}
+
+#if !UE_BUILD_SHIPPING
+	if (!bIsDamageFromSelfDestruct &&
+		(Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Cheat_GodMode)
+			|| Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Cheat_UnlimitedHealth)))
+	{
+		Frame->MinimumHealth = 1.0f;
+	}
+#endif
+
+	ModifierFrames.Add(MoveTemp(Frame));
 
 	return true;
 }
@@ -143,112 +513,76 @@ void UGGYGOHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallback
 {
 	Super::PostGameplayEffectExecute(Data);
 
-	const bool bIsDamageFromSelfDestruct = Data.EffectSpec.GetDynamicAssetTags().HasTagExact(GGYGOGameplayTags::Gameplay_Damage_SelfDestruct);
-
-	// 普通情况下生命值可以被打到 0。
-	float MinimumHealth = 0.0f;
-
-#if !UE_BUILD_SHIPPING
-	// 开发期保命：作弊 Tag 下最低保留 1 点血，但自毁伤害仍可真正致死。
-	if (!bIsDamageFromSelfDestruct &&
-		(Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Cheat_GodMode) || Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Cheat_UnlimitedHealth)))
+	const TSharedPtr<FModifierFrame> Frame = FindFrame(Data);
+	if (!Frame.IsValid())
 	{
-		MinimumHealth = 1.0f;
+		return;
 	}
-#endif
 
-	// 服务器路径可以拿到完整来源上下文。
-	const FGameplayEffectContextHandle& EffectContext = Data.EffectSpec.GetEffectContext();
-	AActor* Instigator = EffectContext.GetOriginalInstigator();
-	AActor* Causer = EffectContext.GetEffectCauser();
-
-	if (Data.EvaluatedData.Attribute == GetDamageAttribute())
+	Frame->bAwaitingInitialWrite = false;
+	const FGameplayAttribute Attribute = Frame->Attribute;
+	if (Attribute == GetDamageAttribute())
 	{
-		// 先广播消息再扣血。消息里的 Magnitude 是未 Clamp 的原始伤害，
-		// 因此伤害数字可能大于目标实际损失的生命值（残血被一击打死的情况）。
-		if (Data.EvaluatedData.Magnitude > 0.0f)
+		// Damage.Message 保留本 Modifier 的 EvaluatedData 原始幅度。结果暂存到 root 退出，
+		// 因而消息回调能看到所有本次嵌套贡献已消费后的状态。
+		if (Frame->OriginalMagnitude > 0.0f)
 		{
-			FGGYGOVerbMessage Message;
-			Message.Verb = GGYGOGameplayTags::Message_Damage;
-			// 这里用 EffectCauser 而不是 OriginalInstigator：表现层关心的是"什么东西打的"。
-			Message.Instigator = Causer;
-			Message.InstigatorTags = *Data.EffectSpec.CapturedSourceTags.GetAggregatedTags();
-			Message.Target = GetOwningActor();
-			Message.TargetTags = *Data.EffectSpec.CapturedTargetTags.GetAggregatedTags();
-			Message.Magnitude = Data.EvaluatedData.Magnitude;
-
-			UGameplayMessageSubsystem& MessageSystem = UGameplayMessageSubsystem::Get(GetWorld());
-			MessageSystem.BroadcastMessage(Message.Verb, Message);
+			QueueMessageResult(GGYGOGameplayTags::Message_Damage, Frame, Frame->OriginalMagnitude);
 		}
 
-		// 转成 -Health 并 Clamp，然后**必须清零**，否则后续 GE 会重复消费同一份伤害。
-		SetHealth(FMath::Clamp(GetHealth() - GetDamage(), MinimumHealth, GetMaxHealth()));
-		SetDamage(0.0f);
-	}
-	else if (Data.EvaluatedData.Attribute == GetHealingAttribute())
-	{
-		SetHealth(FMath::Clamp(GetHealth() + GetHealing(), MinimumHealth, GetMaxHealth()));
-		SetHealing(0.0f);
-	}
-	else if (Data.EvaluatedData.Attribute == GetPoiseDamageAttribute())
-	{
-		if (Data.EvaluatedData.Magnitude > 0.0f)
+		if (!Frame->bMetaConsumed)
 		{
-			FGGYGOVerbMessage Message;
-			Message.Verb = GGYGOGameplayTags::Message_PoiseBreak;
-			Message.Instigator = Causer;
-			Message.InstigatorTags = *Data.EffectSpec.CapturedSourceTags.GetAggregatedTags();
-			Message.Target = GetOwningActor();
-			Message.TargetTags = *Data.EffectSpec.CapturedTargetTags.GetAggregatedTags();
-			Message.Magnitude = Data.EvaluatedData.Magnitude;
+			Frame->bMetaConsumed = true;
+			const float Contribution = Frame->MetaContribution;
+			PushExpectedAttributeChange(Frame, GetDamageAttribute());
+			SetDamage(GetDamage() - Contribution);
+			PopExpectedAttributeChange();
 
-			UGameplayMessageSubsystem& MessageSystem = UGameplayMessageSubsystem::Get(GetWorld());
-			MessageSystem.BroadcastMessage(Message.Verb, Message);
+			PushExpectedAttributeChange(Frame, GetHealthAttribute());
+			SetHealth(FMath::Clamp(GetHealth() - Contribution, Frame->MinimumHealth, GetMaxHealth()));
+			PopExpectedAttributeChange();
 		}
+	}
+	else if (Attribute == GetHealingAttribute())
+	{
+		if (!Frame->bMetaConsumed)
+		{
+			Frame->bMetaConsumed = true;
+			const float Contribution = Frame->MetaContribution;
+			PushExpectedAttributeChange(Frame, GetHealingAttribute());
+			SetHealing(GetHealing() - Contribution);
+			PopExpectedAttributeChange();
 
-		SetPoise(FMath::Clamp(GetPoise() - GetPoiseDamage(), 0.0f, GetMaxPoise()));
-		SetPoiseDamage(0.0f);
+			PushExpectedAttributeChange(Frame, GetHealthAttribute());
+			SetHealth(FMath::Clamp(GetHealth() + Contribution, Frame->MinimumHealth, GetMaxHealth()));
+			PopExpectedAttributeChange();
+		}
 	}
-	else if (Data.EvaluatedData.Attribute == GetHealthAttribute())
+	else if (Attribute == GetPoiseDamageAttribute())
 	{
-		// 外部直接改 Health 时同样 Clamp，然后落到下面的边沿判定。
-		SetHealth(FMath::Clamp(GetHealth(), MinimumHealth, GetMaxHealth()));
-	}
-	else if (Data.EvaluatedData.Attribute == GetPoiseAttribute())
-	{
-		SetPoise(FMath::Clamp(GetPoise(), 0.0f, GetMaxPoise()));
-	}
-	else if (Data.EvaluatedData.Attribute == GetMaxHealthAttribute())
-	{
-		// 当前 Health 超出新上限的压低由 PostAttributeChange 完成，这里只广播上限变化。
-		OnMaxHealthChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Data.EvaluatedData.Magnitude, MaxHealthBeforeAttributeChange, GetMaxHealth());
-	}
+		if (!Frame->bMetaConsumed)
+		{
+			Frame->bMetaConsumed = true;
+			const float Contribution = Frame->MetaContribution;
+			PushExpectedAttributeChange(Frame, GetPoiseDamageAttribute());
+			SetPoiseDamage(GetPoiseDamage() - Contribution);
+			PopExpectedAttributeChange();
 
-	// 只有真实变化才广播，避免 UI 收到无意义刷新。
-	if (GetHealth() != HealthBeforeAttributeChange)
-	{
-		OnHealthChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Data.EvaluatedData.Magnitude, HealthBeforeAttributeChange, GetHealth());
-	}
-
-	if (GetPoise() != PoiseBeforeAttributeChange)
-	{
-		OnPoiseChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Data.EvaluatedData.Magnitude, PoiseBeforeAttributeChange, GetPoise());
-	}
-
-	if ((GetHealth() <= 0.0f) && !bOutOfHealth)
-	{
-		OnOutOfHealth.Broadcast(Instigator, Causer, &Data.EffectSpec, Data.EvaluatedData.Magnitude, HealthBeforeAttributeChange, GetHealth());
+			PushExpectedAttributeChange(Frame, GetPoiseAttribute());
+			SetPoise(FMath::Clamp(GetPoise() - Contribution, 0.0f, GetMaxPoise()));
+			PopExpectedAttributeChange();
+		}
 	}
 
-	if ((GetPoise() <= 0.0f) && !bPoiseBroken)
+	const int32 FrameIndex = ModifierFrames.IndexOfByPredicate([&Frame](const TSharedPtr<FModifierFrame>& Candidate)
 	{
-		OnPoiseBroken.Broadcast(Instigator, Causer, &Data.EffectSpec, Data.EvaluatedData.Magnitude, PoiseBeforeAttributeChange, GetPoise());
+		return Candidate == Frame;
+	});
+	if (ensureMsgf(FrameIndex != INDEX_NONE, TEXT("HealthSet modifier frame disappeared before Post.")))
+	{
+		ModifierFrames.RemoveAt(FrameIndex, 1, EAllowShrinking::No);
 	}
-
-	// 监听方可能在广播过程中又改了属性（例如破韧监听者立刻施加硬直 GE），
-	// 所以边沿状态要在所有广播之后重新读取，不能用上面的旧值。
-	bOutOfHealth = (GetHealth() <= 0.0f);
-	bPoiseBroken = (GetPoise() <= 0.0f);
+	FlushPendingResults();
 }
 
 void UGGYGOHealthSet::PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const
@@ -256,6 +590,14 @@ void UGGYGOHealthSet::PreAttributeBaseChange(const FGameplayAttribute& Attribute
 	Super::PreAttributeBaseChange(Attribute, NewValue);
 
 	ClampAttribute(Attribute, NewValue);
+	ApplyModifierMinimumHealth(Attribute, NewValue);
+
+	// Ordinary ASC base writes pass through this hook. RepNotify's internal rewind and
+	// aggregator recompute write the numeric value directly and do not.
+	if (const TSharedPtr<FRepNotifyFrame> RepFrame = FindRepNotifyFrame(Attribute))
+	{
+		++RepFrame->ExplicitBaseChangeCount;
+	}
 }
 
 void UGGYGOHealthSet::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
@@ -263,11 +605,61 @@ void UGGYGOHealthSet::PreAttributeChange(const FGameplayAttribute& Attribute, fl
 	Super::PreAttributeChange(Attribute, NewValue);
 
 	ClampAttribute(Attribute, NewValue);
+	ApplyModifierMinimumHealth(Attribute, NewValue);
 }
 
 void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue)
 {
+	++AttributeChangeDepth;
 	Super::PostAttributeChange(Attribute, OldValue, NewValue);
+
+	const TSharedPtr<FRepNotifyFrame> ActiveRepFrame = FindRepNotifyFrame(Attribute);
+	bool bExplicitBaseWrite = false;
+	if (ActiveRepFrame.IsValid() && ActiveRepFrame->ExplicitBaseChangeCount > 0)
+	{
+		--ActiveRepFrame->ExplicitBaseChangeCount;
+		bExplicitBaseWrite = true;
+	}
+
+	// 新嵌套 GE 的初始写入优先配对；其后才消费 HealthSet setter 的一次性标记。
+	TSharedPtr<FModifierFrame> Frame = FindAwaitingFrame(Attribute);
+	if (Frame.IsValid())
+	{
+		Frame->bAwaitingInitialWrite = false;
+		if (Attribute == GetDamageAttribute() || Attribute == GetHealingAttribute() || Attribute == GetPoiseDamageAttribute())
+		{
+			Frame->MetaContribution = NewValue - OldValue;
+		}
+	}
+	else
+	{
+		Frame = ConsumeExpectedAttributeChange(Attribute);
+	}
+
+	TSharedPtr<FRepNotifyFrame> RepFrame = Frame.IsValid() || bExplicitBaseWrite ? nullptr : ActiveRepFrame;
+	if (RepFrame.IsValid() && RepFrame->Stage == FRepNotifyFrame::EStage::Undetermined)
+	{
+		// GAMEPLAYATTRIBUTE_REPNOTIFY with an Aggregator first rewinds to OldEvaluatedValue.
+		// That temporary value is not a real result and must not affect caps or latches.
+		RepFrame->Stage = FRepNotifyFrame::EStage::AwaitingFinalWrite;
+		--AttributeChangeDepth;
+		if (AttributeChangeDepth == 0)
+		{
+			FlushPendingResults();
+		}
+		return;
+	}
+
+	const bool bRepNotifyEffectiveWrite = RepFrame.IsValid() && RepFrame->Stage == FRepNotifyFrame::EStage::AwaitingFinalWrite;
+	if (bRepNotifyEffectiveWrite)
+	{
+		// Capture the engine's final effective value once; later real writes cannot replace this history.
+		RepFrame->bEffectiveValueCaptured = true;
+		RepFrame->EffectiveNewValue = NewValue;
+		RepFrame->Stage = FRepNotifyFrame::EStage::RealChanges;
+	}
+	const bool bSuppressProjectResults = bRepNotifyEffectiveWrite;
+	const float EventMagnitude = Frame.IsValid() ? Frame->OriginalMagnitude : (NewValue - OldValue);
 
 	// 上限下调时必须同步压低当前值，否则会出现 Health 大于 MaxHealth。
 	// 走 ASC 的 ApplyModToAttribute 而不是直接 SetHealth，是为了让这次修改仍然经过
@@ -279,7 +671,14 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 			UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
 			check(GGYGOASC);
 
+			PushExpectedAttributeChange(Frame, GetHealthAttribute());
 			GGYGOASC->ApplyModToAttribute(GetHealthAttribute(), EGameplayModOp::Override, NewValue);
+			PopExpectedAttributeChange();
+		}
+
+		if (OldValue != NewValue && !bSuppressProjectResults)
+		{
+			QueueAttributeResult(EQueuedResultType::MaxHealthChanged, Frame, EventMagnitude, OldValue, NewValue);
 		}
 	}
 	else if (Attribute == GetMaxPoiseAttribute())
@@ -289,19 +688,77 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 			UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
 			check(GGYGOASC);
 
+			PushExpectedAttributeChange(Frame, GetPoiseAttribute());
 			GGYGOASC->ApplyModToAttribute(GetPoiseAttribute(), EGameplayModOp::Override, NewValue);
+			PopExpectedAttributeChange();
 		}
 	}
 
-	// 复活或韧性恢复后解锁边沿，使下一次归零能重新广播。
-	if (bOutOfHealth && (GetHealth() > 0.0f))
+	if (Attribute == GetHealthAttribute())
 	{
-		bOutOfHealth = false;
+		if (bRepNotifyEffectiveWrite)
+		{
+			bOutOfHealth = NewValue <= 0.0f;
+		}
+		bool bNotifyOutOfHealth = false;
+		if (NewValue > 0.0f)
+		{
+			bOutOfHealth = false;
+		}
+		else if (OldValue > 0.0f)
+		{
+			const bool bWasOutOfHealth = bOutOfHealth;
+			bOutOfHealth = true;
+			bNotifyOutOfHealth = !bWasOutOfHealth;
+		}
+
+		if (OldValue != NewValue && !bSuppressProjectResults)
+		{
+			QueueAttributeResult(EQueuedResultType::HealthChanged, Frame, EventMagnitude, OldValue, NewValue);
+		}
+		if (bNotifyOutOfHealth && !bSuppressProjectResults)
+		{
+			QueueAttributeResult(EQueuedResultType::OutOfHealth, Frame, EventMagnitude, OldValue, NewValue);
+		}
+	}
+	else if (Attribute == GetPoiseAttribute())
+	{
+		if (bRepNotifyEffectiveWrite)
+		{
+			bPoiseBroken = NewValue <= 0.0f;
+		}
+		bool bNotifyPoiseBroken = false;
+		float BreakMagnitude = FMath::Max(OldValue - NewValue, 0.0f);
+		if (NewValue > 0.0f)
+		{
+			bPoiseBroken = false;
+		}
+		else if (OldValue > 0.0f)
+		{
+			const bool bWasPoiseBroken = bPoiseBroken;
+			bPoiseBroken = true;
+			bNotifyPoiseBroken = !bWasPoiseBroken;
+			if (Frame.IsValid() && Frame->Attribute == GetPoiseDamageAttribute())
+			{
+				BreakMagnitude = Frame->OriginalMagnitude;
+			}
+		}
+
+		if (OldValue != NewValue && !bSuppressProjectResults)
+		{
+			QueueAttributeResult(EQueuedResultType::PoiseChanged, Frame, EventMagnitude, OldValue, NewValue);
+		}
+		if (bNotifyPoiseBroken && !bSuppressProjectResults)
+		{
+			QueueAttributeResult(EQueuedResultType::PoiseBroken, Frame, BreakMagnitude, OldValue, NewValue);
+			QueueMessageResult(GGYGOGameplayTags::Message_PoiseBreak, Frame, BreakMagnitude);
+		}
 	}
 
-	if (bPoiseBroken && (GetPoise() > 0.0f))
+	--AttributeChangeDepth;
+	if (AttributeChangeDepth == 0)
 	{
-		bPoiseBroken = false;
+		FlushPendingResults();
 	}
 }
 

@@ -5,46 +5,219 @@
 #include "GameModes/GGYGOGameMode.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
+#include "CoreGlobals.h"
+#include "Engine/GameInstance.h"
+#include "Engine/LocalPlayer.h"
+#include "Engine/World.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerStart.h"
-#include "GameFeaturesSubsystem.h"
 #include "GameModes/GGYGOExperienceDefinition.h"
+#include "GameModes/GGYGOGameFeatureSession.h"
+#include "Misc/ScopeExit.h"
+#include "Player/GGYGOLocalPlayer.h"
 #include "Player/GGYGOPlayerController.h"
 #include "Player/GGYGOPlayerState.h"
 #include "Teams/GGYGOCharacterSlot.h"
 #include "Teams/GGYGOSquadComponent.h"
 #include "Teams/GGYGOSquadPresets.h"
+#include "Teams/GGYGOSquadTypes.h"
+#include "Templates/Function.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOGameMode)
 
 namespace
 {
-	/**
-	 * 用本地玩家存档里的出战编队填充名单。
-	 *
-	 * 服务器上的远程玩家取不到 LocalPlayer，直接返回 false —— 别人的编队存在
-	 * 他自己的磁盘上，服务器读不到，只能由客户端上报（尚未实现）。
-	 * 所以联机时远程玩家目前走默认编队，这不是错误路径。
-	 *
-	 * @return 是否填充成功。没有编队、出战编队为空、成员全都解析不出来都算失败。
-	 */
-	bool TryApplySavedRoster(const APlayerController* PlayerController, UGGYGOSquadComponent* SquadComponent)
+	enum class ESavedRosterApplyStatus : uint8
 	{
-		UGGYGOSquadPresets* Presets = UGGYGOSquadPresets::GetForPlayerController(PlayerController);
-		if (!Presets)
+		Applied,
+		Unconfigured,
+		Invalid
+	};
+
+	struct FSavedRosterApplyResult
+	{
+		ESavedRosterApplyStatus Status = ESavedRosterApplyStatus::Invalid;
+		FString Error;
+	};
+
+	/** Apply only a complete saved roster; absence and failure remain distinct synchronous outcomes. */
+	FSavedRosterApplyResult TryApplySavedRoster(
+		const TWeakObjectPtr<APlayerController>& OriginalController,
+		const TWeakObjectPtr<UGGYGOSquadComponent>& OriginalSquad,
+		TFunctionRef<bool()> ContextIsCurrent)
+	{
+		const FString ControllerPath = GetPathNameSafe(OriginalController.Get());
+		const FString SquadPath = GetPathNameSafe(OriginalSquad.Get());
+		const auto Reject = [&ControllerPath, &SquadPath](FString Error)
 		{
-			return false;
+			FSavedRosterApplyResult Result;
+			Result.Error = FString::Printf(TEXT("Controller=%s Squad=%s: %s"),
+				*ControllerPath, *SquadPath, *Error);
+			return Result;
+		};
+		if (!ContextIsCurrent() || !OriginalController.IsValid() || !OriginalSquad.IsValid())
+		{
+			return Reject(TEXT("Original creation qualification is invalid before local source lookup."));
 		}
 
+		const ULocalPlayer* const LocalPlayer = OriginalController->GetLocalPlayer();
+		if (!ContextIsCurrent() || !OriginalController.IsValid()
+			|| OriginalController->GetLocalPlayer() != LocalPlayer)
+		{
+			return Reject(TEXT("Original Controller/LocalPlayer qualification changed during source selection."));
+		}
+		if (!LocalPlayer)
+		{
+			// An explicitly absent LP is the existing normal server remote-player source mode.
+			return { ESavedRosterApplyStatus::Unconfigured, FString() };
+		}
+		if (!IsValid(LocalPlayer) || LocalPlayer->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		{
+			return Reject(TEXT("A real LocalPlayer exists but is invalid or being destroyed."));
+		}
+
+		const TWeakObjectPtr<const ULocalPlayer> OriginalLocalPlayer(LocalPlayer);
+		const FString LocalPlayerPath = LocalPlayer->GetPathName();
+		const auto CheckOriginalSource = [OriginalController, OriginalSquad, OriginalLocalPlayer,
+			ContextIsCurrent]() -> FString
+		{
+			if (!ContextIsCurrent() || !OriginalController.IsValid() || !OriginalSquad.IsValid())
+			{
+				return TEXT("Original World/GF session/Controller/PlayerState/Squad/Experience qualification was lost.");
+			}
+			const ULocalPlayer* const CurrentLocalPlayer = OriginalLocalPlayer.Get();
+			if (!CurrentLocalPlayer || CurrentLocalPlayer->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+				|| OriginalController->GetLocalPlayer() != CurrentLocalPlayer)
+			{
+				return TEXT("Original LocalPlayer became unavailable or the Controller now has another source.");
+			}
+			return FString();
+		};
+
+		FString SourceError = CheckOriginalSource();
+		if (!SourceError.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s before TryGetSquadPresets: %s"),
+				*LocalPlayerPath, *SourceError));
+		}
+		const UGGYGOLocalPlayer* const PresetsHost = Cast<UGGYGOLocalPlayer>(OriginalLocalPlayer.Get());
+		if (!PresetsHost)
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s is not GGYGOLocalPlayer; check DefaultEngine.ini LocalPlayerClassName."),
+				*LocalPlayerPath));
+		}
+		UGGYGOSquadPresets* ReturnedPresets = nullptr;
+		FString AcquisitionError;
+		const bool bAcquiredPresets = PresetsHost->TryGetSquadPresets(ReturnedPresets, AcquisitionError);
+		SourceError = CheckOriginalSource();
+		if (!SourceError.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s after TryGetSquadPresets: %s; AcquisitionError=%s"),
+				*LocalPlayerPath, *SourceError, *AcquisitionError));
+		}
+		if (!bAcquiredPresets)
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s: TryGetSquadPresets rejected the original source; AcquisitionError=%s"),
+				*LocalPlayerPath, *AcquisitionError));
+		}
+		if (!IsValid(ReturnedPresets) || ReturnedPresets->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s: TryGetSquadPresets returned success without valid presets; AcquisitionError=%s"),
+				*LocalPlayerPath, *AcquisitionError));
+		}
+
+		const TWeakObjectPtr<UGGYGOSquadPresets> OriginalPresets(ReturnedPresets);
+		const FString PresetsPath = ReturnedPresets->GetPathName();
+		const auto CheckOriginalPresets = [&CheckOriginalSource, OriginalPresets]() -> FString
+		{
+			FString QualificationError = CheckOriginalSource();
+			if (!QualificationError.IsEmpty())
+			{
+				return QualificationError;
+			}
+			const UGGYGOSquadPresets* const CurrentPresets = OriginalPresets.Get();
+			if (!CurrentPresets || CurrentPresets->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+			{
+				return TEXT("The original getter-produced presets became unavailable or began destruction.");
+			}
+			return FString();
+		};
+
+		SourceError = CheckOriginalPresets();
+		if (!SourceError.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s Presets=%s before ResolveActivePresetRoster: %s"),
+				*LocalPlayerPath, *PresetsPath, *SourceError));
+		}
 		TArray<UGGYGOPawnData*> ResolvedRoster;
-		if (Presets->ResolveActivePresetRoster(ResolvedRoster) == 0)
+		const FGGYGOSquadPresetRosterResolveResult Resolution =
+			OriginalPresets->ResolveActivePresetRoster(ResolvedRoster);
+		const auto DescribeResolution = [&Resolution]()
 		{
-			return false;
+			return FString::Printf(TEXT("Presets=%s PresetIndex=%d MemberIndex=%d MemberId=%s MemberPath=%s ResolverError=%s"),
+				*Resolution.PresetsPath, Resolution.PresetIndex, Resolution.MemberIndex,
+				*Resolution.MemberId.ToString(), *Resolution.MemberPath.ToString(), *Resolution.Error);
+		};
+		SourceError = CheckOriginalPresets();
+		if (!SourceError.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s after ResolveActivePresetRoster: %s; %s"),
+				*LocalPlayerPath, *SourceError, *DescribeResolution()));
 		}
 
-		return SquadComponent->SetRoster(ResolvedRoster);
+		switch (Resolution.Status)
+		{
+		case EGGYGOSquadPresetRosterResolveStatus::Invalid:
+			return Reject(FString::Printf(TEXT("Invalid preset resolution; %s"), *DescribeResolution()));
+		case EGGYGOSquadPresetRosterResolveStatus::Unconfigured:
+			if (!ResolvedRoster.IsEmpty())
+			{
+				return Reject(FString::Printf(TEXT("Unconfigured resolution returned a nonempty output; %s"),
+					*DescribeResolution()));
+			}
+			return { ESavedRosterApplyStatus::Unconfigured, FString() };
+		case EGGYGOSquadPresetRosterResolveStatus::Resolved:
+			break;
+		default:
+			return Reject(FString::Printf(TEXT("Unexpected preset resolution status; %s"), *DescribeResolution()));
+		}
+		if (ResolvedRoster.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("Resolved preset returned no complete roster; %s"),
+				*DescribeResolution()));
+		}
+		SourceError = CheckOriginalPresets();
+		if (!SourceError.IsEmpty())
+		{
+			return Reject(FString::Printf(TEXT("LocalPlayer=%s before SetRoster: %s; %s"),
+				*LocalPlayerPath, *SourceError, *DescribeResolution()));
+		}
+		for (int32 OutputIndex = 0; OutputIndex < ResolvedRoster.Num(); ++OutputIndex)
+		{
+			UGGYGOPawnData* const PawnData = ResolvedRoster[OutputIndex];
+			if (!IsValid(PawnData) || PawnData->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+			{
+				return Reject(FString::Printf(TEXT("Resolved output index %d became invalid before SetRoster; %s"),
+					OutputIndex, *DescribeResolution()));
+			}
+		}
+		const bool bAccepted = OriginalSquad->SetRoster(ResolvedRoster);
+		SourceError = CheckOriginalPresets();
+		if (!bAccepted)
+		{
+			return Reject(FString::Printf(TEXT("SetRoster rejected the complete saved roster. Qualification=%s; %s"),
+				*SourceError, *DescribeResolution()));
+		}
+		if (!SourceError.IsEmpty())
+		{
+			// SetRoster's actual commit remains Squad-owned; this request cannot undo it or create Actors.
+			return Reject(FString::Printf(TEXT("SetRoster accepted, then original qualification was lost: %s; %s"),
+				*SourceError, *DescribeResolution()));
+		}
+		return { ESavedRosterApplyStatus::Applied, FString() };
 	}
 }
 
@@ -65,320 +238,857 @@ AGGYGOGameMode::AGGYGOGameMode(const FObjectInitializer& ObjectInitializer)
 
 void AGGYGOGameMode::InitGame(const FString& MapName, const FString& Options, FString& ErrorMessage)
 {
+	if (!IsInGameThread())
+	{
+		ErrorMessage = TEXT("[GameFeature] GameMode InitGame requires the game thread.");
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), *ErrorMessage);
+		return;
+	}
+	if (bGameFeatureStartupAttempted || bGameFeatureCallerClosed)
+	{
+		ErrorMessage = FString::Printf(
+			TEXT("[GameFeature] GameMode [%s] World [%s] Experience [%s]: startup already attempted or caller closed; no replacement/retry."),
+			*GetPathNameSafe(this), *GetPathNameSafe(GetWorld()), *GetPathNameSafe(Experience));
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), *ErrorMessage);
+		return;
+	}
+	bGameFeatureStartupAttempted = true;
+	const TWeakObjectPtr<AGGYGOGameMode> WeakGameMode(this);
 	Super::InitGame(MapName, Options, ErrorMessage);
-
-	if (!Experience)
+	if (WeakGameMode.Get() != this)
 	{
-		// 没有 Experience 就不会生成任何角色，玩家会停在一个空场景里。
-		// 这几乎总是配置遗漏，所以报错而不是静默。
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("InitGame: GameMode [%s] 没有配置 Experience，不会生成任何角色。"), *GetNameSafe(this));
+		ErrorMessage = TEXT("[GameFeature] Original GameMode became invalid during engine InitGame; startup refused.");
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), *ErrorMessage);
+		return;
+	}
+	InitializeGameFeatureSession(ErrorMessage);
+}
+
+void AGGYGOGameMode::InitializeGameFeatureSession(FString& ErrorMessage)
+{
+	const TWeakObjectPtr<AGGYGOGameMode> WeakGameMode(this);
+	const TWeakObjectPtr<UWorld> WeakWorld(GetWorld());
+	UWorld* World = WeakWorld.Get();
+	const FString OwnerLabel = FString::Printf(TEXT("GameMode [%s] Experience [%s]"),
+		*GetPathNameSafe(this), *GetPathNameSafe(Experience));
+	// Synchronous local helper only. This reference never escapes into the Session receiver.
+	const auto Reject = [this, &ErrorMessage, &OwnerLabel](const FString& Reason)
+	{
+		bGameFeatureCallerClosed = true;
+		ErrorMessage = FString::Printf(TEXT("[GameFeature] %s World [%s]: %s"),
+			*OwnerLabel, *GetPathNameSafe(GetWorld()), *Reason);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), *ErrorMessage);
+	};
+	if (!ErrorMessage.IsEmpty())
+	{
+		Reject(FString::Printf(TEXT("Engine InitGame failed: %s"), *ErrorMessage));
+		return;
+	}
+	if (!World || !IsGameFeatureCallerContextCurrent(*World, FGameFeatureSessionPtr()))
+	{
+		Reject(TEXT("Original caller/World admission is closed or no longer authoritative."));
+		return;
+	}
+	if (!IsValid(Experience))
+	{
+		Reject(TEXT("Required Experience is missing or invalid."));
 		return;
 	}
 
-	// 尽早激活插件，给异步加载留出时间。
-	ActivateGameFeatures();
-}
-
-void AGGYGOGameMode::ActivateGameFeatures()
-{
-	if (!Experience)
+	FGGYGOGameFeatureClosureResolver::FInput Input;
+	TArray<FString> Errors;
+	if (!Experience->TryBuildGameFeatureInput(Input, Errors))
 	{
+		Reject(FString::Printf(TEXT("Experience configuration rejected: %s"), *FString::Join(Errors, TEXT("; "))));
 		return;
 	}
-
-	UGameFeaturesSubsystem& Subsystem = UGameFeaturesSubsystem::Get();
-
-	for (const FString& PluginName : Experience->GameFeaturesToEnable)
+	// Both empty is an explicit successful configuration mode, never a failed-input fallback.
+	if (Input.RootPluginNames.IsEmpty() && Input.DeclaredSources.IsEmpty())
 	{
-		if (PluginName.IsEmpty())
-		{
-			continue;
-		}
-
-		FString PluginURL;
-		if (!Subsystem.GetPluginURLByName(PluginName, PluginURL))
-		{
-			// 插件名写错或插件未安装。报错而不是静默跳过 ——
-			// 静默会让"技能没生效"这种问题追查到完全无关的地方。
-			UE_LOG(LogGGYGOAbilitySystem, Error,
-				TEXT("ActivateGameFeatures: 找不到名为 [%s] 的 GameFeature 插件。"), *PluginName);
-			continue;
-		}
-
-		// 计数在发起前递增：回调可能同步触发（插件已加载过时），
-		// 先增后调才能保证递减不会把计数打到负数。
-		++PendingGameFeatureCount;
-
-		Subsystem.LoadAndActivateGameFeaturePlugin(
-			PluginURL,
-			FGameFeaturePluginLoadComplete::CreateUObject(
-				this, &ThisClass::OnGameFeatureActivated, PluginURL));
-	}
-}
-
-void AGGYGOGameMode::OnGameFeatureActivated(const UE::GameFeatures::FResult& Result, FString PluginURL)
-{
-	if (Result.HasError())
-	{
-		// 只报错不阻断：让一个装不上的插件卡住所有玩家的进场，
-		// 比缺这个插件的内容严重得多。
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("GameFeature [%s] 激活失败：%s。依赖它的内容将缺失。"),
-			*PluginURL, *Result.GetError());
-	}
-
-	--PendingGameFeatureCount;
-
-	if (AreGameFeaturesReady())
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Display,
-			TEXT("GameFeature 全部激活完毕，放行等待中的玩家。"));
-
+		bConfiguredNoGameFeatures = true;
 		SpawnSquadForPendingPlayers();
+		return;
 	}
+
+	FString CreateError;
+	const FGameFeatureSessionPtr OriginalSession =
+		FGGYGOGameFeatureSession::TryCreate(*World, OwnerLabel, CreateError);
+	if (!OriginalSession.IsValid())
+	{
+		Reject(FString::Printf(TEXT("Original Session creation failed: %s"), *CreateError));
+		return;
+	}
+	// Publish the fully constructed resource before Start: completion may be synchronous.
+	GameFeatureSession = OriginalSession;
+	const TWeakPtr<FGGYGOGameFeatureSession, ESPMode::ThreadSafe> WeakSession(OriginalSession);
+	// Start is void. A shared diagnostic relays an immediate failure without retaining a stack reference.
+	const TSharedRef<FString, ESPMode::ThreadSafe> StartupError = MakeShared<FString, ESPMode::ThreadSafe>();
+	OriginalSession->Start(MoveTemp(Input),
+		[WeakGameMode, WeakWorld, WeakSession, StartupError](const FGGYGOGameFeatureSession::FStartResult& Result)
+	{
+		const FGameFeatureSessionPtr Session = WeakSession.Pin();
+		AGGYGOGameMode* GameMode = WeakGameMode.Get();
+		UWorld* OriginalWorld = WeakWorld.Get();
+		if (!GameMode || !OriginalWorld || !Session.IsValid()
+			|| !GameMode->IsGameFeatureCallerContextCurrent(*OriginalWorld, Session))
+		{
+			return;
+		}
+		if (Result.Status != FGGYGOGameFeatureSession::EStartStatus::Ready)
+		{
+			*StartupError = FString::Printf(
+				TEXT("[GameFeature] GameMode [%s] World [%s] Experience [%s]: Session startup failed (status %u): %s"),
+				*GetPathNameSafe(GameMode), *GetPathNameSafe(OriginalWorld), *GetPathNameSafe(GameMode->Experience),
+				static_cast<uint32>(Result.Status), *FString::Join(Result.Errors, TEXT("; ")));
+			GameMode->bGameFeatureCallerClosed = true;
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), **StartupError);
+			// Session retains its own failed operation and drains its native resource automatically.
+			return;
+		}
+		if (!GameMode->CanAssembleForGameFeatureContext(*OriginalWorld, Session))
+		{
+			*StartupError = FString::Printf(
+				TEXT("[GameFeature] GameMode [%s] World [%s] Experience [%s]: Ready notification no longer grants current original Session qualification."),
+				*GetPathNameSafe(GameMode), *GetPathNameSafe(OriginalWorld), *GetPathNameSafe(GameMode->Experience));
+			GameMode->bGameFeatureCallerClosed = true;
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("%s"), **StartupError);
+			Session->Close();
+			return;
+		}
+		GameMode->SpawnSquadForPendingPlayers();
+		GameMode = WeakGameMode.Get();
+		OriginalWorld = WeakWorld.Get();
+		if (!GameMode || !OriginalWorld
+			|| !GameMode->CanAssembleForGameFeatureContext(*OriginalWorld, Session))
+		{
+			return;
+		}
+	});
+	if (!StartupError->IsEmpty())
+	{
+		ErrorMessage = *StartupError;
+	}
+}
+
+bool AGGYGOGameMode::IsGameFeatureCallerContextCurrent(
+	const UWorld& ExpectedWorld, const FGameFeatureSessionPtr& ExpectedSession) const
+{
+	if (!IsInGameThread() || !IsValid(this) || IsActorBeingDestroyed()
+		|| !bGameFeatureStartupAttempted || bGameFeatureCallerClosed
+		|| !IsValid(&ExpectedWorld) || ExpectedWorld.bIsTearingDown || ExpectedWorld.IsBeingCleanedUp()
+		|| (ExpectedWorld.WorldType != EWorldType::Game && ExpectedWorld.WorldType != EWorldType::PIE)
+		|| GetWorld() != &ExpectedWorld || ExpectedWorld.GetAuthGameMode() != this
+		|| GameFeatureSession != ExpectedSession)
+	{
+		return false;
+	}
+	const UGameInstance* GI = ExpectedWorld.GetGameInstance();
+	return IsValid(GI) && GI->GetWorld() == &ExpectedWorld;
+}
+
+bool AGGYGOGameMode::AreGameFeaturesReady() const
+{
+	if (!IsInGameThread())
+	{
+		return false;
+	}
+	const UWorld* World = GetWorld();
+	const FGameFeatureSessionPtr Session = GameFeatureSession;
+	if (!World || !IsGameFeatureCallerContextCurrent(*World, Session))
+	{
+		return false;
+	}
+	return bConfiguredNoGameFeatures ? !Session.IsValid()
+		: Session.IsValid() && Session->IsReadyFor(*World);
+}
+
+bool AGGYGOGameMode::CanAssembleForGameFeatureContext(
+	const UWorld& ExpectedWorld, const FGameFeatureSessionPtr& ExpectedSession) const
+{
+	return IsGameFeatureCallerContextCurrent(ExpectedWorld, ExpectedSession) && AreGameFeaturesReady();
 }
 
 void AGGYGOGameMode::SpawnSquadForPendingPlayers()
 {
-	// 遍历当前所有玩家而不是维护一份等待名单：等待期间玩家可能断线，
-	// 名单里就会留下悬垂指针。迭代器给出的是此刻真实存在的 Controller。
-	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	if (!IsInGameThread())
 	{
-		APlayerController* PlayerController = It->Get();
-		if (!PlayerController)
+		return;
+	}
+	const TWeakObjectPtr<AGGYGOGameMode> WeakGameMode(this);
+	const TWeakObjectPtr<UWorld> WeakWorld(GetWorld());
+	const FGameFeatureSessionPtr OriginalSession = GameFeatureSession;
+	AGGYGOGameMode* GameMode = WeakGameMode.Get();
+	UWorld* World = WeakWorld.Get();
+	if (!GameMode || !World || !GameMode->CanAssembleForGameFeatureContext(*World, OriginalSession))
+	{
+		return;
+	}
+
+	// Current Controllers only. The snapshot is weak and local to this one dispatch, not a waiting roster.
+	TArray<TWeakObjectPtr<APlayerController>> Controllers;
+	for (FConstPlayerControllerIterator It = World->GetPlayerControllerIterator(); It; ++It)
+	{
+		Controllers.Add(*It);
+	}
+	for (const TWeakObjectPtr<APlayerController>& WeakController : Controllers)
+	{
+		GameMode = WeakGameMode.Get();
+		World = WeakWorld.Get();
+		if (!GameMode || !World || !GameMode->CanAssembleForGameFeatureContext(*World, OriginalSession))
+		{
+			return;
+		}
+		APlayerController* PlayerController = WeakController.Get();
+		if (!PlayerController || PlayerController->IsActorBeingDestroyed() || PlayerController->GetWorld() != World)
 		{
 			continue;
 		}
-
-		// 已经有队伍的跳过，避免重复装配出两套位置。
-		const AGGYGOPlayerState* GGYGOPlayerState = PlayerController->GetPlayerState<AGGYGOPlayerState>();
-		const UGGYGOSquadComponent* SquadComponent =
-			GGYGOPlayerState ? GGYGOPlayerState->GetSquadComponent() : nullptr;
-
+		const AGGYGOPlayerState* PlayerState = PlayerController->GetPlayerState<AGGYGOPlayerState>();
+		const UGGYGOSquadComponent* SquadComponent = PlayerState ? PlayerState->GetSquadComponent() : nullptr;
 		if (SquadComponent && SquadComponent->IsSquadAssembled())
 		{
 			continue;
 		}
-
-		SpawnSquadForPlayer(PlayerController);
+		GameMode->SpawnSquadForPlayer(PlayerController);
+		GameMode = WeakGameMode.Get();
+		World = WeakWorld.Get();
+		if (!GameMode || !World || !GameMode->CanAssembleForGameFeatureContext(*World, OriginalSession))
+		{
+			return;
+		}
 	}
 }
 
 void AGGYGOGameMode::HandleStartingNewPlayer_Implementation(APlayerController* NewPlayer)
 {
-	// 有意不调用 Super：父类会走默认的"生成一个 Pawn 并附身"流程。
-	if (!NewPlayer)
+	// Deliberately no Super: it would run the engine's single-Pawn spawn path.
+	if (!IsInGameThread())
 	{
 		return;
 	}
-
-	// 插件还没激活完就先不生成。插件里的 Action 可能要往角色类上注入组件、
-	// 授予能力，早生成的角色会缺这些内容且不报错。
-	// 就绪回调里会通过 SpawnSquadForPendingPlayers 补上。
-	if (!AreGameFeaturesReady())
+	const TWeakObjectPtr<AGGYGOGameMode> WeakGameMode(this);
+	const TWeakObjectPtr<UWorld> WeakWorld(GetWorld());
+	const TWeakObjectPtr<APlayerController> WeakPlayer(NewPlayer);
+	const FGameFeatureSessionPtr OriginalSession = GameFeatureSession;
+	AGGYGOGameMode* GameMode = WeakGameMode.Get();
+	UWorld* World = WeakWorld.Get();
+	APlayerController* Player = WeakPlayer.Get();
+	if (!GameMode || !World || !Player || Player->IsActorBeingDestroyed() || Player->GetWorld() != World
+		|| !GameMode->CanAssembleForGameFeatureContext(*World, OriginalSession))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Display,
-			TEXT("HandleStartingNewPlayer: 尚有 %d 个 GameFeature 未激活完毕，[%s] 的队伍延后装配。"),
-			PendingGameFeatureCount, *GetNameSafe(NewPlayer));
 		return;
 	}
+	GameMode->SpawnSquadForPlayer(Player);
+	GameMode = WeakGameMode.Get();
+	World = WeakWorld.Get();
+	if (!GameMode || !World || !GameMode->CanAssembleForGameFeatureContext(*World, OriginalSession))
+	{
+		return;
+	}
+}
 
-	SpawnSquadForPlayer(NewPlayer);
+void AGGYGOGameMode::CloseGameFeatureSession()
+{
+	// Both engine lifecycle hooks guard GT. Retire admission before any Close reentry.
+	bGameFeatureCallerClosed = true;
+	bConfiguredNoGameFeatures = false;
+	FGameFeatureSessionPtr OriginalSession = MoveTemp(GameFeatureSession);
+	if (OriginalSession.IsValid())
+	{
+		OriginalSession->Close();
+	}
+	// No member reset after Close: a reentrant hook sees the original resource already moved.
+}
+
+void AGGYGOGameMode::Destroyed()
+{
+	if (!IsInGameThread())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[GameFeature] GameMode Destroyed requires GT; original caller/resource remains untouched."));
+		return;
+	}
+	// Actor::Destroyed can run before BeginPlay, when RouteEndPlay does not invoke EndPlay.
+	const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(this);
+	CloseGameFeatureSession();
+	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
+	{
+		Creator->ConsumeUntransferredSquadActors(true);
+	}
+	Super::Destroyed();
+}
+
+void AGGYGOGameMode::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	if (!IsInGameThread())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[GameFeature] GameMode EndPlay requires GT; original caller/resource remains untouched."));
+		return;
+	}
+	const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(this);
+	CloseGameFeatureSession();
+	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
+	{
+		Creator->ConsumeUntransferredSquadActors(true);
+	}
+	// Super::Destroyed may route here; the shared consumer cannot release the moved resource twice.
+	Super::EndPlay(EndPlayReason);
+}
+
+bool AGGYGOGameMode::IsSquadCreationContextCurrent(const FSquadCreationContext& Context) const
+{
+	if (!IsInGameThread())
+	{
+		return false;
+	}
+	const UWorld* World = Context.World.Get();
+	const APlayerController* Controller = Context.Controller.Get();
+	const AGGYGOPlayerState* PlayerState = Context.PlayerState.Get();
+	const UGGYGOSquadComponent* Squad = Context.Squad.Get();
+	const UGGYGOExperienceDefinition* OriginalExperience = Context.Experience.Get();
+	return Context.GameMode.Get() == this && World && Controller && PlayerState && Squad && OriginalExperience
+		&& HasAuthority() && CanAssembleForGameFeatureContext(*World, Context.Session)
+		&& !Controller->IsActorBeingDestroyed() && Controller->HasAuthority() && Controller->GetWorld() == World
+		&& !PlayerState->IsActorBeingDestroyed() && PlayerState->HasAuthority() && PlayerState->GetWorld() == World
+		&& Controller->GetPlayerState<AGGYGOPlayerState>() == PlayerState && PlayerState->GetOwner() == Controller
+		&& !Squad->IsBeingDestroyed() && Squad->GetWorld() == World && Squad->GetOwner() == PlayerState
+		&& PlayerState->GetSquadComponent() == Squad && Squad->GetRegistrationController() == Controller
+		&& GetExperience() == OriginalExperience;
+}
+
+void AGGYGOGameMode::RequestUntransferredSquadActorDestruction(
+	TArray<FUntransferredSquadActors>& OriginalActors, const FString& CreatorPath)
+{
+	check(IsInGameThread());
+	// No creator/Controller/world admission is needed to discharge an original creation obligation.
+	const auto RequestDestroy = [&CreatorPath](TWeakObjectPtr<AActor>& OriginalActor,
+		const FUntransferredSquadActors& Origin, const TCHAR* Kind)
+	{
+		AActor* Actor = OriginalActor.Get();
+		if (!Actor || Actor->IsActorBeingDestroyed())
+		{
+			OriginalActor.Reset();
+			return;
+		}
+		const FString ActorPath = Actor->GetPathName();
+		if (!Actor->HasAuthority() || !Actor->GetWorld())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Resource=%s Actor=%s: original destruction denied (Authority/World); obligation retained."),
+				*CreatorPath, *Origin.ControllerPath, *Origin.PawnDataPath, Kind, *ActorPath);
+			return;
+		}
+		const bool bNativeAccepted = Actor->Destroy();
+		Actor = OriginalActor.Get();
+		if (bNativeAccepted || !Actor || Actor->IsActorBeingDestroyed())
+		{
+			OriginalActor.Reset(); // Request obligation only; native/Host physical cleanup is not asserted.
+			return;
+		}
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Resource=%s Actor=%s: native Destroy rejected a live original; obligation retained."),
+			*CreatorPath, *Origin.ControllerPath, *Origin.PawnDataPath, Kind, *ActorPath);
+	};
+	for (FUntransferredSquadActors& Origin : OriginalActors)
+	{
+		RequestDestroy(Origin.OriginalSlot, Origin, TEXT("OriginalSlot"));
+		RequestDestroy(Origin.OriginalPawn, Origin, TEXT("OriginalPawn"));
+	}
+	// Another original's callback may already have started destruction. Never issue a second request for it.
+	for (FUntransferredSquadActors& Origin : OriginalActors)
+	{
+		if (AActor* Slot = Origin.OriginalSlot.Get(); !Slot || Slot->IsActorBeingDestroyed())
+		{
+			Origin.OriginalSlot.Reset();
+		}
+		if (AActor* Pawn = Origin.OriginalPawn.Get(); !Pawn || Pawn->IsActorBeingDestroyed())
+		{
+			Origin.OriginalPawn.Reset();
+		}
+	}
+	OriginalActors.RemoveAll([](const FUntransferredSquadActors& Origin)
+	{
+		return Origin.OriginalSlot.IsExplicitlyNull() && Origin.OriginalPawn.IsExplicitlyNull();
+	});
+}
+
+bool AGGYGOGameMode::FinishUntransferredSquadActors(TArray<FUntransferredSquadActors>& OriginalActors,
+	const TWeakObjectPtr<AGGYGOGameMode>& OriginalCreator, const FString& CreatorPath, bool bFinalDestruction)
+{
+	RequestUntransferredSquadActorDestruction(OriginalActors, CreatorPath);
+	const bool bRequestsRetired = OriginalActors.IsEmpty();
+	AGGYGOGameMode* Creator = OriginalCreator.Get();
+	const bool bFinal = bFinalDestruction || !Creator || Creator->IsActorBeingDestroyed()
+		|| Creator->bGameFeatureCallerClosed || Creator->bFinalSquadCreatorDestructionRequested;
+	if (bFinal)
+	{
+		for (const FUntransferredSquadActors& Origin : OriginalActors)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams] Creator=%s Controller=%s PawnData=%s: final creator close still has untransferred originals Slot=%s Pawn=%s; physical cleanup incomplete%s."),
+				*CreatorPath, *Origin.ControllerPath, *Origin.PawnDataPath,
+				*GetPathNameSafe(Origin.OriginalSlot.Get()), *GetPathNameSafe(Origin.OriginalPawn.Get()),
+				Creator ? TEXT(", original obligation retained") : TEXT(", creator no longer available to retain obligation"));
+		}
+	}
+	if (Creator)
+	{
+		for (FUntransferredSquadActors& Origin : OriginalActors)
+		{
+			Creator->UntransferredSquadActors.Add(MoveTemp(Origin));
+		}
+	}
+	OriginalActors.Reset();
+	return bRequestsRetired; // Request obligations only, not Host/native physical cleanup success.
+}
+
+void AGGYGOGameMode::ConsumeUntransferredSquadActors(bool bFinalDestruction)
+{
+	check(IsInGameThread());
+	bFinalSquadCreatorDestructionRequested |= bFinalDestruction;
+	if (bConsumingUntransferredSquadActors)
+	{
+		return;
+	}
+	bConsumingUntransferredSquadActors = true;
+	const TWeakObjectPtr<AGGYGOGameMode> OriginalCreator(this);
+	const FString CreatorPath = GetPathName();
+	TArray<FUntransferredSquadActors> OriginalActors = MoveTemp(UntransferredSquadActors);
+	UntransferredSquadActors.Reset();
+	FinishUntransferredSquadActors(OriginalActors, OriginalCreator, CreatorPath,
+		bFinalSquadCreatorDestructionRequested);
+	if (AGGYGOGameMode* Creator = OriginalCreator.Get())
+	{
+		Creator->bConsumingUntransferredSquadActors = false;
+	}
 }
 
 void AGGYGOGameMode::SpawnSquadForPlayer(APlayerController* NewPlayer)
 {
-	if (!Experience)
-	{
-		return;
-	}
-
-	AGGYGOPlayerState* GGYGOPlayerState = NewPlayer->GetPlayerState<AGGYGOPlayerState>();
-	UGGYGOSquadComponent* SquadComponent = GGYGOPlayerState ? GGYGOPlayerState->GetSquadComponent() : nullptr;
-	if (!SquadComponent)
+	if (!IsInGameThread() || !IsValid(this) || IsActorBeingDestroyed() || !IsValid(NewPlayer))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SpawnSquadForPlayer: PlayerState 上没有 SquadComponent，无法生成队伍。"));
+			TEXT("[Teams] SpawnSquadForPlayer Creator=%s Controller=%s: invalid synchronous creation caller."),
+			*GetPathNameSafe(this), *GetPathNameSafe(NewPlayer));
+		return;
+	}
+	FSquadCreationContext Context;
+	Context.GameMode = this;
+	Context.World = GetWorld();
+	Context.Controller = NewPlayer;
+	Context.PlayerState = NewPlayer->GetPlayerState<AGGYGOPlayerState>();
+	Context.Squad = Context.PlayerState.IsValid() ? Context.PlayerState->GetSquadComponent() : nullptr;
+	Context.Experience = Experience.Get();
+	Context.Session = GameFeatureSession;
+	Context.CreatorPath = GetPathName();
+	const FString ControllerPath = NewPlayer->GetPathName();
+	const auto ContextIsCurrent = [&Context]()
+	{
+		const AGGYGOGameMode* Creator = Context.GameMode.Get();
+		return Creator && Creator->IsSquadCreationContextCurrent(Context);
+	};
+	const auto ReportClosedContext = [&Context, &ControllerPath](const TCHAR* Stage)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s Experience=%s Stage=%s: original World/GF session/PlayerState/Squad/Experience qualification lost; no new work."),
+			*Context.CreatorPath, *ControllerPath, *GetPathNameSafe(Context.Experience.Get()), Stage);
+	};
+	if (!ContextIsCurrent())
+	{
+		ReportClosedContext(TEXT("Entry"));
+		return;
+	}
+	if (ControllersCreatingSquads.ContainsByPredicate([&Context](const TWeakObjectPtr<APlayerController>& Controller)
+		{ return Controller.HasSameIndexAndSerialNumber(Context.Controller); }))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s: synchronous squad creation already in flight; reentry rejected."),
+			*Context.CreatorPath, *ControllerPath);
+		return;
+	}
+	for (const FUntransferredSquadActors& Origin : UntransferredSquadActors)
+	{
+		const AActor* Slot = Origin.OriginalSlot.Get();
+		const AActor* Pawn = Origin.OriginalPawn.Get();
+		if (Origin.Controller.HasSameIndexAndSerialNumber(Context.Controller)
+			&& ((Slot && !Slot->IsActorBeingDestroyed()) || (Pawn && !Pawn->IsActorBeingDestroyed())))
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams] Creator=%s Controller=%s PawnData=%s: live rejected untransferred resources remain; new creation refused (no automatic retry)."),
+				*Context.CreatorPath, *ControllerPath, *Origin.PawnDataPath);
+			return;
+		}
+	}
+	if (Context.Squad->IsSquadAssembled())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Teams] Creator=%s Controller=%s: existing Slots already assembled; no borrowed member upgraded or new resource created."),
+			*Context.CreatorPath, *ControllerPath);
 		return;
 	}
 
-	// 名单来源按优先级三级回落：
-	//
-	// 1. 已经设好的名单 —— 有别的流程（将来的客户端上报、自动化测试）
-	//    在装配前调过 SetRoster，那就以它为准，不要用存档覆盖。
-	// 2. 本地玩家存档里的出战编队 —— 单机与主机端的正常路径。
-	// 3. Experience 的默认编队 —— 新档、调试关卡、自动化测试的兜底，
-	//    否则"没有编成界面"就等于空场景。
-	const TCHAR* RosterSource = TEXT("Experience 默认编队");
+	ControllersCreatingSquads.Add(Context.Controller);
+	TArray<FUntransferredSquadActors> CreatorActors;
+	ON_SCOPE_EXIT
+	{
+		// In-flight Spawn/handoff resources live only here, never in the lifecycle consumer's collection.
+		FinishUntransferredSquadActors(CreatorActors, Context.GameMode, Context.CreatorPath, false);
+		if (AGGYGOGameMode* Creator = Context.GameMode.Get())
+		{
+			Creator->ControllersCreatingSquads.RemoveAll([&Context](const TWeakObjectPtr<APlayerController>& Controller)
+			{
+				return Controller.HasSameIndexAndSerialNumber(Context.Controller);
+			});
+		}
+	};
+	const auto ReleaseUntransferredPair = [&Context](FUntransferredSquadActors& Origin)
+	{
+		TArray<FUntransferredSquadActors> OriginalActors;
+		OriginalActors.Add(MoveTemp(Origin));
+		Origin = FUntransferredSquadActors();
+		return FinishUntransferredSquadActors(OriginalActors, Context.GameMode, Context.CreatorPath, false);
+	};
+	UGGYGOSquadComponent* SquadComponent = Context.Squad.Get();
+	const UGGYGOExperienceDefinition* OriginalExperience = Context.Experience.Get();
+
+	// Only an explicit normal Unconfigured result selects Experience; errors never select another source.
+	bool bUseExperienceDefault = false;
+	const TCHAR* RosterSource = TEXT("玩家编队（已设置）");
 	if (!SquadComponent->GetRoster().IsEmpty())
 	{
 		RosterSource = TEXT("玩家编队（已设置）");
 	}
-	else if (TryApplySavedRoster(NewPlayer, SquadComponent))
+	else
 	{
-		RosterSource = TEXT("玩家编队（本地存档）");
+		const FSavedRosterApplyResult SavedRoster =
+			TryApplySavedRoster(Context.Controller, Context.Squad, ContextIsCurrent);
+		switch (SavedRoster.Status)
+		{
+		case ESavedRosterApplyStatus::Applied:
+			RosterSource = TEXT("玩家编队（本地存档）");
+			break;
+		case ESavedRosterApplyStatus::Unconfigured:
+			bUseExperienceDefault = true;
+			RosterSource = TEXT("Experience 默认编队");
+			break;
+		case ESavedRosterApplyStatus::Invalid:
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.RosterSource] Creator=%s Controller=%s: %s; this request stopped before Actor generation; no default source selected."),
+				*Context.CreatorPath, *ControllerPath, *SavedRoster.Error);
+			return;
+		default:
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.RosterSource] Creator=%s Controller=%s: unexpected saved-roster apply status; no new work."),
+				*Context.CreatorPath, *ControllerPath);
+			return;
+		}
+	}
+	if (!ContextIsCurrent())
+	{
+		ReportClosedContext(TEXT("RosterResolution"));
+		return;
+	}
+	SquadComponent = Context.Squad.Get();
+	OriginalExperience = Context.Experience.Get();
+	// Copy weak input identities before any subsequent external call; this is not another member roster.
+	TArray<TWeakObjectPtr<const UGGYGOPawnData>> SelectedPawnData;
+	{
+		const TArray<TObjectPtr<const UGGYGOPawnData>>& SquadRoster =
+			bUseExperienceDefault ? OriginalExperience->SquadMembers : SquadComponent->GetRoster();
+		const int32 OriginalRosterCount = SquadRoster.Num();
+		if (!GGYGOSquad::IsMemberCountWithinCapacity(OriginalRosterCount))
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams.Capacity] Creator=%s Controller=%s Experience=%s RosterSource=%s OriginalCount=%d Limit=%d: selected raw roster exceeds capacity; request stopped before Actor creation."),
+				*Context.CreatorPath, *ControllerPath, *GetPathNameSafe(OriginalExperience),
+				RosterSource, OriginalRosterCount, GGYGO_MAX_SQUAD_SIZE);
+			return;
+		}
+		SelectedPawnData.Reserve(SquadRoster.Num());
+		for (const TObjectPtr<const UGGYGOPawnData>& PawnData : SquadRoster)
+		{
+			SelectedPawnData.Add(PawnData.Get());
+		}
 	}
 
-	// 上面两级都没结果时 GetRoster() 仍为空，此时用默认编队。
-	const TArray<TObjectPtr<const UGGYGOPawnData>>& SquadRoster =
-		SquadComponent->GetRoster().IsEmpty() ? Experience->SquadMembers : SquadComponent->GetRoster();
-
-	if (SquadRoster.IsEmpty())
+	if (SelectedPawnData.IsEmpty())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SpawnSquadForPlayer: 既没有编队名单，Experience [%s] 也没有配默认编队，不会生成任何角色。"),
-			*GetNameSafe(Experience));
+			TEXT("[Teams] Creator=%s Controller=%s Experience=%s: selected roster empty; no Actors created."),
+			*Context.CreatorPath, *ControllerPath, *GetPathNameSafe(OriginalExperience));
 		return;
 	}
 
-	// 全员生成在同一个出生点。
-	//
-	// 非出战成员会被立刻隐藏并关闭碰撞，所以位置重叠不会造成挤压。
-	// 分散生成反而有害：切人时角色会从别处瞬移过来。
-	const AActor* StartSpot = ChoosePlayerStart(NewPlayer);
+	const AActor* StartSpot = Context.GameMode->ChoosePlayerStart(Context.Controller.Get());
+	if (!ContextIsCurrent())
+	{
+		ReportClosedContext(TEXT("ChoosePlayerStart"));
+		return;
+	}
+	if (StartSpot && (!IsValid(StartSpot) || StartSpot->IsActorBeingDestroyed() || StartSpot->GetWorld() != Context.World.Get()))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s: ChoosePlayerStart returned an invalid/different-World Actor; creation stopped."),
+			*Context.CreatorPath, *ControllerPath);
+		return;
+	}
+	// The existing null StartSpot -> Identity policy remains for its separately scheduled correction.
 	const FTransform SpawnTransform = StartSpot
 		? StartSpot->GetActorTransform()
 		: FTransform::Identity;
 
-	// 两阶段装配。
-	//
-	// 阶段一只建位置，不建实体：位置持有 ASC 与属性集，走完这一阶段
-	// 全队的属性、冷却、组规则就都已就绪。阶段二生成的 Pawn 无论以什么顺序
-	// 初始化，都不会遇到"属性集还没到"的情况 —— 这是 ASC 放在位置上的目的。
-	TArray<AGGYGOCharacterSlot*> SpawnedSlots;
-	SpawnedSlots.Reserve(SquadRoster.Num());
-
-	for (const TObjectPtr<const UGGYGOPawnData>& PawnData : SquadRoster)
+	CreatorActors.Reserve(SelectedPawnData.Num());
+	int32 FailedItems = 0;
+	int32 AcceptedPairs = 0;
+	// Phase one remains all Slots before any Pawn.
+	for (const TWeakObjectPtr<const UGGYGOPawnData>& SelectedData : SelectedPawnData)
 	{
-		if (!PawnData)
+		if (!ContextIsCurrent())
 		{
+			ReportClosedContext(TEXT("BeforeSlotSpawn"));
+			return;
+		}
+		const UGGYGOPawnData* PawnData = SelectedData.Get();
+		FUntransferredSquadActors Origin;
+		Origin.Controller = Context.Controller;
+		Origin.PawnData = SelectedData;
+		Origin.ControllerPath = ControllerPath;
+		Origin.PawnDataPath = GetPathNameSafe(PawnData);
+		AGGYGOGameMode* Creator = Context.GameMode.Get();
+		if (!Creator->SpawnSquadSlot(Context, PawnData, Origin))
+		{
+			++FailedItems;
+			if (!ReleaseUntransferredPair(Origin))
+			{
+				return; // Stop this Controller's current request as well as future requests after native refusal.
+			}
+			if (!ContextIsCurrent())
+			{
+				ReportClosedContext(TEXT("SlotPreparation"));
+				return;
+			}
+			continue;
+		}
+		CreatorActors.Add(MoveTemp(Origin));
+	}
+	// Phase two prepares each Pawn, requests Host binding, then makes one explicit creation handoff.
+	for (int32 Index = 0; Index < CreatorActors.Num(); ++Index)
+	{
+		if (!ContextIsCurrent())
+		{
+			ReportClosedContext(TEXT("BeforePawnSpawn"));
+			return;
+		}
+		FUntransferredSquadActors& Origin = CreatorActors[Index];
+		const UGGYGOPawnData* PawnData = Origin.PawnData.Get();
+		AGGYGOCharacterSlot* Slot = Cast<AGGYGOCharacterSlot>(Origin.OriginalSlot.Get());
+		if (!Slot || Slot->IsActorBeingDestroyed() || !Slot->HasAuthority()
+			|| Slot->GetWorld() != Context.World.Get() || Slot->GetOwner() != Context.Controller.Get()
+			|| !PawnData || Slot->GetPawnData() != PawnData || !Slot->IsPawnDataInitializationComplete())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams] Creator=%s Controller=%s PawnData=%s: original prepared Slot no longer usable; original pair released."),
+				*Context.CreatorPath, *ControllerPath, *Origin.PawnDataPath);
+			++FailedItems;
+			if (!ReleaseUntransferredPair(Origin))
+			{
+				return; // Stop this Controller's current request as well as future requests after native refusal.
+			}
+			continue;
+		}
+		AGGYGOGameMode* Creator = Context.GameMode.Get();
+		if (!Creator->SpawnSquadMember(Context, PawnData, SpawnTransform, Origin))
+		{
+			++FailedItems;
+			if (!ReleaseUntransferredPair(Origin))
+			{
+				return; // Stop this Controller's current request as well as future requests after native refusal.
+			}
+			if (!ContextIsCurrent())
+			{
+				ReportClosedContext(TEXT("PawnPreparation"));
+				return;
+			}
+			continue;
+		}
+		if (!ContextIsCurrent())
+		{
+			ReportClosedContext(TEXT("BeforeHostAttach"));
+			return;
+		}
+		Slot = Cast<AGGYGOCharacterSlot>(Origin.OriginalSlot.Get());
+		AGGYGOCharacterBase* Member = Cast<AGGYGOCharacterBase>(Origin.OriginalPawn.Get());
+		if (!Slot || Slot->IsActorBeingDestroyed() || !Slot->HasAuthority()
+			|| Slot->GetWorld() != Context.World.Get() || Slot->GetOwner() != Context.Controller.Get()
+			|| !Origin.PawnData.IsValid() || Slot->GetPawnData() != Origin.PawnData.Get()
+			|| !Slot->IsPawnDataInitializationComplete() || !Member || Member->IsActorBeingDestroyed())
+		{
+			++FailedItems;
+			if (!ReleaseUntransferredPair(Origin))
+			{
+				return; // Stop this Controller's current request as well as future requests after native refusal.
+			}
+			continue;
+		}
+		Slot->AttachAvatar(Member); // Host alone coordinates ActorInfo; Squad alone validates new binding admission.
+		if (!ContextIsCurrent())
+		{
+			ReportClosedContext(TEXT("HostAttach"));
+			return;
+		}
+		Slot = Cast<AGGYGOCharacterSlot>(Origin.OriginalSlot.Get());
+		Member = Cast<AGGYGOCharacterBase>(Origin.OriginalPawn.Get());
+		if (!Slot || Slot->IsActorBeingDestroyed() || !Member || Member->IsActorBeingDestroyed())
+		{
+			++FailedItems;
+			if (!ReleaseUntransferredPair(Origin))
+			{
+				return; // Stop this Controller's current request as well as future requests after native refusal.
+			}
 			continue;
 		}
 
-		if (AGGYGOCharacterSlot* Slot = SpawnSquadSlot(NewPlayer, PawnData))
+		// Remove this pair from creator cleanup BEFORE the potentially reentrant acceptance call.
+		FUntransferredSquadActors Handoff = MoveTemp(Origin);
+		Origin = FUntransferredSquadActors();
+		const bool bAccepted = Context.Squad->RegisterCreatedSlot(Slot, Member);
+		// The bool is the historical handoff fact. Do not inspect current admission/Avatar/Slots first.
+		if (bAccepted)
 		{
-			SpawnedSlots.Add(Slot);
+			++AcceptedPairs;
+			Handoff = FUntransferredSquadActors(); // Only Squad can now destroy this explicitly accepted original pair.
+		}
+		else
+		{
+			++FailedItems;
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Teams] Creator=%s Controller=%s PawnData=%s: RegisterCreatedSlot rejected original pair; creator retains cleanup."),
+				*Context.CreatorPath, *ControllerPath, *Handoff.PawnDataPath);
+			if (!ReleaseUntransferredPair(Handoff))
+			{
+				return;
+			}
+		}
+		if (!ContextIsCurrent())
+		{
+			ReportClosedContext(TEXT("AfterHandoff"));
+			return;
 		}
 	}
-
-	// 阶段二：为每个位置生成实体并互相绑定。
-	//
-	// 登记放在这里而不是阶段一：`RegisterSlot` 会把第一个位置设为出战并附身它的 Pawn，
-	// 那要求 Pawn 已经存在。
-	for (AGGYGOCharacterSlot* Slot : SpawnedSlots)
-	{
-		const UGGYGOPawnData* PawnData = Slot->GetPawnData();
-		if (!PawnData)
-		{
-			continue;
-		}
-
-		AGGYGOCharacterBase* Member = SpawnSquadMember(NewPlayer, PawnData, SpawnTransform);
-		if (!Member)
-		{
-			continue;
-		}
-
-		// 唯一装配入口：状态宿主同时更新复制引用、PawnExtension 与 AbilityActorInfo。
-		// 生成方不再直接写 PawnExtension，避免两个调用方争抢当前 Avatar。
-		Slot->AttachAvatar(Member);
-
-		// 第一个登记的位置会由 SquadComponent 自动设为出战并被附身。
-		SquadComponent->RegisterSlot(Slot);
-	}
-
-	// 装配结果留一条记录：这条链路跨 GameMode、位置、Pawn、SquadComponent 四方，
-	// 出问题时"到底装了几个位置、谁在出战"是第一个要回答的问题，
-	// 没有它就只能靠断点或逐个 Actor 翻查。
-	const AGGYGOCharacterBase* ActiveCharacter = SquadComponent->GetActiveCharacter();
 	UE_LOG(LogGGYGOAbilitySystem, Display,
-		TEXT("SpawnSquadForPlayer: 装配完成，名单来源 [%s]，位置 %d 个，出战 [%s]。"),
-		RosterSource,
-		SquadComponent->GetSlotCount(), *GetNameSafe(ActiveCharacter));
+		TEXT("[Teams] Creator=%s Controller=%s: creation dispatch ended, roster source=%s selected=%d accepted original pairs=%d failed items=%d; not a whole-squad/possession success assertion."),
+		*Context.CreatorPath, *ControllerPath, RosterSource, SelectedPawnData.Num(), AcceptedPairs, FailedItems);
 }
 
-AGGYGOCharacterSlot* AGGYGOGameMode::SpawnSquadSlot(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData)
+bool AGGYGOGameMode::SpawnSquadSlot(const FSquadCreationContext& Context, const UGGYGOPawnData* PawnData,
+	FUntransferredSquadActors& OutActors)
 {
-	UWorld* World = GetWorld();
-	if (!World || !PawnData)
-	{
-		return nullptr;
-	}
-
-	FActorSpawnParameters SpawnParams;
-
-	// Owner 必须是 PlayerController。
-	//
-	// GAS 的客户端预测靠 `ASC->GetOwnerActor()->GetNetOwningPlayer()` 找到玩家连接，
-	// 而位置本身不是 Pawn 也不是 PlayerState，这条链只能靠 Owner 建立。
-	// 设错的症状是 PredictionKey 生成不出来、所有 LocalPredicted 能力退化成
-	// 纯服务器执行（输入延迟一个 RTT），而且**不会报任何错**。
-	SpawnParams.Owner = OwningPlayer;
-
-	// 位置没有空间存在感，出生变换取单位变换即可。
-	AGGYGOCharacterSlot* Slot = World->SpawnActor<AGGYGOCharacterSlot>(
-		AGGYGOCharacterSlot::StaticClass(),
-		FTransform::Identity,
-		SpawnParams);
-
-	if (!Slot)
+	const TWeakObjectPtr<const UGGYGOPawnData> OriginalData(PawnData);
+	if (!IsSquadCreationContextCurrent(Context) || !OriginalData.IsValid() || !OutActors.OriginalSlot.IsExplicitlyNull())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SpawnSquadSlot: 为 [%s] 生成队伍位置失败。"), *GetNameSafe(PawnData));
-		return nullptr;
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=SpawnSlot: invalid original context/configuration or occupied output; no spawn."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath);
+		return false;
 	}
-
-	// 装载角色定义：注入组规则与 Tag 关系表，并授予该角色的 AbilitySet。
-	// 这一步完成后本位置的属性与能力就已可用，与实体是否存在无关。
-	Slot->InitializeForPawnData(PawnData);
-
-	return Slot;
+	UWorld* World = Context.World.Get();
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.Owner = Context.Controller.Get();
+	SpawnParams.CustomPreSpawnInitialization = [&OutActors](AActor* OriginalActor)
+	{
+		OutActors.OriginalSlot = OriginalActor; // Before pre-spawn/global/project callbacks, no external work here.
+	};
+	AGGYGOCharacterSlot* SpawnedSlot = World->SpawnActor<AGGYGOCharacterSlot>(
+		AGGYGOCharacterSlot::StaticClass(), FTransform::Identity, SpawnParams);
+	AGGYGOGameMode* Creator = Context.GameMode.Get();
+	AGGYGOCharacterSlot* Slot = Cast<AGGYGOCharacterSlot>(OutActors.OriginalSlot.Get());
+	if (!Creator || !Creator->IsSquadCreationContextCurrent(Context) || !SpawnedSlot || SpawnedSlot != Slot
+		|| !Slot || Slot->IsActorBeingDestroyed() || !Slot->HasAuthority()
+		|| Slot->GetWorld() != Context.World.Get() || Slot->GetOwner() != Context.Controller.Get()
+		|| !OriginalData.IsValid())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=SpawnSlotReturn: original Spawn/context rejected; captured Slot=%s remains creator-owned."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath,
+			*GetPathNameSafe(OutActors.OriginalSlot.Get()));
+		return false;
+	}
+	Slot->InitializeForPawnData(OriginalData.Get());
+	Creator = Context.GameMode.Get();
+	Slot = Cast<AGGYGOCharacterSlot>(OutActors.OriginalSlot.Get());
+	if (!Creator || !Creator->IsSquadCreationContextCurrent(Context) || !Slot || Slot->IsActorBeingDestroyed()
+		|| !Slot->HasAuthority() || Slot->GetWorld() != Context.World.Get() || Slot->GetOwner() != Context.Controller.Get()
+		|| !OriginalData.IsValid() || Slot->GetPawnData() != OriginalData.Get() || !Slot->IsPawnDataInitializationComplete())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=SlotInitialization: original Slot preparation failed; captured original retained."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath);
+		return false;
+	}
+	return true; // Original initialization loop completed, not every GA/GE configuration or client Ready.
 }
 
-AGGYGOCharacterBase* AGGYGOGameMode::SpawnSquadMember(APlayerController* OwningPlayer, const UGGYGOPawnData* PawnData, const FTransform& SpawnTransform)
+bool AGGYGOGameMode::SpawnSquadMember(const FSquadCreationContext& Context, const UGGYGOPawnData* PawnData,
+	const FTransform& SpawnTransform, FUntransferredSquadActors& OutActors)
 {
-	if (!PawnData || !PawnData->PawnClass)
+	const TWeakObjectPtr<const UGGYGOPawnData> OriginalData(PawnData);
+	if (!IsSquadCreationContextCurrent(Context) || !OriginalData.IsValid() || !PawnData->PawnClass
+		|| !PawnData->PawnClass->IsChildOf(AGGYGOCharacterBase::StaticClass())
+		|| !OutActors.OriginalPawn.IsExplicitlyNull())
 	{
-		return nullptr;
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=SpawnPawn: invalid original context/PawnClass or occupied output; no alternate Pawn spawned."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath);
+		return false;
 	}
-
-	UWorld* World = GetWorld();
-	if (!World)
-	{
-		return nullptr;
-	}
-
+	UWorld* World = Context.World.Get();
 	FActorSpawnParameters SpawnParams;
-	SpawnParams.Owner = OwningPlayer;
-
-	// AdjustIfPossibleButAlwaysSpawn：全员共用一个出生点，必然重叠。
-	// 用默认策略会让第二、三个成员因碰撞而生成失败。
+	SpawnParams.Owner = Context.Controller.Get();
 	SpawnParams.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AdjustIfPossibleButAlwaysSpawn;
-
-	AGGYGOCharacterBase* Member = World->SpawnActor<AGGYGOCharacterBase>(
-		PawnData->PawnClass.Get(),
-		SpawnTransform,
-		SpawnParams);
-
-	if (!Member)
+	SpawnParams.CustomPreSpawnInitialization = [&OutActors](AActor* OriginalActor)
+	{
+		OutActors.OriginalPawn = OriginalActor;
+	};
+	AGGYGOCharacterBase* SpawnedMember = World->SpawnActor<AGGYGOCharacterBase>(
+		PawnData->PawnClass.Get(), SpawnTransform, SpawnParams);
+	AGGYGOGameMode* Creator = Context.GameMode.Get();
+	AGGYGOCharacterBase* Member = Cast<AGGYGOCharacterBase>(OutActors.OriginalPawn.Get());
+	if (!Creator || !Creator->IsSquadCreationContextCurrent(Context) || !SpawnedMember || SpawnedMember != Member
+		|| !Member || Member->IsActorBeingDestroyed() || !Member->HasAuthority()
+		|| Member->GetWorld() != Context.World.Get() || Member->GetOwner() != Context.Controller.Get()
+		|| !OriginalData.IsValid())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SpawnSquadMember: 生成 [%s] 失败。"), *GetNameSafe(PawnData->PawnClass.Get()));
-		return nullptr;
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=SpawnPawnReturn: original Spawn/context rejected; captured Pawn=%s remains creator-owned."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath,
+			*GetPathNameSafe(OutActors.OriginalPawn.Get()));
+		return false;
 	}
-
-	// 必须在生成后立刻注入 PawnData：InitState 的 DataAvailable 以它为前提，
-	// 晚一步会让角色卡在 Spawned 直到下一次 CheckDefaultInitialization。
-	if (UGGYGOPawnExtensionComponent* PawnExtComp = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Member))
-	{
-		PawnExtComp->SetPawnData(PawnData);
-	}
-	else
+	UGGYGOPawnExtensionComponent* Extension = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Member);
+	if (!IsValid(Extension) || Extension->IsBeingDestroyed())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SpawnSquadMember: [%s] 上没有 PawnExtensionComponent，PawnData 无法注入。"), *GetNameSafe(Member));
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=PawnData: original Pawn=%s has no valid PawnExtension; preparation rejected."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath, *GetPathNameSafe(Member));
+		return false;
 	}
-
-	return Member;
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(Extension);
+	Extension->SetPawnData(OriginalData.Get());
+	Creator = Context.GameMode.Get();
+	Member = Cast<AGGYGOCharacterBase>(OutActors.OriginalPawn.Get());
+	Extension = OriginalExtension.Get();
+	if (!Creator || !Creator->IsSquadCreationContextCurrent(Context) || !Member || Member->IsActorBeingDestroyed()
+		|| !Member->HasAuthority() || Member->GetWorld() != Context.World.Get() || Member->GetOwner() != Context.Controller.Get()
+		|| (Member->GetController() && Member->GetController() != Context.Controller.Get())
+		|| !Extension || Extension->IsBeingDestroyed() || Extension->GetOwner() != Member
+		|| UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Member) != Extension
+		|| !OriginalData.IsValid() || Extension->GetPawnData<UGGYGOPawnData>() != OriginalData.Get())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Creator=%s Controller=%s PawnData=%s Stage=PawnDataReturn: original Pawn/Extension injection readback failed; captured original retained."),
+			*Context.CreatorPath, *OutActors.ControllerPath, *OutActors.PawnDataPath);
+		return false;
+	}
+	return true;
 }

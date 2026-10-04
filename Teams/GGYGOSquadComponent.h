@@ -27,13 +27,17 @@
 #pragma once
 
 #include "Components/GameFrameworkComponent.h"
+#include "UObject/WeakObjectPtrTemplates.h"
 
 #include "GGYGOSquadComponent.generated.h"
+
+namespace EEndPlayReason { enum Type : int; }
 
 class APawn;
 class APlayerController;
 class AGGYGOCharacterBase;
 class AGGYGOCharacterSlot;
+class AGGYGOGameMode;
 class UGGYGOPawnData;
 class UObject;
 
@@ -64,9 +68,10 @@ public:
 	 * 而位置上的属性集是默认子对象，换角色时数值会残留。
 	 * 要换编队就在下一局开始前换。
 	 *
-	 * 超出 `GGYGO_MAX_SQUAD_SIZE` 的部分会被截断并报错。名单里的空项被跳过。
+	 * 按原始名单数量校验容量，超过 `GGYGO_MAX_SQUAD_SIZE` 时整体拒绝，不截断。
+	 * 名单里的空项被跳过；验证后至少有一名成员，才一次替换原名单。
 	 *
-	 * @return 是否被接受。已装配、非服务器、名单为空都返回 false。
+	 * @return 是否被接受。已装配、非服务器、原始数量超限、空名单或全空项返回 false，原名单不变。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SetRoster(const TArray<UGGYGOPawnData*>& InRoster);
@@ -84,16 +89,27 @@ public:
 	bool IsSquadAssembled() const { return Slots.Num() > 0; }
 
 	/**
-	 * 登记一个队伍位置。仅服务器有效。
+	 * 借用登记一个已初始化且 Avatar 绑定一致的队伍位置。仅服务器有效。
 	 *
-	 * 由装配流程调用：先为名单里的每份 PawnData 生成一个位置，再逐个登记，
-	 * 之后才生成 Pawn。第一个登记的位置会自动成为出战位。
+	 * 当前装配流程先生成并初始化 Slot，再生成 Pawn、设置 PawnData 和绑定 Avatar，
+	 * 最后登记。此入口只接收成员关系，不取得 Slot 或 Pawn 的创建清理责任。
+	 * 新成员默认待命；没有出战位时尝试激活第一个位置。
 	 *
 	 * 超过 `GGYGO_MAX_SQUAD_SIZE` 的登记会被拒绝 —— 每个位置带一个 ASC，
 	 * 配置写错的代价是成倍的复制开销，宁可在装配阶段就拒绝。
+	 * 已登记的同一位置返回 true，不重复激活，也不改变既有创建责任。
+	 *
+	 * @return 成员关系是否已被接收；不保证自动激活或 Possess 成功。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
-	void RegisterSlot(AGGYGOCharacterSlot* Slot);
+	bool RegisterSlot(AGGYGOCharacterSlot* Slot);
+
+	/**
+	 * 终止本组件的成员关系，并请求销毁显式接收的原创建 Actor。
+	 * 借用 Actor 不销毁；原生接受只代表移交销毁生命周期，不保证物理清理已完成。
+	 * 重复入口不重放控制/通知；拒绝且仍存活的资源保留给后续明确入口处理。
+	 */
+	void DestroySquad();
 
 	/** 当前出战位置。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
@@ -132,6 +148,8 @@ public:
 	FGGYGOActiveCharacterChanged OnActiveCharacterChanged;
 
 protected:
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
 	/** 出战序号复制到达。客户端据此更新表现。 */
@@ -179,4 +197,45 @@ protected:
 	 */
 	UPROPERTY(ReplicatedUsing = OnRep_ActiveSlotIndex)
 	int32 ActiveSlotIndex = INDEX_NONE;
+
+private:
+	friend class AGGYGOGameMode;
+
+	/** 原始创建对象的清理责任；不代表当前 Avatar 或另一份成员名单。 */
+	struct FCreatedSlotResources
+	{
+		TWeakObjectPtr<AGGYGOCharacterSlot> Slot;
+		TWeakObjectPtr<APawn> OriginalCreatedPawn;
+	};
+
+	/**
+	 * 接收 GameMode 实际创建的 Slot 与原始 Pawn；仅 C++ 创建者调用。
+	 * 已借用登记的位置不能升级为自创；相同原始身份对重复请求幂等。
+	 * 提交责任后返回 true，即使自动激活失败；GameMode 实际创建交付仍须独立接线。
+	 */
+	bool RegisterCreatedSlot(AGGYGOCharacterSlot* Slot, APawn* OriginalCreatedPawn);
+
+	/** 两种入口共用接收事务；所有身份验证先于名单和责任提交。 */
+	bool RegisterSlotInternal(AGGYGOCharacterSlot* Slot, APawn* OriginalCreatedPawn, bool bAcceptCreatedResources);
+
+	/** 当前组件必须是权威 PlayerState 的唯一队伍，且 Controller/World 对应。 */
+	APlayerController* GetRegistrationController() const;
+
+	/** 只读验证新成员的初始化、连接归属和 Slot/ASC/PawnExtension 绑定。 */
+	bool HasValidSlotBinding(const AGGYGOCharacterSlot* Slot, const APlayerController* OwningController) const;
+
+	/** 外调返回后只核对原表现对象与本组件终止边界，不认证 ASC 绑定。 */
+	bool CanContinueSlotPresentation(const TWeakObjectPtr<AGGYGOCharacterSlot>& OriginalSlot,
+		const TWeakObjectPtr<AGGYGOCharacterBase>& OriginalCharacter) const;
+
+	/** 三个实际终止入口共用；只消费本组件的原 Actor 责任，不编排绑定清理。 */
+	void ConsumeCreatedSlotResources(bool bFinalComponentDestruction);
+
+	/** 仅记录已明确交付且尚未移交原生销毁的资源；消费栈临时取得唯一责任，不复制。 */
+	TArray<FCreatedSlotResources> CreatedSlotResources;
+
+	/** 只关闭本实例准入；不充当第二个装配状态，也不随 BeginPlay 重开。 */
+	bool bSquadTerminationStarted = false;
+	bool bConsumingCreatedSlotResources = false;
+	bool bFinalComponentDestructionRequested = false;
 };

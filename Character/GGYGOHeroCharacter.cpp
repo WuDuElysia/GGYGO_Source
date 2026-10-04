@@ -23,5 +23,8 @@ AGGYGOHeroCharacter::AGGYGOHeroCharacter(const FObjectInitializer& ObjectInitial
 	// 而相机模式已经自己处理了跟随与平滑。
 	CameraComponent->SetupAttachment(RootComponent);
 
+	// Preserve the serialized subobject class/name of existing Blueprints. This
+	// compatibility subclass contains no character selection or asset defaults;
+	// its reusable base only renders the bindings authored on the character BP.
 	StylizedRenderComponent = CreateDefaultSubobject<UGGYGOPyriosRenderComponent>(TEXT("StylizedRenderComponent"));
 }

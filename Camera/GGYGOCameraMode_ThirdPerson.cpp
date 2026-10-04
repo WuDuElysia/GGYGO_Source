@@ -4,9 +4,6 @@
  */
 #include "Camera/GGYGOCameraMode_ThirdPerson.h"
 
-#include "Engine/World.h"
-#include "GameFramework/Actor.h"
-
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCameraMode_ThirdPerson)
 
 UGGYGOCameraMode_ThirdPerson::UGGYGOCameraMode_ThirdPerson()
@@ -19,7 +16,38 @@ UGGYGOCameraMode_ThirdPerson::UGGYGOCameraMode_ThirdPerson()
 	ViewPitchMax = 70.0f;
 }
 
-void UGGYGOCameraMode_ThirdPerson::UpdateView(float DeltaTime)
+FGGYGOCameraEvaluationResult UGGYGOCameraMode_ThirdPerson::ValidateModeConfiguration() const
+{
+	if (!FMath::IsFinite(TargetOffset.X))
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("TargetOffset.X"), TEXT("non-finite"));
+	}
+	if (!FMath::IsFinite(TargetOffset.Y))
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("TargetOffset.Y"), TEXT("non-finite"));
+	}
+	if (!FMath::IsFinite(TargetOffset.Z))
+	{
+		return FGGYGOCameraEvaluationResult::Failure(this, TEXT("TargetOffset.Z"), TEXT("non-finite"));
+	}
+	// Disabled prevention intentionally does not use either collision parameter.
+	if (bPreventPenetration)
+	{
+		if (!FMath::IsFinite(PenetrationProbeRadius) || PenetrationProbeRadius < 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(this, TEXT("PenetrationProbeRadius"),
+				FMath::IsFinite(PenetrationProbeRadius) ? TEXT("negative") : TEXT("non-finite"));
+		}
+		if (!FMath::IsFinite(PenetrationRecoverySpeed) || PenetrationRecoverySpeed < 0.0f)
+		{
+			return FGGYGOCameraEvaluationResult::Failure(this, TEXT("PenetrationRecoverySpeed"),
+				FMath::IsFinite(PenetrationRecoverySpeed) ? TEXT("negative") : TEXT("non-finite"));
+		}
+	}
+	return FGGYGOCameraEvaluationResult::Success();
+}
+
+void UGGYGOCameraMode_ThirdPerson::UpdateView(float)
 {
 	const FVector PivotLocation = GetPivotLocation();
 	FRotator PivotRotation = GetPivotRotation();
@@ -34,52 +62,13 @@ void UGGYGOCameraMode_ThirdPerson::UpdateView(float DeltaTime)
 	// 与角色自身朝向无关。用角色朝向会让原地转身时镜头绕着角色转。
 	const FVector DesiredOffset = PivotRotation.RotateVector(TargetOffset);
 	const FVector DesiredLocation = PivotLocation + DesiredOffset;
+	View.Location = DesiredLocation;
 
-	if (!bPreventPenetration)
+	CameraPenetrationRequest.bEnabled = bPreventPenetration;
+	if (bPreventPenetration)
 	{
-		View.Location = DesiredLocation;
-		CurrentArmLengthRatio = 1.0f;
-		return;
+		CameraPenetrationRequest.PivotLocation = PivotLocation;
+		CameraPenetrationRequest.ProbeRadius = PenetrationProbeRadius;
+		CameraPenetrationRequest.RecoverySpeed = PenetrationRecoverySpeed;
 	}
-
-	const AActor* TargetActor = GetTargetActor();
-	const UWorld* World = GetWorld();
-	if (!TargetActor || !World)
-	{
-		View.Location = DesiredLocation;
-		return;
-	}
-
-	// 从枢轴往目标位置扫一个球，命中就说明中间有遮挡。
-	FCollisionQueryParams QueryParams(SCENE_QUERY_STAT(GGYGOCameraPenetration), /*bTraceComplex=*/false);
-	QueryParams.AddIgnoredActor(TargetActor);
-
-	FHitResult Hit;
-	const bool bBlocked = World->SweepSingleByChannel(
-		Hit,
-		PivotLocation,
-		DesiredLocation,
-		FQuat::Identity,
-		ECC_Camera,
-		FCollisionShape::MakeSphere(PenetrationProbeRadius),
-		QueryParams);
-
-	float TargetRatio = 1.0f;
-	if (bBlocked)
-	{
-		TargetRatio = FMath::Clamp(Hit.Time, 0.0f, 1.0f);
-	}
-
-	if (TargetRatio < CurrentArmLengthRatio)
-	{
-		// 立即拉近。平滑拉近意味着这几帧里镜头仍在墙内，会看到背面。
-		CurrentArmLengthRatio = TargetRatio;
-	}
-	else
-	{
-		// 平滑推远。立即推远会在经过门框、柱子时产生剧烈的前后抽动。
-		CurrentArmLengthRatio = FMath::FInterpTo(CurrentArmLengthRatio, TargetRatio, DeltaTime, PenetrationRecoverySpeed);
-	}
-
-	View.Location = PivotLocation + (DesiredOffset * CurrentArmLengthRatio);
 }

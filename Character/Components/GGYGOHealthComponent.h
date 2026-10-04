@@ -30,17 +30,21 @@
  * 2. **不重置属性**。Lyra 在初始化时有一段 `SetNumericAttributeBase(Health, MaxHealth)`
  *    并自标为 TEMP。属性初值应由 PawnData 里的初始化 GE 给，写在这里会覆盖掉
  *    "残血复活""继承上一场血量"这类合理需求。
- * 3. **自毁 GE 配在组件上**。Lyra 从 `ULyraGameData` 全局资产取伤害 GE，
- *    本项目没有那层全局资产管理，所以做成组件的 `EditDefaultsOnly` 字段。
+ * 3. **自毁 GE 支持组件覆盖**。非空覆盖优先；留空时读取AssetManager启动预载的
+ *    共享自毁GE快照。预载未就绪或失败则诊断并返回，运行入口不加载资产。
  */
 #pragma once
 
 #include "Components/GameFrameworkComponent.h"
+#include "Templates/SharedPointer.h"
 #include "Templates/SubclassOf.h"
 
 #include "GGYGOHealthComponent.generated.h"
 
 class AActor;
+class FGGYGOPawnASCResourceHandle;
+class UGGYGOPawnExtensionComponent;
+struct FGGYGOAvatarBindingContext;
 class UGameplayEffect;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOHealthComponent;
@@ -68,7 +72,7 @@ enum class EGGYGODeathState : uint8
 	/** 生命归零，死亡演出进行中。仍在场，不响应输入。 */
 	DeathStarted,
 
-	/** 演出结束，可以销毁或进入复活流程。 */
+	/** 演出结束。死亡标签保持单调投影；本组件不提供复活流程。 */
 	DeathFinished
 };
 
@@ -88,17 +92,30 @@ public:
 	}
 
 	/**
-	 * 绑定到 ASC 上的 HealthSet。
-	 *
-	 * 由拥有者 Pawn 在 `UGGYGOPawnExtensionComponent::OnAbilitySystemInitialized_RegisterAndCall`
-	 * 的回调里调用，不要手工排在 BeginPlay 里 —— ASC 就绪时机不固定。
+	 * 兼容请求入口：捕获自身 Extension 的真实 Ready H/Context，验证 InASC 后调用唯一资源实现。
+	 * 没有原 H/Ready 时明确拒绝；不构造仅凭 ASC 的绑定。
+	 * 绑定成功后投影已有 DeathState，不重放死亡事件。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Health")
 	void InitializeWithAbilitySystem(UGGYGOAbilitySystemComponent* InASC);
 
-	/** 解绑。会清掉本组件施加的死亡 Tag。 */
+	/** 捕获自身原记录并精确归还五个 token；不清死亡 Tag，不读取 Extension 后继换目标。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Health")
 	void UninitializeFromAbilitySystem();
+
+	/** 同步安装明确的原 Ready 资源；返回值为本次完成历史，不是当前权限。 */
+	bool InitializeWithLocalAbilitySystemResource(
+		UGGYGOPawnExtensionComponent* ExpectedExtension,
+		const FGGYGOPawnASCResourceHandle& ExpectedResource,
+		const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError);
+	/** 认证同 H 的新发布 Context；不重装 token 或重复 UI 初值。 */
+	bool RefreshLocalAbilitySystemResource(
+		UGGYGOPawnExtensionComponent* ExpectedExtension,
+		const FGGYGOPawnASCResourceHandle& ExpectedResource,
+		const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError);
+	/** 只释放匹配的原 H；清理不依赖 Ready 或 Extension Released。 */
+	bool UninitializeFromLocalAbilitySystemResource(
+		const FGGYGOPawnASCResourceHandle& ExpectedResource, FString& OutError);
 
 	// ===== 只读转发。未初始化时一律返回 0，不崩 =====
 
@@ -136,10 +153,10 @@ public:
 	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "GGYGO|Health", meta = (ExpandBoolAsExecs = "ReturnValue"))
 	bool IsDeadOrDying() const { return DeathState > EGGYGODeathState::NotDead; }
 
-	/** 开始死亡：施加 `State.Dying`，广播 `OnDeathStarted`。重复调用是空操作。 */
+	/** 开始死亡：向当前 Avatar 的 ASC 投影 `State.Dying`，广播 `OnDeathStarted`。重复调用是空操作。 */
 	virtual void StartDeath();
 
-	/** 结束死亡：施加 `State.Dead`，广播 `OnDeathFinished`。未开始时调用是空操作。 */
+	/** 结束死亡：向当前 Avatar 的 ASC 投影 `State.Dying` / `State.Dead`，广播 `OnDeathFinished`。未开始时调用是空操作。 */
 	virtual void FinishDeath();
 
 	/**
@@ -151,6 +168,9 @@ public:
 	 *
 	 * 免疫穿透是无条件的：spec 上会带 `Gameplay.Damage.SelfDestruct`，
 	 * `UGGYGOHealthSet` 见到它就跳过无敌帧与开发期 GodMode。自毁的定义就是必须死成。
+	 *
+	 * 非空SelfDestructEffectOverride优先；空覆盖读取共享预载快照。
+	 * 共享GE未就绪、配置缺失或加载失败时诊断并返回，不加载、重试或直接写Health。
 	 *
 	 * @param bFellOutOfWorld 掉出世界时为 true。只作为**死因标记**加进 spec，
 	 *                        供死亡表现区分（掉出世界不播倒地动画），不影响伤害计算。
@@ -179,23 +199,32 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOHealth_DeathEvent OnDeathStarted;
 
-	/** 死亡演出结束。销毁或复活逻辑挂这里。 */
+	/** 死亡演出结束。销毁逻辑可挂这里；本组件不提供复活流程。 */
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOHealth_DeathEvent OnDeathFinished;
 
 protected:
+	struct FAbilitySystemResource;
+	virtual void OnRegister() override;
+	virtual void BeginPlay() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void OnUnregister() override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
 
-	/** 清掉本组件施加的 `State.Dying` / `State.Dead`。 */
-	void ClearGameplayTags();
+	/** 将 DeathState 单调投影到仍以 Owner 为 Avatar 的绑定 ASC；NotDead 不清除 Tag。 */
+	void ApplyDeathStateToAbilitySystem();
 
-	//~HealthSet 原生委托的处理器。签名必须与 FGGYGOAttributeEvent 一致
-	virtual void HandleHealthChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
-	virtual void HandleMaxHealthChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
-	virtual void HandleOutOfHealth(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
-	virtual void HandlePoiseChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
-	virtual void HandlePoiseBroken(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+	//~HealthSet 原生委托处理器：原记录/事件 Context 加 FGGYGOAttributeEvent 的六个值参数。
+	virtual void HandleHealthChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+	virtual void HandleMaxHealthChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+	virtual void HandleOutOfHealth(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+	virtual void HandlePoiseChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+	virtual void HandlePoiseBroken(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	//~End of handlers
 
 	/** 死亡状态复制到达。会把跳级变化补成逐级调用。 */
@@ -205,22 +234,31 @@ protected:
 	/**
 	 * 自毁用的伤害 GE，覆盖项目默认值。
 	 *
-	 * 留空则用 `UGGYGOGameData::SelfDestructGameplayEffect` —— 自毁对所有角色
-	 * 是同一件事，通常不需要逐个配。这个字段留给特例（例如爆炸型敌人
-	 * 死亡时要连带范围伤害）。
+	 * 非空值始终优先；留空则读UGGYGOGameData::GetSharedSelfDestructGameplayEffect的
+	 * 启动预载快照。Manager/预载未就绪、共享配置缺失或加载失败时，自毁诊断并返回。
+	 * 不在运行路径加载软引用，也不因共享缺失改用直接属性写入。
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Health")
 	TSubclassOf<UGameplayEffect> SelfDestructEffectOverride;
 
-	/** 本组件绑定的 ASC。 */
-	UPROPERTY()
-	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;
-
-	/** ASC 上的 HealthSet。`const` 因为本组件只读它，写入必须走 GE。 */
-	UPROPERTY()
-	TObjectPtr<const UGGYGOHealthSet> HealthSet;
-
 	/** 死亡阶段。复制以便客户端播放死亡表现。 */
 	UPROPERTY(ReplicatedUsing = OnRep_DeathState)
 	EGGYGODeathState DeathState;
+
+private:
+	bool ValidateLocalReadyResource(UGGYGOPawnExtensionComponent* ExpectedExtension,
+		const FGGYGOPawnASCResourceHandle& ExpectedResource,
+		const FGGYGOAvatarBindingContext& PublishedContext,
+		UGGYGOAbilitySystemComponent*& OutASC, const UGGYGOHealthSet*& OutHealthSet, FString& OutError) const;
+	static bool IsOriginalResourceCurrent(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext);
+	static void RetireOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource);
+	static bool ProjectDeathStateToOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
+		const FGGYGOAvatarBindingContext& ExpectedContext);
+	TSharedPtr<FAbilitySystemResource> GetReadyResource() const;
+
+	/** 唯一 Health 装配记录；ASC/Set/token/Context 均由这份记录保存，不另建缓存。 */
+	TSharedPtr<FAbilitySystemResource> AbilitySystemResource{};
+	/** 本组件生命周期的新装配准入；清理始终按原记录执行。 */
+	bool bResourceAdmissionClosed = false;
 };

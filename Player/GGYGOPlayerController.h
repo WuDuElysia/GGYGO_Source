@@ -2,7 +2,8 @@
  * @file GGYGOPlayerController.h
  * @brief 玩家控制器
  *
- * 当前只承担一件事：在正确的时机驱动 ASC 消费本帧的输入缓存。
+ * 包围原生输入系统创建，并在正确的时机驱动 ASC 消费本帧的输入缓存。
+ * 创建执行阶段归本Controller；输入出生资格和物理来源分别归Input资源与生产者。
  *
  * ## 为什么必须由 Controller 驱动，且必须在 PostProcessInput 里
  * ASC 把输入分成 pressed / held / released 三个缓存，需要有人每帧统一消费。
@@ -30,6 +31,9 @@ class GGYGO_API AGGYGOPlayerController : public APlayerController
 
 public:
 	AGGYGOPlayerController(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	/** Native creation only; rejection lasts for this Actor and never grants input qualification. */
+	virtual void InitInputSystem() override;
 
 	/** 取当前操控角色的 ASC。未附身或角色没有 ASC 时返回 nullptr。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|PlayerController")
@@ -80,4 +84,10 @@ protected:
 	//~APlayerController interface
 	virtual void PostProcessInput(const float DeltaTime, const bool bGamePaused) override;
 	//~End of APlayerController interface
+
+private:
+	enum class ENativeInputInitializationStage : uint8 { Idle, Running, Rejected };
+	ENativeInputInitializationStage NativeInputInitializationStage = ENativeInputInitializationStage::Idle;
+	/** Diagnostic suppression only; nested calls never alter the outer execution stage. */
+	bool bReportedNativeInputInitializationBusy = false;
 };

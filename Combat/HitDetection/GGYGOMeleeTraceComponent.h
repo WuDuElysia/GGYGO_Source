@@ -6,8 +6,8 @@
  * 用武器上的碰撞体做 Overlap 有两个硬伤：快速挥砍时武器在两帧之间可能
  * 完全穿过敌人（隧穿），以及无法控制"哪一段动画才算有效判定"。
  *
- * 本组件改为在判定窗口内**每帧沿两个骨骼之间的线段扫掠胶囊**，
- * 用上一帧到本帧的位置做连续检测，隧穿因此消失；而窗口的开关由
+ * 本组件在两个 Socket 之间按半径分段取点，每帧对各点做球形扫掠，
+ * 用上一帧到本帧的位置做连续检测，降低跨帧漏判；而窗口的开关由
  * 能力（配合 AnimNotifyState）控制，判定时机与动画严格对齐。
  *
  * ## 每次攻击只命中一次
@@ -44,7 +44,7 @@ public:
 	 *
 	 * @param InStartSocket 判定线段的起点骨骼（通常是武器根）。
 	 * @param InEndSocket   终点骨骼（通常是武器尖）。
-	 * @param InTraceRadius 扫掠胶囊半径。
+	 * @param InTraceRadius 扫掠球半径。
 	 *
 	 * 每次开启都会清空已命中记录，所以连招的每一段都能重新命中同一个敌人。
 	 */
@@ -59,7 +59,7 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combat")
 	bool IsTracing() const { return bIsTracing; }
 
-	/** 命中时广播。仅服务器与本地控制端触发。 */
+	/** 命中时广播。开窗调用者负责权限，组件只报告碰撞候选。 */
 	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Combat")
 	FGGYGOMeleeHitSignature OnMeleeHit;
 
@@ -72,12 +72,20 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combat")
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Pawn;
 
+	/** 每帧武器线段最多分段数；所需密度超过此值时拒绝窗口并告警，避免静默产生空洞。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combat", meta = (ClampMin = "1", ClampMax = "512"))
+	int32 MaxTraceSegments = 64;
+
 protected:
+	virtual void OnUnregister() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void Deactivate() override;
+
 	/** 执行一帧扫掠。 */
 	void PerformTrace();
 
-	/** 取骨骼在世界空间的位置。骨骼不存在时回退到 Mesh 组件原点。 */
-	FVector GetSocketLocation(const USkeletalMeshComponent* Mesh, FName SocketName) const;
+	/** 仅使用当前角色主 Mesh；缺失 Socket 必须关闭窗口，不能退回组件原点。 */
+	USkeletalMeshComponent* GetTraceMesh() const;
 
 	/** 判定线段起点骨骼。 */
 	FName StartSocket;
@@ -109,4 +117,9 @@ protected:
 	 * 用弱引用：命中后目标可能被销毁（一击必杀），持强引用会阻止 GC。
 	 */
 	TArray<TWeakObjectPtr<AActor>> HitActorsThisWindow;
+
+	/** 回调中关闭或重开窗口时改变，旧扫掠不能继续广播或写回采样基线。 */
+	uint32 WindowSerial = 0;
+
+	friend class FGGYGOMeleeTraceSafetyTest;
 };

@@ -34,8 +34,9 @@ bool FGGYGOGameplayEffectContext::NetSerialize(FArchive& Ar, class UPackageMap* 
 	FGameplayEffectContext::NetSerialize(Ar, Map, bOutSuccess);
 
 	// 故意不序列化的扩展字段：
-	//   HitID              —— 只用于本地判定归组
-	//   AbilitySourceObject —— 只在服务器结算时使用，弱引用无法可靠复制
+	//   HitID                    —— 只用于本地判定归组
+	//   AbilitySourceObject       —— 只在服务器结算时使用，弱引用无法可靠复制
+	//   bHasSourceOriginSnapshot —— 区分调用方快照与父类隐式 TraceStart，仅服务器结算读取
 	// 保持与引擎 EffectContext 相同的网络格式，下面的转发宏才成立。
 
 	return true;
@@ -63,6 +64,22 @@ const IGGYGOAbilitySourceInterface* FGGYGOGameplayEffectContext::GetAbilitySourc
 	return Cast<IGGYGOAbilitySourceInterface>(AbilitySourceObject.Get());
 }
 
+void FGGYGOGameplayEffectContext::SetSourceOriginSnapshot(const FVector& InOrigin)
+{
+	AddOrigin(InOrigin);
+	bHasSourceOriginSnapshot = true;
+}
+
+void FGGYGOGameplayEffectContext::AddHitResult(const FHitResult& InHitResult, bool bReset)
+{
+	if (bReset)
+	{
+		bHasSourceOriginSnapshot = false;
+	}
+
+	FGameplayEffectContext::AddHitResult(InHitResult, bReset);
+}
+
 const UPhysicalMaterial* FGGYGOGameplayEffectContext::GetPhysicalMaterial() const
 {
 	if (const FHitResult* HitResultPtr = GetHitResult())
@@ -70,4 +87,17 @@ const UPhysicalMaterial* FGGYGOGameplayEffectContext::GetPhysicalMaterial() cons
 		return HitResultPtr->PhysMaterial.Get();
 	}
 	return nullptr;
+}
+
+float FGGYGOGameplayEffectContext::GetDistanceFromOriginToHitResult() const
+{
+	if (HasSourceOriginSnapshot())
+	{
+		if (const FHitResult* HitResultPtr = GetHitResult())
+		{
+			return FVector::Dist(GetOrigin(), HitResultPtr->ImpactPoint);
+		}
+	}
+
+	return 0.0f;
 }

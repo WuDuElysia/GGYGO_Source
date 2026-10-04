@@ -44,7 +44,10 @@ protected:
 
 	void SetReplicatedStateTag(FGameplayTag& CurrentTag, FGameplayTag NewTag);
 
-	UPROPERTY(Replicated, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
+	UFUNCTION()
+	void OnRep_BossDefinition();
+
+	UPROPERTY(ReplicatedUsing = OnRep_BossDefinition, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
 	TObjectPtr<const UGGYGOBossDefinition> BossDefinition;
 
 	UPROPERTY(Replicated, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
@@ -53,4 +56,7 @@ protected:
 	UPROPERTY(Replicated, VisibleInstanceOnly, BlueprintReadOnly, Category = "GGYGO|Boss")
 	FGameplayTag CurrentPhaseTag;
 
+private:
+	/** 从初始形态 PawnData 将规则配置应用到 ASC；可由初始化与复制回调重复调用。 */
+	void ApplyAbilitySystemConfiguration();
 };

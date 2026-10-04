@@ -5,13 +5,12 @@
  * 做成独立 DataAsset 而不是内联在角色配置里，理由与 `UGGYGOPawnData` 相同：
  * 移动手感需要能跨角色复用，也需要能给同一角色换一套（受伤状态、水下、载具）。
  *
- * ## 速度来源的优先级
- * 曲线速度（`RootMotion_Speed`，逐帧给出，用于消除脚滑）优先；
- * 动画没有烘焙曲线时回落到 `WalkSpeed` / `RunSpeed`。
+ * ## 配置校验与当前消费边界
+ * ValidateMovementSet 提供统一纯校验：曲线模式要求七份有效 Profile，
+ * 显式固定模式使用 WalkSpeed / RunSpeed，允许 Profile 留空。
  *
- * 保留固定速度作为兜底而不是让角色停住：若"动画没配曲线"表现为角色完全不动，
- * 排查方向会指向输入或移动组件，离真正的原因很远；
- * 表现为"能动但有脚滑"则问题明显且不阻塞其它验证。
+ * 当前 CMC 尚未接入该校验；缺 Profile 后使用固定速度、非法值替换等旧路径
+ * 仍存在，须在后续消费者步骤整改。新增校验不表示运行时已拒绝这些配置。
  */
 #pragma once
 
@@ -21,6 +20,7 @@
 #include "GGYGOMovementSet.generated.h"
 
 class UObject;
+class UGGYGOLocomotionMotionProfile;
 
 UCLASS(BlueprintType, Const, meta = (DisplayName = "GGYGO Movement Set", ShortTooltip = "一个角色的移动参数"))
 class GGYGO_API UGGYGOMovementSet : public UPrimaryDataAsset
@@ -51,6 +51,14 @@ public:
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Gait", meta = (ClampMin = "0.1", ClampMax = "60.0", UIMin = "0.1", UIMax = "60.0", ForceUnits = "s"))
 	float WalkToRunHoldSeconds = 1.5f;
+
+	/** WalkRun BlendSpace 的权重推进速率（1/秒）。0 表示立即吸附；非法值由统一校验拒绝，CMC 接入待后续步骤。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Gait", meta = (DisplayName = "Walk Run Blend Interp Speed", ClampMin = "0.0", ClampMax = "50.0", UIMin = "0.0", UIMax = "50.0"))
+	float WalkRunBlendInterpSpeed = 6.0f;
+
+	/** 起步后在该时间内松手时选择 StartStop。该计时只由 CMC 推进。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Stop", meta = (ClampMin = "0.0", UIMin = "0.0", ForceUnits = "s"))
+	float StartStopSelectionSeconds = 0.3f;
 
 	// ===== 旋转与加减速 =====
 
@@ -84,12 +92,13 @@ public:
 	// ===== 曲线驱动 =====
 
 	/**
-	 * 是否让动画曲线接管速度。
+	 * 是否让 Locomotion Profile 曲线接管速度。
 	 *
 	 * 开启后速度由 `RootMotion_Speed` 曲线逐帧给出，脚步与位移严格对齐（不打滑）。
 	 * 关闭则一直用上面的 `WalkSpeed` / `RunSpeed`。
 	 *
-	 * 动画没有烘焙曲线时会自动回退到固定速度，所以开启它对未处理的动画无害。
+	 * 统一校验要求曲线模式的七份 Profile 齐全；显式关闭时允许留空。
+	 * 当前 CMC 尚未接入校验，缺 Profile 的旧固定速度替代路径仍待删除。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven")
 	bool bUseCurveDrivenSpeed = true;
@@ -98,22 +107,35 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float RootMotionScale = 1.0f;
 
-	/**
-	 * 曲线速度的上界（cm/s），用于非本地控制端的速度校验。
-	 *
-	 * 曲线值是本地动画状态，服务器若没有评估动画就采不到曲线。
-	 * 那种情况下服务器用固定速度会低于客户端的曲线速度，
-	 * 导致位置校正持续触发（角色被反复拉回）。本字段给服务器一个足够宽松的
-	 * 上界，代价是这个上界内客户端的速度不受精确约束。
-	 *
-	 * 必须大于所有动画 `RootMotion_Speed` 的峰值。Pyrios 的实测峰值：
-	 * 走跑类不超过 1000，转身 2412，而攻击类有瞬移式突进，
-	 * `Attack_Normal_Enhance_03` 单帧位移 312cm、峰值 18724 cm/s。
-	 * 默认值按这个量级留了余量。设得过小会拉回角色，过大则放宽了作弊空间 ——
-	 * 但位置本身仍受服务器校验，收益上限有限。
-	 */
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0", ForceUnits = "cm/s"))
+	/** 旧服务器放宽上界，仅保留资产序列化兼容；Profile 权威后不再读取。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Locomotion profiles are evaluated on the server; this bound is no longer used."))
 	float MaxCurveDrivenSpeed = 20000.0f;
+
+	// ===== Locomotion Motion Profiles =====
+	// 这些 Profile 从实际动画 RootMotion_* 曲线迁移。统一校验要求曲线模式七项齐全；
+	// 固定模式允许留空，已填项仍校验。CMC 的旧空值替代路径尚未整改。
+	// 不允许 CMC 回头读取 AnimInstance 作为第二个模拟时钟。
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkStartProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkLoopProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> RunLoopProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> StartStopProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkStopProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> RunStopProfile;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	TObjectPtr<const UGGYGOLocomotionMotionProfile> TurnBackProfile;
 
 	// ===== TurnBack（急停转身）=====
 	// 由 UGGYGOCharacterMovementComponent 的相位机读取。
@@ -169,6 +191,7 @@ public:
 
 	/**
 	 * 转身总时长上限（秒）。超过即强制结束。
+	 * 0 是合法的显式立即截止配置，统一校验不会替换为默认上限。
 	 *
 	 * 这是兜底而非正常出口：正常情况下 `RunOut` 段由松手结束。
 	 * 需要它是因为相位推进依赖曲线，而动画可能被别的状态打断、
@@ -183,9 +206,26 @@ public:
 	 *
 	 * `None` 返回 0，这是有意的：被禁止移动和静止都映射到 `None`，
 	 * 让 `GetMaxSpeed()` 只需查这一张表，不必再写分支。
+	 * 当前实现仍把负速度钳为0；消费者接入统一校验后的移除工作待后续步骤。
 	 */
 	float GetSpeedForGait(EGGYGOGait Gait) const;
 
-	/** 取经过合法性校验的走跑切换阈值。非有限或越界时返回钳制后的安全值。 */
+	/** 旧兼容 getter：非有限或<=0时替换为1.5秒，>60时截为60；不等同 ValidateMovementSet，消费者迁移待后续步骤。 */
 	float GetSanitizedWalkToRunHoldSeconds() const;
+
+	/** 解析非 WalkRun 段使用的 Profile；WalkRun 由 CMC 同时混合 Walk/Run Loop。 */
+	const UGGYGOLocomotionMotionProfile* GetProfileForMotion(EGGYGOLocomotionMotionType MotionType) const;
+
+	/**
+	 * 纯校验非废弃数值与 Profile 引用，不修改配置或持有运行状态。
+	 * 曲线模式要求七份 Profile，Walk/Run Loop 必须循环，其余五份必须非循环；
+	 * 显式固定模式允许空引用，已填 Profile 仍校验。曲线内部规则委托 ValidateProfile。
+	 * 合法零值保持原语义；成功清空旧错误，失败含资产路径、字段与原因。
+	 * 编辑器使用同一规则，当前 CMC 尚未接入，旧 getter/消费者替代行为仍存在。
+	 */
+	bool ValidateMovementSet(FString& OutError) const;
+
+#if WITH_EDITOR
+	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
+#endif
 };

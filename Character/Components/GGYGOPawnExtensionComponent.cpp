@@ -9,6 +9,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
+#include "Character/Interfaces/GGYGOAvatarBindingHostInterface.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
@@ -19,6 +20,85 @@
 
 class FLifetimeProperty;
 class UActorComponent;
+
+struct FGGYGOPawnASCResourceHandle::FLocalResource
+{
+	FLocalResource(UGGYGOPawnExtensionComponent* InExtension,
+		const FGGYGOPawnASCResourceIdentity& InIdentity,
+		const FGGYGOAvatarBindingContext& InInstallationContext)
+		: Extension(InExtension), Identity(InIdentity), InstallationContext(InInstallationContext)
+	{
+	}
+
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
+	const FGGYGOPawnASCResourceIdentity Identity;
+	const FGGYGOAvatarBindingContext InstallationContext;
+	FGGYGOAvatarBindingContext PublishedContext{};
+	bool bInstalled = true;
+	bool bEverReady = false;
+	bool bReleasedNotified = false;
+};
+
+
+namespace
+{
+	FGGYGOAvatarBindingHostResult MakeAvatarHostRequestFailure(
+		EGGYGOAvatarBindingOutcome Outcome, EGGYGOAvatarBindingHostReason Reason)
+	{
+		FGGYGOAvatarBindingHostResult Result;
+		Result.Outcome = Outcome;
+		Result.Reason = Reason;
+		return Result;
+	}
+
+	FGGYGOAvatarBindingHostResult DispatchOriginalAvatarHostRequest(
+		const FGGYGOAvatarBindingHostRequest& Request, bool& bOutHostInvoked)
+	{
+		bOutHostInvoked = false;
+		if (!Request.ExpectedASC.IsValid())
+		{
+			return MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Failed,
+				EGGYGOAvatarBindingHostReason::InvalidASC);
+		}
+		AActor* OriginalHost = Request.ExpectedHost.Get();
+		if (!OriginalHost || OriginalHost->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		{
+			return MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Failed,
+				EGGYGOAvatarBindingHostReason::InvalidHost);
+		}
+		IGGYGOAvatarBindingHostInterface* HostInterface = Cast<IGGYGOAvatarBindingHostInterface>(OriginalHost);
+		if (!HostInterface)
+		{
+			return MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Rejected,
+				EGGYGOAvatarBindingHostReason::UnsupportedHost);
+		}
+		// The Host owns admission and native execution. Ordinary notice callbacks may reenter it.
+		bOutHostInvoked = true;
+		return HostInterface->RequestAvatarBinding(Request);
+	}
+
+	void LogAvatarHostRequestResult(const TCHAR* EntryPoint,
+		const FGGYGOAvatarBindingHostRequest& Request, const FGGYGOAvatarBindingHostResult& Result)
+	{
+		if (Result.Outcome == EGGYGOAvatarBindingOutcome::Succeeded) { return; }
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Character/PawnExtension] %s: Host=%s ASC=%s Pawn=%s Extension=%s Operation=%u Binding=%llu Write=%llu Outcome=%u Reason=%u Steps=%d"),
+			EntryPoint, *GetPathNameSafe(Request.ExpectedHost.Get()), *GetPathNameSafe(Request.ExpectedASC.Get()),
+			*GetPathNameSafe(Request.ExpectedPawn.Get()), *GetPathNameSafe(Request.ExpectedExtension.Get()),
+			static_cast<uint32>(Request.Operation), static_cast<unsigned long long>(Request.ExpectedContext.Binding.Serial),
+			static_cast<unsigned long long>(Request.ExpectedContext.LastActorInfoWrite.Serial),
+			static_cast<uint32>(Result.Outcome), static_cast<uint32>(Result.Reason), Result.Steps.Num());
+	}
+
+	void AppendAvatarHostLocalHistory(FGGYGOAvatarBindingHostResult& History,
+		EGGYGOAvatarBindingHostStep Step, const FGGYGOPawnASCLocalResult& Local)
+	{
+		FGGYGOAvatarBindingHostStepResult ReturnedStep;
+		ReturnedStep.Step = Step;
+		ReturnedStep.LocalResult = Local;
+		History.Steps.Add(MoveTemp(ReturnedStep));
+	}
+}
 
 const FName UGGYGOPawnExtensionComponent::NAME_ActorFeatureName("PawnExtension");
 
@@ -33,7 +113,6 @@ UGGYGOPawnExtensionComponent::UGGYGOPawnExtensionComponent(const FObjectInitiali
 	SetIsReplicatedByDefault(true);
 
 	PawnData = nullptr;
-	AbilitySystemComponent = nullptr;
 }
 
 void UGGYGOPawnExtensionComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -65,6 +144,14 @@ void UGGYGOPawnExtensionComponent::OnRegister()
 
 void UGGYGOPawnExtensionComponent::BeginPlay()
 {
+	// 首次 PreBegin 默认开放；只在真实组件 BeginPlay 入口重开上一生命周期。
+	APawn* Pawn = GetPawn<APawn>();
+	if (!HasBegunPlay() && IsRegistered() && IsValid(this) && !IsBeingDestroyed()
+		&& Pawn && !Pawn->IsActorBeingDestroyed()
+		&& (Pawn->IsActorBeginningPlay() || Pawn->HasActorBegunPlay()))
+	{
+		bLocalAbilitySystemAdmissionClosed = false;
+	}
 	Super::BeginPlay();
 
 	// 监听**所有** feature 的状态变化（第一个参数 NAME_None 表示不筛选 feature，
@@ -79,9 +166,8 @@ void UGGYGOPawnExtensionComponent::BeginPlay()
 
 void UGGYGOPawnExtensionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	// 先解除 ASC 关联（会回收已授予的能力），再注销 feature。
-	// 顺序不能反：注销 feature 后其它组件收不到状态变化，
-	// 它们绑在 OnAbilitySystemUninitialized 上的清理逻辑就没机会跑。
+	// 先关闭新 Install/Ready/回放，再处理原 H；关闭的 Released 只退休义务并返回真实失败。
+	bLocalAbilitySystemAdmissionClosed = true;
 	UninitializeAbilitySystem();
 	UnregisterInitStateFeature();
 
@@ -122,121 +208,160 @@ void UGGYGOPawnExtensionComponent::OnRep_PawnData()
 	CheckDefaultInitialization();
 }
 
-void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemComponent* InASC, AActor* InOwnerActor)
+UGGYGOAbilitySystemComponent* UGGYGOPawnExtensionComponent::GetGGYGOAbilitySystemComponent() const
 {
-	check(InASC);
-	check(InOwnerActor);
-
-	APawn* Pawn = GetPawnChecked<APawn>();
-	if (AbilitySystemComponent == InASC &&
-		InASC->GetOwnerActor() == InOwnerActor &&
-		InASC->GetAvatarActor() == Pawn)
-	{
-		// 只有 ASC、Owner、Avatar 三者都一致才算幂等。
-		// 仅比较 ASC 会掩盖外部宿主已经清空/替换 Avatar 的情况。
-		return;
-	}
-
-	if (AbilitySystemComponent)
-	{
-		// 换 ASC 前先清理旧的，否则旧 ASC 会一直把本 Pawn 当 Avatar。
-		UninitializeAbilitySystem();
-	}
-
-	AActor* ExistingAvatar = InASC->GetAvatarActor();
-
-	UE_LOG(LogGGYGOAbilitySystem, Verbose,
-		TEXT("InitializeAbilitySystem: ASC [%s] → Pawn [%s]，Owner [%s]，原 Avatar [%s]。"),
-		*GetNameSafe(InASC), *GetNameSafe(Pawn), *GetNameSafe(InOwnerActor), *GetNameSafe(ExistingAvatar));
-
-	if ((ExistingAvatar != nullptr) && (ExistingAvatar != Pawn))
-	{
-		// 该 ASC 已经有别的 Avatar。这在客户端延迟时会发生：
-		// 新 Pawn 生成并被附身了，而旧 Pawn 的销毁复制还没到。
-		// 服务器上不该出现这种情况，所以用 ensure 把它标出来。
-		ensure(!ExistingAvatar->HasAuthority());
-
-		if (UGGYGOPawnExtensionComponent* OtherExtensionComponent = FindPawnExtensionComponent(ExistingAvatar))
-		{
-			OtherExtensionComponent->UninitializeAbilitySystem();
-		}
-	}
-
-	AbilitySystemComponent = InASC;
-	AbilitySystemComponent->InitAbilityActorInfo(InOwnerActor, Pawn);
-
-	// PawnData 的配置分发**不在这里做**，见 ApplyPawnDataToConsumers 的说明。
-	// 这里只建立 ASC 与 Avatar 的关系，让订阅方（HealthComponent、CMC）能拿到 ASC。
-	//
-	// 但如果 PawnData 已经就绪（关卡里放置的实例在 PostInitializeComponents 前就有值），
-	// 顺手分发一次没有坏处，而且能覆盖"InitState 因故没走完"的退化情况。
-	ApplyPawnDataToConsumers();
-
-	OnAbilitySystemInitialized.Broadcast();
+	check(IsInGameThread());
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
+	return IsLocalAbilitySystemResourceReady(OriginalResource)
+		? OriginalResource.Resource->Identity.ASC.Get() : nullptr;
 }
 
-void UGGYGOPawnExtensionComponent::UninitializeAbilitySystem()
+void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemComponent* InASC, AActor* InOwnerActor)
 {
-	if (!AbilitySystemComponent)
+	check(IsInGameThread());
+	FGGYGOAvatarBindingHostRequest Request;
+	Request.Operation = EGGYGOAvatarBindingHostOperation::Initialize;
+	Request.ExpectedHost = InOwnerActor;
+	Request.ExpectedASC = InASC;
+	Request.ExpectedPawn = GetPawn<APawn>();
+	Request.ExpectedExtension = this;
+	// 空 H 请求；Context 只取本次原 ASC 值，是否允许 Bootstrap 由 Host/ASC 判定。
+	if (IsValid(InASC))
+	{
+		Request.ExpectedContext = InASC->GetAvatarBindingContext();
+	}
+	FGGYGOAvatarBindingHostResult Result;
+	if (bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		Result = MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Rejected,
+			EGGYGOAvatarBindingHostReason::LifecycleClosed);
+	}
+	else if (!Request.ExpectedPawn.IsValid() || Request.ExpectedPawn->IsActorBeingDestroyed())
+	{
+		Result = MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Rejected,
+			EGGYGOAvatarBindingHostReason::InvalidPawn);
+	}
+	else
+	{
+		bool bHostInvoked;
+		Result = DispatchOriginalAvatarHostRequest(Request, bHostInvoked);
+	}
+	// 只有 Host -> ASC -> 本地 NotifyReady 可以完成绑定。旧栈不补广播或分发退化配置。
+	LogAvatarHostRequestResult(TEXT("InitializeAbilitySystem"), Request, Result);
+}
+
+void UGGYGOPawnExtensionComponent::UninitializeAbilitySystem(UGGYGOAbilitySystemComponent* ExpectedASC)
+{
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
+	if (!OriginalResource.HasResource()) { return; }
+	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
+	if (ExpectedASC && !Identity.ASC.HasSameIndexAndSerialNumber(
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent>(ExpectedASC)))
 	{
 		return;
 	}
-
-	// 只在"本 Pawn 仍是 Avatar"时清理。
-	// 如果 Avatar 已经换成别的 Pawn，说明那个 Pawn 在成为 Avatar 时已经清理过了，
-	// 这里再清一遍会把新 Avatar 的能力误取消。
-	if (AbilitySystemComponent->GetAvatarActor() == GetOwner())
+	FGGYGOAvatarBindingHostRequest Request;
+	Request.Operation = EGGYGOAvatarBindingHostOperation::Release;
+	Request.ExpectedASC = Identity.ASC;
+	Request.ExpectedPawn = Identity.Pawn;
+	Request.ExpectedExtension = OriginalExtension;
+	Request.ExpectedResource = OriginalResource;
+	Request.ExpectedContext = OriginalResource.Resource->PublishedContext.HasIssuedContext()
+		? OriginalResource.Resource->PublishedContext : OriginalResource.Resource->InstallationContext;
+	if (UGGYGOAbilitySystemComponent* OriginalASC = Identity.ASC.Get())
 	{
-		// 这里**不**回收 AbilitySet：能力由队伍位置授予，与位置同生命周期。
-		// 本 Pawn 只是 Avatar，它下场或销毁不该带走位置上的能力 ——
-		// 那正是"待命角色冷却继续走"依赖的前提。
-
-		// 死亡相关能力要能跨过 Avatar 更替继续跑（死亡演出、掉落物结算）。
-		FGameplayTagContainer AbilityTypesToIgnore;
-		AbilityTypesToIgnore.AddTag(GGYGOGameplayTags::Ability_Behavior_SurvivesDeath);
-
-		AbilitySystemComponent->CancelAbilities(nullptr, &AbilityTypesToIgnore);
-		AbilitySystemComponent->ClearAbilityInput();
-		AbilitySystemComponent->RemoveAllGameplayCues();
-
-		if (AbilitySystemComponent->GetOwnerActor() != nullptr)
-		{
-			// Owner 还在，只解除 Avatar 绑定，ASC 本身继续可用
-			// （队伍换角色时队伍级 ASC 走这条路）。
-			AbilitySystemComponent->SetAvatarActor(nullptr);
-		}
-		else
-		{
-			// Owner 都没了，整个 ActorInfo 都得清，只清 Avatar 会留下悬空的 Owner 引用。
-			AbilitySystemComponent->ClearActorInfo();
-		}
-
-		OnAbilitySystemUninitialized.Broadcast();
+		// 固定的组件 Owner 是原 Host；不能用可变 ActorInfo Owner 或当前 Context 猜权限。
+		Request.ExpectedHost = OriginalASC->GetOwner();
 	}
-
-	AbilitySystemComponent = nullptr;
+	bool bHostInvoked;
+	FGGYGOAvatarBindingHostResult Result = DispatchOriginalAvatarHostRequest(Request, bHostInvoked);
+	if (!bHostInvoked)
+	{
+		// 端口未受理时只归还捕获的本地 H，保留端口失败；不执行原生替代或处理后继。
+		if (UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get())
+		{
+			const FGGYGOPawnASCLocalResult Withdrawn =
+				LiveExtension->WithdrawLocalAbilitySystemResources(OriginalResource);
+			AppendAvatarHostLocalHistory(Result, EGGYGOAvatarBindingHostStep::WithdrawLocalResources, Withdrawn);
+			if (Withdrawn.Outcome == EGGYGOPawnASCLocalOutcome::Succeeded)
+			{
+				if (UGGYGOPawnExtensionComponent* OriginalLiveExtension = OriginalExtension.Get())
+				{
+					const FGGYGOPawnASCLocalResult Released =
+						OriginalLiveExtension->NotifyLocalResourcesReleased(OriginalResource);
+					AppendAvatarHostLocalHistory(Result, EGGYGOAvatarBindingHostStep::NotifyLocalReleased, Released);
+				}
+			}
+		}
+	}
+	// 已受理的原生失败归 Host 真实历史；回调接续后此处只诊断，不再写本地槽。
+	LogAvatarHostRequestResult(TEXT("UninitializeAbilitySystem"), Request, Result);
 }
 
 void UGGYGOPawnExtensionComponent::HandleControllerChanged()
 {
-	if (AbilitySystemComponent && (AbilitySystemComponent->GetAvatarActor() == GetPawnChecked<APawn>()))
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
+	FGGYGOAvatarBindingContext ConfigurationContext;
+	if (OriginalResource.HasResource())
 	{
-		ensure(AbilitySystemComponent->AbilityActorInfo->OwnerActor == AbilitySystemComponent->GetOwnerActor());
-
-		if (AbilitySystemComponent->GetOwnerActor() == nullptr)
+		const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
+		FGGYGOAvatarBindingHostRequest Request;
+		Request.Operation = EGGYGOAvatarBindingHostOperation::Refresh;
+		Request.ExpectedASC = Identity.ASC;
+		Request.ExpectedPawn = Identity.Pawn;
+		Request.ExpectedExtension = OriginalExtension;
+		Request.ExpectedResource = OriginalResource;
+		Request.ExpectedContext = OriginalResource.Resource->PublishedContext;
+		if (UGGYGOAbilitySystemComponent* OriginalASC = Identity.ASC.Get())
 		{
-			// Owner 没了（PlayerState 级 ASC 场景下玩家离开），整体反初始化。
-			UninitializeAbilitySystem();
+			Request.ExpectedHost = OriginalASC->GetOwner();
+		}
+		FGGYGOAvatarBindingHostResult Result;
+		if (!IsLocalAbilitySystemResourceReady(OriginalResource))
+		{
+			Result = MakeAvatarHostRequestFailure(EGGYGOAvatarBindingOutcome::Rejected,
+				EGGYGOAvatarBindingHostReason::ReadyNotEstablished);
 		}
 		else
 		{
-			// ActorInfo 里缓存了 Controller、AnimInstance、MovementComponent 等，
-			// Controller 换了必须刷新，否则能力里拿到的还是旧 Controller。
-			AbilitySystemComponent->RefreshAbilityActorInfo();
+			bool bHostInvoked;
+			Result = DispatchOriginalAvatarHostRequest(Request, bHostInvoked);
+		}
+		LogAvatarHostRequestResult(TEXT("HandleControllerChanged"), Request, Result);
+		if (Result.Outcome != EGGYGOAvatarBindingOutcome::Succeeded) { return; }
+		for (const FGGYGOAvatarBindingHostStepResult& Step : Result.Steps)
+		{
+			if (Step.Step == EGGYGOAvatarBindingHostStep::ActorInfoRefresh && Step.ASCResult.IsSet()
+				&& Step.ASCResult.GetValue().bCommitted)
+			{
+				ConfigurationContext = Step.ASCResult.GetValue().CommittedContext;
+			}
+		}
+		if (!ConfigurationContext.HasIssuedContext())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Warning,
+				TEXT("[Character/PawnExtension] Refresh returned no committed Context: Host=%s ASC=%s Extension=%s."),
+				*GetPathNameSafe(Request.ExpectedHost.Get()), *GetPathNameSafe(Request.ExpectedASC.Get()),
+				*GetPathNameSafe(OriginalExtension.Get()));
+			return;
 		}
 	}
-
-	CheckDefaultInitialization();
+	UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+	if (!LiveExtension || LiveExtension->bLocalAbilitySystemAdmissionClosed
+		|| LiveExtension->IsBeingDestroyed() || LiveExtension->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| (OriginalResource.HasResource()
+			&& (!LiveExtension->IsLocalAbilitySystemResourceReady(OriginalResource)
+				|| !OriginalResource.Resource->PublishedContext.HasSameContext(ConfigurationContext))))
+	{
+		return;
+	}
+	// 只推进本次真实 Refresh 后仍匹配的原 H/Context；后续写入或装配接续会停止旧尾部。
+	LiveExtension->CheckDefaultInitialization();
 }
 
 void UGGYGOPawnExtensionComponent::HandlePlayerStateReplicated()
@@ -354,8 +479,8 @@ void UGGYGOPawnExtensionComponent::HandleChangeInitState(UGameFrameworkComponent
 	{
 		// 配置分发放在这一步，而不是 InitializeAbilitySystem 里。
 		//
-		// 原因是时序：InitializeAbilitySystem 由 Pawn 在 PostInitializeComponents 调用，
-		// 那时 PawnData 可能还没设置（运行时生成的角色是先 SpawnActor 再 SetPawnData）。
+		// 原因是时序：Host 绑定与 PawnData 到达相互独立，
+		// 运行时生成的角色可能先 SpawnActor 再 SetPawnData。
 		// 而 DataInitialized 的前置条件里包含 DataAvailable，后者要求 PawnData 非空，
 		// 所以走到这里 PawnData 一定有值。
 		ApplyPawnDataToConsumers();
@@ -377,22 +502,457 @@ void UGGYGOPawnExtensionComponent::OnActorInitStateChanged(const FActorInitState
 
 void UGGYGOPawnExtensionComponent::OnAbilitySystemInitialized_RegisterAndCall(FSimpleMulticastDelegate::FDelegate Delegate)
 {
+	check(IsInGameThread());
+	if (!Delegate.IsBound() || bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Character/PawnExtension] Initialized registration rejected: Extension=%s, unbound delegate or closed lifecycle."),
+			*GetPathNameSafe(this));
+		return;
+	}
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
 	if (!OnAbilitySystemInitialized.IsBoundToObject(Delegate.GetUObject()))
 	{
 		OnAbilitySystemInitialized.Add(Delegate);
 	}
-
-	// 补发已经发生的那次广播。见头文件里对时序竞态的说明。
-	if (AbilitySystemComponent)
+	if (IsLocalAbilitySystemResourceReady(OriginalResource))
 	{
+		const FGGYGOAvatarBindingContext OriginalContext = OriginalResource.Resource->PublishedContext;
 		Delegate.Execute();
+		UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+		if (!LiveExtension || !LiveExtension->IsLocalAbilitySystemResourceReady(OriginalResource)
+			|| !OriginalResource.Resource->PublishedContext.HasSameContext(OriginalContext))
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Verbose,
+				TEXT("[Character/PawnExtension] Initialized replay invalidated: Extension=%s Binding=%llu Write=%llu."),
+				*GetPathNameSafe(OriginalExtension.Get()),
+				static_cast<unsigned long long>(OriginalContext.Binding.Serial),
+				static_cast<unsigned long long>(OriginalContext.LastActorInfoWrite.Serial));
+		}
 	}
 }
 
 void UGGYGOPawnExtensionComponent::OnAbilitySystemUninitialized_Register(FSimpleMulticastDelegate::FDelegate Delegate)
 {
+	check(IsInGameThread());
+	if (!Delegate.IsBound() || bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Character/PawnExtension] Uninitialized registration rejected: Extension=%s, unbound delegate or closed lifecycle."),
+			*GetPathNameSafe(this));
+		return;
+	}
 	if (!OnAbilitySystemUninitialized.IsBoundToObject(Delegate.GetUObject()))
 	{
 		OnAbilitySystemUninitialized.Add(Delegate);
 	}
 }
+
+// K4-Character-L1 local resource implementation begin.
+namespace
+{
+	FGGYGOPawnASCLocalResult MakePawnASCLocalResourceResult(
+		const TWeakObjectPtr<UGGYGOPawnExtensionComponent>& Extension,
+		const FGGYGOPawnASCResourceHandle& OriginalResource,
+		EGGYGOPawnASCLocalOutcome Outcome, EGGYGOPawnASCLocalReason Reason,
+		bool bLocalChanged = false)
+	{
+		FGGYGOPawnASCLocalResult Result;
+		Result.Outcome = Outcome;
+		Result.Reason = Reason;
+		Result.Resource = OriginalResource;
+		Result.bLocalChanged = bLocalChanged;
+		if (Outcome != EGGYGOPawnASCLocalOutcome::Succeeded)
+		{
+			const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
+			UE_LOG(LogGGYGOAbilitySystem, Verbose,
+				TEXT("[Character/PawnExtension] LocalResources Extension=%s ASC=%s Pawn=%s Binding=%llu Outcome=%u Reason=%u"),
+				*GetNameSafe(Extension.Get()), *GetNameSafe(Identity.ASC.Get()), *GetNameSafe(Identity.Pawn.Get()),
+				static_cast<unsigned long long>(Identity.Binding.Serial),
+				static_cast<uint32>(Outcome), static_cast<uint32>(Reason));
+		}
+		return Result;
+	}
+}
+
+bool FGGYGOPawnASCResourceIdentity::HasSameIdentity(const FGGYGOPawnASCResourceIdentity& Other) const
+{
+	return Binding.HasSameIdentity(Other.Binding)
+		&& ASC.HasSameIndexAndSerialNumber(Other.ASC)
+		&& Pawn.HasSameIndexAndSerialNumber(Other.Pawn);
+}
+
+bool FGGYGOPawnASCResourceHandle::HasResource() const
+{
+	return Resource.IsValid();
+}
+
+bool FGGYGOPawnASCResourceHandle::HasSameResource(const FGGYGOPawnASCResourceHandle& Other) const
+{
+	return Resource.IsValid() && Other.Resource.IsValid() && Resource == Other.Resource;
+}
+
+FGGYGOPawnASCResourceIdentity FGGYGOPawnASCResourceHandle::GetIdentity() const
+{
+	return Resource.IsValid() ? Resource->Identity : FGGYGOPawnASCResourceIdentity{};
+}
+
+bool UGGYGOPawnExtensionComponent::OwnsLocalAbilitySystemResource(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource) const
+{
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Self(
+		const_cast<UGGYGOPawnExtensionComponent*>(this));
+	return ExpectedResource.HasResource()
+		&& ExpectedResource.Resource->Extension.HasSameIndexAndSerialNumber(Self);
+}
+
+FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::InstallLocalAbilitySystemResources(
+	UGGYGOAbilitySystemComponent* ExpectedASC, APawn* ExpectedPawn,
+	const FGGYGOAvatarBindingContext& CommittedContext)
+{
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle Empty;
+	const auto Reject = [&](EGGYGOPawnASCLocalReason Reason)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Verbose,
+			TEXT("[Character/PawnExtension] Install rejected: Extension=%s ExpectedASC=%s ExpectedPawn=%s Binding=%llu Reason=%u"),
+			*GetNameSafe(OriginalExtension.Get()), *GetNameSafe(ExpectedASC), *GetNameSafe(ExpectedPawn),
+			static_cast<unsigned long long>(CommittedContext.Binding.Serial), static_cast<uint32>(Reason));
+		return MakePawnASCLocalResourceResult(OriginalExtension, Empty, EGGYGOPawnASCLocalOutcome::Rejected, Reason);
+	};
+	if (bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::LifecycleClosed);
+	}
+	if (!IsValid(ExpectedASC) || ExpectedASC->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::InvalidASC);
+	}
+	if (!IsValid(ExpectedPawn) || ExpectedPawn->IsActorBeingDestroyed())
+	{
+		return Reject(EGGYGOPawnASCLocalReason::InvalidPawn);
+	}
+	if (GetPawn<APawn>() != ExpectedPawn)
+	{
+		return Reject(EGGYGOPawnASCLocalReason::WrongExtension);
+	}
+	if (!CommittedContext.HasIssuedContext())
+	{
+		return Reject(EGGYGOPawnASCLocalReason::InvalidBinding);
+	}
+	EGGYGOAvatarBindingReason ASCReason;
+	if (ExpectedASC->CheckAvatarBindingContext(CommittedContext, ASCReason) != EGGYGOAvatarBindingOutcome::Succeeded
+		|| ExpectedASC->GetAvatarActor() != ExpectedPawn)
+	{
+		return Reject(EGGYGOPawnASCLocalReason::ContextMismatch);
+	}
+	FGGYGOPawnASCResourceIdentity Identity;
+	Identity.ASC = ExpectedASC;
+	Identity.Pawn = ExpectedPawn;
+	Identity.Binding = CommittedContext.Binding;
+	const FGGYGOPawnASCResourceHandle Existing = LocalAbilitySystemResource;
+	if (Existing.HasResource())
+	{
+		if (!OwnsLocalAbilitySystemResource(Existing) || !Existing.Resource->bInstalled
+			|| !Existing.Resource->Identity.HasSameIdentity(Identity))
+		{
+			return Reject(EGGYGOPawnASCLocalReason::ResourceConflict);
+		}
+		return MakePawnASCLocalResourceResult(OriginalExtension, Existing,
+			EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None);
+	}
+	FGGYGOPawnASCResourceHandle Installed;
+	Installed.Resource = MakeShared<FGGYGOPawnASCResourceHandle::FLocalResource>(this, Identity, CommittedContext);
+	// No external calls, PawnData distribution or legacy cache writes in this installation.
+	LocalAbilitySystemResource = Installed;
+	return MakePawnASCLocalResourceResult(OriginalExtension, Installed,
+		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);
+}
+
+FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::WithdrawLocalAbilitySystemResources(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource)
+{
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = ExpectedResource;
+	if (!OriginalResource.HasResource())
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Rejected, EGGYGOPawnASCLocalReason::InvalidArguments);
+	}
+	if (!OwnsLocalAbilitySystemResource(OriginalResource))
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Rejected, EGGYGOPawnASCLocalReason::WrongExtension);
+	}
+	if (!OriginalResource.Resource->bInstalled)
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None);
+	}
+	if (!LocalAbilitySystemResource.HasSameResource(OriginalResource))
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::ResourceConflict);
+	}
+	// Detach before any future callbacks. Expired ASC/Pawn identities are not dereferenced.
+	LocalAbilitySystemResource = FGGYGOPawnASCResourceHandle{};
+	OriginalResource.Resource->bInstalled = false;
+	return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);
+}
+
+bool UGGYGOPawnExtensionComponent::IsLocalAbilitySystemResourceInstalled(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource) const
+{
+	check(IsInGameThread());
+	if (!IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| !OwnsLocalAbilitySystemResource(ExpectedResource)
+		|| !LocalAbilitySystemResource.HasSameResource(ExpectedResource)
+		|| !ExpectedResource.Resource->bInstalled)
+	{
+		return false;
+	}
+	const FGGYGOPawnASCResourceIdentity& Identity = ExpectedResource.Resource->Identity;
+	UGGYGOAbilitySystemComponent* OriginalASC = Identity.ASC.Get();
+	APawn* OriginalPawn = Identity.Pawn.Get();
+	EGGYGOAvatarBindingReason ASCReason;
+	return OriginalASC && OriginalPawn && !OriginalPawn->IsActorBeingDestroyed()
+		&& GetPawn<APawn>() == OriginalPawn
+		&& OriginalASC->CheckAvatarBindingIdentity(Identity.Binding, ASCReason) == EGGYGOAvatarBindingOutcome::Succeeded
+		&& OriginalASC->GetAvatarActor() == OriginalPawn;
+}
+
+bool UGGYGOPawnExtensionComponent::IsLocalAbilitySystemResourceReady(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource) const
+{
+	check(IsInGameThread());
+	if (bLocalAbilitySystemAdmissionClosed || IsBeingDestroyed()
+		|| !IsLocalAbilitySystemResourceInstalled(ExpectedResource) || !ExpectedResource.Resource->bEverReady)
+	{
+		return false;
+	}
+	UGGYGOAbilitySystemComponent* OriginalASC = ExpectedResource.Resource->Identity.ASC.Get();
+	return OriginalASC
+		&& ExpectedResource.Resource->Identity.Binding.HasSameIdentity(ExpectedResource.Resource->PublishedContext.Binding)
+		&& OriginalASC->IsAvatarBindingPublicationContextCurrent(ExpectedResource.Resource->PublishedContext);
+}
+
+FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::NotifyLocalResourcesReleased(
+	const FGGYGOPawnASCResourceHandle& ReleasedResource)
+{
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = ReleasedResource;
+	if (!OriginalResource.HasResource() || !OwnsLocalAbilitySystemResource(OriginalResource))
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Rejected, OriginalResource.HasResource()
+				? EGGYGOPawnASCLocalReason::WrongExtension : EGGYGOPawnASCLocalReason::InvalidArguments);
+	}
+	if (OriginalResource.Resource->bInstalled)
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Rejected, EGGYGOPawnASCLocalReason::ResourceNotWithdrawn);
+	}
+	if (bLocalAbilitySystemAdmissionClosed || !OriginalExtension.IsValid() || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		// Retire only this local notification obligation; a closed Extension cannot call observers.
+		const bool bChanged = !OriginalResource.Resource->bReleasedNotified;
+		OriginalResource.Resource->bReleasedNotified = true;
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Failed, EGGYGOPawnASCLocalReason::LifecycleClosed, bChanged);
+	}
+	if (OriginalResource.Resource->bReleasedNotified)
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None);
+	}
+	const FGGYGOPawnASCResourceIdentity OriginalIdentity = OriginalResource.GetIdentity();
+	const auto RecheckReleased = [&]()
+	{
+		UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+		return LiveExtension && !LiveExtension->bLocalAbilitySystemAdmissionClosed
+			&& !LiveExtension->IsBeingDestroyed() && !LiveExtension->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& LiveExtension->OwnsLocalAbilitySystemResource(OriginalResource)
+			&& OriginalResource.Resource->Identity.HasSameIdentity(OriginalIdentity)
+			&& !OriginalResource.Resource->bInstalled && OriginalResource.Resource->bReleasedNotified;
+	};
+	OriginalResource.Resource->bReleasedNotified = true;
+	FGGYGOPawnASCLocalNotice Notice;
+	Notice.Kind = EGGYGOPawnASCLocalNoticeKind::Released;
+	Notice.Resource = OriginalResource;
+	LocalAbilitySystemNotice.Broadcast(Notice);
+	if (!RecheckReleased())
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
+	}
+	UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+	if (LiveExtension->LocalAbilitySystemResource.HasResource())
+	{
+		// Identity consumers may finish old cleanup; a no-argument observer cannot identify a successor.
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
+	}
+	LiveExtension->OnAbilitySystemUninitialized.Broadcast();
+	if (!RecheckReleased() || OriginalExtension.Get()->LocalAbilitySystemResource.HasResource())
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
+	}
+	return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);
+}
+
+FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::NotifyLocalResourcesReady(
+	const FGGYGOPawnASCResourceHandle& ExpectedResource,
+	const FGGYGOAvatarBindingPublicationReceipt& Publication)
+{
+	check(IsInGameThread());
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = ExpectedResource;
+	const FGGYGOAvatarBindingPublicationReceipt OwnPublication = Publication;
+	const auto Reject = [&](EGGYGOPawnASCLocalReason Reason)
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource, EGGYGOPawnASCLocalOutcome::Rejected, Reason);
+	};
+	if (bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::LifecycleClosed);
+	}
+	if (!OriginalResource.HasResource()) { return Reject(EGGYGOPawnASCLocalReason::InvalidArguments); }
+	if (!OwnsLocalAbilitySystemResource(OriginalResource)) { return Reject(EGGYGOPawnASCLocalReason::WrongExtension); }
+	if (!OriginalResource.Resource->bInstalled || !LocalAbilitySystemResource.HasSameResource(OriginalResource))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::ResourceNotInstalled);
+	}
+	UGGYGOAbilitySystemComponent* OriginalASC = OriginalResource.Resource->Identity.ASC.Get();
+	if (!OriginalASC) { return Reject(EGGYGOPawnASCLocalReason::InvalidASC); }
+	// This authentication MUST precede reading history, including duplicate and Refresh paths.
+	if (!OriginalASC->IsAvatarBindingNoticeDispatching(OwnPublication))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::PublicationNotDispatching);
+	}
+	FGGYGOAvatarBindingResult History;
+	FGGYGOAvatarBindingNotice BindingNotice;
+	if (!OwnPublication.TryGetCommittedEvidence(History, BindingNotice))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::InvalidPublication);
+	}
+	const bool bInitialized = BindingNotice.Kind == EGGYGOAvatarBindingNoticeKind::Initialized;
+	const bool bRefreshed = BindingNotice.Kind == EGGYGOAvatarBindingNoticeKind::Refreshed;
+	const FGGYGOPawnASCResourceIdentity& Identity = OriginalResource.Resource->Identity;
+	APawn* OriginalPawn = Identity.Pawn.Get();
+	const TWeakObjectPtr<AActor> OriginalAvatar(OriginalPawn);
+	if ((!bInitialized && !bRefreshed) || !History.bCommitted
+		|| !History.CommittedContext.HasSameContext(BindingNotice.After)
+		|| !Identity.Binding.HasSameIdentity(BindingNotice.After.Binding)
+		|| !OriginalAvatar.HasSameIndexAndSerialNumber(BindingNotice.AvatarActor)
+		|| !OriginalPawn || OriginalPawn->IsActorBeingDestroyed() || GetPawn<APawn>() != OriginalPawn)
+	{
+		return Reject(EGGYGOPawnASCLocalReason::InvalidPublication);
+	}
+	if (bInitialized && !OriginalResource.Resource->InstallationContext.HasSameContext(BindingNotice.After))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::ContextMismatch);
+	}
+	if (bRefreshed && (!OriginalResource.Resource->bEverReady
+		|| !Identity.Binding.HasSameIdentity(BindingNotice.Before.Binding)))
+	{
+		return Reject(EGGYGOPawnASCLocalReason::ReadyNotEstablished);
+	}
+	if (OriginalResource.Resource->bEverReady
+		&& OriginalResource.Resource->PublishedContext.HasSameContext(BindingNotice.After))
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None);
+	}
+	const auto RecheckReady = [&]()
+	{
+		UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+		UGGYGOAbilitySystemComponent* LiveASC = Identity.ASC.Get();
+		return LiveExtension && LiveASC && LiveExtension->IsLocalAbilitySystemResourceReady(OriginalResource)
+			&& OriginalResource.Resource->PublishedContext.HasSameContext(BindingNotice.After)
+			&& LiveASC->IsAvatarBindingNoticeDispatching(OwnPublication);
+	};
+	// Mark this exact publication before external callbacks; reentrant delivery is idempotent.
+	OriginalResource.Resource->bEverReady = true;
+	OriginalResource.Resource->PublishedContext = BindingNotice.After;
+	FGGYGOPawnASCLocalNotice Notice;
+	Notice.Kind = bInitialized ? EGGYGOPawnASCLocalNoticeKind::Ready : EGGYGOPawnASCLocalNoticeKind::Refreshed;
+	Notice.Resource = OriginalResource;
+	Notice.PublishedContext = BindingNotice.After;
+	LocalAbilitySystemNotice.Broadcast(Notice);
+	if (!RecheckReady())
+	{
+		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
+	}
+	if (bInitialized)
+	{
+		OriginalExtension.Get()->OnAbilitySystemInitialized.Broadcast();
+		if (!RecheckReady())
+		{
+			return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+				EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
+		}
+	}
+	return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);
+}
+
+FDelegateHandle UGGYGOPawnExtensionComponent::RegisterLocalAbilitySystemNoticeAndCall(
+	FGGYGOPawnASCLocalNoticeDelegate::FDelegate Delegate)
+{
+	check(IsInGameThread());
+	if (!Delegate.IsBound() || bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
+		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Verbose,
+			TEXT("[Character/PawnExtension] Local notice registration rejected: Extension=%s, unbound delegate or closed lifecycle."),
+			*GetNameSafe(this));
+		return FDelegateHandle{};
+	}
+	const FDelegateHandle Handle = LocalAbilitySystemNotice.Add(Delegate);
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
+	if (IsLocalAbilitySystemResourceReady(OriginalResource))
+	{
+		FGGYGOPawnASCLocalNotice Notice;
+		Notice.Kind = EGGYGOPawnASCLocalNoticeKind::Ready;
+		Notice.Resource = OriginalResource;
+		Notice.PublishedContext = OriginalResource.Resource->PublishedContext;
+		Delegate.Execute(Notice);
+		UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+		if (!LiveExtension || !LiveExtension->IsLocalAbilitySystemResourceReady(OriginalResource)
+			|| !OriginalResource.Resource->PublishedContext.HasSameContext(Notice.PublishedContext))
+		{
+			// The returned handle is registration history, never proof that this replay remains Ready.
+			MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
+				EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated);
+		}
+	}
+	return Handle;
+}
+
+void UGGYGOPawnExtensionComponent::UnregisterLocalAbilitySystemNotice(FDelegateHandle Handle)
+{
+	check(IsInGameThread());
+	LocalAbilitySystemNotice.Remove(Handle);
+}
+
+FGGYGOPawnASCResourceHandle UGGYGOPawnExtensionComponent::GetCurrentLocalAbilitySystemResource() const
+{
+	check(IsInGameThread());
+	return LocalAbilitySystemResource;
+}
+
+// K4-Character-L1 local resource implementation end.

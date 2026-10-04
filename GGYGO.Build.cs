@@ -33,6 +33,11 @@ public class GGYGO : ModuleRules
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			"Json",
+			// Native输入测试夹具直接使用Slate窗口/控件，须显式声明所属模块链接依赖。
+			"Slate",
+			"SlateCore",
+			// GameFeature 依赖分类：IPluginManager / IPlugin 的公开接口来自 Projects。
+			"Projects",
 			// 解耦的 Gameplay 消息广播；模块来自 Plugins/GameplayMessageRouter。
 			"GameplayMessageRuntime",
 		});
@@ -48,6 +53,8 @@ public class GGYGO : ModuleRules
 		if (Target.bBuildEditor)
 		{
 			PrivateDependencyModuleNames.Add("AutomationController");
+			// 原生首按测试的自有PIE作用域；调用按WITH_EDITOR保护。
+			PrivateDependencyModuleNames.Add("UnrealEd");
 		}
 
 		// Iris 网络序列化支持。
@@ -58,8 +65,6 @@ public class GGYGO : ModuleRules
 		SetupIrisSupport(Target);
 
 
-		// Uncomment if you are using Slate UI
-		// PrivateDependencyModuleNames.AddRange(new string[] { "Slate", "SlateCore" });
 		
 		// Uncomment if you are using online features
 		// PrivateDependencyModuleNames.Add("OnlineSubsystem");
