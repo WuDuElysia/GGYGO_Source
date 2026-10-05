@@ -20,6 +20,7 @@
 #include "GameFramework/GameplayMessageSubsystem.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GameplayAbilitySpec.h"
 #include "Physics/GGYGOPhysicalMaterialWithTags.h"
 #include "System/GGYGOGameplayTags.h"
 
@@ -121,6 +122,7 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
 	Proof->ActorInfoAffectedAnimInstanceTag = Snapshot.ActorInfoAffectedAnimInstanceTag;
 	Proof->ASCAffectedAnimInstanceTag = Snapshot.ASCAffectedAnimInstanceTag;
 	CurrentControlledActivation.Proof = Proof;
+	NativeCleanupActivation = CurrentControlledActivation;
 	OutReason = EGGYGOAbilityActivationRequestReason::None;
 	return CurrentControlledActivation;
 }
@@ -192,6 +194,11 @@ void UGGYGOGameplayAbility::RetireControlledActivation()
 
 void UGGYGOGameplayAbility::RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle)
 {
+	if (!IsActive() && NativeCleanupActivation.Proof.IsValid()
+		&& NativeCleanupActivation.Proof->SpecHandle == Handle)
+	{
+		NativeCleanupActivation = {};
+	}
 	// A qualified/uncontrolled End cannot authenticate history: retire provenance, never infer completion.
 	if (!ControlledActivationEndScope)
 	{
@@ -209,7 +216,9 @@ void UGGYGOGameplayAbility::RetireControlledActivationForNativeEnd(FGameplayAbil
 UGGYGOGameplayAbility::FScopedControlledActivationEnd::FScopedControlledActivationEnd(
 	UGGYGOGameplayAbility* InAbility, bool bInOwnsDispatch)
 	: Ability(InAbility), Previous(InAbility->ControlledActivationEndScope),
-	  Original(InAbility->CurrentControlledActivation), Termination(InAbility->OriginalTermination),
+	  Original(InAbility->OriginalTermination.IsValid() && InAbility->OriginalTermination->bHasNativeCleanupSource
+		? InAbility->OriginalTermination->Context.GetOriginalActivation() : InAbility->CurrentControlledActivation),
+	  Termination(InAbility->OriginalTermination),
 	  bOwnsDispatch(bInOwnsDispatch)
 {
 	check(IsInGameThread());
@@ -299,7 +308,7 @@ FGGYGOAbilityTerminationResult UGGYGOGameplayAbility::GetOriginalTerminationResu
 
 TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbility::BeginOriginalTermination(
 	const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-	bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult, bool bAllowNativeRemoval)
+	bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult)
 {
 	check(IsInGameThread());
 	using EReason = EGGYGOAbilityTerminationReason;
@@ -323,8 +332,7 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	}
 	if (!IsValid(this) || !IsInstantiated()) { OutResult.Reason = EReason::InvalidAbility; return {}; }
 	if (!IsActive()) { OutResult.Outcome = EOutcome::Stale; OutResult.Reason = EReason::NotActive; return {}; }
-	const FGGYGOAbilityActivationHandle Current = bAllowNativeRemoval
-		? ValidateCurrentControlledActivation(true, false) : CaptureCurrentActivation();
+	const FGGYGOAbilityActivationHandle Current = CaptureCurrentActivation();
 	if (!Current.HasSameActivation(Original))
 	{
 		OutResult.Outcome = EOutcome::Stale;
@@ -335,7 +343,7 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Original.Proof->Allocation.Pin();
 	if (!IsValid(ASC)) { OutResult.Reason = EReason::InvalidASC; return {}; }
 	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Original.Proof->SpecHandle);
-	if ((!Spec || Spec->PendingRemove) && !bAllowNativeRemoval) { OutResult.Reason = EReason::InvalidAbility; return {}; }
+	if (!Spec || Spec->PendingRemove) { OutResult.Reason = EReason::InvalidAbility; return {}; }
 	if (!ActorInfo.IsValid() || !IsEndAbilityValid(Original.Proof->SpecHandle, ActorInfo.Get()))
 	{
 		// PreActivate's witness precedes native ActiveCount++; it is not yet endable.
@@ -374,13 +382,24 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	Proof->Serial = ++LastOriginalTerminationSerial;
 	Proof->Activation = Original;
 	Context.OriginalTermination.Proof = Proof;
+	const TSharedPtr<FOriginalTerminationRecord> Record = InstallOriginalTerminationRecord(
+		Context, ASC, ActorInfo, Original.Proof->SpecHandle, CurrentActivationInfo);
+	OutResult = GetOriginalTerminationResult(*Record);
+	return Record;
+}
+
+TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbility::InstallOriginalTerminationRecord(
+	const FGGYGOAbilityTerminationContext& Context, UGGYGOAbilitySystemComponent* ASC,
+	const TSharedPtr<const FGameplayAbilityActorInfo>& ActorInfo,
+	FGameplayAbilitySpecHandle Handle, FGameplayAbilityActivationInfo ActivationInfo)
+{
 	TSharedPtr<FOriginalTerminationRecord> Record = MakeShared<FOriginalTerminationRecord>();
 	Record->Context = Context;
 	Record->Ability = this;
 	Record->ASC = ASC;
 	Record->ActorInfo = ActorInfo;
-	Record->SpecHandle = Original.Proof->SpecHandle;
-	Record->ActivationInfo = CurrentActivationInfo;
+	Record->SpecHandle = Handle;
+	Record->ActivationInfo = ActivationInfo;
 	Record->CameraOffsetComponent = AppliedCameraOffsetComponent;
 	Record->CameraOffsetHandle = AppliedCameraOffsetHandle;
 	Record->CameraModeHero = AppliedCameraModeHeroComponent;
@@ -389,14 +408,149 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	OriginalTermination = Record; // Install before any native cancellation/cleanup callback.
 	for (FScopedAbilityActivationCall* Call = AbilityActivationCall; Call; Call = Call->Previous)
 	{
-		if (!Call->Original.HasSameActivation(Original)) { continue; }
+		if (!Call->Original.HasSameActivation(Context.GetOriginalActivation())) { continue; }
 		check(!Call->Termination.IsValid());
 		Call->Termination = Record;
 		++Record->OpenDispatches;
 	}
 	ASC->RegisterOriginalTerminationTryDependencies(Record);
-	OutResult = GetOriginalTerminationResult(*Record);
 	return Record;
+}
+
+bool UGGYGOGameplayAbility::HandleNativeAbilityCleanup(EGGYGOAbilityTerminationRequestKind Kind,
+	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+	FGameplayAbilityActivationInfo ActivationInfo, bool bReplicate, bool bWasCancelled)
+{
+	check(IsInGameThread());
+	UGGYGOAbilitySystemComponent* ASC = ActorInfo
+		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()) : nullptr;
+	if (!ASC || !ASC->NativeAbilityCleanupScope) { return false; }
+	if (!IsActive()) { return true; } // Native task/delegate reentry after End is cleanup-only and idempotent.
+	FGGYGOAbilityActivationHandle Original;
+	if (!ASC->GetNativeAbilityCleanupSource(this, Handle, ActorInfo, ActivationInfo, Original))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] rejected: instance, allocation, activation key or original resource lease changed."),
+			*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+		return true;
+	}
+	if (Original.HasActivation() && (Original.Proof->Ability.Get() != this || Original.Proof->ASC.Get() != ASC
+		|| Original.Proof->SpecHandle != Handle || Original.Proof->Allocation.Pin().Get() != ActorInfo
+		|| Original.Proof->ActivationKey != ActivationInfo.GetActivationPredictionKey()))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] rejected: captured resource lease belongs to another native source."),
+			*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+		return true;
+	}
+	if (Kind == EGGYGOAbilityTerminationRequestKind::Cancel && !CanBeCanceled()) { return true; }
+	if (ScopeLockCount > 0)
+	{
+		// A removed locked instance has no supported native return obligation. Do not
+		// queue an unauthenticated later call after this synchronous source expires.
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] rejected: ability scope is locked."),
+			*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+		return true;
+	}
+
+	TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
+	if (Record.IsValid())
+	{
+		const bool bSameOriginal = Original.HasActivation()
+			? Record->Context.GetOriginalActivation().HasSameActivation(Original)
+			: !Record->Context.GetOriginalActivation().HasActivation();
+		if (Record->bSealed || Record->ASC.Get() != ASC || Record->SpecHandle != Handle
+			|| Record->ActorInfo.Pin().Get() != ActorInfo || !bSameOriginal
+			|| Record->ActivationInfo.GetActivationPredictionKey() != ActivationInfo.GetActivationPredictionKey())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] rejected: another original termination owns the resources."),
+				*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+			return true;
+		}
+	}
+	else
+	{
+		FGGYGOAbilityTerminationContext Context;
+		Context.OriginalActivation = Original;
+		Context.RequestKind = Kind;
+		Context.bReplicateEndAbility = Kind == EGGYGOAbilityTerminationRequestKind::End && bReplicate;
+		Context.bReplicateCancelAbility = Kind == EGGYGOAbilityTerminationRequestKind::Cancel && bReplicate;
+		Context.bWasCancelled = Kind == EGGYGOAbilityTerminationRequestKind::Cancel || bWasCancelled;
+		Context.OriginalMontageCapture = ASC->CaptureMontagePlaybackOwnership(this, Handle, ActivationInfo);
+		// Private record identity only: native teardown does not issue an accepted
+		// business request serial and can never produce its Completed notice.
+		TSharedRef<FGGYGOAbilityTerminationHandle::FTerminationProof> Proof =
+			MakeShared<FGGYGOAbilityTerminationHandle::FTerminationProof>();
+		Proof->Ability = this;
+		Proof->Activation = Original;
+		Context.OriginalTermination.Proof = Proof;
+		Record = InstallOriginalTerminationRecord(Context, ASC, ASC->AbilityActorInfo, Handle, ActivationInfo);
+		if (!Original.HasActivation())
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] has no controlled resource lease; only exact native GAS resources can retire."),
+				*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+		}
+		const EGGYGOAbilityMontagePlaybackOutcome CaptureOutcome = Context.OriginalMontageCapture.Outcome;
+		if (CaptureOutcome != EGGYGOAbilityMontagePlaybackOutcome::Succeeded
+			&& CaptureOutcome != EGGYGOAbilityMontagePlaybackOutcome::NoOwnedPlayback)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] original montage capture failed: outcome=%d reason=%d."),
+				*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString(),
+				static_cast<int32>(CaptureOutcome), static_cast<int32>(Context.OriginalMontageCapture.Reason));
+		}
+	}
+	Record->bHasNativeCleanupSource = true;
+	if (Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
+	{
+		Record->Outcome = EGGYGOAbilityTerminationOutcome::Failed;
+		Record->Reason = EGGYGOAbilityTerminationReason::NativeCleanup;
+	}
+	Record->bContinuationQueued = false;
+	Record->bContinuationReady = false;
+	if (Record->bNativeEndStarted) { return true; } // The original native call still owns its return.
+	if (!IsEndAbilityValid(Handle, ActorInfo))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] rejected: GAS does not consider the original instance endable."),
+			*GetPathName(), *GetPathNameSafe(ASC), *Handle.ToString());
+		TryCompleteOriginalTermination(Record);
+		return true;
+	}
+	FScopedControlledActivationEnd EndScope(this, /*bInOwnsDispatch=*/!Record->bDriving);
+	// Pin the original Spec through hooks and GAS delegates. Its native lock drains
+	// pending removal before EndScope releases the existing return obligation.
+	FScopedAbilityListLock AbilityListLock(*ASC);
+	if (Kind == EGGYGOAbilityTerminationRequestKind::Cancel)
+	{
+		if (Record->bCancelEntered) { return true; }
+		Record->bCancelEntered = true;
+		Super::CancelAbility(Handle, ActorInfo, Record->ActivationInfo, Record->Context.GetReplicateCancelAbility());
+		Record->bCancelReturned = true;
+		return true;
+	}
+	Record->bNativeEndStarted = true;
+	if (!Record->bCleanupStarted)
+	{
+		Record->bCleanupStarted = true;
+		// A native instance without a business lease cannot authenticate derived
+		// resources. Its diagnostic above remains; GAS still retires its own tasks.
+		if (Original.HasActivation()) { CleanupAbilityResourcesForTermination(Record->Context); }
+	}
+	if (!Record->Ability.IsValid() || CheckOriginalTerminationSource(*Record) != EGGYGOAbilityTerminationReason::None)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] stopped: original source changed across its cleanup hook."),
+			*GetPathNameSafe(Record->Ability.Get()), *GetPathNameSafe(ASC), *Handle.ToString());
+		return true;
+	}
+	Super::EndAbility(Handle, ActorInfo, Record->ActivationInfo,
+		Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+	Record->bNativeEndReturned = true;
+	return true;
 }
 
 EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckOriginalTerminationSource(
@@ -405,6 +559,25 @@ EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckOriginalTerminationSo
 	using EReason = EGGYGOAbilityTerminationReason;
 	if (!IsValid(this) || Record.Ability.Get() != this) { return EReason::InvalidAbility; }
 	if (!Record.ASC.IsValid()) { return EReason::InvalidASC; }
+	if (Record.bHasNativeCleanupSource)
+	{
+		// This exact record was authenticated by an ASC native call. Binding retirement is
+		// legal here; allocation, instance, Spec and original resource lease may not change.
+		const TSharedPtr<const FGameplayAbilityActorInfo> Info = Record.ActorInfo.Pin();
+		const FGameplayAbilitySpec* Spec = Record.ASC->FindAbilitySpecFromHandle(Record.SpecHandle);
+		const bool bSameLease = Record.Context.GetOriginalActivation().HasActivation()
+			? NativeCleanupActivation.HasSameActivation(Record.Context.GetOriginalActivation())
+			: !NativeCleanupActivation.HasActivation();
+		if (OriginalTermination.Get() != &Record || !Info.IsValid() || Info.Get() != CurrentActorInfo
+			|| Record.ASC->AbilityActorInfo.Get() != Info.Get()
+			|| Info->AbilitySystemComponent.Get() != Record.ASC.Get() || CurrentSpecHandle != Record.SpecHandle
+			|| CurrentActivationInfo.GetActivationPredictionKey() != Record.ActivationInfo.GetActivationPredictionKey()
+			|| !Spec || !Spec->GetAbilityInstances().Contains(const_cast<UGGYGOGameplayAbility*>(this)) || !bSameLease)
+		{
+			return EReason::ActivationChanged;
+		}
+		return EReason::None;
+	}
 	if (OriginalTermination.Get() != &Record
 		|| !ValidateCurrentControlledActivation().HasSameActivation(Record.Context.GetOriginalActivation()))
 	{
@@ -435,6 +608,11 @@ void UGGYGOGameplayAbility::TryCompleteOriginalTermination(const TSharedPtr<FOri
 {
 	if (!Record.IsValid() || Record->bSealed || Record->OpenDispatches != 0
 		|| Record->OpenTryCalls != 0 || Record->bContinuationQueued || Record->bContinuationReady) { return; }
+	if (Record->bHasNativeCleanupSource && Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
+	{
+		Record->Outcome = EGGYGOAbilityTerminationOutcome::Failed;
+		Record->Reason = EGGYGOAbilityTerminationReason::NativeCleanup;
+	}
 	if (Record->Outcome != EGGYGOAbilityTerminationOutcome::Failed)
 	{
 		if (!Record->bNativeEndObserved || !Record->bNativeEndReturned || !Record->bFullEndReturned
@@ -506,14 +684,17 @@ void UGGYGOGameplayAbility::ResumeOriginalTermination(TSharedPtr<FOriginalTermin
 	Record->Reason = EGGYGOAbilityTerminationReason::None;
 	Record->bDriving = true;
 	++Record->OpenDispatches;
-	if (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelEntered)
 	{
-		CancelAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo, Record->Context.GetReplicateCancelAbility());
-	}
-	else
-	{
-		EndAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo,
-			Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+		FScopedAbilityListLock AbilityListLock(*Record->ASC.Get());
+		if (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelEntered)
+		{
+			CancelAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo, Record->Context.GetReplicateCancelAbility());
+		}
+		else
+		{
+			EndAbility(Record->SpecHandle, ActorInfo.Get(), Record->ActivationInfo,
+				Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
+		}
 	}
 	// Only immutable original history is touched after the virtual call, even if it destroyed GA.
 	Record->bDriving = false;
@@ -596,18 +777,28 @@ void UGGYGOGameplayAbility::ObserveOriginalNativeEnd(UGGYGOAbilitySystemComponen
 	const TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
 	if (Record.IsValid() && !Record->bSealed && Record->bNativeEndStarted
 		&& Record->ASC.Get() == OriginalASC && Record->SpecHandle == Handle && ControlledActivationEndScope
-		&& ControlledActivationEndScope->Original.HasSameActivation(Record->Context.GetOriginalActivation()))
+		&& (ControlledActivationEndScope->Original.HasSameActivation(Record->Context.GetOriginalActivation())
+			|| (Record->bHasNativeCleanupSource && !ControlledActivationEndScope->Original.HasActivation()
+				&& !Record->Context.GetOriginalActivation().HasActivation())))
 	{
 		const FGameplayAbilitySpec* Spec = OriginalASC->FindAbilitySpecFromHandle(Handle);
-		if (!Spec || Spec->PendingRemove || !Spec->GetAbilityInstances().Contains(this))
+		if (!Spec || (!Record->bHasNativeCleanupSource && Spec->PendingRemove) || !Spec->GetAbilityInstances().Contains(this))
 		{
 			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility);
 			return;
 		}
 		// Native already cleared IsActive before this notification; compare original provenance
 		// and ActorInfo directly, without manufacturing a fresh active identity.
-		if (!ValidateCurrentControlledActivation(false).HasSameActivation(Record->Context.GetOriginalActivation()))
+		if (Record->bHasNativeCleanupSource
+			? CheckOriginalTerminationSource(*Record) != EGGYGOAbilityTerminationReason::None
+			: !ValidateCurrentControlledActivation(false).HasSameActivation(Record->Context.GetOriginalActivation()))
 		{
+			if (Record->bHasNativeCleanupSource)
+			{
+				UE_LOG(LogGGYGOAbilitySystem, Error,
+					TEXT("AbilitySystem native cleanup [%s] ASC [%s] Spec [%s] end notification rejected: original source changed."),
+					*GetPathName(), *GetPathNameSafe(OriginalASC), *Handle.ToString());
+			}
 			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::ActivationChanged);
 			return;
 		}
@@ -775,7 +966,7 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 		{
 			const UGGYGOAbilitySystemComponent* ASC = OriginalEvaluationASC.Get();
 			const FGameplayAbilitySpec* Spec = ASC ? ASC->FindAbilitySpecFromHandle(Handle) : nullptr;
-			if (!Spec || Spec->PendingRemove) { return false; }
+			if (!Spec || Spec->PendingRemove || ASC->IsSpecUnderNativeAbilityCleanup(Handle)) { return false; }
 			const UGGYGOGameplayAbility* Ability = OriginalEvaluationAbility.Get();
 			if (!Ability) { return false; }
 			const UGGYGOGameplayAbility* Instance = Ability->IsInstantiated() ? Ability
@@ -1592,6 +1783,8 @@ void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handl
 	const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility)
 {
 	check(IsInGameThread());
+	if (HandleNativeAbilityCleanup(EGGYGOAbilityTerminationRequestKind::Cancel,
+		Handle, ActorInfo, ActivationInfo, bReplicateCancelAbility, true)) { return; }
 	TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
 	if (!Record.IsValid())
 	{
@@ -1644,6 +1837,8 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 #if WITH_DEV_AUTOMATION_TESTS
 	ObserveAbilityEndEntryForTest(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 #endif
+	if (HandleNativeAbilityCleanup(EGGYGOAbilityTerminationRequestKind::End,
+		Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled)) { return; }
 	if (!IsEndAbilityValid(Handle, ActorInfo))
 	{
 		return;
@@ -1653,9 +1848,8 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 	bool bOwnsDispatch = false;
 	if (!Record.IsValid())
 	{
-		// Native removal may already have marked this Spec PendingRemove. It can clear only
-		// the existing original resources; such teardown will fail visibly, never Completed.
-		const FGGYGOAbilityActivationHandle Original = ValidateCurrentControlledActivation(true, false);
+		// Actual GAS teardown was handled only by its authenticated native scope above.
+		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
 		if (!Original.HasActivation() || Original.Proof->SpecHandle != Handle
 			|| Original.Proof->Allocation.Pin().Get() != ActorInfo
 			|| Original.Proof->ActivationKey != ActivationInfo.GetActivationPredictionKey())
@@ -1667,7 +1861,7 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 		}
 		FGGYGOAbilityTerminationResult Result;
 		Record = BeginOriginalTermination(Original, EGGYGOAbilityTerminationRequestKind::End,
-			bReplicateEndAbility, bWasCancelled, Result, /*bAllowNativeRemoval=*/true);
+			bReplicateEndAbility, bWasCancelled, Result);
 		if (!Record.IsValid())
 		{
 			UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -1677,42 +1871,11 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 		}
 		bOwnsDispatch = true;
 	}
+	if (!Record->ASC.IsValid()) { FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidASC); return; }
 	FScopedControlledActivationEnd OriginalEndScope(this, bOwnsDispatch);
+	FScopedAbilityListLock AbilityListLock(*Record->ASC.Get());
 	if (Record.IsValid())
 	{
-		const FGameplayAbilitySpec* Spec = Record->ASC.IsValid()
-			? Record->ASC->FindAbilitySpecFromHandle(Record->SpecHandle) : nullptr;
-		if (!Record->bNativeEndStarted && !Record->bSealed
-			&& Record->ASC.IsValid() && (!Spec || Spec->PendingRemove)
-			&& ValidateCurrentControlledActivation(true, false).HasSameActivation(Record->Context.GetOriginalActivation())
-			&& Record->SpecHandle == Handle && Record->ActorInfo.Pin().Get() == ActorInfo
-			&& ActorInfo && ActorInfo->AbilitySystemComponent.Get() == Record->ASC.Get()
-			&& Record->ActivationInfo.GetActivationPredictionKey() == ActivationInfo.GetActivationPredictionKey())
-		{
-			// Native OnRemove must still tear down the exact original GAS resources. Removal
-			// invalidates this protocol record; it can never turn that teardown into Completed.
-			FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidAbility);
-			if (!Record->bCleanupStarted)
-			{
-				Record->bCleanupStarted = true;
-				CleanupAbilityResourcesForTermination(Record->Context);
-			}
-			if (!Record->Ability.IsValid()) { return; }
-			if (!ValidateCurrentControlledActivation(true, false).HasSameActivation(Record->Context.GetOriginalActivation())) { return; }
-			if (ScopeLockCount > 0)
-			{
-				// GAS teardown of a removed, still locked instance has no supported return proof.
-				// Release original camera resources, fail visibly, and add no second native delegate.
-				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem original removal [%s] Spec [%s] is scope locked; native teardown return is unsupported."),
-					*GetPathName(), *Handle.ToString());
-				return;
-			}
-			Record->bNativeEndStarted = true;
-			Super::EndAbility(Handle, ActorInfo, Record->ActivationInfo,
-				Record->Context.GetReplicateEndAbility(), Record->Context.WasCancelled());
-			Record->bNativeEndReturned = true;
-			return;
-		}
 		if (!Record->bDriving || Record->bNativeEndStarted || Record->bSealed
 			|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed) { return; }
 		if (Record->SpecHandle != Handle || Record->ActorInfo.Pin().Get() != ActorInfo

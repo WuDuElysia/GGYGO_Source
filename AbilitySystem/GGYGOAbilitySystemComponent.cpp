@@ -97,6 +97,99 @@ UGGYGOAbilitySystemComponent::UGGYGOAbilitySystemComponent(const FObjectInitiali
 	ActiveAbilitiesByGroup.Reset();
 }
 
+UGGYGOAbilitySystemComponent::FScopedNativeAbilityCleanup::FScopedNativeAbilityCleanup(
+	UGGYGOAbilitySystemComponent* InASC, ENativeAbilityCleanupSource InSource,
+	const FGameplayAbilitySpec* OnlySpec)
+	: ASC(InASC), Previous(InASC->NativeAbilityCleanupScope), Source(InSource),
+	  RemovedSpec(OnlySpec ? OnlySpec->Handle : FGameplayAbilitySpecHandle()),
+	  Allocation(InASC->AbilityActorInfo)
+{
+	check(IsInGameThread());
+	const auto CaptureSpec = [this](const FGameplayAbilitySpec& Spec)
+	{
+		for (UGameplayAbility* Instance : Spec.GetAbilityInstances())
+		{
+			UGGYGOGameplayAbility* Ability = Cast<UGGYGOGameplayAbility>(Instance);
+			if (!Ability || !Ability->IsActive() || Ability->GetCurrentActorInfo() != Allocation.Get()) { continue; }
+			FNativeAbilityCleanupTarget& Target = Targets.AddDefaulted_GetRef();
+			Target.Ability = Ability;
+			Target.Handle = Spec.Handle;
+			Target.ActivationKey = Ability->GetCurrentActivationInfo().GetActivationPredictionKey();
+			Target.Activation = Ability->NativeCleanupActivation;
+		}
+	};
+	if (OnlySpec) { CaptureSpec(*OnlySpec); }
+	else
+	{
+		for (const FGameplayAbilitySpec& Spec : InASC->ActivatableAbilities.Items) { CaptureSpec(Spec); }
+	}
+	InASC->NativeAbilityCleanupScope = this;
+}
+
+UGGYGOAbilitySystemComponent::FScopedNativeAbilityCleanup::~FScopedNativeAbilityCleanup()
+{
+	check(IsInGameThread());
+	if (UGGYGOAbilitySystemComponent* OriginalASC = ASC.GetEvenIfUnreachable())
+	{
+		check(OriginalASC->NativeAbilityCleanupScope == this);
+		OriginalASC->NativeAbilityCleanupScope = Previous;
+	}
+}
+
+bool UGGYGOAbilitySystemComponent::GetNativeAbilityCleanupSource(
+	const UGGYGOGameplayAbility* Ability, FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	FGGYGOAbilityActivationHandle& OutActivation, bool bRequireActive) const
+{
+	OutActivation = {};
+	const FScopedNativeAbilityCleanup* Scope = NativeAbilityCleanupScope;
+	if (!Scope || !IsValid(Ability) || !Ability->IsInstantiated()
+		|| (bRequireActive && !Ability->IsActive()) || !ActorInfo
+		|| Scope->Allocation.Get() != ActorInfo || AbilityActorInfo.Get() != ActorInfo
+		|| ActorInfo->AbilitySystemComponent.Get() != this
+		|| Ability->GetCurrentActorInfo() != ActorInfo
+		|| Ability->GetCurrentAbilitySpecHandle() != Handle
+		|| Ability->GetCurrentActivationInfo().GetActivationPredictionKey() != ActivationInfo.GetActivationPredictionKey())
+	{
+		return false;
+	}
+	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
+	if (!Spec || !Spec->GetAbilityInstances().Contains(const_cast<UGGYGOGameplayAbility*>(Ability))) { return false; }
+	for (const FNativeAbilityCleanupTarget& Target : Scope->Targets)
+	{
+		if (Target.Ability.Get() == Ability && Target.Handle == Handle
+			&& Target.ActivationKey == ActivationInfo.GetActivationPredictionKey()
+			&& (Target.Activation.HasActivation()
+				? Target.Activation.HasSameActivation(Ability->NativeCleanupActivation)
+				: !Ability->NativeCleanupActivation.HasActivation()))
+		{
+			OutActivation = Target.Activation;
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UGGYGOAbilitySystemComponent::IsSpecUnderNativeAbilityCleanup(FGameplayAbilitySpecHandle Handle) const
+{
+	const FScopedNativeAbilityCleanup* Scope = NativeAbilityCleanupScope;
+	return Scope && (Scope->Source != ENativeAbilityCleanupSource::SpecRemoval || Scope->RemovedSpec == Handle);
+}
+
+void UGGYGOAbilitySystemComponent::DestroyActiveState()
+{
+	FScopedAvatarBindingNativeWrite NativeWrite(this);
+	FScopedNativeAbilityCleanup Cleanup(this, ENativeAbilityCleanupSource::DestroyActiveState);
+	Super::DestroyActiveState();
+}
+
+void UGGYGOAbilitySystemComponent::OnRemoveAbility(FGameplayAbilitySpec& AbilitySpec)
+{
+	FScopedAvatarBindingNativeWrite NativeWrite(this);
+	FScopedNativeAbilityCleanup Cleanup(this, ENativeAbilityCleanupSource::SpecRemoval, &AbilitySpec);
+	Super::OnRemoveAbility(AbilitySpec);
+}
+
 /** Immutable proof of one completed native Local write; no playback executor or activity state. */
 struct FGGYGOAbilityMontagePlaybackHandle::FPlaybackProof final
 {
@@ -166,11 +259,25 @@ FGGYGOAbilityMontageOwnershipCheck UGGYGOAbilitySystemComponent::CheckMontagePla
 	{
 		return Fail(EOutcome::Stale, EReason::ActorInfoChanged);
 	}
-	if (!ValidateAvatarBindingActualSnapshot(Actual, ActorReason))
+	const FGGYGOAbilityMontagePlaybackHandle::FPlaybackProof& Proof = *Original.Proof;
+	const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Proof.Ability.Get());
+	FGGYGOAbilityActivationHandle CleanupActivation;
+	bool bNativeCleanup = ProjectAbility && GetNativeAbilityCleanupSource(ProjectAbility,
+		Proof.SpecHandle, Actual.Allocation.Get(), ProjectAbility->GetCurrentActivationInfo(),
+		CleanupActivation, /*bRequireActive=*/false);
+	if (!bNativeCleanup && ProjectAbility && ProjectAbility->OriginalTermination.IsValid())
+	{
+		const auto& Record = ProjectAbility->OriginalTermination;
+		bNativeCleanup = Record->bHasNativeCleanupSource && Record->ASC.Get() == this
+			&& Record->SpecHandle == Proof.SpecHandle
+			&& Record->ActivationInfo.GetActivationPredictionKey() == Proof.ActivationKey
+			&& ProjectAbility->CheckOriginalTerminationSource(*Record) == EGGYGOAbilityTerminationReason::None;
+	}
+	if (!ValidateAvatarBindingActualSnapshotForPurpose(Actual, bNativeCleanup
+		? EAvatarBindingSnapshotPurpose::CommittedCleanup : EAvatarBindingSnapshotPurpose::WorkingBinding, ActorReason))
 	{
 		return Fail(EOutcome::Failed, EReason::InvalidActorInfo);
 	}
-	const FGGYGOAbilityMontagePlaybackHandle::FPlaybackProof& Proof = *Original.Proof;
 	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(
 		Proof.Guard.Identity.OriginalAnimInstance.Get());
 	if (!Guard || !Guard->IsMontagePlayGuardIdentityCurrent(Proof.Guard.Identity))
@@ -789,7 +896,7 @@ void UGGYGOAbilitySystemComponent::TryPublishOriginalTerminationCompleted(
 {
 	check(IsInGameThread());
 	if (!Record.IsValid() || Record->bSealed || Record->ASC.Get() != this
-		|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed
+		|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed || Record->bHasNativeCleanupSource
 		|| Record->OpenDispatches != 0 || Record->OpenTryCalls != 0 || Record->bContinuationQueued || Record->bContinuationReady
 		|| !Record->bNativeEndObserved || !Record->bNativeEndReturned || !Record->bFullEndReturned
 		|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelReturned))
@@ -988,6 +1095,9 @@ void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
 {
 	// This is the actual native PreActivate notification, before public activation listeners.
 	// GA alone issues the identity; a controlled Try supplies only its outer return provenance.
+	// The preceding lease cannot authenticate a later native activation, including
+	// an unsupported raw entry that bypassed admission and fails to issue a new one.
+	Ability->NativeCleanupActivation = {};
 	if (Ability->IsControlledActivationTerminationBusy())
 	{
 		Ability->InvalidateOriginalTerminationForActivation();
@@ -4394,10 +4504,13 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAb
 	if (!Recheck()) { return MakeAvatarBindingExecutionFailure(Result, Reason); }
 	ReleaseAvatarBindingPublicationForContext(Result.Before);
 	// Include the entire native traversal and its list-lock destructor in this Busy scope.
-	Super::CancelAbilities(
-		bHasWithTags ? &WithTagsSnapshot : nullptr,
-		bHasWithoutTags ? &WithoutTagsSnapshot : nullptr,
-		nullptr);
+	{
+		FScopedNativeAbilityCleanup Cleanup(this, ENativeAbilityCleanupSource::AvatarBindingRelease);
+		Super::CancelAbilities(
+			bHasWithTags ? &WithTagsSnapshot : nullptr,
+			bHasWithoutTags ? &WithoutTagsSnapshot : nullptr,
+			nullptr);
+	}
 	if (!Recheck()) { return MakeAvatarBindingExecutionFailure(Result, Reason); }
 	// No external call between final recheck and exact operation completion.
 	if (!TryCompleteAvatarBindingIdentityOperation(Operation, Reason))

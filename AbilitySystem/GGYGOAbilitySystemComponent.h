@@ -180,6 +180,8 @@ class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
 
 public:
 	UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+	/** Actual GAS destruction supplies a synchronous native cleanup source. */
+	virtual void DestroyActiveState() override;
 
 	/**
 	 * Identity-only APIs; game thread only. No native binding or write-window execution.
@@ -478,6 +480,9 @@ protected:
 	/** 结束后从组中摘除。 */
 	virtual void NotifyAbilityEnded(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled) override;
 
+	/** These real GAS calls supply cleanup provenance, not a second ability lifecycle. */
+	virtual void OnRemoveAbility(FGameplayAbilitySpec& AbilitySpec) override;
+
 	/** 用关系表扩展阻断 / 取消 Tag 后再交给父类执行。 */
 	virtual void ApplyAbilityBlockAndCancelTags(const FGameplayTagContainer& AbilityTags, UGameplayAbility* RequestingAbility, bool bEnableBlockTags, const FGameplayTagContainer& BlockTags, bool bExecuteCancelTags, const FGameplayTagContainer& CancelTags) override;
 	//~End of UAbilitySystemComponent interface
@@ -668,6 +673,38 @@ private:
 	uint64 AllocateAbilityActivationOriginSerial();
 
 	friend class UGGYGOGameplayAbility;
+	/** Read-only targets captured before a native cleanup traversal, valid only in its stack. */
+	struct FNativeAbilityCleanupTarget
+	{
+		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+		FGameplayAbilitySpecHandle Handle;
+		FPredictionKey ActivationKey;
+		FGGYGOAbilityActivationHandle Activation;
+	};
+	enum class ENativeAbilityCleanupSource : uint8 { AvatarBindingRelease, DestroyActiveState, SpecRemoval };
+	class FScopedNativeAbilityCleanup final
+	{
+	public:
+		FScopedNativeAbilityCleanup(UGGYGOAbilitySystemComponent* InASC,
+			ENativeAbilityCleanupSource InSource, const FGameplayAbilitySpec* OnlySpec = nullptr);
+		~FScopedNativeAbilityCleanup();
+		FScopedNativeAbilityCleanup(const FScopedNativeAbilityCleanup&) = delete;
+		FScopedNativeAbilityCleanup& operator=(const FScopedNativeAbilityCleanup&) = delete;
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		FScopedNativeAbilityCleanup* Previous = nullptr;
+		ENativeAbilityCleanupSource Source;
+		FGameplayAbilitySpecHandle RemovedSpec;
+		TSharedPtr<const FGameplayAbilityActorInfo> Allocation;
+		TArray<FNativeAbilityCleanupTarget> Targets;
+		friend class UGGYGOAbilitySystemComponent;
+	};
+	FScopedNativeAbilityCleanup* NativeAbilityCleanupScope = nullptr;
+	bool GetNativeAbilityCleanupSource(const UGGYGOGameplayAbility* Ability,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, FGGYGOAbilityActivationHandle& OutActivation,
+		bool bRequireActive = true) const;
+	bool IsSpecUnderNativeAbilityCleanup(FGameplayAbilitySpecHandle Handle) const;
 	uint64 LastAbilityActivationOriginSerial = 0;
 	FAbilityInputActivationAttempt AbilityInputActivationAttempt{};
 	TArray<FAbilityActivationEvaluationToken> AbilityActivationEvaluations;

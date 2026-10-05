@@ -163,7 +163,9 @@ enum class EGGYGOAbilityTerminationReason : uint8
 	ActivationCallInProgress,
 	MontageCaptureFailed,
 	NativeEndNotObserved,
-	UnsupportedEntry
+	UnsupportedEntry,
+	/** GAS resources were retired by a trusted native cleanup, not a completed gameplay request. */
+	NativeCleanup
 };
 
 /**
@@ -646,6 +648,9 @@ private:
 	bool IsControlledActivationTerminationBusy() const;
 	uint64 LastControlledActivationSerial = 0;
 	FGGYGOAbilityActivationHandle CurrentControlledActivation{};
+	/** Original resource lease only; business retirement cannot erase native cleanup provenance.
+	 * GAS Active/spec state remains authoritative. Retired by its actual native End notification. */
+	FGGYGOAbilityActivationHandle NativeCleanupActivation{};
 	FScopedControlledActivationEnd* ControlledActivationEndScope = nullptr;
 
 	/** One original resource/return obligation. GAS alone owns Active, counts and task execution.
@@ -677,14 +682,22 @@ private:
 		bool bNativeEndReturned = false;
 		bool bFullEndReturned = false;
 		bool bSealed = false;
+		/** Set only by an exact ASC native cleanup source; never qualifies business Completed. */
+		bool bHasNativeCleanupSource = false;
 		EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Accepted;
 		EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::None;
 		TArray<TWeakPtr<FGGYGOAbilityTerminationCompletedNotice>> TryCompletionSlots;
 	};
 	TSharedPtr<FOriginalTerminationRecord> BeginOriginalTermination(
 		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult,
-		bool bAllowNativeRemoval = false);
+		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult);
+	TSharedPtr<FOriginalTerminationRecord> InstallOriginalTerminationRecord(
+		const FGGYGOAbilityTerminationContext& Context, UGGYGOAbilitySystemComponent* ASC,
+		const TSharedPtr<const FGameplayAbilityActorInfo>& ActorInfo,
+		FGameplayAbilitySpecHandle Handle, FGameplayAbilityActivationInfo ActivationInfo);
+	bool HandleNativeAbilityCleanup(EGGYGOAbilityTerminationRequestKind Kind,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, bool bReplicate, bool bWasCancelled);
 	void ResumeOriginalTermination(TSharedPtr<FOriginalTerminationRecord> Record);
 	void DeferOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record);
 	EGGYGOAbilityTerminationReason CheckOriginalTerminationSource(const FOriginalTerminationRecord& Record) const;
