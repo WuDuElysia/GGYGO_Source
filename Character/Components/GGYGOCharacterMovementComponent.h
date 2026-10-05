@@ -1,18 +1,19 @@
 /**
  * @file GGYGOCharacterMovementComponent.h
- * @brief Locomotion 权威组件：步态、WalkRun 混合、起停/转身选择、Profile 时钟与预测。
+ * @brief Locomotion 权威组件：步态、WalkRun 混合、起停/转身选择与原移动区间预测。
  *
  * 输入驱动的 Walk/Run 继续使用 CMC CalcVelocity；Stop 与 TurnBack 通过现有
  * FRootMotionSource_GGYGOCurve 提交 Override 速度。两条路径的曲线都由 MovementSet
- * 引用的 Locomotion Profile 纯求值，不读取 AnimInstance，也不建立第二个 Tick。
+ * 参数与 Animation 发布的原始源绑定纯求值，不反查 AnimInstance 当前姿态，也不建立第二个 Tick。
  * SavedMove 保存预测起点和原来源检查点，NetworkMoveData 携带该值及最小语义提示。
- * 来源检查点当前仅捕获/发送，尚未接入服务端准入；服务端使用自己的 MovementSet/Profile
+ * 来源检查点由原生 receipt 准入；服务端使用自己的 MovementSet 与动画源绑定
  * 重新模拟。位置校正通过自定义 response 带回权威相位与时间，
  * 未确认 move 从该基线连续重放，避免恢复旧的预测时钟。
  */
 #pragma once
 
 #include "Character/Data/GGYGOMovementTypes.h"
+#include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 #include "Input/GGYGOMovementInputTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/CharacterMovementReplication.h"
@@ -33,7 +34,6 @@ class FSavedMove_Character;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOMovementSet;
 class UGGYGOActionMotionProfile;
-class UGGYGOLocomotionMotionProfile;
 class UObject;
 class UGGYGOCharacterMovementComponent;
 struct FRootMotionSource_GGYGOCurve;
@@ -124,6 +124,7 @@ struct FGGYGOCurveRootMotionOrigin
 	EGGYGOLocomotionMotionType MotionType = EGGYGOLocomotionMotionType::None;
 	uint16 MotionSequence = 0;
 	TWeakObjectPtr<const UGGYGOMovementSet> MovementSet;
+	FGGYGOLocomotionSourceBindingPtr SourceBinding;
 	float SourceTimeOrigin = 0.0f;
 	float MotionTimeOrigin = 0.0f;
 	float BaseYaw = 0.0f;
@@ -260,7 +261,7 @@ public:
 	/** 本次 move 开始时是否持有"下次移动直接进 Run"的契约。 */
 	bool bSavedWantsRunOnNextMove = false;
 
-	/** 本次 move 开始时的 Locomotion 模拟状态。曲线量由 Profile 和这些时间重新求值。 */
+	/** 本次 move 开始时的 Locomotion 模拟状态。曲线量由原动画源和这些区间重新求值。 */
 	EGGYGOLocomotionMotionType SavedLocomotionMotionType = EGGYGOLocomotionMotionType::None;
 	EGGYGOStopMotionType SavedStopMotionType = EGGYGOStopMotionType::None;
 	float SavedLocomotionMotionTime = 0.0f;
@@ -289,6 +290,7 @@ public:
 	/** Original local input/result, including a source first issued during this move. */
 	TSharedPtr<const FGGYGOCurveRootMotionMoveInput> SavedCurveRootMotionInput;
 	TSharedPtr<const FGGYGOCurveRootMotionPrepared> SavedCurveRootMotionPrepared;
+	FGGYGOLocomotionSourceBindingPtr SavedLocomotionSourceBinding;
 
 	/** Original SetMoveFor value; sending and PostUpdate_Replay must not replace it. */
 	FGGYGOMovementInputSourceCheckpoint SavedMovementInputSourceCheckpoint;
@@ -322,7 +324,7 @@ public:
 	virtual FSavedMovePtr AllocateNewMove() override;
 };
 
-/** 原来源值与Owner元数据运输；服务端经M2原生receipt消费，Profile/曲线/速度仍由自身MovementSet解析。 */
+/** 原来源值与Owner元数据运输；服务端经原生receipt消费，动画/曲线/速度使用自身源绑定求值。 */
 struct FCharacterNetworkMoveData_GGYGO : public FCharacterNetworkMoveData
 {
 	/** 固定 9/137 位扩展，原生 owning actor RPC 提供实际 PC/Connection 身份。 */
@@ -431,10 +433,14 @@ public:
 	 * 非空无效配置保留 ValidateMovementSet 原因并输出拒绝诊断。
 	 * nullptr 是合法解绑，返回 false、清空 OutError，不输出错误。
 	 * 成功后原样应用已校验参数并清空 OutError，不影响 GA ActionMotion 所有权。
-	 * 绑定期配置、Profile 及外部曲线须保持只读；变更须重绑，不支持热编辑自动失效。
-	 * 未绑定有效配置时普通地面执行被拒绝；Profile 运行时求值失败整改仍待后续。
+	 * 绑定期移动参数须保持只读，变更须重绑；动画来源随其原生命周期独立发布。
+	 * 未绑定有效配置或曲线模式缺有效源时普通地面执行被拒绝。
 	 */
 	bool SetMovementSet(const UGGYGOMovementSet* InMovementSet, FString* OutError = nullptr);
+
+	/** Animation's original lifecycle publication. Does not grant an input request or start a move. */
+	bool PublishLocomotionSourceBinding(const FGGYGOLocomotionSourceBinding& Binding, FString& OutError);
+	void RetireLocomotionSourceBinding(UAnimInstance* OriginalProducer, uint64 OriginalConfigurationGeneration);
 
 	bool GetMovementOwnerSyncScope(FGGYGOMovementOwnerSyncScopeId& OutScope, FString& OutError) const;
 	/** 先安装原记录并写 OutObserver，再同步回放；须直接传长期原 Scope 成员。 */
@@ -509,7 +515,7 @@ public:
 	 */
 	bool HasCurveRootMotionSource() const;
 
-	/** 成功的 Locomotion Profile 样本是否提供速度来源；合法零速/零Scale仍有资格，活动Action不参与。 */
+	/** 成功的原动画源样本是否提供速度来源；合法零速/零Scale仍有资格，活动Action不参与。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	bool IsCurveDrivingSpeed() const;
 
@@ -769,8 +775,10 @@ private:
 		bool bOnGround, bool bMoveInputRising, bool bBlockReleased, float DeltaSeconds, float& Timer) const;
 	void SetLocomotionMotion(EGGYGOLocomotionMotionType NewType, FLocomotionUpdateCandidate& Candidate) const;
 	bool UpdateWalkRunBlend(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
-	bool EvaluateLocomotionProfile(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
-	bool EvaluateWalkRunProfiles(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
+	bool EvaluateLocomotionSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
+	bool EvaluateWalkRunSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
+	bool GetLocomotionSourceBinding(FGGYGOLocomotionSourceBindingPtr& OutBinding, FString& OutError) const;
+	bool IsLocomotionSourceBindingCurrent(const FGGYGOLocomotionSourceBindingPtr& Binding, FString& OutError) const;
 	bool IsCurrentMotionFinished(const FLocomotionUpdateCandidate& Candidate,
 		bool& bOutFinished, FString& OutError) const;
 	void BeginTurnBack(FLocomotionUpdateCandidate& Candidate) const;
@@ -795,6 +803,11 @@ private:
 	TSharedPtr<const FGGYGOCurveRootMotionPrepared> ConsumedLocomotionCurvePrepared;
 	TSharedPtr<const FGGYGOCurveRootMotionMoveInput> ReplayLocomotionCurveInput;
 	TSharedPtr<const FGGYGOCurveRootMotionPrepared> ReplayLocomotionCurvePrepared;
+	FGGYGOLocomotionSourceBindingPtr LocomotionSourceBinding;
+	FGGYGOLocomotionSourceBindingPtr ReplayLocomotionSourceBinding;
+	TWeakObjectPtr<UAnimInstance> LastLocomotionSourceProducer;
+	uint64 LastLocomotionSourceConfigurationGeneration = 0;
+	bool bReplayPreparedFromAuthority = false;
 	const FRootMotionSourceGroup* PreparingLocomotionCurveReplayGroup = nullptr;
 	bool bLocomotionCurveReplayRejected = false;
 	TOptional<FLocomotionUpdateCandidate> LocomotionCurveReplayEntryState;
@@ -835,7 +848,7 @@ private:
 	FString LocomotionRequestFailureReason;
 	bool bMovementInputAdmissionDiagnosticReported = false;
 
-	/** 只从已接受指针派生，不代表 Profile 本帧求值成功。 */
+	/** 只从已接受配置指针派生，不代表原动画源本帧求值成功。 */
 	bool HasAcceptedMovementSet() const;
 
 	/** 实际动画 RootMotion 或符合已有提交契约的 ActionCurve；未知 RMS 不构成豁免。 */
@@ -886,7 +899,7 @@ protected:
 	void CaptureComponentDefaults();
 	void RestoreComponentDefaults();
 
-	/** CMC 内唯一 Locomotion 状态推进与 Profile 求值入口。 */
+	/** CMC 内唯一 Locomotion 状态推进与原动画源求值入口。 */
 	bool UpdateLocomotionMotion(float DeltaSeconds, bool bHadMoveInput, EGGYGOGait PreviousGait);
 	void UpdateWalkRunBlend(float DeltaSeconds);
 	void SetLocomotionMotion(EGGYGOLocomotionMotionType NewType);
@@ -895,7 +908,7 @@ protected:
 	/**
 	 * 推进转身相位机。
 	 *
-	 * 相位边界全部由本帧 Profile 区间求值的 `CurveMotion` 决定。
+	 * 相位边界全部由本帧原动画源区间求值的 `CurveMotion` 决定。
 	 */
 	/** 当前输入是否构成"要转身"（跑动中输入接近反向）。 */
 	bool IsReverseRunInput() const;
@@ -1019,7 +1032,7 @@ protected:
 	 * "曲线正在接管转身"的复制标志。
 	 *
 	 * SavedMove / MoveData 只在"客户端→服务器"方向传递，不会转发给其它客户端，
-	 * 所以模拟代理无法从那条路径得知转身状态。服务器按自身 Profile 解算后写入本属性，
+	 * 所以模拟代理无法从那条路径得知转身状态。服务器按自身动画源解算后写入本属性，
 	 * 再由属性复制发给其它客户端。
 	 *
 	 * 只复制这一个 bool 而不是完整相位：`Turning` 与 `Braking` 的移动行为一致，

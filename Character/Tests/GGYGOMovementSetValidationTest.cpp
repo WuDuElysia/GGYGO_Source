@@ -244,16 +244,15 @@ bool FGGYGOMovementSetValidationTest::RunTest(const FString& Parameters)
 	bPassed &= CheckValidation(TEXT("Unused deprecated bound is not validated or repaired"), *Set, true, nullptr, nullptr);
 	Set->MaxCurveDrivenSpeed = OriginalDeprecatedValue;
 
-	// 2. Curve mode requires each of the seven slots independently.
+	// 2. Serialized Profile slots are migration history, not numeric MovementSet authority.
 	for (const FMovementSetProfileCase& Case : MovementSetProfileCases)
 	{
 		ConfigureMovementSetValidationProfiles(*Set, true, SingleProfile.Get(), LoopProfile.Get());
 		(*Set).*Case.Member = nullptr;
-		bPassed &= CheckValidation(FString(Case.Field) + TEXT(" missing in curve mode"), *Set, false, Case.Field,
-			TEXT("a Profile is required when bUseCurveDrivenSpeed is true"));
+		bPassed &= CheckValidation(FString(Case.Field) + TEXT(" missing historical reference"), *Set, true, nullptr, nullptr);
 	}
 
-	// 3. Each supplied slot enforces its Loop contract in both explicit modes.
+	// 3. Historical loop flags cannot authorize or reject a numeric Set; real source loop admission is tested at its consumer.
 	const bool CurveModes[] = {false, true};
 	for (const bool bCurveMode : CurveModes)
 	{
@@ -270,15 +269,12 @@ bool FGGYGOMovementSetValidationTest::RunTest(const FString& Parameters)
 			(*Set).*Case.Member = WrongLoopProfile.Get();
 			FString Error;
 			const FString Name = FString::Printf(TEXT("%s wrong Loop / mode %d"), Case.Field, int32(bCurveMode));
-			bPassed &= CheckValidation(Name, *Set, false, Case.Field,
-				Case.bExpectedLoop ? TEXT("must use bLoop=true") : TEXT("must use bLoop=false"), &Error);
-			bPassed &= TestTrue(Name + TEXT(" identifies the assigned Profile path"),
-				Error.Contains(WrongLoopProfile->GetPathName(), ESearchCase::CaseSensitive));
+			bPassed &= CheckValidation(Name, *Set, true, nullptr, nullptr, &Error);
 			bPassed &= TestEqual(Name + TEXT(" preserves the wrong Loop flag"), WrongLoopProfile->bLoop, OriginalLoop);
 		}
 	}
 
-	// 4. Profile's real negative-key error survives MovementSet wrapping, including fixed mode.
+	// 4. Preserve Profile's original negative-key evidence without making it a second runtime source.
 	auto NegativeProfile = CreateMovementSetValidationProfile(false, -1.0f);
 	FString NativeProfileError;
 	if (!TestFalse(TEXT("Negative Speed fixture fails native Profile validation"), NegativeProfile->ValidateProfile(NativeProfileError))
@@ -332,15 +328,12 @@ bool FGGYGOMovementSetValidationTest::RunTest(const FString& Parameters)
 		Set->WalkStartProfile = NegativeProfile.Get();
 		FString Error;
 		const FString Name = FString::Printf(TEXT("Assigned negative Profile / mode %d"), int32(bCurveMode));
-		bPassed &= CheckValidation(Name, *Set, false, TEXT("WalkStartProfile"), TEXT("speed must be non-negative"), &Error);
-		bPassed &= TestTrue(Name + TEXT(" retains the native Profile error"), Error.Contains(NativeProfileError, ESearchCase::CaseSensitive));
-		bPassed &= TestTrue(Name + TEXT(" identifies the assigned Profile path"),
-			Error.Contains(NegativeProfile->GetPathName(), ESearchCase::CaseSensitive));
+		bPassed &= CheckValidation(Name, *Set, true, nullptr, nullptr, &Error);
 		bPassed &= CheckNegativeProfileUnchanged(Name);
 	}
 
 #if WITH_EDITOR
-	// 5. The editor reports exactly the same failure as the runtime validator, without warnings.
+	// 5. The editor and runtime report the same numeric contract, without warnings.
 	const auto CheckEditor = [this, &CheckValidation, &CheckUnchanged](const FString& Case,
 		const UGGYGOMovementSet& Config, bool bExpectedSuccess, const TCHAR* Field, const TCHAR* Reason)
 	{
@@ -373,8 +366,7 @@ bool FGGYGOMovementSetValidationTest::RunTest(const FString& Parameters)
 	Set->RootMotionScale = OriginalScale;
 	ConfigureMovementSetValidationProfiles(*Set, false, SingleProfile.Get(), LoopProfile.Get());
 	Set->WalkStartProfile = NegativeProfile.Get();
-	bPassed &= CheckEditor(TEXT("Assigned invalid Profile in fixed mode"), *Set, false,
-		TEXT("WalkStartProfile"), TEXT("speed must be non-negative"));
+	bPassed &= CheckEditor(TEXT("Historical invalid Profile does not change the numeric contract"), *Set, true, nullptr, nullptr);
 	bPassed &= CheckNegativeProfileUnchanged(TEXT("Editor Profile validation"));
 #endif
 

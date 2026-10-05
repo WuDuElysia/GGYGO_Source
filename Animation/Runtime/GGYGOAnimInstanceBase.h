@@ -5,6 +5,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Animation/Debug/GGYGOAnimationDebugFrame.h"
 #include "Animation/Runtime/GGYGOAnimationStateCapture.h"
@@ -13,6 +14,7 @@
 #include "GGYGOAnimInstanceBase.generated.h"
 
 class ACharacter;
+class UGGYGOCharacterMovementComponent;
 
 /**
  * 不知道任何 AnimBP 状态名或过渡拓扑，只负责游戏线程抓取与只读发布。
@@ -49,16 +51,30 @@ protected:
 	/** 生命周期复位时清理派生 AnimInstance 自己持有的运行时表现状态。 */
 	virtual void OnAnimationLifecycleReset();
 
+	/** Resolve configured assets only. Curve evaluation and all motion clocks belong to Movement. */
+	virtual void ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const;
+	/** Compare current configuration against the last immutable publication without allocating asset holders. */
+	virtual bool IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const;
+
 	const FGGYGOAnimationDebugFrame& GetAnimationDebugFrame() const { return AnimationDebug; }
 
 private:
 	/** 幂等地清理基类运行时状态并通知派生表现层。 */
 	void ResetAnimationLifecycleState();
 	void RefreshAnimationStateFrame();
+	void RefreshLocomotionSourceBinding();
+	void RetireLocomotionSourceBinding();
 
 	TWeakObjectPtr<ACharacter> CharacterOwner;
 	/** 记录上次绑定过有效 Character，避免弱引用失效后无法识别 nullptr -> nullptr。 */
 	bool bHadCharacterOwner = false;
 	FGGYGOAnimationStateCapture StateCapture;
 	FGGYGOAnimationDebugFrame AnimationDebug;
+	/** Only the publication/resource handle is owned here; no movement state is mirrored. */
+	FGGYGOLocomotionSourceBindingPtr PublishedLocomotionSource;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> LocomotionSourceConsumer;
+	uint64 AnimationLifecycleGeneration = 0;
+	/** Never reset across reinitialization: an old retirement cannot match a later publication. */
+	uint64 LocomotionSourceConfigurationGeneration = 0;
+	bool bSourceGenerationExhausted = false;
 };

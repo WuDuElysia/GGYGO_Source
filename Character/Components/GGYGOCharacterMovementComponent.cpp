@@ -6,7 +6,7 @@
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
 #include "Character/Data/GGYGOActionMotionProfile.h"
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
-#include "Character/Data/GGYGOLocomotionMotionProfile.h"
+#include "Animation/AnimInstance.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/Components/GGYGOCurveRootMotionSource.h"
@@ -168,7 +168,7 @@ namespace GGYGOMovementConstants
 	/** 走跑计时器上限（秒）。防止长时间行走导致浮点累加失去精度。 */
 	constexpr float MaxWalkHoldSeconds = 3600.0f;
 
-	/** ForceWalk 是客户端输入请求；步态与动作段由服务端按自身 MovementSet/Profile 重算。 */
+	/** ForceWalk 是客户端输入请求；步态与动作段由服务端按自身 MovementSet/原动画源重算。 */
 	constexpr uint8 ForceWalkFlag = FSavedMove_Character::FLAG_Custom_3;
 
 	/**
@@ -458,6 +458,7 @@ void FSavedMove_GGYGO::Clear()
 	SavedMovementInputRequest = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
+	SavedLocomotionSourceBinding.Reset();
 
 	SavedGait = EGGYGOGait::None;
 	NetworkGait = EGGYGOGait::None;
@@ -493,6 +494,7 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 	SavedMovementInputRequest = {};
 	SavedCurveRootMotionInput.Reset();
 	SavedCurveRootMotionPrepared.Reset();
+	SavedLocomotionSourceBinding.Reset();
 
 	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
 	{
@@ -504,6 +506,7 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedMovementOwnerGeneration = Context->Notice.GetServerOwnerGeneration();
 		}
 		SavedMovementInputSourceCheckpoint = MoveComp->MovementInputSourceCheckpoint;
+		SavedLocomotionSourceBinding = MoveComp->LocomotionSourceBinding;
 		SavedMovementInputRequest.Binding = MoveComp->MovementInputBinding;
 		SavedMovementInputRequest.Request = MoveComp->MovementInputRequest;
 		SavedMovementInputRequest.ExecutionRequestSerial = MoveComp->LocomotionRequestSerial;
@@ -640,6 +643,7 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter, float MaxDelta) const
 {
 	const FSavedMove_GGYGO* NewGGYGOMove = static_cast<const FSavedMove_GGYGO*>(NewMove.Get());
+	if (NewGGYGOMove && NewGGYGOMove->SavedLocomotionSourceBinding != SavedLocomotionSourceBinding) return false;
 	if (NewGGYGOMove && (NewGGYGOMove->SavedMovementOwnerSyncScope != SavedMovementOwnerSyncScope
 		|| NewGGYGOMove->SavedMovementOwnerGeneration != SavedMovementOwnerGeneration)) return false;
 	if (NewGGYGOMove && NewGGYGOMove->SavedMovementInputSourceCheckpoint != SavedMovementInputSourceCheckpoint)
@@ -998,6 +1002,9 @@ void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPla
 	ConsumedLocomotionCurvePrepared.Reset();
 	LocomotionCurveReplayEntryState.Reset();
 	EndLocomotionCurveReplay();
+	LocomotionSourceBinding.Reset();
+	LastLocomotionSourceProducer.Reset();
+	LastLocomotionSourceConfigurationGeneration = 0;
 	ReleaseLocalAbilitySystemSubscription();
 
 	if (bMovementInputBindingActive)
@@ -2365,6 +2372,84 @@ bool UGGYGOCharacterMovementComponent::SetMovementSet(const UGGYGOMovementSet* I
 	return false;
 }
 
+bool UGGYGOCharacterMovementComponent::PublishLocomotionSourceBinding(
+	const FGGYGOLocomotionSourceBinding& Binding, FString& OutError)
+{
+	OutError.Reset();
+	const FGGYGOLocomotionSourceIdentity& Identity = Binding.Identity;
+	UAnimInstance* Producer = Identity.Producer.Get();
+	USkeletalMeshComponent* Mesh = Identity.Mesh.Get();
+	ACharacter* SourceCharacter = Cast<ACharacter>(GetOwner());
+	if (!IsInGameThread() || !SourceCharacter || Identity.Character.Get() != SourceCharacter
+		|| !Mesh || Mesh != SourceCharacter->GetMesh() || !Producer || Mesh->GetAnimInstance() != Producer
+		|| Producer->GetSkelMeshComponent() != Mesh || Identity.LifecycleGeneration == 0
+		|| Identity.ConfigurationGeneration == 0)
+	{
+		OutError = FString::Printf(TEXT("Movement source publication rejected: CMC='%s', Character='%s', Mesh='%s', Producer='%s': original primary lifecycle identity is not current."),
+			*GetPathName(), *GetPathNameSafe(Identity.Character.Get()), *GetPathNameSafe(Mesh), *GetPathNameSafe(Producer));
+		return false;
+	}
+	if (LastLocomotionSourceProducer == Producer
+		&& Identity.ConfigurationGeneration <= LastLocomotionSourceConfigurationGeneration)
+	{
+		OutError = TEXT("Movement source publication rejected: producer configuration generation did not advance.");
+		return false;
+	}
+	// Publication is independent of MovementSet/input readiness. A rejected source replaces only its own publication.
+	RetireLocomotionCurveRootMotion();
+	CompletedLocomotionCurveOrigin.Reset();
+	CurveMotion.Reset();
+	LastLocomotionSourceProducer = Producer;
+	LastLocomotionSourceConfigurationGeneration = Identity.ConfigurationGeneration;
+	LocomotionSourceBinding = MakeShared<const FGGYGOLocomotionSourceBinding, ESPMode::ThreadSafe>(Binding);
+	// Receipt acknowledges the original publication, including explicit Missing/Invalid states.
+	// Curve execution alone requires Available + validated sources; Fixed/GA modes do not consume this optional capability.
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::RetireLocomotionSourceBinding(
+	UAnimInstance* OriginalProducer, uint64 OriginalConfigurationGeneration)
+{
+	if (!IsInGameThread() || !LocomotionSourceBinding.IsValid()
+		|| LocomotionSourceBinding->Identity.Producer.Get() != OriginalProducer
+		|| LocomotionSourceBinding->Identity.ConfigurationGeneration != OriginalConfigurationGeneration) return;
+	RetireLocomotionCurveRootMotion();
+	CompletedLocomotionCurveOrigin.Reset();
+	CurveMotion.Reset();
+	LocomotionSourceBinding.Reset();
+}
+
+bool UGGYGOCharacterMovementComponent::IsLocomotionSourceBindingCurrent(
+	const FGGYGOLocomotionSourceBindingPtr& Binding, FString& OutError) const
+{
+	OutError.Reset();
+	if (!Binding.IsValid() || !LocomotionSourceBinding.IsValid()
+		|| !Binding->Identity.IsSameIdentity(LocomotionSourceBinding->Identity))
+	{
+		OutError = TEXT("Movement Animation source binding is missing or its original publication is stale.");
+		return false;
+	}
+	const FGGYGOLocomotionSourceIdentity& Identity = Binding->Identity;
+	USkeletalMeshComponent* Mesh = Identity.Mesh.Get();
+	if (!CharacterOwner || Identity.Character.Get() != CharacterOwner || !Mesh
+		|| Mesh != CharacterOwner->GetMesh() || !Identity.Producer.IsValid()
+		|| Mesh->GetAnimInstance() != Identity.Producer.Get())
+	{
+		OutError = TEXT("Movement Animation source binding's original Character/Mesh/Producer lifecycle is stale.");
+		return false;
+	}
+	return GGYGOLocomotionEvaluation::ValidateBinding(*Binding, OutError);
+}
+
+bool UGGYGOCharacterMovementComponent::GetLocomotionSourceBinding(
+	FGGYGOLocomotionSourceBindingPtr& OutBinding, FString& OutError) const
+{
+	OutBinding = (CharacterOwner && CharacterOwner->bClientUpdating && MovementInputReplayCapture.IsSet())
+		? ReplayLocomotionSourceBinding : LocomotionSourceBinding;
+	if (!IsLocomotionSourceBindingCurrent(OutBinding, OutError)) { OutBinding.Reset(); return false; }
+	return true;
+}
+
 void UGGYGOCharacterMovementComponent::ResetLocomotionState()
 {
 	RetireLocomotionCurveRootMotion();
@@ -2722,6 +2807,7 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 			ReplayLocomotionCurvePrepared.Reset();
 		}
 		if (!bLocomotionCurveReplayRejected && ReplayLocomotionCurvePrepared.IsValid()
+			&& (!bReplayLocomotionFromAuthority || bReplayPreparedFromAuthority)
 			&& ReplayLocomotionCurvePrepared->Input == ReplayLocomotionCurveInput)
 		{
 			// Super::PrepMoveFor already prepared this original native interval, or retained
@@ -2897,12 +2983,15 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 		OutError = TEXT("CurveRMS staging requires an admitted original request, accepted curve MovementSet, UpdatedComponent and positive finite movement tick.");
 		return false;
 	}
-	const auto SameSegment = [this, &Candidate](const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin)
+	FGGYGOLocomotionSourceBindingPtr SourceBinding;
+	if (!GetLocomotionSourceBinding(SourceBinding, OutError)) return false;
+	const auto SameSegment = [this, &Candidate, &SourceBinding](const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin)
 	{
 		return Origin.IsValid() && Origin->Owner.Get() == this
 			&& Origin->ExecutionRequestSerial == LocomotionRequestSerial
 			&& Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
 			&& Origin->MovementSet.Get() == MovementSet.Get() && Origin->MotionType == Candidate.MotionType
+			&& Origin->SourceBinding == SourceBinding
 			&& Origin->MotionSequence == Candidate.MotionSequence;
 	};
 	if (SameSegment(CompletedLocomotionCurveOrigin))
@@ -2910,7 +2999,7 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 		// Native completion closes this resource. The remaining clip semantics use the ordinary
 		// CMC path, and cannot remount the same physical execution even if a later speed is positive.
 		FLocomotionUpdateCandidate Remaining = Candidate;
-		if (!EvaluateLocomotionProfile(MovementTickTime, Remaining, OutError)) return false;
+		if (!EvaluateLocomotionSource(MovementTickTime, Remaining, OutError)) return false;
 		CommitLocomotionCandidate(Remaining);
 		return true;
 	}
@@ -2926,6 +3015,7 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 		Origin->MotionType = Candidate.MotionType;
 		Origin->MotionSequence = Candidate.MotionSequence;
 		Origin->MovementSet = MovementSet.Get();
+		Origin->SourceBinding = SourceBinding;
 		Origin->MotionTimeOrigin = Candidate.MotionTime;
 		Origin->BaseYaw = Candidate.MotionType == EGGYGOLocomotionMotionType::TurnBack
 			? Candidate.TurnEntryYaw : UpdatedComponent->GetComponentRotation().Yaw;
@@ -3027,6 +3117,8 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 	PendingLocomotionCurveInput.Reset();
 	ReplayLocomotionCurveInput = Move.SavedCurveRootMotionInput;
 	ReplayLocomotionCurvePrepared = Move.SavedCurveRootMotionPrepared;
+	ReplayLocomotionSourceBinding = Move.SavedLocomotionSourceBinding;
+	bReplayPreparedFromAuthority = false;
 	PreparingLocomotionCurveReplayGroup = &Move.SavedRootMotion;
 	const auto Reject = [this, &OutError](const TCHAR* Reason)
 	{
@@ -3056,6 +3148,16 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 		{
 			return Reject(TEXT("SavedMove original MovementSet is no longer the CMC's accepted configuration."));
 		}
+		if (Origin->SourceBinding != ReplayLocomotionSourceBinding)
+		{
+			return Reject(TEXT("SavedMove original animation publication does not match its source Origin."));
+		}
+		if (!IsLocomotionSourceBindingCurrent(Origin->SourceBinding, OutError))
+		{
+			bLocomotionCurveReplayRejected = true;
+			ReplayLocomotionCurvePrepared.Reset();
+			return false;
+		}
 		if (ReplayLocomotionCurvePrepared.IsValid()
 			&& (ReplayLocomotionCurvePrepared->Input != ReplayLocomotionCurveInput
 				|| !ReplayLocomotionCurvePrepared->State.IsValid()
@@ -3065,7 +3167,8 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 			return Reject(TEXT("SavedMove prepared interval belongs to a different original input."));
 		}
 	}
-	const auto HasOriginalSources = [this](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
+	bool bHasOriginalNativeSource = false;
+	const auto HasOriginalSources = [this, &bHasOriginalNativeSource](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
 	{
 		for (const TSharedPtr<FRootMotionSource>& Source : Sources)
 		{
@@ -3073,6 +3176,7 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 				|| Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval)) continue;
 			const FRootMotionSource_GGYGOCurve* Curve = static_cast<const FRootMotionSource_GGYGOCurve*>(Source.Get());
 			if (!ReplayLocomotionCurveInput.IsValid() || Curve->Origin != ReplayLocomotionCurveInput->Origin) return false;
+			bHasOriginalNativeSource = true;
 		}
 		return true;
 	};
@@ -3080,6 +3184,39 @@ bool UGGYGOCharacterMovementComponent::BeginLocomotionCurveReplay(
 		|| !HasOriginalSources(Move.SavedRootMotion.PendingAddRootMotionSources))
 	{
 		return Reject(TEXT("SavedRootMotion clone has no matching local Origin/input; imported origins remain unsupported."));
+	}
+	if (ReplayLocomotionCurvePrepared.IsValid() && !bHasOriginalNativeSource)
+	{
+		return Reject(TEXT("SavedMove has an actual prepared interval but no original native source in SavedRootMotion; record the native group at the original move boundary."));
+	}
+	if (bReplayLocomotionFromAuthority && ReplayLocomotionCurvePrepared.IsValid())
+	{
+		// Retain only the actual original native interval. Old derived state/velocity cannot overwrite the correction.
+		const TSharedPtr<const FGGYGOCurveRootMotionPrepared> OriginalInterval = ReplayLocomotionCurvePrepared;
+		ReplayLocomotionCurvePrepared.Reset();
+		if (CharacterOwner && !CharacterOwner->bClientResimulateRootMotionSources)
+		{
+			const auto Reprepare = [&](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
+			{
+				for (const TSharedPtr<FRootMotionSource>& Native : Sources)
+				{
+					if (!Native.IsValid() || Native->GetScriptStruct() != FRootMotionSource_GGYGOCurve::StaticStruct()) continue;
+					FRootMotionSource_GGYGOCurve* Curve = static_cast<FRootMotionSource_GGYGOCurve*>(Native.Get());
+					if (Curve->Origin != OriginalInterval->Input->Origin
+						|| Curve->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval)) continue;
+					Curve->SetTime(OriginalInterval->NativeStartTime);
+					Curve->Status.UnSetFlag(ERootMotionSourceStatusFlags::Finished);
+					Curve->PrepareRootMotion(OriginalInterval->SimulationTime, OriginalInterval->MovementTickTime, *CharacterOwner, *this);
+					return true;
+				}
+				return false;
+			};
+			if (!Reprepare(Move.SavedRootMotion.RootMotionSources)
+				&& !Reprepare(Move.SavedRootMotion.PendingAddRootMotionSources))
+			{
+				return Reject(TEXT("SavedMove authority replay could not prepare its original native source; the actual recorded interval cannot be replaced."));
+			}
+		}
 	}
 	return true;
 }
@@ -3094,6 +3231,8 @@ void UGGYGOCharacterMovementComponent::EndLocomotionCurveReplay()
 	PreparingLocomotionCurveReplayGroup = nullptr;
 	ReplayLocomotionCurveInput.Reset();
 	ReplayLocomotionCurvePrepared.Reset();
+	ReplayLocomotionSourceBinding.Reset();
+	bReplayPreparedFromAuthority = false;
 	bLocomotionCurveReplayRejected = false;
 }
 
@@ -3156,13 +3295,15 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 	Prepared->SimulationTime = SimulationTime;
 	Prepared->MovementTickTime = MovementTickTime;
 	Prepared->MotionStartTime = Origin->MotionTimeOrigin + (Prepared->NativeStartTime - Origin->SourceTimeOrigin);
+	const bool bAuthorityReplay = bReplayPrepare && bReplayLocomotionFromAuthority;
+	FLocomotionUpdateCandidate Candidate = bAuthorityReplay ? CaptureLocomotionCandidate() : Input->StartCandidate;
+	if (bAuthorityReplay) Prepared->MotionStartTime = Candidate.MotionTime;
 	Prepared->MotionEndTime = Prepared->MotionStartTime + SimulationTime;
 	if (!FMath::IsFinite(Prepared->NativeEndTime) || !FMath::IsFinite(Prepared->MotionStartTime)
 		|| Prepared->MotionStartTime < 0.0f || !FMath::IsFinite(Prepared->MotionEndTime))
 	{
 		return Reject(TEXT("CurveRMS native-to-motion interval mapping is non-finite or negative."));
 	}
-	FLocomotionUpdateCandidate Candidate = Input->StartCandidate;
 	const bool bGrounded = bReplayPrepare ? Input->bOnGround : IsMovingOnGround();
 	const bool bNormalExit = !bGrounded
 		|| Source.Status.HasFlag(ERootMotionSourceStatusFlags::Finished)
@@ -3191,13 +3332,14 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 		{
 			return Reject(TEXT("CurveRMS original configuration, segment or scalar parameters no longer match."));
 		}
-		const UGGYGOLocomotionMotionProfile* Profile = OriginalSet->GetProfileForMotion(Origin->MotionType);
-		if (IsValid(Profile) && Profile->bLoop)
+		if (!IsLocomotionSourceBindingCurrent(Origin->SourceBinding, OutError)) return Reject(OutError);
+		const FGGYGOLocomotionSequenceSource* AnimationSource = Origin->SourceBinding->GetSingleSource(Origin->MotionType);
+		if (!AnimationSource || AnimationSource->bLoop)
 		{
-			return Reject(FString::Printf(TEXT("CurveRMS non-loop segment has loop Profile='%s'."), *Profile->GetPathName()));
+			return Reject(TEXT("CurveRMS original non-loop animation source is missing or has loop semantics."));
 		}
 		FGGYGOLocomotionEvaluationResult Evaluation;
-		if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(Profile,
+		if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(*AnimationSource,
 			Prepared->MotionStartTime, Prepared->MotionEndTime, Origin->RootMotionScale, Evaluation, &OutError))
 		{
 			return Reject(OutError);
@@ -3221,7 +3363,7 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 			return Reject(TEXT("CurveRMS successful sample has no authored source or finite turn elapsed time."));
 		}
 		const bool bNaturalEnd = (SimulationTime > 0.0f && Origin->bEndOnZeroSpeed
-			&& (!Evaluation.Sample.HasUsableSpeed() || Evaluation.ScaledSpeed <= UE_KINDA_SMALL_NUMBER))
+			&& Evaluation.Sample.Speed == 0.0f)
 			|| (Origin->MotionType == EGGYGOLocomotionMotionType::TurnBack
 				&& Candidate.TurnPhase != EGGYGOTurnBackPhase::Turning
 				&& Candidate.TurnPhase != EGGYGOTurnBackPhase::Braking);
@@ -3235,7 +3377,9 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 			// This is an endpoint sample at the actual native interval, not a translation integral.
 			const float Ratio = SimulationTime / MovementTickTime;
 			if (!FMath::IsFinite(Ratio)) return Reject(TEXT("CurveRMS native simulation/tick ratio is non-finite."));
-			Prepared->OverrideVelocity = FRotator(0.0f, Origin->BaseYaw, 0.0f)
+			const float BasisYaw = bAuthorityReplay && Origin->MotionType == EGGYGOLocomotionMotionType::TurnBack
+				? Candidate.TurnEntryYaw : Origin->BaseYaw;
+			Prepared->OverrideVelocity = FRotator(0.0f, BasisYaw, 0.0f)
 				.RotateVector(Evaluation.ScaledVelocity) * Ratio;
 			Prepared->Result = EGGYGOCurveRootMotionPrepareResult::Prepared;
 		}
@@ -3251,6 +3395,7 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 	if (bReplayPrepare)
 	{
 		ReplayLocomotionCurvePrepared = Prepared;
+		bReplayPreparedFromAuthority = bAuthorityReplay;
 	}
 	else
 	{
@@ -3356,7 +3501,7 @@ void UGGYGOCharacterMovementComponent::ResolveGait(float DeltaSeconds, FLocomoti
 	// 计时达标则本帧立即升档并归零，不等下一帧 —— 延后一帧会让升档时机
 	// 与配置的阈值差一个帧时长，在低帧率下可感知。
 	if (FrameGait == EGGYGOGait::Walk && bHasMoveInput && !bBlocked && !bForceWalkRequested && bOnGround
-		&& MovementSet && Candidate.WalkHoldSeconds >= MovementSet->GetSanitizedWalkToRunHoldSeconds())
+		&& MovementSet && Candidate.WalkHoldSeconds >= MovementSet->WalkToRunHoldSeconds)
 	{
 		FrameGait = EGGYGOGait::Run;
 		Candidate.WalkHoldSeconds = 0.0f;
@@ -3459,43 +3604,38 @@ bool UGGYGOCharacterMovementComponent::IsCurrentMotionFinished(
 	const FLocomotionUpdateCandidate& Candidate, bool& bOutFinished, FString& OutError) const
 {
 	bOutFinished = false;
-	const UGGYGOLocomotionMotionProfile* Profile = MovementSet->GetProfileForMotion(Candidate.MotionType);
 	if (!MovementSet->bUseCurveDrivenSpeed)
 	{
-		// Profiles are optional in the explicitly selected fixed-speed mode.
-		bOutFinished = !Profile || !FMath::IsFinite(Profile->Duration)
-			|| Profile->Duration <= UE_SMALL_NUMBER || Candidate.MotionTime >= Profile->Duration;
+		// Explicit fixed mode has no source-driven start/stop timeline.
+		bOutFinished = true;
 		return true;
 	}
-	if (IsValid(Profile) && FMath::IsFinite(Profile->Duration) && Profile->Duration > UE_SMALL_NUMBER
-		&& FMath::IsFinite(Candidate.MotionTime) && Candidate.MotionTime >= 0.0f
-		&& Candidate.MotionTime < Profile->Duration)
+	FGGYGOLocomotionSourceBindingPtr Binding;
+	if (!GetLocomotionSourceBinding(Binding, OutError)) return false;
+	const FGGYGOLocomotionSequenceSource* Source = Binding->GetSingleSource(Candidate.MotionType);
+	if (!Source)
 	{
-		return true;
-	}
-	// Do not turn missing/invalid data into a completed clip and skip its error.
-	if (IsValid(Profile) && Profile->bLoop)
-	{
-		OutError = FString::Printf(TEXT("Non-loop motion %d Profile='%s' must use bLoop=false."),
-			static_cast<int32>(Candidate.MotionType), *GetPathNameSafe(Profile));
+		OutError = FString::Printf(TEXT("Animation source route missing for motion %d."), static_cast<int32>(Candidate.MotionType));
 		return false;
 	}
 	FGGYGOLocomotionEvaluationResult CompletedInterval;
-	if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(Profile, Candidate.MotionTime, Candidate.MotionTime,
+	if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(*Source, Candidate.MotionTime, Candidate.MotionTime,
 		MovementSet->RootMotionScale, CompletedInterval, &OutError))
 	{
 		return false;
 	}
-	bOutFinished = Candidate.MotionTime >= Profile->Duration;
+	bOutFinished = static_cast<double>(Candidate.MotionTime) * Source->SequenceRateScale >= Source->PlayLength;
 	return true;
 }
 
-bool UGGYGOCharacterMovementComponent::EvaluateWalkRunProfiles(
+bool UGGYGOCharacterMovementComponent::EvaluateWalkRunSource(
 	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const
 {
 	FGGYGOWalkRunEvaluationResult Result;
+	FGGYGOLocomotionSourceBindingPtr Binding;
+	if (!GetLocomotionSourceBinding(Binding, OutError)) return false;
 	if (!GGYGOLocomotionEvaluation::EvaluateWalkRunInterval(
-		MovementSet->WalkLoopProfile, MovementSet->RunLoopProfile, Candidate.CyclePhase,
+		*Binding, Candidate.CyclePhase,
 		DeltaSeconds, Candidate.BlendAlpha, MovementSet->RootMotionScale, Result, &OutError))
 	{
 		return false;
@@ -3512,7 +3652,7 @@ bool UGGYGOCharacterMovementComponent::EvaluateWalkRunProfiles(
 	return true;
 }
 
-bool UGGYGOCharacterMovementComponent::EvaluateLocomotionProfile(
+bool UGGYGOCharacterMovementComponent::EvaluateLocomotionSource(
 	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const
 {
 	if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds < 0.0f)
@@ -3546,19 +3686,20 @@ bool UGGYGOCharacterMovementComponent::EvaluateLocomotionProfile(
 	}
 	if (Candidate.MotionType == EGGYGOLocomotionMotionType::WalkRun)
 	{
-		return EvaluateWalkRunProfiles(AcceptedDelta, Candidate, OutError);
+		return EvaluateWalkRunSource(AcceptedDelta, Candidate, OutError);
 	}
 
-	const UGGYGOLocomotionMotionProfile* Profile = MovementSet->GetProfileForMotion(Candidate.MotionType);
-	if (IsValid(Profile) && Profile->bLoop)
+	FGGYGOLocomotionSourceBindingPtr Binding;
+	if (!GetLocomotionSourceBinding(Binding, OutError)) return false;
+	const FGGYGOLocomotionSequenceSource* Source = Binding->GetSingleSource(Candidate.MotionType);
+	if (!Source)
 	{
-		OutError = FString::Printf(TEXT("Non-loop motion %d Profile='%s' must use bLoop=false."),
-			static_cast<int32>(Candidate.MotionType), *GetPathNameSafe(Profile));
+		OutError = FString::Printf(TEXT("Animation source route missing for motion %d."), static_cast<int32>(Candidate.MotionType));
 		return false;
 	}
 	FGGYGOLocomotionEvaluationResult Result;
 	const float EndTime = Candidate.MotionTime + AcceptedDelta;
-	if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(Profile, Candidate.MotionTime, EndTime,
+	if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(*Source, Candidate.MotionTime, EndTime,
 		MovementSet->RootMotionScale, Result, &OutError))
 	{
 		return false;
@@ -3709,7 +3850,7 @@ bool UGGYGOCharacterMovementComponent::TryUpdateLocomotion(
 	{
 		Candidate.StopType = EGGYGOStopMotionType::None;
 		const bool bCanStart = !bHadMoveInput && Candidate.Gait == EGGYGOGait::Walk
-			&& (MovementSet->bUseCurveDrivenSpeed || MovementSet->WalkStartProfile);
+			&& MovementSet->bUseCurveDrivenSpeed;
 		if (bCanStart)
 		{
 			SetLocomotionMotion(EGGYGOLocomotionMotionType::WalkStart, Candidate);
@@ -3773,7 +3914,7 @@ bool UGGYGOCharacterMovementComponent::TryUpdateLocomotion(
 		if (!StageLocomotionCurveRootMotion(DeltaSeconds, Candidate, Error)) return Reject();
 		return true;
 	}
-	if (!EvaluateLocomotionProfile(DeltaSeconds, Candidate, Error))
+	if (!EvaluateLocomotionSource(DeltaSeconds, Candidate, Error))
 	{
 		return Reject();
 	}
@@ -3804,7 +3945,7 @@ void UGGYGOCharacterMovementComponent::ValidateClientLocomotionHint() const
 		return;
 	}
 
-	// 这些值只用于发现客户端/服务端预测分歧。服务端不会从这里取 Profile、速度或时间。
+	// 这些值只用于发现客户端/服务端预测分歧。服务端不会从这里取动画源、速度或时间。
 	if (MoveData->LocomotionMotionType != LocomotionMotionType
 		|| MoveData->StopMotionType != StopMotionType)
 	{
@@ -3948,9 +4089,10 @@ void UGGYGOCharacterMovementComponent::UpdateTurnBackRootMotion()
 		return;
 	}
 
-	const bool bCurveDrivenEnabled = MovementSet
-		&& MovementSet->bUseCurveDrivenSpeed
-		&& MovementSet->TurnBackProfile;
+	FGGYGOLocomotionSourceBindingPtr Binding;
+	FString Error;
+	const bool bCurveDrivenEnabled = MovementSet && MovementSet->bUseCurveDrivenSpeed
+		&& GetLocomotionSourceBinding(Binding, Error);
 	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_Authority)
 	{
 		bReplicatedTurnBackCurveDriven = bCurveDrivenEnabled && IsTurnBackCurveDriven();

@@ -1,6 +1,7 @@
 /** C33 / P1-T1: real-profile coverage for three frozen mathematical contracts. */
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
+#include "Character/Tests/GGYGOLocomotionMovementTestTypes.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
@@ -130,6 +131,70 @@ namespace GGYGOLocomotionEvaluationT1
 		CheckWalkRun(Test, Label + TEXT(" reset"), Result, FGGYGOWalkRunEvaluationResult());
 		CheckReplacedError(Test, Label, Error);
 	}
+
+	bool CheckOriginalAnimationSources(FAutomationTestBase& Test)
+	{
+		using namespace GGYGOLocomotionEvaluation;
+		const auto MakeSource = [](EGGYGOLocomotionMotionType Type, bool bLoop, float Speed, float DirectionX)
+		{
+			UGGYGOLocomotionTestSequence* Sequence = NewObject<UGGYGOLocomotionTestSequence>(GetTransientPackage());
+			for (const TPair<FName, float>& Curve : {TPair<FName, float>(TEXT("RootMotion_Speed"), Speed),
+				TPair<FName, float>(TEXT("RootMotion_DirX"), DirectionX), TPair<FName, float>(TEXT("RootMotion_DirY"), 0.0f),
+				TPair<FName, float>(TEXT("RootMotion_Yaw"), 0.0f)})
+			{
+				FRichCurve Data; Data.AddKey(0.0f, Curve.Value); Sequence->TestCurves.Add(Curve.Key, Data);
+			}
+			Sequence->RateScale = 1.0f;
+			FGGYGOLocomotionSequenceSource Source;
+			Source.MotionType = Type; Source.RouteKey = TEXT("OriginalFixture"); Source.Sequence.Reset(Sequence);
+			Source.bLoop = bLoop; Source.PlayLength = 1.0f; Source.SequenceRateScale = 1.0f;
+			return Source;
+		};
+		FGGYGOLocomotionSourceBinding Binding;
+		Binding.Status = EGGYGOLocomotionSourceStatus::Available;
+		for (EGGYGOLocomotionMotionType Type : {EGGYGOLocomotionMotionType::WalkStart, EGGYGOLocomotionMotionType::StartStop,
+			EGGYGOLocomotionMotionType::WalkStop, EGGYGOLocomotionMotionType::RunStop, EGGYGOLocomotionMotionType::TurnBack})
+			Binding.SingleSources.Add(MakeSource(Type, false, 8.0f, 1.0f));
+		FGGYGOLocomotionBlendSpaceSampleSource Walk, Run;
+		Walk.Source = MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, 1.0f);
+		Run.Source = MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, -1.0f);
+		Walk.SampleIndex = 0; Run.SampleIndex = 1; Walk.SampleRateScale = Run.SampleRateScale = 1.0f;
+		Run.SampleValue = FVector(1.0, 0.0, 0.0);
+		FString FixtureError;
+		UBlendSpace1D* BS = MakeGGYGOLocomotionTestBlendSpace(GetTransientPackage(), Walk.Source.Sequence.Get(), Run.Source.Sequence.Get(), FixtureError);
+		if (!Test.TestTrue(FString::Printf(TEXT("Native BlendSpace fixture is authored successfully (Error='%s')"), *FixtureError), BS != nullptr && FixtureError.IsEmpty())) return false;
+		Binding.WalkRunKey = TEXT("walkRun"); Binding.WalkRunBlendSpace.Reset(BS); Binding.bWalkRunLoop = true;
+		Binding.WalkRunSamples = {Walk, Run};
+		FString Error;
+		FGGYGOWalkRunEvaluationResult Mixed = MakeDirtyWalkRun();
+		if (!Test.TestTrue(TEXT("Original native BS evaluates opposite source vectors"), EvaluateWalkRunInterval(Binding, 0.0f, 0.1f, 0.5f, 1.0f, Mixed, &Error))) return false;
+		if (!Test.TestTrue(TEXT("Legitimate source vector cancellation succeeds as exact zero"), Mixed.Motion.Sample.bHasCurveSource
+			&& Mixed.Motion.Sample.Speed == 0.0f && Mixed.Motion.ScaledVelocity == FVector::ZeroVector && Error.IsEmpty())) return false;
+		FGGYGOLocomotionSourceBinding Missing = Binding;
+		Missing.Status = EGGYGOLocomotionSourceStatus::Missing; Missing.Error = TEXT("original motion route is missing");
+		Mixed = MakeDirtyWalkRun();
+		if (!Test.TestFalse(TEXT("Required curve evaluation refuses a Missing publication"), EvaluateWalkRunInterval(Missing, 0.0f, 0.1f, 0.5f, 1.0f, Mixed, &Error))) return false;
+		CheckFailure(Test, TEXT("Missing original publication"), Mixed, Error);
+		if (!Test.TestTrue(TEXT("Missing publication retains its original cause"), Error.Contains(Missing.Error))) return false;
+		FGGYGOLocomotionSequenceSource& Single = Binding.SingleSources[0];
+		UGGYGOLocomotionTestSequence* Sequence = CastChecked<UGGYGOLocomotionTestSequence>(Single.Sequence.Get());
+		Sequence->TestCurves.Remove(TEXT("RootMotion_DirX"));
+		if (!Test.TestFalse(TEXT("Missing original curve rejects the real source contract"), ValidateBinding(Binding, Error))
+			|| !Test.TestTrue(TEXT("Missing curve error identifies original asset and curve"), Error.Contains(Sequence->GetPathName()) && Error.Contains(TEXT("RootMotion_DirX")))) return false;
+		FRichCurve TinyDirection; TinyDirection.AddKey(0.0f, 1.e-30f); Sequence->TestCurves.Add(TEXT("RootMotion_DirX"), TinyDirection);
+		Single.bLoop = true;
+		if (!Test.TestFalse(TEXT("Wrong-loop original single route rejects at binding admission"), ValidateBinding(Binding, Error))
+			|| !Test.TestTrue(TEXT("Loop rejection identifies bLoop"), Error.Contains(TEXT("bLoop")))) return false;
+		Single.bLoop = false;
+		FGGYGOLocomotionEvaluationResult Motion = MakeDirtyMotion();
+		if (!Test.TestTrue(TEXT("Tiny nonzero original direction remains valid"), EvaluateSingleInterval(Single, 0.0f, 0.1f, 1.0f, Motion, &Error))
+			|| !Test.TestTrue(TEXT("Tiny direction normalizes without tolerance loss"), Motion.Sample.Direction == FVector::ForwardVector)) return false;
+		Sequence->TestCurves.FindChecked(TEXT("RootMotion_Speed")).SetKeys({FRichCurveKey(0.0f, -1.0f)});
+		Motion = MakeDirtyMotion();
+		if (!Test.TestFalse(TEXT("Negative actual source speed rejects evaluation"), EvaluateSingleInterval(Single, 0.0f, 0.1f, 1.0f, Motion, &Error))) return false;
+		CheckFailure(Test, TEXT("Original negative speed"), Motion, Error);
+		return Test.TestTrue(TEXT("Negative source diagnosis identifies runtime speed and original asset"), Error.Contains(TEXT("RootMotion_Speed")) && Error.Contains(Sequence->GetPathName()));
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOLocomotionSingleIntervalRawAndScaledTest,
@@ -139,6 +204,7 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOLocomotionSingleIntervalRawAndScaledTest,
 bool FGGYGOLocomotionSingleIntervalRawAndScaledTest::RunTest(const FString& Parameters)
 {
 	using namespace GGYGOLocomotionEvaluationT1;
+	if (!CheckOriginalAnimationSources(*this)) return false;
 	auto Profile = MakeConstantProfile(1.0f, false, 8.0f, 1.0f, 0.0f, 0.0f);
 	SetLinearCurve(Profile->YawCurve, 1.0f, 0.0f, 40.0f);
 	FGGYGOLocomotionCurveSample NativeSample;

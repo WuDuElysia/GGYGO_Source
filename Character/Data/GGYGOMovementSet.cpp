@@ -10,15 +10,6 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOMovementSet)
 
-namespace GGYGOMovementSetDefaults
-{
-	/** 配置值非法时的兜底走跑阈值。与字段默认值一致。 */
-	constexpr float WalkToRunHoldSeconds = 1.5f;
-
-	/** 走跑阈值上限。超过一分钟的"持续走"在任何玩法下都是配置错误。 */
-	constexpr float MaxWalkToRunHoldSeconds = 60.0f;
-}
-
 UGGYGOMovementSet::UGGYGOMovementSet(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
@@ -31,10 +22,10 @@ float UGGYGOMovementSet::GetSpeedForGait(EGGYGOGait Gait) const
 	switch (Gait)
 	{
 	case EGGYGOGait::Walk:
-		return FMath::Max(WalkSpeed, 0.0f);
+		return WalkSpeed;
 
 	case EGGYGOGait::Run:
-		return FMath::Max(RunSpeed, 0.0f);
+		return RunSpeed;
 
 	case EGGYGOGait::None:
 	default:
@@ -44,13 +35,9 @@ float UGGYGOMovementSet::GetSpeedForGait(EGGYGOGait Gait) const
 
 float UGGYGOMovementSet::GetSanitizedWalkToRunHoldSeconds() const
 {
-	// 非有限值（NaN / Inf）无法参与比较，会让计时器永远达不到或立刻达到阈值。
-	if (!FMath::IsFinite(WalkToRunHoldSeconds) || WalkToRunHoldSeconds <= 0.0f)
-	{
-		return GGYGOMovementSetDefaults::WalkToRunHoldSeconds;
-	}
-
-	return FMath::Min(WalkToRunHoldSeconds, GGYGOMovementSetDefaults::MaxWalkToRunHoldSeconds);
+	// Compatibility accessor: configuration admission owns validation. Do not
+	// turn an invalid value into an apparently valid walk/run policy.
+	return WalkToRunHoldSeconds;
 }
 
 const UGGYGOLocomotionMotionProfile* UGGYGOMovementSet::GetProfileForMotion(EGGYGOLocomotionMotionType MotionType) const
@@ -140,47 +127,9 @@ bool UGGYGOMovementSet::ValidateMovementSet(FString& OutError) const
 		}
 	}
 
-	struct FProfileRule
-	{
-		const TCHAR* Field;
-		const UGGYGOLocomotionMotionProfile* Profile;
-		bool bExpectedLoop;
-	};
-	const FProfileRule ProfileRules[] = {
-		{TEXT("WalkStartProfile"), WalkStartProfile.Get(), false},
-		{TEXT("WalkLoopProfile"), WalkLoopProfile.Get(), true},
-		{TEXT("RunLoopProfile"), RunLoopProfile.Get(), true},
-		{TEXT("StartStopProfile"), StartStopProfile.Get(), false},
-		{TEXT("WalkStopProfile"), WalkStopProfile.Get(), false},
-		{TEXT("RunStopProfile"), RunStopProfile.Get(), false},
-		{TEXT("TurnBackProfile"), TurnBackProfile.Get(), false}
-	};
-	for (const FProfileRule& Rule : ProfileRules)
-	{
-		if (!Rule.Profile)
-		{
-			if (bUseCurveDrivenSpeed)
-			{
-				return FailField(Rule.Field, TEXT("a Profile is required when bUseCurveDrivenSpeed is true."));
-			}
-			continue;
-		}
-		if (!IsValid(Rule.Profile))
-		{
-			return FailField(Rule.Field, TEXT("references an invalid Profile object."));
-		}
-		if (Rule.Profile->bLoop != Rule.bExpectedLoop)
-		{
-			return FailField(Rule.Field, FString::Printf(TEXT("Profile '%s' must use bLoop=%s."),
-				*Rule.Profile->GetPathName(), Rule.bExpectedLoop ? TEXT("true") : TEXT("false")));
-		}
-		FString ProfileError;
-		if (!Rule.Profile->ValidateProfile(ProfileError))
-		{
-			return FailField(Rule.Field, FString::Printf(TEXT("Profile '%s': %s"),
-				*Rule.Profile->GetPathName(), *ProfileError));
-		}
-	}
+	// Motion sources are resolved from Animation's original source binding.
+	// Serialized profile copies are retained only as migration history; their
+	// presence or contents cannot admit (or replace) a runtime animation source.
 	return true;
 }
 

@@ -71,6 +71,7 @@ void FRootMotionSource_GGYGOCurve::PrepareRootMotion(
 	if (!OriginalOwner || OriginalOwner != Character.GetCharacterMovement()
 		|| static_cast<const UCharacterMovementComponent*>(OriginalOwner) != &MoveComponent)
 	{
+		// The original CMC/animation publication travels only in this local resource, never by pose lookup.
 		// A retired/unproven contribution must not override a successor or independent action.
 		RootMotionParams.Set(FTransform::Identity);
 		AccumulateMode = ERootMotionAccumulateMode::Additive;

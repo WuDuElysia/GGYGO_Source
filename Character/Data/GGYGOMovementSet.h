@@ -5,12 +5,9 @@
  * 做成独立 DataAsset 而不是内联在角色配置里，理由与 `UGGYGOPawnData` 相同：
  * 移动手感需要能跨角色复用，也需要能给同一角色换一套（受伤状态、水下、载具）。
  *
- * ## 配置校验与当前消费边界
- * ValidateMovementSet 提供统一纯校验：曲线模式要求七份有效 Profile，
- * 显式固定模式使用 WalkSpeed / RunSpeed，允许 Profile 留空。
- *
- * 当前 CMC 尚未接入该校验；缺 Profile 后使用固定速度、非法值替换等旧路径
- * 仍存在，须在后续消费者步骤整改。新增校验不表示运行时已拒绝这些配置。
+ * ValidateMovementSet 只校验本资产的移动参数。曲线模式由 Animation 发布的
+ * 原始动画源绑定提供运动曲线；显式固定模式使用 WalkSpeed / RunSpeed。
+ * 源绑定的资格与生命周期由 CMC 请求入口检查，不由复制的 Profile 授权。
  */
 #pragma once
 
@@ -52,7 +49,7 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Gait", meta = (ClampMin = "0.1", ClampMax = "60.0", UIMin = "0.1", UIMax = "60.0", ForceUnits = "s"))
 	float WalkToRunHoldSeconds = 1.5f;
 
-	/** WalkRun BlendSpace 的权重推进速率（1/秒）。0 表示立即吸附；非法值由统一校验拒绝，CMC 接入待后续步骤。 */
+	/** WalkRun BlendSpace 的权重推进速率（1/秒）。0 表示立即吸附；非法值由统一校验拒绝。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Gait", meta = (DisplayName = "Walk Run Blend Interp Speed", ClampMin = "0.0", ClampMax = "50.0", UIMin = "0.0", UIMax = "50.0"))
 	float WalkRunBlendInterpSpeed = 6.0f;
 
@@ -92,18 +89,17 @@ public:
 	// ===== 曲线驱动 =====
 
 	/**
-	 * 是否让 Locomotion Profile 曲线接管速度。
+	 * 是否让原始动画源曲线接管速度。
 	 *
-	 * 开启后速度由 `RootMotion_Speed` 曲线逐帧给出，脚步与位移严格对齐（不打滑）。
+	 * 开启后速度由源动画的 `RootMotion_Speed` 曲线给出。
 	 * 关闭则一直用上面的 `WalkSpeed` / `RunSpeed`。
 	 *
-	 * 统一校验要求曲线模式的七份 Profile 齐全；显式关闭时允许留空。
-	 * 当前 CMC 尚未接入校验，缺 Profile 的旧固定速度替代路径仍待删除。
+	 * 曲线模式必须有有效的 Animation 源绑定；缺失或非法源不会回落为固定速度。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven")
 	bool bUseCurveDrivenSpeed = true;
 
-	/** 动画曲线速度的缩放系数。只缩放速度，不缩放位移量。 */
+	/** 源动画曲线速度的缩放系数，不缩放 Yaw。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Curve Driven", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float RootMotionScale = 1.0f;
 
@@ -111,30 +107,29 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Locomotion profiles are evaluated on the server; this bound is no longer used."))
 	float MaxCurveDrivenSpeed = 20000.0f;
 
-	// ===== Locomotion Motion Profiles =====
-	// 这些 Profile 从实际动画 RootMotion_* 曲线迁移。统一校验要求曲线模式七项齐全；
-	// 固定模式允许留空，已填项仍校验。CMC 的旧空值替代路径尚未整改。
-	// 不允许 CMC 回头读取 AnimInstance 作为第二个模拟时钟。
+	// ===== 历史 Locomotion Motion Profiles =====
+	// 仅保留旧资产序列化与迁移记录，不参与源绑定资格或运行时求值。
+	// CMC 消费 Animation 发布的不可变源绑定，不反查 AnimInstance 当前姿态。
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkStartProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkLoopProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> RunLoopProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> StartStopProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> WalkStopProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> RunStopProfile;
 
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Locomotion Profiles")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Deprecated|Locomotion Profiles", meta = (DeprecatedProperty, DeprecationMessage = "Motion curves come from the original Animation source binding."))
 	TObjectPtr<const UGGYGOLocomotionMotionProfile> TurnBackProfile;
 
 	// ===== TurnBack（急停转身）=====
@@ -206,22 +201,21 @@ public:
 	 *
 	 * `None` 返回 0，这是有意的：被禁止移动和静止都映射到 `None`，
 	 * 让 `GetMaxSpeed()` 只需查这一张表，不必再写分支。
-	 * 当前实现仍把负速度钳为0；消费者接入统一校验后的移除工作待后续步骤。
+	 * 返回已编写的原值；调用者须先通过配置校验。
 	 */
 	float GetSpeedForGait(EGGYGOGait Gait) const;
 
-	/** 旧兼容 getter：非有限或<=0时替换为1.5秒，>60时截为60；不等同 ValidateMovementSet，消费者迁移待后续步骤。 */
+	/** 旧名称兼容入口，返回已编写的原值；调用者须先通过配置校验。 */
 	float GetSanitizedWalkToRunHoldSeconds() const;
 
-	/** 解析非 WalkRun 段使用的 Profile；WalkRun 由 CMC 同时混合 Walk/Run Loop。 */
+	/** 仅供历史 Profile 迁移工具查询，运行时不据此选择或替代动画源。 */
 	const UGGYGOLocomotionMotionProfile* GetProfileForMotion(EGGYGOLocomotionMotionType MotionType) const;
 
 	/**
-	 * 纯校验非废弃数值与 Profile 引用，不修改配置或持有运行状态。
-	 * 曲线模式要求七份 Profile，Walk/Run Loop 必须循环，其余五份必须非循环；
-	 * 显式固定模式允许空引用，已填 Profile 仍校验。曲线内部规则委托 ValidateProfile。
+	 * 纯校验本资产的非废弃数值，不修改配置或持有运行状态。
+	 * 原始动画源、曲线和生命周期资格由源绑定消费入口独立校验。
 	 * 合法零值保持原语义；成功清空旧错误，失败含资产路径、字段与原因。
-	 * 编辑器使用同一规则，当前 CMC 尚未接入，旧 getter/消费者替代行为仍存在。
+	 * 编辑器与 CMC 配置接纳使用同一数值规则。
 	 */
 	bool ValidateMovementSet(FString& OutError) const;
 

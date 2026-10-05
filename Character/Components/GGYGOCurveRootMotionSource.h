@@ -34,7 +34,7 @@ struct FGGYGOCurveRootMotionPrepared;
  * 曲线驱动的位移源。
  *
  * 每次 PrepareRootMotion 将原发行引用和实际原生区间交给原 CMC 求值。
- * 不选择 Profile、不推进 CMC 语义时钟；Clone 保留原引用及区间派生结果。
+ * 不选择动画或复制曲线、不推进 CMC 语义时钟；Clone 保留含原源绑定的发行引用。
  * 本地来源不在 NetSerialize 中传输，网络导入来源尚未接入本消费契约。
  */
 USTRUCT()

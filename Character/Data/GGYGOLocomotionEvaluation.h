@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Character/Data/GGYGOMovementTypes.h"
+#include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 
 class UGGYGOLocomotionMotionProfile;
 
@@ -21,6 +22,22 @@ struct FGGYGOWalkRunEvaluationResult
 
 namespace GGYGOLocomotionEvaluation
 {
+	/** Validate original metadata and required curve presence without retaining state. */
+	GGYGO_API bool ValidateSource(const FGGYGOLocomotionSequenceSource& Source, FString& OutError);
+	GGYGO_API bool ValidateBinding(const FGGYGOLocomotionSourceBinding& Binding, FString& OutError);
+
+	/** Move seconds map through the source's authored rate. Uses runtime curve data, never the current pose. */
+	GGYGO_API bool EvaluateSingleInterval(const FGGYGOLocomotionSequenceSource& Source,
+		float StartTime, float EndTime, float RootMotionScale,
+		FGGYGOLocomotionEvaluationResult& OutResult, FString* OutError = nullptr);
+
+	/** Native BlendSpace weights/period on the CMC move context; this is not the AnimGraph node's filtered cache. */
+	GGYGO_API bool EvaluateWalkRunInterval(const FGGYGOLocomotionSourceBinding& Binding,
+		float StartCyclePosition, float AcceptedIntervalSeconds, float BlendAlpha, float RootMotionScale,
+		FGGYGOWalkRunEvaluationResult& OutResult, FString* OutError = nullptr);
+
+	// Historical Profile APIs below remain for migration tools and their original failure evidence.
+	// Production movement exclusively consumes the original source overloads above.
 	/**
 	 * Delegate asset evaluation to Profile::EvaluateInterval, then check scaling.
 	 * Authored zero, tiny positive speed and zero Scale are successful values.

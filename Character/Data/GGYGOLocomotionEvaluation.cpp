@@ -1,6 +1,220 @@
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
 
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
+#include "Animation/BlendSpace1D.h"
+
+namespace GGYGOLocomotionSourceEvaluation
+{
+	const FName SpeedName(TEXT("RootMotion_Speed"));
+	const FName DirXName(TEXT("RootMotion_DirX"));
+	const FName DirYName(TEXT("RootMotion_DirY"));
+	const FName YawName(TEXT("RootMotion_Yaw"));
+
+	bool Fail(FString* Error, const UObject* Asset, const TCHAR* Field, const FString& Reason)
+	{
+		if (Error) *Error = FString::Printf(TEXT("AnimationSource='%s': %s: %s"), *GetPathNameSafe(Asset), Field, *Reason);
+		return false;
+	}
+
+	bool Store(double Value, float& Out, const UObject* Asset, const TCHAR* Field, FString* Error)
+	{
+		if (!FMath::IsFinite(Value) || FMath::Abs(Value) > TNumericLimits<float>::Max())
+			return Fail(Error, Asset, Field, TEXT("computed value is non-finite or outside float range"));
+		Out = static_cast<float>(Value);
+		return true;
+	}
+
+	// Scaling before normalization preserves every finite nonzero authored direction, including subnormal floats.
+	bool Direction(double X, double Y, FVector& Out)
+	{
+		const double Largest = FMath::Max(FMath::Abs(X), FMath::Abs(Y));
+		if (Largest == 0.0) { Out = FVector::ZeroVector; return false; }
+		X /= Largest; Y /= Largest;
+		const double Length = FMath::Sqrt(X * X + Y * Y);
+		Out = FVector(X / Length, Y / Length, 0.0);
+		return true;
+	}
+
+	bool Scale(const FGGYGOLocomotionCurveSample& Sample, float ScaleValue,
+		FGGYGOLocomotionEvaluationResult& Out, const UObject* Asset, FString* Error)
+	{
+		if (!FMath::IsFinite(ScaleValue) || ScaleValue < 0.0f)
+			return Fail(Error, Asset, TEXT("RootMotionScale"), TEXT("must be finite and non-negative"));
+		if (!Store(static_cast<double>(Sample.Speed) * ScaleValue, Out.ScaledSpeed, Asset, TEXT("ScaledSpeed"), Error)) return false;
+		Out.Sample = Sample;
+		Out.ScaledVelocity = Sample.Direction * Out.ScaledSpeed;
+		return !Out.ScaledVelocity.ContainsNaN() || Fail(Error, Asset, TEXT("ScaledVelocity"), TEXT("must be finite"));
+	}
+
+	/** Clip coordinates are explicit and can cross multiple loops; no clock is retained. */
+	bool SampleInterval(const FGGYGOLocomotionSequenceSource& Source, double Start, double End,
+		double TimeRate, FGGYGOLocomotionCurveSample& Out, FString* Error)
+	{
+		UAnimSequence* Sequence = Source.Sequence.Get();
+		FString ValidationError;
+		if (!GGYGOLocomotionEvaluation::ValidateSource(Source, ValidationError))
+		{ if (Error) *Error = ValidationError; return false; }
+		if (!FMath::IsFinite(Start) || Start < 0.0 || !FMath::IsFinite(End) || End < Start
+			|| !FMath::IsFinite(TimeRate) || TimeRate <= 0.0)
+			return Fail(Error, Sequence, TEXT("Interval"), TEXT("requires finite ordered non-negative times and positive time rate"));
+		const double Length = Source.PlayLength;
+		const auto Read = [Sequence](FName Name, double Time)
+		{ return Sequence->EvaluateCurveData(Name, FAnimExtractContext(Time, false), false); };
+		const auto YawAt = [&](double Time, double& Value)
+		{
+			if (!Source.bLoop) { Value = Read(YawName, FMath::Min(Time, Length)); }
+			else
+			{
+				const double Cycles = FMath::FloorToDouble(Time / Length);
+				const double Phase = FMath::Fmod(Time, Length);
+				const double First = Read(YawName, 0.0), Last = Read(YawName, Length);
+				Value = Read(YawName, Phase) + (Last - First) * Cycles;
+			}
+			return FMath::IsFinite(Value);
+		};
+		const double EndPhase = Source.bLoop ? FMath::Fmod(End, Length) : FMath::Min(End, Length);
+		const float RawSpeed = Read(SpeedName, EndPhase);
+		const float X = Read(DirXName, EndPhase), Y = Read(DirYName, EndPhase);
+		if (!FMath::IsFinite(RawSpeed) || RawSpeed < 0.0f)
+			return Fail(Error, Sequence, TEXT("RootMotion_Speed"), FString::Printf(TEXT("interval [%.9g, %.9g] has non-finite or negative endpoint speed"), Start, End));
+		if (!FMath::IsFinite(X) || !FMath::IsFinite(Y))
+			return Fail(Error, Sequence, TEXT("RootMotion_DirX/DirY"), TEXT("endpoint direction must be finite"));
+		Out.bHasAuthoredDirection = Direction(X, Y, Out.Direction);
+		if (RawSpeed > 0.0f && !Out.bHasAuthoredDirection)
+			return Fail(Error, Sequence, TEXT("RootMotion_DirX/DirY"), FString::Printf(TEXT("interval [%.9g, %.9g]: positive speed requires nonzero authored direction"), Start, End));
+		double StartYaw = 0.0, EndYaw = 0.0;
+		if (!YawAt(Start, StartYaw) || !YawAt(End, EndYaw))
+			return Fail(Error, Sequence, TEXT("RootMotion_Yaw"), TEXT("interval endpoint or loop accumulation is non-finite"));
+		if (!Store(static_cast<double>(RawSpeed) * TimeRate, Out.Speed, Sequence, TEXT("Speed"), Error)
+			|| !Store(EndYaw, Out.YawTotalDegrees, Sequence, TEXT("YawTotalDegrees"), Error)
+			|| !Store(EndYaw - StartYaw, Out.YawDeltaDegrees, Sequence, TEXT("YawDeltaDegrees"), Error)) return false;
+		Out.Velocity = Out.Direction * Out.Speed;
+		Out.DirectionAngle = Out.bHasAuthoredDirection ? FMath::RadiansToDegrees(FMath::Atan2(Out.Direction.Y, Out.Direction.X)) : 0.0f;
+		Out.ClipLength = Source.PlayLength;
+		Out.bLoopClip = Source.bLoop;
+		Out.bHasCurveSource = true;
+		return true;
+	}
+}
+
+bool GGYGOLocomotionEvaluation::ValidateSource(const FGGYGOLocomotionSequenceSource& Source, FString& OutError)
+{
+	using namespace GGYGOLocomotionSourceEvaluation;
+	OutError.Reset();
+	UAnimSequence* Sequence = Source.Sequence.Get();
+	if (!IsValid(Sequence)) return Fail(&OutError, Sequence, TEXT("Sequence"), TEXT("original route must reference a live animation"));
+	if (Source.RouteKey.IsNone()) return Fail(&OutError, Sequence, TEXT("RouteKey"), TEXT("original route is required"));
+	if (!FMath::IsFinite(Source.PlayLength) || Source.PlayLength <= 0.0f
+		|| !FMath::IsFinite(Source.SequenceRateScale) || Source.SequenceRateScale <= 0.0f)
+		return Fail(&OutError, Sequence, TEXT("PlayLength/RateScale"), TEXT("forward source requires finite positive length and rate"));
+	if (Sequence->GetPlayLength() != Source.PlayLength || Sequence->RateScale != Source.SequenceRateScale)
+		return Fail(&OutError, Sequence, TEXT("Configuration"), TEXT("original length or rate changed; republish configuration before evaluation"));
+	for (FName Name : {SpeedName, DirXName, DirYName, YawName})
+		if (!Sequence->HasCurveData(Name, false)) return Fail(&OutError, Sequence, *Name.ToString(), TEXT("required runtime curve is missing"));
+	return true;
+}
+
+bool GGYGOLocomotionEvaluation::ValidateBinding(const FGGYGOLocomotionSourceBinding& Binding, FString& OutError)
+{
+	using namespace GGYGOLocomotionSourceEvaluation;
+	OutError.Reset();
+	if (Binding.Status != EGGYGOLocomotionSourceStatus::Available)
+		return Fail(&OutError, Binding.WalkRunBlendSpace.Get(), TEXT("Binding"), Binding.Error.IsEmpty() ? TEXT("source publication is not available") : Binding.Error);
+	for (EGGYGOLocomotionMotionType Type : {EGGYGOLocomotionMotionType::WalkStart, EGGYGOLocomotionMotionType::StartStop,
+		EGGYGOLocomotionMotionType::WalkStop, EGGYGOLocomotionMotionType::RunStop, EGGYGOLocomotionMotionType::TurnBack})
+	{
+		const FGGYGOLocomotionSequenceSource* Source = Binding.GetSingleSource(Type);
+		if (!Source) return Fail(&OutError, nullptr, TEXT("MotionRoute"), FString::Printf(TEXT("motion %d has no original animation route"), static_cast<int32>(Type)));
+		if (Source->bLoop) return Fail(&OutError, Source->Sequence.Get(), TEXT("bLoop"), TEXT("single locomotion segment must not loop"));
+		if (!ValidateSource(*Source, OutError)) return false;
+	}
+	UBlendSpace* BS = Binding.WalkRunBlendSpace.Get();
+	if (!IsValid(BS) || !BS->IsA<UBlendSpace1D>() || Binding.WalkRunKey.IsNone() || !Binding.bWalkRunLoop)
+		return Fail(&OutError, BS, TEXT("WalkRun"), TEXT("requires original looping BlendSpace1D route"));
+	const FBlendParameter& Axis = BS->GetBlendParameter(0);
+	if (Axis.Min != 0.0f || Axis.Max != 1.0f)
+		return Fail(&OutError, BS, TEXT("WalkRun.Axis"), TEXT("WalkRun alpha contract requires the authored axis [0,1]"));
+	const TArray<FBlendSample>& Samples = BS->GetBlendSamples();
+	if (Samples.Num() == 0 || Samples.Num() != Binding.WalkRunSamples.Num())
+		return Fail(&OutError, BS, TEXT("Samples"), TEXT("original sample table changed or is empty"));
+	for (int32 Index = 0; Index < Samples.Num(); ++Index)
+	{
+		const FGGYGOLocomotionBlendSpaceSampleSource* Bound = Binding.GetWalkRunSample(Index);
+		const FBlendSample& Native = Samples[Index];
+		if (!Bound || Native.Animation != Bound->Source.Sequence.Get() || Native.SampleValue != Bound->SampleValue
+			|| Native.RateScale != Bound->SampleRateScale || Native.bUseSingleFrameForBlending || Native.bMirror)
+			return Fail(&OutError, BS, TEXT("Samples"), FString::Printf(TEXT("sample %d changed or uses unsupported single-frame/mirror semantics"), Index));
+		if (!FMath::IsFinite(Bound->SampleRateScale) || Bound->SampleRateScale <= 0.0f || !Bound->Source.bLoop)
+			return Fail(&OutError, BS, TEXT("Sample.RateScale/bLoop"), TEXT("loop samples require finite positive rate and loop semantics"));
+		if (!ValidateSource(Bound->Source, OutError)) return false;
+	}
+	return true;
+}
+
+bool GGYGOLocomotionEvaluation::EvaluateSingleInterval(const FGGYGOLocomotionSequenceSource& Source,
+	float StartTime, float EndTime, float RootMotionScale, FGGYGOLocomotionEvaluationResult& OutResult, FString* OutError)
+{
+	using namespace GGYGOLocomotionSourceEvaluation;
+	OutResult = {}; if (OutError) OutError->Reset();
+	FGGYGOLocomotionCurveSample Sample;
+	FGGYGOLocomotionEvaluationResult Candidate;
+	if (!SampleInterval(Source, static_cast<double>(StartTime) * Source.SequenceRateScale,
+		static_cast<double>(EndTime) * Source.SequenceRateScale, Source.SequenceRateScale, Sample, OutError)
+		|| !Scale(Sample, RootMotionScale, Candidate, Source.Sequence.Get(), OutError)) return false;
+	OutResult = Candidate; return true;
+}
+
+bool GGYGOLocomotionEvaluation::EvaluateWalkRunInterval(const FGGYGOLocomotionSourceBinding& Binding,
+	float StartCyclePosition, float AcceptedIntervalSeconds, float BlendAlpha, float RootMotionScale,
+	FGGYGOWalkRunEvaluationResult& OutResult, FString* OutError)
+{
+	using namespace GGYGOLocomotionSourceEvaluation;
+	OutResult = {}; if (OutError) OutError->Reset();
+	FString Error;
+	if (!ValidateBinding(Binding, Error)) { if (OutError) *OutError = Error; return false; }
+	UBlendSpace* BS = Binding.WalkRunBlendSpace.Get();
+	if (!FMath::IsFinite(StartCyclePosition) || StartCyclePosition < 0.0f
+		|| !FMath::IsFinite(AcceptedIntervalSeconds) || AcceptedIntervalSeconds < 0.0f
+		|| !FMath::IsFinite(BlendAlpha) || BlendAlpha < 0.0f || BlendAlpha > 1.0f)
+		return Fail(OutError, BS, TEXT("WalkRun.Interval/Alpha"), TEXT("requires non-negative finite interval/cycle and alpha in [0,1]"));
+	TArray<FBlendSampleData> Samples;
+	int32 Triangulation = INDEX_NONE;
+	if (!BS->GetSamplesFromBlendInput(FVector(BlendAlpha, 0.0, 0.0), Samples, Triangulation, false) || Samples.IsEmpty())
+		return Fail(OutError, BS, TEXT("NativeSamples"), TEXT("native BlendSpace sampling returned no active samples"));
+	const float Period = BS->GetAnimationLengthFromSampleData(Samples);
+	if (!FMath::IsFinite(Period) || Period <= 0.0f)
+		return Fail(OutError, BS, TEXT("NativePeriod"), TEXT("native BlendSpace period must be finite and positive"));
+	FGGYGOWalkRunEvaluationResult Candidate;
+	if (!Store(static_cast<double>(StartCyclePosition) + static_cast<double>(AcceptedIntervalSeconds) / Period,
+		Candidate.EndCyclePosition, BS, TEXT("EndCyclePosition"), OutError)) return false;
+	FVector Velocity = FVector::ZeroVector;
+	double YawDelta = 0.0, YawTotal = 0.0;
+	for (const FBlendSampleData& Native : Samples)
+	{
+		const FGGYGOLocomotionBlendSpaceSampleSource* Source = Binding.GetWalkRunSample(Native.SampleDataIndex);
+		const float Weight = Native.GetClampedWeight();
+		if (!Source || !FMath::IsFinite(Weight) || Weight < 0.0f)
+			return Fail(OutError, BS, TEXT("NativeSamples"), TEXT("active sample has no original binding or finite weight"));
+		FGGYGOLocomotionCurveSample Sample;
+		const double Length = Source->Source.PlayLength;
+		if (!SampleInterval(Source->Source, static_cast<double>(StartCyclePosition) * Length,
+			static_cast<double>(Candidate.EndCyclePosition) * Length, Length / Period, Sample, OutError)) return false;
+		Velocity += Sample.Velocity * Weight;
+		YawDelta += static_cast<double>(Sample.YawDeltaDegrees) * Weight;
+		YawTotal += static_cast<double>(Sample.YawTotalDegrees) * Weight;
+	}
+	FGGYGOLocomotionCurveSample Mixed;
+	if (!Store(Velocity.Size(), Mixed.Speed, BS, TEXT("Mixed.Speed"), OutError)
+		|| !Store(YawDelta, Mixed.YawDeltaDegrees, BS, TEXT("Mixed.YawDeltaDegrees"), OutError)
+		|| !Store(YawTotal, Mixed.YawTotalDegrees, BS, TEXT("Mixed.YawTotalDegrees"), OutError)) return false;
+	Mixed.Velocity = Velocity;
+	Mixed.bHasAuthoredDirection = Direction(Velocity.X, Velocity.Y, Mixed.Direction);
+	Mixed.DirectionAngle = Mixed.bHasAuthoredDirection ? FMath::RadiansToDegrees(FMath::Atan2(Mixed.Direction.Y, Mixed.Direction.X)) : 0.0f;
+	Mixed.ClipLength = Period; Mixed.bLoopClip = true; Mixed.bHasCurveSource = true;
+	// Opposed source velocities may legitimately cancel. Only individual positive-speed sources require direction.
+	if (!Scale(Mixed, RootMotionScale, Candidate.Motion, BS, OutError)) return false;
+	OutResult = Candidate; return true;
+}
 
 namespace
 {

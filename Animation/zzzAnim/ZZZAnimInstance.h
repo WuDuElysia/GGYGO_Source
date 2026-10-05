@@ -170,6 +170,8 @@ protected:
 
 	/** 清理本实例在 Pawn 生命周期之间持有的兼容表现状态。 */
 	virtual void OnAnimationLifecycleReset() override;
+	virtual void ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const override;
+	virtual bool IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const override;
 
 private:
 	/** 通用语义帧适配成旧快照，再映射到现有 AnimBP 表现存储。 */

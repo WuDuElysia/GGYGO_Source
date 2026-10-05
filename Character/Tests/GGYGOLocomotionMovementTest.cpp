@@ -1,8 +1,11 @@
 #include "Character/Tests/GGYGOLocomotionMovementTestTypes.h"
+#include "Character/Components/GGYGOCurveRootMotionSource.h"
 
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Data/GGYGOMovementSet.h"
+#include "Character/Data/GGYGOLocomotionEvaluation.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Input/GGYGOMovementInputTypes.h"
@@ -153,6 +156,68 @@ namespace
 		AddLinearKeys(Profile->YawCurve, 0.0f, EndYaw);
 		return Profile;
 	}
+
+	bool BindMovementFixture(UGGYGOCharacterMovementComponent* Move, const UGGYGOMovementSet* Set, FString* OutError = nullptr)
+	{
+		if (!Move->SetMovementSet(Set, OutError)) return false;
+		if (!Set->bUseCurveDrivenSpeed) return true;
+		ACharacter* Character = Cast<ACharacter>(Move->GetOwner());
+		if (!Character) return false;
+		USkeletalMeshComponent* Mesh = Character->GetMesh();
+		UGGYGOLocomotionTestAnimInstance* Producer = Cast<UGGYGOLocomotionTestAnimInstance>(Mesh->GetAnimInstance());
+		if (!Producer)
+		{
+			// Synthetic primary producer on a skeleton-free test character; still enters the real publication identity gate.
+			Producer = NewObject<UGGYGOLocomotionTestAnimInstance>(Mesh);
+			Mesh->AnimScriptInstance = Producer;
+		}
+		FGGYGOLocomotionSourceBinding Binding;
+		Binding.Identity.Producer = Producer; Binding.Identity.Character = Character; Binding.Identity.Mesh = Mesh;
+		Binding.Identity.LifecycleGeneration = 1; Binding.Identity.ConfigurationGeneration = ++Producer->PublicationGeneration;
+		Binding.Status = EGGYGOLocomotionSourceStatus::Available;
+		const auto Source = [](const UGGYGOLocomotionMotionProfile* Profile, EGGYGOLocomotionMotionType Type, FName Key)
+		{
+			FGGYGOLocomotionSequenceSource Result;
+			Result.MotionType = Type; Result.RouteKey = Key;
+			if (Profile)
+			{
+				// Preserve the original strict fixture values/tangents; only adapt their public evaluation boundary.
+				UGGYGOLocomotionTestSequence* Sequence = NewObject<UGGYGOLocomotionTestSequence>(const_cast<UGGYGOLocomotionMotionProfile*>(Profile));
+				Sequence->TestLength = Profile->Duration; Sequence->RateScale = 1.0f;
+				Sequence->TestCurves.Add(TEXT("RootMotion_Speed"), *Profile->SpeedCurve.GetRichCurveConst());
+				Sequence->TestCurves.Add(TEXT("RootMotion_DirX"), *Profile->DirectionXCurve.GetRichCurveConst());
+				Sequence->TestCurves.Add(TEXT("RootMotion_DirY"), *Profile->DirectionYCurve.GetRichCurveConst());
+				Sequence->TestCurves.Add(TEXT("RootMotion_Yaw"), *Profile->YawCurve.GetRichCurveConst());
+				Result.Sequence.Reset(Sequence); Result.PlayLength = Profile->Duration;
+				Result.SequenceRateScale = Sequence->RateScale; Result.bLoop = Profile->bLoop;
+			}
+			return Result;
+		};
+		Binding.SingleSources = {
+			Source(Set->WalkStartProfile, EGGYGOLocomotionMotionType::WalkStart, TEXT("WalkStart")),
+			Source(Set->StartStopProfile, EGGYGOLocomotionMotionType::StartStop, TEXT("WalkStartEnd")),
+			Source(Set->WalkStopProfile, EGGYGOLocomotionMotionType::WalkStop, TEXT("WalkEnd")),
+			Source(Set->RunStopProfile, EGGYGOLocomotionMotionType::RunStop, TEXT("RunEnd")),
+			Source(Set->TurnBackProfile, EGGYGOLocomotionMotionType::TurnBack, TEXT("TurnBack"))};
+		FGGYGOLocomotionBlendSpaceSampleSource Walk, Run;
+		Walk.Source = Source(Set->WalkLoopProfile, EGGYGOLocomotionMotionType::WalkRun, TEXT("walkRun"));
+		Run.Source = Source(Set->RunLoopProfile, EGGYGOLocomotionMotionType::WalkRun, TEXT("walkRun"));
+		Walk.SampleIndex = 0; Walk.SampleRateScale = 1.0f;
+		Run.SampleIndex = 1; Run.SampleRateScale = 1.0f; Run.SampleValue = FVector(1.0, 0.0, 0.0);
+		FString FixtureError;
+		UBlendSpace1D* BS = MakeGGYGOLocomotionTestBlendSpace(Character, Walk.Source.Sequence.Get(), Run.Source.Sequence.Get(), FixtureError);
+		if (!BS)
+		{
+			if (OutError) *OutError = FixtureError;
+			return false;
+		}
+		Binding.WalkRunKey = TEXT("walkRun"); Binding.WalkRunBlendSpace.Reset(BS); Binding.bWalkRunLoop = true;
+		Binding.WalkRunSamples = {Walk, Run};
+		FString Error;
+		const bool bPublished = Move->PublishLocomotionSourceBinding(Binding, Error);
+		if (OutError) *OutError = Error;
+		return bPublished;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOLocomotionMovementTest,
@@ -192,13 +257,13 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 
 	const float DefaultAcceleration = Move->MaxAcceleration;
 	const float DefaultFriction = Move->GroundFriction;
-	if (!TestTrue(TEXT("Curve MovementSet binding succeeds"), Move->SetMovementSet(FirstSet))) return false;
+	if (!TestTrue(TEXT("Curve MovementSet binding succeeds"), BindMovementFixture(Move, FirstSet))) return false;
 	TestEqual(TEXT("MovementSet applies acceleration"), Move->MaxAcceleration, 1234.0f);
 	TestEqual(TEXT("MovementSet applies friction"), Move->GroundFriction, 3.0f);
 	if (!TestFalse(TEXT("Legal null detach leaves no admitted MovementSet"), Move->SetMovementSet(nullptr))) return false;
 	TestEqual(TEXT("Null MovementSet restores component acceleration"), Move->MaxAcceleration, DefaultAcceleration);
 	TestEqual(TEXT("Null MovementSet restores component friction"), Move->GroundFriction, DefaultFriction);
-	if (!TestTrue(TEXT("Curve MovementSet rebinding succeeds"), Move->SetMovementSet(FirstSet))) return false;
+	if (!TestTrue(TEXT("Curve MovementSet rebinding succeeds"), BindMovementFixture(Move, FirstSet))) return false;
 	FLocomotionMovementConsumerFixture MovementSource(*this, Move, TEXT("Authority/mapping"));
 	if (!MovementSource.Bind() || !MovementSource.StartFreshRequest(TEXT("Initial curve scene"))) return false;
 
@@ -217,13 +282,55 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 		|| !MovementSource.Release(TEXT("RunStop scene"))) return false;
 	Move->SetTestGait(EGGYGOGait::Run);
 	Move->SetTestMotion(EGGYGOLocomotionMotionType::WalkRun, 0.0f);
+	FNetworkPredictionData_Client_Character* ClientData = Move->GetPredictionData_Client_Character();
+	FSavedMovePtr RecordedPtr(new FSavedMove_GGYGO());
+	FSavedMove_GGYGO* Recorded = static_cast<FSavedMove_GGYGO*>(RecordedPtr.Get());
+	Recorded->SetMoveFor(Character, 0.016f, FVector::ZeroVector, *ClientData);
 	Move->AdvanceTestMotion(0.016f, true, EGGYGOGait::Run);
+	Recorded->PostUpdate(Character, FSavedMove_Character::PostUpdate_Record);
 	TestEqual(TEXT("Stopping from Run selects RunStop"), Move->GetStopMotionType(), EGGYGOStopMotionType::RunStop);
 
 	if (!TestTrue(TEXT("RunStop produces a usable finite curve source sample"),
 		Move->GetTestCurveMotion().HasUsableSpeed()
 			&& FMath::IsFinite(Move->GetTestCurveMotion().Speed))) return false;
 	const FGGYGOLocomotionCurveSample RunStopCurveMotion = Move->GetTestCurveMotion();
+	if (!TestTrue(TEXT("Original Stop SavedMove captures the actual native prepared interval"), Recorded->SavedCurveRootMotionPrepared.IsValid())) return false;
+	const auto OriginalPrepared = Recorded->SavedCurveRootMotionPrepared;
+	// This local resource fixture is an unpossessed authority, not an autonomous player's prediction loop.
+	// Preserve the actual original native group at the record boundary; PerformMovement does this automatically
+	// for locally controlled autonomous pawns. No interval, prepared output or replay result is authored here.
+	Recorded->SavedRootMotion = Move->CurrentRootMotion;
+	const auto ContainsOriginalPreparedSource = [&OriginalPrepared](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
+	{
+		return Sources.ContainsByPredicate([&OriginalPrepared](const TSharedPtr<FRootMotionSource>& Source)
+		{
+			if (!Source.IsValid() || Source->GetScriptStruct() != FRootMotionSource_GGYGOCurve::StaticStruct()) return false;
+			const FRootMotionSource_GGYGOCurve* Curve = static_cast<const FRootMotionSource_GGYGOCurve*>(Source.Get());
+			return Curve->Origin.IsValid() && Curve->Prepared == OriginalPrepared
+				&& Curve->GetTime() == OriginalPrepared->NativeEndTime;
+		});
+	};
+	if (!TestTrue(TEXT("Original resource snapshot retains the actual native source/Prepared and endpoint"),
+		ContainsOriginalPreparedSource(Recorded->SavedRootMotion.RootMotionSources)
+			|| ContainsOriginalPreparedSource(Recorded->SavedRootMotion.PendingAddRootMotionSources))) return false;
+	if (!TestTrue(TEXT("Original Stop move retains a valid released source checkpoint"),
+		Recorded->SavedMovementInputSourceCheckpoint.bPresent
+			&& !Recorded->SavedMovementInputSourceCheckpoint.bConsumerInvalidated
+			&& Recorded->SavedMovementInputSourceCheckpoint.RequestSerial != 0)) return false;
+	Move->SetTestMotion(EGGYGOLocomotionMotionType::RunStop, 0.4f, EGGYGOStopMotionType::RunStop);
+	ClientData->SavedMoves.Add(RecordedPtr);
+	Character->bClientUpdating = true;
+	Move->SetAuthorityReplayForTest(true);
+	Recorded->PrepMoveFor(Character);
+	Move->UpdateCharacterStateBeforeMovement(0.016f);
+	Character->bClientUpdating = false;
+	Move->SetAuthorityReplayForTest(false);
+	ClientData->SavedMoves.RemoveSingle(RecordedPtr);
+	const bool bAuthorityTime = TestEqual(TEXT("Stop correction recomputes motion time from authority baseline"), Move->GetTestMotionTime(), 0.416f, 0.000001f);
+	const bool bAuthoritySpeed = TestEqual(TEXT("Stop correction recomputes source speed instead of restoring old Prepared"), Move->GetCurveMotion().Speed, 292.0f, 0.0001f);
+	const bool bOriginalPreparedUnchanged = TestTrue(TEXT("Original prepared interval remains immutable"),
+		Recorded->SavedCurveRootMotionPrepared == OriginalPrepared && OriginalPrepared->MotionEndTime == 0.016f);
+	if (!bAuthorityTime || !bAuthoritySpeed || !bOriginalPreparedUnchanged) return false;
 
 	// Fixed mode reuses all seven valid profiles and is configured before binding.
 	UGGYGOMovementSet* FixedSet = NewObject<UGGYGOMovementSet>(Character);
@@ -235,7 +342,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	FixedSet->WalkStopProfile = FirstSet->WalkStopProfile;
 	FixedSet->RunStopProfile = FirstSet->RunStopProfile;
 	FixedSet->TurnBackProfile = FirstSet->TurnBackProfile;
-	if (!TestTrue(TEXT("Explicit fixed MovementSet binding succeeds"), Move->SetMovementSet(FixedSet))) return false;
+	if (!TestTrue(TEXT("Explicit fixed MovementSet binding succeeds"), BindMovementFixture(Move, FixedSet))) return false;
 	if (!MovementSource.StartFreshRequest(TEXT("Explicit fixed rebind scene"))) return false;
 
 	// Restore the real old sample after binding cleanup to test this update's cleanup.
@@ -251,7 +358,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	Move->AdvanceTestMotion(0.016f, true, EGGYGOGait::Run);
 	TestEqual(TEXT("Curve-off clears TurnBack phase"), Move->GetTurnBackPhase(), EGGYGOTurnBackPhase::None);
 	TestFalse(TEXT("Curve-off produces no curve source sample"), Move->GetTestCurveMotion().bHasCurveSource);
-	if (!TestTrue(TEXT("Curve mode is rebound before later state setup"), Move->SetMovementSet(FirstSet))) return false;
+	if (!TestTrue(TEXT("Curve mode is rebound before later state setup"), BindMovementFixture(Move, FirstSet))) return false;
 	if (!MovementSource.StartFreshRequest(TEXT("Curve rebind authority scene"))) return false;
 
 	Character->SetActorRotation(FRotator::ZeroRotator);
@@ -329,7 +436,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	UGGYGOMovementSet* ZeroScaleSet = MakeScaledSpeedSet(true, 0.0f);
 	UGGYGOMovementSet* FixedSpeedSet = MakeScaledSpeedSet(false, 2.0f);
 	UGGYGOMovementSet* OverflowScaleSet = MakeScaledSpeedSet(true, MAX_flt);
-	if (!TestTrue(TEXT("Speed-consumer curve configuration binds"), SpeedMove->SetMovementSet(SpeedSet))) return false;
+	if (!TestTrue(TEXT("Speed-consumer curve configuration binds"), BindMovementFixture(SpeedMove, SpeedSet))) return false;
 	FLocomotionMovementConsumerFixture SpeedSource(*this, SpeedMove, TEXT("Speed consumer"));
 	if (!SpeedSource.Bind() || !SpeedSource.StartFreshRequest(TEXT("Initial speed scene"))) return false;
 
@@ -375,15 +482,28 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	SpeedMove->SetForceWalkRequested(false);
 	TestFalse(TEXT("Speed fixture clears its ForceWalk request"), SpeedMove->IsForceWalkRequested());
 
-	if (!TestTrue(TEXT("Explicit zero-Scale configuration binds"), SpeedMove->SetMovementSet(ZeroScaleSet))) return false;
+	if (!TestTrue(TEXT("Explicit zero-Scale configuration binds"), BindMovementFixture(SpeedMove, ZeroScaleSet))) return false;
 	if (!SpeedSource.StartFreshRequest(TEXT("Zero-Scale rebind scene"))) return false;
 	SpeedMove->SetTestCurveMotion(PositiveSpeedSample);
 	SpeedMove->SetTestGait(EGGYGOGait::Run);
 	TestTrue(TEXT("Zero Scale retains a successful curve source"), SpeedMove->IsCurveDrivingSpeed());
 	TestTrue(TEXT("Zero-Scale consumer preserves exact zero"), SpeedMove->GetMaxSpeed() == 0.0f);
 
-	if (!TestTrue(TEXT("Explicit fixed speed configuration binds"), SpeedMove->SetMovementSet(FixedSpeedSet))) return false;
+	if (!TestTrue(TEXT("Explicit fixed speed configuration binds"), BindMovementFixture(SpeedMove, FixedSpeedSet))) return false;
 	if (!SpeedSource.StartFreshRequest(TEXT("Fixed speed rebind scene"))) return false;
+	UGGYGOLocomotionTestAnimInstance* FixedProducer = CastChecked<UGGYGOLocomotionTestAnimInstance>(SpeedCharacter->GetMesh()->GetAnimInstance());
+	FGGYGOLocomotionSourceBinding OptionalMissing;
+	OptionalMissing.Identity.Producer = FixedProducer; OptionalMissing.Identity.Character = SpeedCharacter;
+	OptionalMissing.Identity.Mesh = SpeedCharacter->GetMesh(); OptionalMissing.Identity.LifecycleGeneration = 1;
+	OptionalMissing.Identity.ConfigurationGeneration = ++FixedProducer->PublicationGeneration;
+	OptionalMissing.Status = EGGYGOLocomotionSourceStatus::Missing;
+	OptionalMissing.Error = TEXT("Fixed character does not provide the optional locomotion source resolver");
+	FString PublicationError;
+	if (!TestTrue(TEXT("Fixed mode receives Missing capability without rejecting the normal character"),
+		SpeedMove->PublishLocomotionSourceBinding(OptionalMissing, PublicationError) && PublicationError.IsEmpty())) return false;
+	if (!TestFalse(TEXT("A duplicate old producer generation cannot be republished"),
+		SpeedMove->PublishLocomotionSourceBinding(OptionalMissing, PublicationError))
+		|| !TestTrue(TEXT("Duplicate publication provides a generation diagnosis"), PublicationError.Contains(TEXT("generation")))) return false;
 	SpeedMove->SetTestCurveMotion(PositiveSpeedSample);
 	SpeedMove->SetTestGait(EGGYGOGait::Walk);
 	TestFalse(TEXT("Explicit fixed mode does not qualify a curve source"), SpeedMove->IsCurveDrivingSpeed());
@@ -391,7 +511,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	SpeedMove->SetTestGait(EGGYGOGait::Run);
 	TestTrue(TEXT("Explicit fixed Run retains configured speed exactly"), SpeedMove->GetMaxSpeed() == 512.0f);
 
-	if (!TestTrue(TEXT("Curve configuration rebinds before failure qualification"), SpeedMove->SetMovementSet(SpeedSet))) return false;
+	if (!TestTrue(TEXT("Curve configuration rebinds before failure qualification"), BindMovementFixture(SpeedMove, SpeedSet))) return false;
 	if (!SpeedSource.StartFreshRequest(TEXT("Curve qualification rebind scene"))) return false;
 	FGGYGOLocomotionCurveSample FailedSample = PositiveSpeedSample;
 	if (!TestFalse(TEXT("Real reversed interval evaluation fails"),
@@ -402,7 +522,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	SpeedMove->SetTestGait(EGGYGOGait::Run);
 	TestFalse(TEXT("Failed evaluation cannot qualify as successful zero speed"), SpeedMove->IsCurveDrivingSpeed());
 
-	if (!TestTrue(TEXT("Finite MAX_flt Scale configuration genuinely binds"), SpeedMove->SetMovementSet(OverflowScaleSet))) return false;
+	if (!TestTrue(TEXT("Finite MAX_flt Scale configuration genuinely binds"), BindMovementFixture(SpeedMove, OverflowScaleSet))) return false;
 	if (!SpeedSource.StartFreshRequest(TEXT("Overflow qualification rebind scene"))) return false;
 	SpeedMove->SetTestCurveMotion(PositiveSpeedSample);
 	SpeedMove->SetTestGait(EGGYGOGait::Run);
@@ -544,7 +664,7 @@ bool FGGYGOLocomotionInputConsumerModeTest::RunTest(const FString& Parameters)
 	Set->WalkStopProfile = MakeProfile(Set, false, 64.0f, 0.0f);
 	Set->RunStopProfile = MakeProfile(Set, false, 128.0f, 0.0f);
 	Set->TurnBackProfile = MakeProfile(Set, false, 128.0f, 0.0f, 180.0f);
-	if (!TestTrue(TEXT("Seven healthy consumer Profiles bind"), Move->SetMovementSet(Set))) return false;
+	if (!TestTrue(TEXT("Seven healthy consumer Profiles bind"), BindMovementFixture(Move, Set))) return false;
 
 	FConsumerBindingCleanup ColdCleanup{*this, Move, {},
 		TStrongObjectPtr<UObject>(NewObject<UInputAction>(Move, NAME_None, RF_Transient)), TEXT("Cold")};
@@ -612,7 +732,7 @@ bool FGGYGOLocomotionInputConsumerModeTest::RunTest(const FString& Parameters)
 	if (!TestNotNull(TEXT("Unresolved consumer actual CMC"), UnknownMove)) return false;
 	UnknownMove->SetUpdatedComponent(UnknownCharacter->GetCapsuleComponent());
 	UnknownMove->MovementMode = MOVE_Walking;
-	if (!TestTrue(TEXT("Unresolved consumer shares immutable healthy Profiles"), UnknownMove->SetMovementSet(Set))) return false;
+	if (!TestTrue(TEXT("Unresolved consumer shares immutable healthy Profiles"), BindMovementFixture(UnknownMove, Set))) return false;
 	FConsumerBindingCleanup UnknownCleanup{*this, UnknownMove, {},
 		TStrongObjectPtr<UObject>(NewObject<UInputAction>(UnknownMove, NAME_None, RF_Transient)), TEXT("Unresolved")};
 	FGGYGOMovementInputSessionIdentity UnknownSession;
@@ -733,7 +853,7 @@ bool FGGYGOLocomotionFailedRequestRecoveryTest::RunTest(const FString& Parameter
 	const auto BindSet = [this, Move](const UGGYGOMovementSet* Set, const TCHAR* Stage)
 	{
 		FString Error;
-		const bool bAccepted = Move->SetMovementSet(Set, &Error);
+		const bool bAccepted = BindMovementFixture(Move, Set, &Error);
 		return TestTrue(FString::Printf(TEXT("%s accepts immutable configuration (Error='%s')"), Stage, *Error),
 			bAccepted && Error.IsEmpty());
 	};

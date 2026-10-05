@@ -6,6 +6,22 @@
 #include "Animation/zzzAnim/ZZZAnimInstance.h"
 #include "Animation/zzzAnim/ZZZAnimLog.h"
 
+namespace
+{
+	FName GetSingleSourceKey(const FZZZAnimSet& AnimSet, EGGYGOLocomotionMotionType MotionType)
+	{
+		switch (MotionType)
+		{
+		case EGGYGOLocomotionMotionType::WalkStart: return AnimSet.WalkStartSourceKey;
+		case EGGYGOLocomotionMotionType::StartStop: return AnimSet.StartStopSourceKey;
+		case EGGYGOLocomotionMotionType::WalkStop: return AnimSet.WalkStopSourceKey;
+		case EGGYGOLocomotionMotionType::RunStop: return AnimSet.RunStopSourceKey;
+		case EGGYGOLocomotionMotionType::TurnBack: return AnimSet.TurnBackSourceKey;
+		default: return NAME_None;
+		}
+	}
+}
+
 // ============================================================================
 // AnimInstance 生命周期
 // ============================================================================
@@ -88,4 +104,140 @@ UAnimSequence* UZZZAnimInstance::GetSeqByKey(FName Key) const
 UBlendSpace* UZZZAnimInstance::GetBlendSpaceByKey(FName Key) const
 {
 	return AnimSet.BlendSpaces.FindRef(Key);
+}
+
+void UZZZAnimInstance::ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const
+{
+	check(IsInGameThread());
+	OutBinding = {};
+	const auto Fail = [this, &OutBinding](EGGYGOLocomotionSourceStatus Status, FName Key, const UObject* Asset, const FString& Reason)
+	{
+		OutBinding = {};
+		OutBinding.Status = Status;
+		OutBinding.Error = FString::Printf(TEXT("[Animation][LocomotionSource] Producer=%s Config=AnimSet Key=%s Asset=%s Reason=%s"),
+			*GetPathName(), *Key.ToString(), *GetPathNameSafe(Asset), *Reason);
+	};
+
+	const EGGYGOLocomotionMotionType SingleMotions[] = {
+		EGGYGOLocomotionMotionType::WalkStart, EGGYGOLocomotionMotionType::StartStop,
+		EGGYGOLocomotionMotionType::WalkStop, EGGYGOLocomotionMotionType::RunStop,
+		EGGYGOLocomotionMotionType::TurnBack
+	};
+	for (EGGYGOLocomotionMotionType MotionType : SingleMotions)
+	{
+		const FName Key = GetSingleSourceKey(AnimSet, MotionType);
+		UAnimSequence* Sequence = Key.IsNone() ? nullptr : AnimSet.Sequences.FindRef(Key);
+		if (Key.IsNone() || !IsValid(Sequence))
+		{
+			Fail(EGGYGOLocomotionSourceStatus::Missing, Key, Sequence,
+				FString::Printf(TEXT("Motion=%d required single source route/sequence is missing"), static_cast<uint8>(MotionType)));
+			return;
+		}
+		if (!FMath::IsFinite(Sequence->RateScale) || Sequence->RateScale <= 0.0f
+			|| !FMath::IsFinite(Sequence->GetPlayLength()) || Sequence->GetPlayLength() <= 0.0f)
+		{
+			Fail(EGGYGOLocomotionSourceStatus::Invalid, Key, Sequence,
+				FString::Printf(TEXT("Motion=%d RateScale=%g PlayLength=%g must be finite and positive"),
+					static_cast<uint8>(MotionType), Sequence->RateScale, Sequence->GetPlayLength()));
+			return;
+		}
+		FGGYGOLocomotionSequenceSource& Source = OutBinding.SingleSources.AddDefaulted_GetRef();
+		Source.MotionType = MotionType;
+		Source.RouteKey = Key;
+		Source.Sequence = TStrongObjectPtr<UAnimSequence>(Sequence);
+		Source.bLoop = false;
+		Source.SequenceRateScale = Sequence->RateScale;
+		Source.PlayLength = Sequence->GetPlayLength();
+	}
+
+	const FName BlendKey = AnimSet.WalkRunSourceKey;
+	UBlendSpace* BlendSpace = BlendKey.IsNone() ? nullptr : AnimSet.BlendSpaces.FindRef(BlendKey);
+	if (BlendKey.IsNone() || !IsValid(BlendSpace))
+	{
+		Fail(EGGYGOLocomotionSourceStatus::Missing, BlendKey, BlendSpace, TEXT("required WalkRun route/BlendSpace is missing"));
+		return;
+	}
+	const TArray<FBlendSample>& Samples = BlendSpace->GetBlendSamples();
+	if (Samples.IsEmpty())
+	{
+		Fail(EGGYGOLocomotionSourceStatus::Missing, BlendKey, BlendSpace, TEXT("WalkRun BlendSpace has no source samples"));
+		return;
+	}
+	OutBinding.WalkRunKey = BlendKey;
+	OutBinding.WalkRunBlendSpace = TStrongObjectPtr<UBlendSpace>(BlendSpace);
+	OutBinding.bWalkRunLoop = true;
+	for (int32 Index = 0; Index < Samples.Num(); ++Index)
+	{
+		const FBlendSample& Sample = Samples[Index];
+		UAnimSequence* Sequence = Sample.Animation;
+		if (!IsValid(Sequence))
+		{
+			Fail(EGGYGOLocomotionSourceStatus::Missing, BlendKey, BlendSpace,
+				FString::Printf(TEXT("SampleIndex=%d has no valid sequence"), Index));
+			return;
+		}
+		if (!FMath::IsFinite(Sample.SampleValue.X) || !FMath::IsFinite(Sample.SampleValue.Y)
+			|| !FMath::IsFinite(Sample.SampleValue.Z) || !FMath::IsFinite(Sample.RateScale) || Sample.RateScale <= 0.0f
+			|| !FMath::IsFinite(Sequence->RateScale) || Sequence->RateScale <= 0.0f
+			|| !FMath::IsFinite(Sequence->GetPlayLength()) || Sequence->GetPlayLength() <= 0.0f)
+		{
+			Fail(EGGYGOLocomotionSourceStatus::Invalid, BlendKey, Sequence,
+				FString::Printf(TEXT("SampleIndex=%d coordinates=(%g,%g,%g) SampleRateScale=%g SequenceRateScale=%g PlayLength=%g are invalid"),
+					Index, Sample.SampleValue.X, Sample.SampleValue.Y, Sample.SampleValue.Z,
+					Sample.RateScale, Sequence->RateScale, Sequence->GetPlayLength()));
+			return;
+		}
+		FGGYGOLocomotionBlendSpaceSampleSource& Source = OutBinding.WalkRunSamples.AddDefaulted_GetRef();
+		Source.SampleIndex = Index;
+		Source.SampleValue = Sample.SampleValue;
+		Source.SampleRateScale = Sample.RateScale;
+		Source.Source.MotionType = EGGYGOLocomotionMotionType::WalkRun;
+		Source.Source.RouteKey = BlendKey;
+		Source.Source.Sequence = TStrongObjectPtr<UAnimSequence>(Sequence);
+		Source.Source.bLoop = true;
+		Source.Source.SequenceRateScale = Sequence->RateScale;
+		Source.Source.PlayLength = Sequence->GetPlayLength();
+	}
+	OutBinding.Status = EGGYGOLocomotionSourceStatus::Available;
+}
+
+bool UZZZAnimInstance::IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const
+{
+	check(IsInGameThread());
+	if (Binding.Status != EGGYGOLocomotionSourceStatus::Available || Binding.SingleSources.Num() != 5
+		|| Binding.WalkRunKey != AnimSet.WalkRunSourceKey || !Binding.bWalkRunLoop)
+	{
+		return false;
+	}
+	for (const FGGYGOLocomotionSequenceSource& Source : Binding.SingleSources)
+	{
+		const FName Key = GetSingleSourceKey(AnimSet, Source.MotionType);
+		UAnimSequence* Sequence = Key.IsNone() ? nullptr : AnimSet.Sequences.FindRef(Key);
+		if (Source.RouteKey != Key || !IsValid(Sequence) || Source.Sequence.Get() != Sequence || Source.bLoop
+			|| Source.SequenceRateScale != Sequence->RateScale || Source.PlayLength != Sequence->GetPlayLength())
+		{
+			return false;
+		}
+	}
+	UBlendSpace* BlendSpace = AnimSet.BlendSpaces.FindRef(AnimSet.WalkRunSourceKey);
+	if (!IsValid(BlendSpace) || Binding.WalkRunBlendSpace.Get() != BlendSpace
+		|| Binding.WalkRunSamples.Num() != BlendSpace->GetBlendSamples().Num())
+	{
+		return false;
+	}
+	const TArray<FBlendSample>& Samples = BlendSpace->GetBlendSamples();
+	for (int32 Index = 0; Index < Samples.Num(); ++Index)
+	{
+		const FBlendSample& Sample = Samples[Index];
+		const FGGYGOLocomotionBlendSpaceSampleSource& Source = Binding.WalkRunSamples[Index];
+		UAnimSequence* Sequence = Sample.Animation;
+		if (!IsValid(Sequence) || Source.SampleIndex != Index || Source.Source.Sequence.Get() != Sequence
+			|| Source.SampleValue.X != Sample.SampleValue.X || Source.SampleValue.Y != Sample.SampleValue.Y
+			|| Source.SampleValue.Z != Sample.SampleValue.Z || Source.SampleRateScale != Sample.RateScale
+			|| Source.Source.SequenceRateScale != Sequence->RateScale || Source.Source.PlayLength != Sequence->GetPlayLength())
+		{
+			return false;
+		}
+	}
+	return true;
 }
