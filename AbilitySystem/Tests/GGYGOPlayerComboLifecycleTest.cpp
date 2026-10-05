@@ -43,9 +43,10 @@ void UGGYGOPlayerComboLifecycleTestAbility::ConfigureStepsForTest(
 		Step.EndSection = TEXT("End");
 		Step.NextStepIndex = Index == 0 ? 1 : INDEX_NONE;
 		Step.PlayRate = Index == 0 ? FirstPlayRate : 1.0f;
-		Step.TraceStartSocket = TraceStartBone;
-		Step.TraceEndSocket = TraceEndBone;
-		Step.TraceRadius = 20.0f;
+		Step.TraceShape.Mode = EGGYGOMeleeTraceShapeMode::SocketChains;
+		Step.TraceShape.Chains.SetNum(1);
+		Step.TraceShape.Chains[0].Points = { TraceStartBone, TraceEndBone };
+		Step.TraceShape.Chains[0].WorldRadiusCm = 20.0f;
 	}
 }
 
@@ -157,7 +158,9 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 #include "NativeGameplayTags.h"
 #include "Serialization/MemoryReader.h"
 #include "Serialization/MemoryWriter.h"
+#include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 #include "TimerManager.h"
+#include "UObject/UnrealType.h"
 
 /** Owns the synthetic components and is the single narrow friend used to inspect private GA resources. */
 struct FGGYGOPlayerComboLifecycleFixture
@@ -265,6 +268,11 @@ struct FGGYGOPlayerComboLifecycleFixture
 	}
 
 	bool HasActiveMesh() const { return Ability && Ability->ActiveMesh != nullptr; }
+	FGGYGOComboStep& GetFirstStepForTest() const
+	{
+		check(Ability && Ability->ComboSteps.IsValidIndex(0));
+		return Ability->ComboSteps[0];
+	}
 	bool WereAllResourcesCleanedBeforeBroadcast(
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* EndingMontageTask,
 		const UGGYGOAbilityTask_WaitComboInput* EndingInputTask) const
@@ -428,6 +436,199 @@ namespace
 		return FGameplayAbilityTargetDataHandle(new FGGYGOComboCorrectionData(
 			Revision, RequestId, ServerStep, Position, bWindowOpen, bWindowClosed, bAccepted));
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboTraceShapeCompatibilityTest,
+	"GGYGO.AbilitySystem.PlayerCombo.TraceShape.Compatibility",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parameters)
+{
+	UScriptStruct* StepStruct = FGGYGOComboStep::StaticStruct();
+	const FProperty* LegacyStart = StepStruct->FindPropertyByName(TEXT("TraceStartSocket"));
+	const FProperty* LegacyEnd = StepStruct->FindPropertyByName(TEXT("TraceEndSocket"));
+	const FProperty* LegacyRadius = StepStruct->FindPropertyByName(TEXT("TraceRadius"));
+	if (!TestNotNull(TEXT("历史起点成员仍在"), CastField<FNameProperty>(LegacyStart))
+		|| !TestNotNull(TEXT("历史终点成员仍在"), CastField<FNameProperty>(LegacyEnd))
+		|| !TestNotNull(TEXT("历史半径成员类型仍为 float"), CastField<FFloatProperty>(LegacyRadius))) { return false; }
+	for (const FProperty* Property : { LegacyStart, LegacyEnd, LegacyRadius })
+	{
+		TestFalse(FString::Printf(TEXT("历史成员 %s 没有丢序列化值的标志"), *Property->GetName()),
+			Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated));
+	}
+	FGGYGOComboStep Original;
+	TestTrue(TEXT("历史起终点默认仍为空"), Original.TraceStartSocket.IsNone() && Original.TraceEndSocket.IsNone());
+	TestEqual(TEXT("历史半径默认仍为 20"), Original.TraceRadius, 20.0f);
+	Original.TraceStartSocket = TEXT("StoredLegacyStart");
+	Original.TraceEndSocket = TEXT("StoredLegacyEnd");
+	Original.TraceRadius = 37.25f;
+	Original.TraceShape.Mode = EGGYGOMeleeTraceShapeMode::SocketChains;
+	FGGYGOMeleeTraceChain& StoredChain = Original.TraceShape.Chains.AddDefaulted_GetRef();
+	StoredChain.Points = { FName(TEXT("StoredPoint0")), FName(TEXT("StoredPoint1")), FName(TEXT("StoredPoint2")) };
+	StoredChain.WorldRadiusCm = 13.5f;
+	TArray<uint8> SerializedBytes;
+	{
+		FMemoryWriter InnerWriter(SerializedBytes, true);
+		FObjectAndNameAsStringProxyArchive Writer(InnerWriter, false);
+		StepStruct->SerializeItem(Writer, &Original, nullptr);
+		if (!TestFalse(TEXT("Step 属性写入没有归档错误"), Writer.IsError())) { return false; }
+	}
+	FGGYGOComboStep RoundTrip;
+	{
+		FMemoryReader InnerReader(SerializedBytes, true);
+		FObjectAndNameAsStringProxyArchive Reader(InnerReader, false);
+		StepStruct->SerializeItem(Reader, &RoundTrip, nullptr);
+		if (!TestFalse(TEXT("Step 属性读回没有归档错误"), Reader.IsError())) { return false; }
+	}
+	TestEqual(TEXT("历史起点非默认值留存"), RoundTrip.TraceStartSocket, Original.TraceStartSocket);
+	TestEqual(TEXT("历史终点非默认值留存"), RoundTrip.TraceEndSocket, Original.TraceEndSocket);
+	TestEqual(TEXT("历史半径非默认值留存"), RoundTrip.TraceRadius, Original.TraceRadius);
+	TestTrue(TEXT("新 Shape 模式留存"), RoundTrip.TraceShape.Mode == Original.TraceShape.Mode);
+	if (!TestEqual(TEXT("新 Shape 链数量留存"), RoundTrip.TraceShape.Chains.Num(), 1)) { return false; }
+	TestTrue(TEXT("新 Shape 有序点留存"), RoundTrip.TraceShape.Chains[0].Points == StoredChain.Points);
+	TestEqual(TEXT("新 Shape 世界半径留存"), RoundTrip.TraceShape.Chains[0].WorldRadiusCm, StoredChain.WorldRadiusCm);
+
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.GetFirstStepForTest();
+	Step.TraceStartSocket = NAME_None;
+	Step.TraceEndSocket = NAME_None;
+	Step.TraceRadius = std::numeric_limits<float>::quiet_NaN();
+	FString Error(TEXT("stale diagnostic"));
+	TestTrue(TEXT("合法新 Shape 不读取非法历史值"), Fixture.Ability->ValidateComboConfiguration(Error));
+	TestTrue(TEXT("成功验证清空诊断"), Error.IsEmpty());
+	int32 CommitCount = 0;
+	const FDelegateHandle CommitHandle = Fixture.ASC->AbilityCommittedCallbacks.AddLambda([&](UGameplayAbility* Ability)
+	{
+		if (Ability == Fixture.Ability) { ++CommitCount; }
+	});
+	ON_SCOPE_EXIT { Fixture.ASC->AbilityCommittedCallbacks.Remove(CommitHandle); };
+	const FGGYGOAbilityActivationRequestResult ShapeActivation =
+		Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("新 Shape 正常激活且忽略非法历史值"), ShapeActivation.bNativeAccepted)) { return false; }
+	if (!TestTrue(TEXT("新 Shape 受控请求保留确切本地 Original"),
+		ShapeActivation.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& ShapeActivation.Reason == EGGYGOAbilityActivationRequestReason::None
+		&& ShapeActivation.OriginalActivation.HasActivation()
+		&& Fixture.Ability->CaptureCurrentActivation().HasSameActivation(ShapeActivation.OriginalActivation))) { return false; }
+	TestEqual(TEXT("正常路径提交一次"), CommitCount, 1);
+	TestEqual(TEXT("正常路径实际 Montage 播放一次"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 1);
+	TestEqual(TEXT("正常路径保留原 Montage 与 Input 两任务"), Fixture.Ability->GetActiveTaskCountForTest(), 2);
+	const FGGYGOAbilityTerminationResult ShapeEnd =
+		Fixture.Ability->RequestAbilityEnd(ShapeActivation.OriginalActivation, false, false);
+	TestTrue(TEXT("新 Shape 普通结束取得真实 Completed"), ShapeEnd.Outcome == EGGYGOAbilityTerminationOutcome::Completed
+		&& ShapeEnd.Reason == EGGYGOAbilityTerminationReason::None);
+	TestTrue(TEXT("新 Shape 结束保留固定 Original 和普通 End 参数"),
+		ShapeEnd.Original.GetOriginalActivation().HasSameActivation(ShapeActivation.OriginalActivation)
+		&& ShapeEnd.Original.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::End
+		&& !ShapeEnd.Original.GetReplicateEndAbility() && !ShapeEnd.Original.WasCancelled());
+	TestFalse(TEXT("正常结束关闭 Trace"), Fixture.Trace->IsTracing());
+	TestEqual(TEXT("正常结束清空任务"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
+	AddInfo(TEXT("成员往返仅证明序列化留存，不代表未知旧 Blueprint Pin/地图消费者已迁移。"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboInvalidTraceShapeTest,
+	"GGYGO.AbilitySystem.PlayerCombo.TraceShape.InvalidConfiguration",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboInvalidTraceShapeTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	// 通过公开基类虚接口调用；动态目标仍是项目 final 准入校验。
+	const UGameplayAbility* const PublicAdmissionAbility = Fixture.Ability;
+	FGGYGOComboStep& Step = Fixture.GetFirstStepForTest();
+	const FGGYGOMeleeTraceShape ValidShape = Step.TraceShape;
+	Step.TraceStartSocket = Fixture.TraceStartBone;
+	Step.TraceEndSocket = Fixture.TraceEndBone;
+	Step.TraceRadius = 20.0f;
+	Step.TraceShape = FGGYGOMeleeTraceShape();
+	FString Error;
+	bool bBehaviorPassed = TestFalse(TEXT("有效旧值不能补齐空 Shape"), Fixture.Ability->ValidateComboConfiguration(Error));
+	bBehaviorPassed &= TestTrue(TEXT("空 Shape 诊断指明新配置与历史值无运行效力"),
+		Error.Contains(TEXT("TraceShape")) && Error.Contains(TEXT("历史存值")));
+	bBehaviorPassed &= TestFalse(TEXT("第一次纯准入拒绝空 Shape"),
+		PublicAdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+	bBehaviorPassed &= TestFalse(TEXT("重复纯准入仍拒绝且不产生动作"),
+		PublicAdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+	Step.TraceShape = ValidShape;
+	Step.TraceShape.Chains[0].WorldRadiusCm = 0.0f;
+	bBehaviorPassed &= TestFalse(TEXT("有效旧半径不能补齐非法新半径"), Fixture.Ability->ValidateComboConfiguration(Error));
+	bBehaviorPassed &= TestFalse(TEXT("纯准入拒绝非法新半径"),
+		PublicAdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+	Step.TraceShape = FGGYGOMeleeTraceShape();
+	int32 CommitCount = 0;
+	int32 EndCount = 0;
+	bool bEndWasCanceled = false;
+	bool bResourcesCleanAtEnd = false;
+	const FDelegateHandle CommitHandle = Fixture.ASC->AbilityCommittedCallbacks.AddLambda([&](UGameplayAbility* Ability)
+	{
+		if (Ability == Fixture.Ability) { ++CommitCount; }
+	});
+	const FDelegateHandle EndHandle = Fixture.ASC->OnAbilityEnded.AddLambda([&](const FAbilityEndedData& Data)
+	{
+		if (Data.AbilityThatEnded == Fixture.Ability)
+		{
+			++EndCount;
+			bEndWasCanceled = Data.bWasCancelled;
+			FString Diagnostic;
+			bResourcesCleanAtEnd = Fixture.AreRuntimeResourceMembersDetachedForTest(Diagnostic);
+		}
+	});
+	ON_SCOPE_EXIT
+	{
+		Fixture.ASC->AbilityCommittedCallbacks.Remove(CommitHandle);
+		Fixture.ASC->OnAbilityEnded.Remove(EndHandle);
+	};
+	// Keep both actual production Error diagnostics visible, as with the required-GE fault leaves.
+	const FGGYGOAbilityActivationRequestResult EmptyShapeRequest =
+		Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	bBehaviorPassed &= TestFalse(TEXT("实际请求明确拒绝空 Shape"), EmptyShapeRequest.bNativeAccepted);
+	bBehaviorPassed &= TestTrue(TEXT("受控准入拒绝没有激活或完成历史"),
+		EmptyShapeRequest.Outcome == EGGYGOAbilityActivationRequestOutcome::Rejected
+		&& EmptyShapeRequest.Reason == EGGYGOAbilityActivationRequestReason::NativeActivationRejected
+		&& !EmptyShapeRequest.OriginalActivation.HasActivation() && !EmptyShapeRequest.OriginalTerminationCompleted.HasCompletion());
+	bBehaviorPassed &= TestEqual(TEXT("准入拒绝未创建激活结束通知"), EndCount, 0);
+	Step.TraceShape = ValidShape;
+	bool bBlueprintCallbackRan = false;
+	Fixture.Ability->SetK2ActivateActionForTest([&]
+	{
+		bBlueprintCallbackRan = true;
+		Fixture.GetFirstStepForTest().TraceShape = FGGYGOMeleeTraceShape();
+	});
+	const FGGYGOAbilityActivationRequestResult ClearedShapeRequest =
+		Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	bBehaviorPassed &= TestTrue(TEXT("受控请求保留提交前结束的 Original 历史"),
+		ClearedShapeRequest.bNativeAccepted && ClearedShapeRequest.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& ClearedShapeRequest.Reason == EGGYGOAbilityActivationRequestReason::None
+		&& ClearedShapeRequest.OriginalActivation.HasActivation());
+	const FGGYGOAbilityTerminationCompletedNotice& ClearedShapeCompletion = ClearedShapeRequest.OriginalTerminationCompleted;
+	bBehaviorPassed &= TestTrue(TEXT("真实 outer Try 返回后取得同原激活的 Completed"),
+		ClearedShapeCompletion.HasCompletion() && ClearedShapeCompletion.GetReason() == EGGYGOAbilityTerminationReason::None
+		&& ClearedShapeCompletion.GetOriginal().GetOriginalActivation().HasSameActivation(ClearedShapeRequest.OriginalActivation)
+		&& ClearedShapeCompletion.GetOriginal().GetRequestKind() == EGGYGOAbilityTerminationRequestKind::End
+		&& ClearedShapeCompletion.GetOriginal().GetReplicateEndAbility() && ClearedShapeCompletion.GetOriginal().WasCancelled());
+	bBehaviorPassed &= TestTrue(TEXT("实际 Super/BP 回调已运行并撤掉 Shape"), bBlueprintCallbackRan);
+	bBehaviorPassed &= TestEqual(TEXT("提交前拒绝没有 Commit 通知"), CommitCount, 0);
+	bBehaviorPassed &= TestEqual(TEXT("提交前拒绝仅结束原激活一次"), EndCount, 1);
+	bBehaviorPassed &= TestTrue(TEXT("提交前拒绝按故障取消原激活"), bEndWasCanceled);
+	bBehaviorPassed &= TestTrue(TEXT("结束广播前原资源已清理"), bResourcesCleanAtEnd);
+	bBehaviorPassed &= TestFalse(TEXT("无活动 GA"), Fixture.Ability->IsActive());
+	bBehaviorPassed &= TestEqual(TEXT("从未播放 Montage"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 0);
+	bBehaviorPassed &= TestEqual(TEXT("没有残留 Task"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
+	bBehaviorPassed &= TestFalse(TEXT("没有 Trace 执行"), Fixture.Trace->IsTracing());
+	bBehaviorPassed &= TestFalse(TEXT("没有 Owned 窗口"), Fixture.GetTraceWindow().HasWindow());
+	bBehaviorPassed &= TestTrue(TEXT("没有 Watchdog"), Fixture.GetWatchdogRemaining() < 0.0f);
+	bBehaviorPassed &= TestFalse(TEXT("未接管 Mesh Tick 依赖"), Fixture.HasMeshPrerequisite());
+	bBehaviorPassed &= TestEqual(TEXT("未改变原 Mesh Tick 策略"), Fixture.Mesh->VisibilityBasedAnimTickOption,
+		EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+	bBehaviorPassed &= TestTrue(TEXT("未改变原 URO"), Fixture.Mesh->bEnableUpdateRateOptimizations);
+	AddInfo(FString::Printf(TEXT("TraceShape invalid configuration behavior assertions %s; production diagnostics retained."),
+		bBehaviorPassed ? TEXT("PASS") : TEXT("FAIL")));
+	return bBehaviorPassed;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboActivationReentryTest,

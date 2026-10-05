@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceShape.h"
 #include "GGYGOComboTypes.generated.h"
 
 class UAnimMontage;
@@ -27,11 +28,16 @@ struct GGYGO_API FGGYGOComboStep
 	float Damage = 20.0f;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ClampMin = "0.0"))
 	float PoiseDamage = 10.0f;
+	/** 本段唯一运行查询配置；空/非法配置明确失败，不从历史字段补齐。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
+	FGGYGOMeleeTraceShape TraceShape;
+	/** 保留旧资产/Struct Pin 的成员身份和序列化数据；不参与运行，须显式配置 TraceShape。
+	 *  保留成员不代表旧 Make/Set Members/Break 图已迁移；迁移核验前不得删除或使用丢值标志。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ToolTip = "历史存值，不参与运行；请显式配置 TraceShape。"))
 	FName TraceStartSocket;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ToolTip = "历史存值，不参与运行；请显式配置 TraceShape。"))
 	FName TraceEndSocket;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ClampMin = "1.0"))
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ClampMin = "1.0", ToolTip = "历史存值，不参与运行；请在 TraceShape 中显式配置固定世界半径。"))
 	float TraceRadius = 20.0f;
 };
 

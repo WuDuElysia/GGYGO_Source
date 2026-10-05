@@ -51,6 +51,7 @@ bool UGGYGOPlayerComboAbility::IsStepPlayable(int32 Index) const
 
 bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) const
 {
+	OutError.Reset();
 	if (ComboSteps.IsEmpty()) { OutError = TEXT("ComboSteps 为空。"); return false; }
 	if (!FMath::IsFinite(InputBufferSeconds) || InputBufferSeconds < 0.0f || InputBufferSeconds > 1.0f)
 	{
@@ -60,12 +61,19 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 	for (int32 Index = 0; Index < ComboSteps.Num(); ++Index)
 	{
 		const FGGYGOComboStep& Step = ComboSteps[Index];
-		if (!IsStepPlayable(Index) || Step.TraceStartSocket.IsNone() || Step.TraceEndSocket.IsNone()
-			|| !FMath::IsFinite(Step.TraceRadius) || Step.TraceRadius < 1.0f
+		if (!IsStepPlayable(Index)
 			|| !FMath::IsFinite(Step.Damage) || Step.Damage < 0.0f
 			|| !FMath::IsFinite(Step.PoiseDamage) || Step.PoiseDamage < 0.0f)
 		{
-			OutError = FString::Printf(TEXT("段 %d 的 Montage/Section/速率/伤害/Socket 无效。"), Index);
+			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 Montage/Section/速率/伤害无效。"),
+				Index, *GetPathNameSafe(Step.Montage));
+			return false;
+		}
+		FString ShapeError;
+		if (!UGGYGOMeleeTraceComponent::ValidateTraceShapeDefinition(Step.TraceShape, ShapeError))
+		{
+			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 TraceShape 无效：%s；旧 TraceStartSocket/TraceEndSocket/TraceRadius 仅历史存值，不参与运行，请显式配置 TraceShape。"),
+				Index, *GetPathNameSafe(Step.Montage), *ShapeError);
 			return false;
 		}
 		if (Step.NextStepIndex != INDEX_NONE && (Step.NextStepIndex <= Index || !ComboSteps.IsValidIndex(Step.NextStepIndex)))
@@ -150,13 +158,19 @@ bool UGGYGOPlayerComboAbility::CanActivateAbilityAdditional(FGameplayAbilitySpec
 		return false;
 	}
 	FString Error;
-	return ValidateDamageEffectDependency(Error);
+	return ValidateComboConfiguration(Error) && ValidateDamageEffectDependency(Error);
 }
 
 void UGGYGOPlayerComboAbility::NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const
 {
 	FString Error;
-	if (!ValidateDamageEffectDependency(Error))
+	if (!ValidateComboConfiguration(Error))
+	{
+		// Pure CanActivate queries never log; report the actual rejected request once.
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时连段配置无效：%s"),
+			*GetPathNameSafe(this), *Error);
+	}
+	else if (!ValidateDamageEffectDependency(Error))
 	{
 		// This is an actual failed request; repeated pure CanActivate queries never log.
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时伤害GE依赖无效：%s"),
@@ -206,6 +220,16 @@ void UGGYGOPlayerComboAbility::ActivateAbilityBody(const FGGYGOAbilityActivation
 	}
 	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (!IsActivationCurrent(Original)) { return; }
+
+	// Blueprint activation is an external callback; revalidate before committing the original.
+	FString ConfigurationError;
+	if (!ValidateComboConfiguration(ConfigurationError))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前连段配置无效：%s"),
+			*GetPathNameSafe(this), *ConfigurationError);
+		RequestAbilityEnd(Original, true, true);
+		return;
+	}
 
 	FString DamageDependencyError;
 	if (!ValidateDamageEffectDependency(DamageDependencyError))
@@ -364,10 +388,12 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		return false;
 	}
 	const FGGYGOComboStep Step = ComboSteps[Index];
-	if (!ActiveMesh->DoesSocketExist(Step.TraceStartSocket) || !ActiveMesh->DoesSocketExist(Step.TraceEndSocket))
+	FString ShapeError;
+	if (!TraceComponent->ValidateTraceShapeOnCurrentMesh(Step.TraceShape, ActiveMesh.Get(), ShapeError))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：段 %d 的武器 Socket 不存在 [%s → %s]。"),
-			Index, *Step.TraceStartSocket.ToString(), *Step.TraceEndSocket.ToString());
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] StartStep %d Montage [%s] Trace [%s] Mesh [%s] 的 TraceShape 无效：%s"),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage),
+			*GetPathNameSafe(TraceComponent.Get()), *GetPathNameSafe(ActiveMesh.Get()), *ShapeError);
 		RequestAbilityCancel(Original, true);
 		return false;
 	}
@@ -619,21 +645,24 @@ void UGGYGOPlayerComboAbility::OpenTraceWindow(const FGGYGOAbilityActivationHand
 {
 	if (!IsActivationCurrent(Original) || !ComboSteps.IsValidIndex(CurrentStep)) { return; }
 	const FGGYGOComboStep Step = ComboSteps[CurrentStep];
+	const int32 ExpectedStepIndex = CurrentStep;
 	const uint64 ExpectedStepToken = CurrentStepToken;
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
 	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace(TraceComponent.Get());
+	const TWeakObjectPtr<USkeletalMeshComponent> OriginalMesh(ActiveMesh.Get());
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> WeakTask(MontageTask.Get());
 	ReleaseTraceWindow(Original);
 	if (!IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get())) { return; }
-	if (!OriginalTrace.IsValid())
+	if (!OriginalTrace.IsValid() || !OriginalMesh.IsValid())
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open rejected: original Trace component is invalid."), *GetPathNameSafe(this));
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open rejected: original Trace [%s] or Mesh [%s] is invalid."),
+			*GetPathNameSafe(this), *GetPathNameSafe(OriginalTrace.Get()), *GetPathNameSafe(OriginalMesh.Get()));
 		RequestAbilityCancel(Original, true);
 		return;
 	}
 	FGGYGOMeleeTraceWindowHandle OpenedWindow;
 	const EGGYGOMeleeTraceWindowOpenResult OpenResult = OriginalTrace->TryOpenOwnedTraceWindow(
-		Step.TraceStartSocket, Step.TraceEndSocket, Step.TraceRadius, {}, OpenedWindow);
+		Step.TraceShape, OriginalMesh.Get(), {}, OpenedWindow);
 	if (!IsStepCurrent(Original, ExpectedStepToken, WeakTask.Get()))
 	{
 		if (OriginalTrace.IsValid() && OpenedWindow.HasWindow()) { OriginalTrace->CloseOwnedTraceWindow(OpenedWindow); }
@@ -641,9 +670,10 @@ void UGGYGOPlayerComboAbility::OpenTraceWindow(const FGGYGOAbilityActivationHand
 	}
 	if (OpenResult != EGGYGOMeleeTraceWindowOpenResult::Opened)
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open failed: Trace [%s], Montage [%s], sockets [%s -> %s], radius %.3f, result %d."),
-			*GetPathNameSafe(this), *GetPathNameSafe(OriginalTrace.Get()), *GetPathNameSafe(Step.Montage),
-			*Step.TraceStartSocket.ToString(), *Step.TraceEndSocket.ToString(), Step.TraceRadius, static_cast<int32>(OpenResult));
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] owned trace open failed: step %d, Trace [%s], Montage [%s], Mesh [%s], TraceShape Mode=%d Chains=%d, result %d."),
+			*GetPathNameSafe(this), ExpectedStepIndex, *GetPathNameSafe(OriginalTrace.Get()), *GetPathNameSafe(Step.Montage),
+			*GetPathNameSafe(OriginalMesh.Get()), static_cast<int32>(Step.TraceShape.Mode),
+			Step.TraceShape.Chains.Num(), static_cast<int32>(OpenResult));
 		RequestAbilityCancel(Original, true);
 		return;
 	}

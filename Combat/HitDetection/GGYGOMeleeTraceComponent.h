@@ -6,7 +6,7 @@
  * 用武器上的碰撞体做 Overlap 有两个硬伤：快速挥砍时武器在两帧之间可能
  * 完全穿过敌人（隧穿），以及无法控制"哪一段动画才算有效判定"。
  *
- * 本组件在两个 Socket 之间按半径分段取点，每帧对各点做球形扫掠，
+ * 本组件在配置折线的相邻 Socket 之间按固定世界半径取点，每帧做球形扫掠，
  * 用上一帧到本帧的位置做连续检测，降低跨帧漏判；而窗口的开关由
  * 能力（配合 AnimNotifyState）控制，判定时机与动画严格对齐。
  *
@@ -17,6 +17,7 @@
 #pragma once
 
 #include "Components/ActorComponent.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceShape.h"
 #include "Delegates/Delegate.h"
 #include "GameplayTagContainer.h"
 
@@ -25,6 +26,8 @@
 class AActor;
 class UObject;
 class USkeletalMeshComponent;
+class USkeletalMesh;
+class UWorld;
 class UGGYGOMeleeTraceComponent;
 struct FHitResult;
 
@@ -135,6 +138,24 @@ public:
 		FName InStartSocket, FName InEndSocket, float InTraceRadius,
 		const FGGYGOMeleeTraceWindowHandle& ExpectedWindow, FGGYGOMeleeTraceWindowHandle& OutWindow);
 
+	/** 纯配置检查，不需要 Actor/World、不记录日志、不改变窗口。 */
+	static bool ValidateTraceShapeDefinition(const FGGYGOMeleeTraceShape& Shape, FString& OutError);
+
+	/**
+	 * GameThread 只读预检：ExpectedMainMesh 必须是 Owner 的当前主 Mesh。
+	 * 核全部点、坐标与当前整窗预算；不签句柄、不扫掠、不建立基线。
+	 */
+	bool ValidateTraceShapeOnCurrentMesh(const FGGYGOMeleeTraceShape& Shape,
+		const USkeletalMeshComponent* ExpectedMainMesh, FString& OutError) const;
+
+	/**
+	 * 显式 Shape 开窗，ExpectedMainMesh 是原资源一致性条件，不是替代 Mesh 入口。
+	 * 与 RootTip 参数入口共用身份、执行及清理规则；失败不回落旧参数或另一模式。
+	 */
+	EGGYGOMeleeTraceWindowOpenResult TryOpenOwnedTraceWindow(const FGGYGOMeleeTraceShape& Shape,
+		const USkeletalMeshComponent* ExpectedMainMesh,
+		const FGGYGOMeleeTraceWindowHandle& ExpectedWindow, FGGYGOMeleeTraceWindowHandle& OutWindow);
+
 	/** GameThread：仅关闭确切原窗口。已结束/被替换返回 AlreadyInactive，不影响后继窗口。 */
 	EGGYGOMeleeTraceWindowCloseResult CloseOwnedTraceWindow(const FGGYGOMeleeTraceWindowHandle& Window);
 
@@ -161,7 +182,7 @@ public:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combat")
 	TEnumAsByte<ECollisionChannel> TraceChannel = ECC_Pawn;
 
-	/** 每帧武器线段最多分段数；所需密度超过此值时拒绝窗口并告警，避免静默产生空洞。 */
+	/** 整窗每帧最多 MaxTraceSegments+1 次 Sweep，保留单段原预算；多链共用且包含重复端点。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combat", meta = (ClampMin = "1", ClampMax = "512"))
 	int32 MaxTraceSegments = 64;
 
@@ -176,26 +197,16 @@ protected:
 	/** 仅使用当前角色主 Mesh；缺失 Socket 必须关闭窗口，不能退回组件原点。 */
 	USkeletalMeshComponent* GetTraceMesh() const;
 
-	/** 判定线段起点骨骼。 */
-	FName StartSocket;
-
-	/** 判定线段终点骨骼。 */
-	FName EndSocket;
-
-	/** 扫掠半径。 */
-	float TraceRadius = 20.0f;
-
 	/** 窗口是否开启。 */
 	bool bIsTracing = false;
 
 	/**
-	 * 上一帧的线段端点。
+	 * 原窗口全部控制点的上一帧世界坐标，顺序与 ActiveShape 的链/点一致。
 	 *
 	 * 连续检测的关键：本帧扫掠的是"上一帧位置到本帧位置"这段路径，
 	 * 只用本帧位置会在武器移动快于胶囊直径时漏过敌人。
 	 */
-	FVector PreviousStart = FVector::ZeroVector;
-	FVector PreviousEnd = FVector::ZeroVector;
+	TArray<FVector> PreviousPoints;
 
 	/** 上一帧端点是否有效。窗口开启的第一帧没有可比对的上一帧。 */
 	bool bHasPreviousTransform = false;
@@ -226,8 +237,31 @@ private:
 	};
 	TArray<FWindowHitSubscription> WindowHitSubscriptions;
 
+	/** 原窗口唯一配置快照及其借用资源；不持有角色/能力业务状态。 */
+	FGGYGOMeleeTraceShape ActiveShape;
+	TWeakObjectPtr<USkeletalMeshComponent> WindowMesh;
+	TWeakObjectPtr<USkeletalMesh> WindowMeshAsset;
+	TWeakObjectPtr<UWorld> WindowWorld;
+
+	/** 本批只读派生的采样计划；从全链预检后生成，不另设执行器。 */
+	struct FTraceSegment
+	{
+		int32 StartPoint = 0;
+		int32 EndPoint = 0;
+		int32 Subdivisions = 0;
+		float Radius = 0.0f;
+	};
+	/** 核实 Socket 的父骨及动画缓存，禁止引擎缺骨/缺缓存返回原点冒充有效点。 */
+	static bool ReadTracePoint(const USkeletalMeshComponent* Mesh, FName Point, FVector& OutPosition, FString& OutError);
+	bool ReadTraceShapeFrame(const FGGYGOMeleeTraceShape& Shape,
+		const USkeletalMeshComponent* ExpectedMainMesh, const TArray<FVector>* PriorPoints,
+		TArray<FVector>& OutPoints, TArray<FTraceSegment>& OutSegments, FString& OutError) const;
+	/** 原身份失效时不碰后继；原资源失效时诊断并关闭同原窗。 */
+	bool EnsureActiveTraceResources(uint64 Serial);
+
 	EGGYGOMeleeTraceWindowOpenResult StartTraceWindow(
-		FName InStartSocket, FName InEndSocket, float InTraceRadius, EWindowSource Source);
+		const FGGYGOMeleeTraceShape& Shape, const USkeletalMeshComponent* ExpectedMainMesh,
+		const USkeletalMesh* ExpectedMeshAsset, EWindowSource Source);
 	/** 生命周期/内部失败的唯一清理入口；公共 Legacy End 不具备此权限。 */
 	void CloseCurrentTraceWindow();
 	bool IsActiveWindow(uint64 Serial) const;
