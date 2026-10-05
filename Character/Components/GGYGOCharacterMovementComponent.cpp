@@ -2425,6 +2425,11 @@ void UGGYGOCharacterMovementComponent::EnforceMovementInputLocomotionAdmission()
 	Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
 }
 
+bool UGGYGOCharacterMovementComponent::IsMontageActionMovementModeSupported() const
+{
+	return IsMovingOnGround() || IsFalling();
+}
+
 bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
 	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
@@ -2440,10 +2445,10 @@ bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 			OriginalSource.IsValid() ? *OriginalSource->SectionName.ToString() : TEXT("None"), *Reason);
 		return false;
 	};
-	if (!IsInGameThread() || !IsValid(CharacterOwner) || IsBeingDestroyed() || !IsMovingOnGround()
+	if (!IsInGameThread() || !IsValid(CharacterOwner) || IsBeingDestroyed() || !IsMontageActionMovementModeSupported()
 		|| (!CharacterOwner->HasAuthority() && (CharacterOwner->GetLocalRole() != ROLE_AutonomousProxy
 			|| !CharacterOwner->IsLocallyControlled())) || CharacterOwner->bClientUpdating)
-		return Reject(TEXT("a live authority or original autonomous owner on the ground is required"));
+		return Reject(TEXT("a live authority or original autonomous owner in Walking, NavWalking or Falling is required"));
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
 	const TWeakObjectPtr<ACharacter> OriginalCharacter(CharacterOwner);
 	const auto OriginalOwnerContext = MovementOwnerSyncContext;
@@ -2494,6 +2499,10 @@ bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 	Resource->Handle = NextActionMotionHandle;
 	const auto Source = MakeShared<FRootMotionSource_GGYGOActionCurve>();
 	Source->SourceMode = EGGYGOActionCurveSourceMode::OriginalMontage;
+	// The original XYZ trajectory owns all velocity axes while its native interval is active.
+	// Sensitive native liftoff lets authored upward motion leave Walking without a jump impulse.
+	Source->Settings.UnSetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
+	Source->Settings.SetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
 	Source->OriginalBinding = OriginalSource;
 	Source->OriginalResource = Resource;
 	Source->MontageStartSeconds = MontagePositionSeconds;
@@ -2533,10 +2542,16 @@ bool UGGYGOCharacterMovementComponent::ValidateMontageActionRuntime(
 	const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const
 {
 	OutError.Reset();
-	if (!IsValid(CharacterOwner) || !IsMovingOnGround() || !Source.OriginalBinding.IsValid()
+	if (!IsValid(CharacterOwner) || !IsMontageActionMovementModeSupported() || !Source.OriginalBinding.IsValid()
 		|| CharacterOwner->IsPlayingRootMotion())
 	{
-		OutError = TEXT("ground action/source is unavailable or native animation RootMotion conflicts");
+		OutError = TEXT("original XYZ action requires Walking, NavWalking or Falling, its source and no native animation RootMotion conflict");
+		return false;
+	}
+	if (Source.Settings.HasFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate)
+		|| !Source.Settings.HasFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck))
+	{
+		OutError = TEXT("original XYZ action source must override Z and use native sensitive liftoff");
 		return false;
 	}
 	const auto Resource = Source.OriginalResource;
@@ -2764,6 +2779,8 @@ bool UGGYGOCharacterMovementComponent::CancelMontageActionMotionForMovement(
 			== EGGYGOQualifiedMovementIntentQueryResult::Qualified && AfterReleaseIntent == OriginalIntent)
 	{
 		Self->Velocity.X = 0.0; Self->Velocity.Y = 0.0;
+		// Airborne cancellation retains actual vertical momentum; native Falling resumes gravity.
+		// Never restore the entry mode or manufacture a landing to admit this original input.
 		Self->CurveMotion.Reset();
 	}
 	return true;
@@ -2872,11 +2889,12 @@ void UGGYGOCharacterMovementComponent::CleanupFinishedActionMotion()
 	if (ActiveMontageActionResource.IsValid())
 	{
 		const auto Resource = ActiveMontageActionResource;
-		if (!IsMovingOnGround())
+		if (!IsMontageActionMovementModeSupported())
 		{
 			const FString Error = FString::Printf(
-				TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' token=%d: original ground action left the ground"),
-				*GetPathName(), *GetPathNameSafe(Resource->Source->Montage.Get()), Resource->Handle);
+				TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' token=%d: original XYZ action entered unsupported MovementMode=%d CustomMode=%d"),
+				*GetPathName(), *GetPathNameSafe(Resource->Source->Montage.Get()), Resource->Handle,
+				static_cast<int32>(MovementMode), static_cast<int32>(CustomMovementMode));
 			UE_LOG(LogGGYGOMovement, Error, TEXT("%s"), *Error);
 			FailMontageActionMotion(Resource, Error);
 		}

@@ -12,6 +12,7 @@ FRootMotionSource_GGYGOActionCurve::FRootMotionSource_GGYGOActionCurve()
 {
 	AccumulateMode = ERootMotionAccumulateMode::Override;
 	bInLocalSpace = false;
+	// This is the explicit ground Profile default. Original Montage execution configures XYZ.
 	Settings.SetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
 }
 
@@ -103,8 +104,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource, Error);
 			return;
 		}
-		FVector WorldDelta = EntryActorRotation.RotateVector(Delta * TranslationScale);
-		WorldDelta.Z = 0.0;
+		const FVector WorldDelta = EntryActorRotation.RotateVector(Delta * TranslationScale);
 		const FVector OverrideVelocity = WorldDelta / MovementTickTime;
 		if (OverrideVelocity.ContainsNaN())
 		{
@@ -205,11 +205,17 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 				bOutSuccess = false; return false;
 			}
 			OriginalBinding = MakeShared<const FGGYGOActionMotionSourceBinding, ESPMode::ThreadSafe>(MoveTemp(Wire));
+			// Native base NetSerialize omits Settings. Derive the fixed execution policy from the
+			// explicitly serialized mode, just as local Original Montage admission configures it.
+			Settings.UnSetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
+			Settings.SetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
 		}
 	}
 	else if (Ar.IsLoading())
 	{
 		OriginalResource.Reset(); OriginalBinding.Reset(); bNativeImported = false;
+		Settings.SetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
+		Settings.UnSetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
 	}
 	bOutSuccess = !Ar.IsError();
 	return bOutSuccess;

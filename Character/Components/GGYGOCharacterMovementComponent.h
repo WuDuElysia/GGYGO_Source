@@ -539,6 +539,7 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement|Action Motion")
 	void EndActionMotion(int32 Handle);
 
+	/** Original Montage XYZ trajectory; native Walking/NavWalking/Falling own collision and landing. */
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, int32& OutHandle, FString& OutError);
@@ -1037,6 +1038,7 @@ protected:
 
 	friend struct FRootMotionSource_GGYGOActionCurve;
 	bool ValidateMontageActionRuntime(const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const;
+	bool IsMontageActionMovementModeSupported() const;
 	void FailMontageActionMotion(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource, const FString& Error);
 	void NeutralizeMontageActionSource(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource);
 	void ResumeLocomotionAfterAction();

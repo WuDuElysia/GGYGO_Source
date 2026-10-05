@@ -26,6 +26,23 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOPlayerComboAbility)
 
+namespace
+{
+	const TCHAR* DescribeQualifiedMovementResult(EGGYGOQualifiedMovementIntentQueryResult Result)
+	{
+		switch (Result)
+		{
+		case EGGYGOQualifiedMovementIntentQueryResult::Unavailable: return TEXT("Unavailable");
+		case EGGYGOQualifiedMovementIntentQueryResult::Qualified: return TEXT("Qualified");
+		case EGGYGOQualifiedMovementIntentQueryResult::NotHeld: return TEXT("NotHeld");
+		case EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof: return TEXT("AwaitingPhysicalProof");
+		case EGGYGOQualifiedMovementIntentQueryResult::WaitingForAdmission: return TEXT("WaitingForAdmission");
+		case EGGYGOQualifiedMovementIntentQueryResult::ExecutionFailed: return TEXT("ExecutionFailed");
+		default: return TEXT("UnsupportedQueryValue");
+		}
+	}
+}
+
 /** GA owns these resources; section interpretation is derived only from its original Task. */
 struct UGGYGOPlayerComboAbility::FStepMotionResources
 {
@@ -464,6 +481,19 @@ bool UGGYGOPlayerComboAbility::InitializeStepMotion(const TSharedPtr<FStepMotion
 	}
 	if (!IsMotionResourceCurrent(Resource)) { return false; }
 	Resource->MontageInstanceId = Snapshot.MontageInstanceId;
+	const int32 EndSectionIndex = Resource->Source->Montage->GetSectionIndex(Resource->EndSection);
+	float EndStartSeconds = 0.0f, EndEndSeconds = 0.0f;
+	if (EndSectionIndex != INDEX_NONE)
+	{
+		Resource->Source->Montage->GetSectionStartAndEndTime(EndSectionIndex, EndStartSeconds, EndEndSeconds);
+	}
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=OriginalSnapshot Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d Section='%s' Position=%.9g Main='%s' MainRange=[%.9g,%.9g] End='%s' EndRangeAvailable=%d EndRange=[%.9g,%.9g] MontageLength=%.9g EffectiveRate=%.9g"),
+		*Resource->AbilityPath, Resource->StepIndex, static_cast<unsigned long long>(Resource->StepToken),
+		*GetPathNameSafe(Snapshot.Montage), Snapshot.MontageInstanceId, *Snapshot.SectionName.ToString(), Snapshot.PositionSeconds,
+		*Resource->Source->SectionName.ToString(), Resource->Source->MontageStartSeconds, Resource->Source->MontageEndSeconds,
+		*Resource->EndSection.ToString(), EndSectionIndex != INDEX_NONE, EndStartSeconds, EndEndSeconds,
+		Resource->Source->MontageLength, Resource->EffectiveRate);
 	FString Error;
 	if (!Resource->Movement.IsValid() || !Resource->Movement->GetMovementOwnerSyncScope(Resource->Scope, Error))
 	{
@@ -518,6 +548,11 @@ void UGGYGOPlayerComboAbility::HandleMontageSection(const TSharedPtr<FStepMotion
 	const FGGYGOMontageSectionFact& Fact)
 {
 	if (!IsMotionResourceCurrent(Resource) || Resource->MontageInstanceId == INDEX_NONE) { return; }
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=SectionReceived Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d Section='%s' Looped=%d ExpectedInstance=%d End='%s' DerivedSection=%d"),
+		*Resource->AbilityPath, Resource->StepIndex, static_cast<unsigned long long>(Resource->StepToken),
+		*GetPathNameSafe(Fact.Montage), Fact.MontageInstanceId, *Fact.SectionName.ToString(), Fact.bLooped,
+		Resource->MontageInstanceId, *Resource->EndSection.ToString(), static_cast<int32>(Resource->Section));
 	if (Fact.Montage != Resource->Source->Montage.Get() || Fact.MontageInstanceId != Resource->MontageInstanceId)
 	{
 		FailStepMotion(Resource, TEXT("Section fact does not identify this step's original playback."));
@@ -540,6 +575,10 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 {
 	if (!IsMotionResourceCurrent(Resource) || Resource->Section == FStepMotionResources::ESection::End) { return; }
 	Resource->Section = FStepMotionResources::ESection::End;
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=EnterEnd Ability='%s' Step=%d StepToken=%llu Instance=%d MotionHandle=%d Scope=%llu"),
+		*Resource->AbilityPath, Resource->StepIndex, static_cast<unsigned long long>(Resource->StepToken),
+		Resource->MontageInstanceId, Resource->MotionHandle, static_cast<unsigned long long>(Resource->Scope.GetScopeSerial()));
 	FString Error;
 	if (!Resource->Movement.IsValid())
 	{
@@ -556,12 +595,27 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
 	const TWeakPtr<FStepMotionResources> WeakResource(Resource);
 	const auto ReceiveIntent = [WeakThis, WeakResource](EGGYGOQualifiedMovementIntentQueryResult Result,
-		const FGGYGOQualifiedMovementIntent& Intent, const FString& Diagnostic)
+		const FGGYGOQualifiedMovementIntent& Intent, const FString& Diagnostic, const TCHAR* Delivery)
 	{
 		ThisClass* Self = WeakThis.Get();
 		const TSharedPtr<FStepMotionResources> OriginalResource = WeakResource.Pin();
 		if (!Self || !Self->IsMotionResourceCurrent(OriginalResource)
 			|| OriginalResource->Section != FStepMotionResources::ESection::End) { return; }
+		// Read the exact Task once at this boundary; an unavailable snapshot is diagnostic only.
+		FGGYGOMontageSectionSnapshot CurrentSnapshot;
+		const bool bSnapshotAvailable = OriginalResource->Task->TryGetOriginalSectionSnapshot(CurrentSnapshot);
+		const FString OriginalLogContext = FString::Printf(
+			TEXT("Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d MotionHandle=%d Scope=%llu"),
+			*OriginalResource->AbilityPath, OriginalResource->StepIndex, static_cast<unsigned long long>(OriginalResource->StepToken),
+			*GetPathNameSafe(OriginalResource->Source->Montage.Get()), OriginalResource->MontageInstanceId,
+			OriginalResource->MotionHandle, static_cast<unsigned long long>(OriginalResource->Scope.GetScopeSerial()));
+		UE_LOG(LogGGYGOAbilitySystem, Display,
+			TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=EndIntent Delivery=%s %s Result=%s(%d) Provenance=%d IntentScope=%llu Binding=%llu Session=%llu Request=%llu Execution=%llu SnapshotAvailable=%d SnapshotSection='%s' Position=%.9g MontageLength=%.9g Diagnostic='%s'"),
+			Delivery, *OriginalLogContext, DescribeQualifiedMovementResult(Result), static_cast<int32>(Result), static_cast<int32>(Intent.Provenance),
+			static_cast<unsigned long long>(Intent.Scope.GetScopeSerial()), static_cast<unsigned long long>(Intent.BindingSerial),
+			static_cast<unsigned long long>(Intent.SessionSerial), static_cast<unsigned long long>(Intent.RequestSerial),
+			static_cast<unsigned long long>(Intent.ExecutionRequestSerial), bSnapshotAvailable,
+			*CurrentSnapshot.SectionName.ToString(), CurrentSnapshot.PositionSeconds, OriginalResource->Source->MontageLength, *Diagnostic);
 		if (Result == EGGYGOQualifiedMovementIntentQueryResult::Unavailable
 			|| Result == EGGYGOQualifiedMovementIntentQueryResult::ExecutionFailed)
 		{
@@ -577,6 +631,9 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 		FString CancelError;
 		FGGYGOQualifiedMovementIntent CurrentIntent;
 		const auto CurrentResult = OriginalResource->Movement->QueryQualifiedMovementIntent(OriginalResource->Scope, CurrentIntent, CancelError);
+		UE_LOG(LogGGYGOAbilitySystem, Display,
+			TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=IntentRevalidation %s Result=%s(%d) SameIntent=%d Diagnostic='%s'"),
+			*OriginalLogContext, DescribeQualifiedMovementResult(CurrentResult), static_cast<int32>(CurrentResult), CurrentIntent == Intent, *CancelError);
 		if (CurrentResult != EGGYGOQualifiedMovementIntentQueryResult::Qualified || !(CurrentIntent == Intent))
 		{
 			if (CurrentResult == EGGYGOQualifiedMovementIntentQueryResult::Unavailable
@@ -586,20 +643,43 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 			}
 			return; // A retired/replaced notification cannot cancel with a successor request.
 		}
-		if (OriginalResource->MotionHandle != INDEX_NONE
-			&& !OriginalResource->Movement->CancelMontageActionMotionForMovement(OriginalResource->MotionHandle, Intent, CancelError))
+		if (OriginalResource->MotionHandle != INDEX_NONE)
 		{
-			Self->FailStepMotion(OriginalResource, FString::Printf(TEXT("Original End movement cancellation was rejected: %s"), *CancelError));
-			return;
+			const bool bMotionCancelled = OriginalResource->Movement->CancelMontageActionMotionForMovement(OriginalResource->MotionHandle, Intent, CancelError);
+			UE_LOG(LogGGYGOAbilitySystem, Display,
+				TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=MotionCancellation %s Succeeded=%d Diagnostic='%s'"),
+				*OriginalLogContext, bMotionCancelled, *CancelError);
+			if (!bMotionCancelled)
+			{
+				Self->FailStepMotion(OriginalResource, FString::Printf(TEXT("Original End movement cancellation was rejected: %s"), *CancelError));
+				return;
+			}
 		}
 		if (!Self->IsMotionResourceCurrent(OriginalResource)) { return; }
 		OriginalResource->MotionHandle = INDEX_NONE;
 		// This is the GA's selected End lifecycle rule, including its no-Main-resource correction path.
-		Self->RequestAbilityEnd(OriginalResource->Activation, true, true);
+		const FGGYGOAbilityTerminationResult EndResult = Self->RequestAbilityEnd(OriginalResource->Activation, true, true);
+		switch (EndResult.Outcome)
+		{
+		case EGGYGOAbilityTerminationOutcome::Completed:
+		case EGGYGOAbilityTerminationOutcome::Accepted:
+		case EGGYGOAbilityTerminationOutcome::Deferred:
+		case EGGYGOAbilityTerminationOutcome::AlreadyPending:
+			UE_LOG(LogGGYGOAbilitySystem, Display,
+				TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=AbilityEndResult %s Outcome=%d Reason=%d"),
+				*OriginalLogContext, static_cast<int32>(EndResult.Outcome), static_cast<int32>(EndResult.Reason));
+			break;
+		default:
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=AbilityEndResult %s Outcome=%d Reason=%d; original End request was not accepted"),
+				*OriginalLogContext, static_cast<int32>(EndResult.Outcome), static_cast<int32>(EndResult.Reason));
+			break;
+		}
+		// Only local immutable diagnostic data is accessed after the external End request.
 	};
 	FGGYGOQualifiedMovementIntent InitialIntent;
 	const auto InitialResult = Resource->Movement->QueryQualifiedMovementIntent(Resource->Scope, InitialIntent, Error);
-	ReceiveIntent(InitialResult, InitialIntent, Error);
+	ReceiveIntent(InitialResult, InitialIntent, Error, TEXT("EndEntry"));
 	if (!IsMotionResourceCurrent(Resource)) { return; }
 	const bool bSubscribed = Resource->Movement->SubscribeQualifiedMovementIntent(Resource->Scope,
 		FGGYGOQualifiedMovementIntentDelegate::CreateLambda(
@@ -611,7 +691,7 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 				if (Self && Self->IsMotionResourceCurrent(OriginalResource)
 					&& OriginalResource->Observer == OriginalObserver && OriginalObserver.GetScope() == OriginalResource->Scope)
 				{
-					ReceiveIntent(Result, Intent, Diagnostic);
+					ReceiveIntent(Result, Intent, Diagnostic, TEXT("Observer"));
 				}
 			}), Resource->Observer, Error);
 	// OutObserver is installed before Replay, so reentrant termination can clean the original record.

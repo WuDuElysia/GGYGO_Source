@@ -1,8 +1,10 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
+#include "Character/GGYGOCharacterBase.h"
 #include "Character/Data/GGYGOActionMotionProfile.h"
 #include "Character/Data/GGYGOActionMotionEvaluation.h"
+#include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimData/IAnimationDataController.h"
@@ -11,6 +13,7 @@
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/BoxComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Curves/CurveVector.h"
 #include "Engine/SkeletalMesh.h"
@@ -317,6 +320,192 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("Native animation root motion cannot also execute position curves"),
 		GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, 0.5f, 1.5f, OriginalDelta, Error));
 	TestTrue(TEXT("Rejected original interval has no partial output"), OriginalDelta.IsZero());
+
+	// Exercise the same original-source executor through native capsule physics, including nonzero Z.
+	// These are transient source/model/collision resources, not replacements for production animations.
+	const FVector XYZFloorOrigin(5000.0, 0.0, 0.0);
+	const auto MakeXYZCollisionBox = [World](const FVector& Location, const FVector& Extent) -> UBoxComponent*
+	{
+		AActor* BoxOwner = World->SpawnActor<AActor>();
+		if (!BoxOwner) return nullptr;
+		UBoxComponent* Box = NewObject<UBoxComponent>(BoxOwner);
+		BoxOwner->SetRootComponent(Box);
+		Box->SetBoxExtent(Extent);
+		Box->SetCollisionProfileName(TEXT("BlockAll"));
+		Box->RegisterComponent();
+		Box->SetWorldLocation(Location);
+		return Box;
+	};
+	UBoxComponent* XYZFloor = MakeXYZCollisionBox(XYZFloorOrigin - FVector(0.0, 0.0, 20.0), FVector(1000.0, 1000.0, 20.0));
+	if (!TestNotNull(TEXT("XYZ fixture has a real blocking floor"), XYZFloor)) return false;
+	AGGYGOCharacterBase* XYZCharacter = World->SpawnActor<AGGYGOCharacterBase>(
+		XYZFloorOrigin + FVector(0.0, 0.0, 500.0), FRotator(0.0, 90.0, 0.0));
+	if (!TestNotNull(TEXT("XYZ capsule character"), XYZCharacter)) return false;
+	// Use the Character's actual default CMC so native mode and landing callbacks see the same executor.
+	UGGYGOCharacterMovementComponent* XYZMove = XYZCharacter->GetGGYGOMovementComponent();
+	if (!TestNotNull(TEXT("XYZ fixture uses the Character's original native CMC"), XYZMove)) return false;
+	XYZMove->SetComponentTickEnabled(false);
+	XYZMove->bRunPhysicsWithNoController = true;
+	if (!TestTrue(TEXT("XYZ fixture binds the original valid MovementSet"), XYZMove->SetMovementSet(FixedSet))) return false;
+	const float XYZCapsuleHalfHeight = XYZCharacter->GetCapsuleComponent()->GetScaledCapsuleHalfHeight();
+	const FVector XYZEntryLocation = XYZFloorOrigin + FVector(0.0, 0.0, XYZCapsuleHalfHeight + 2.15);
+	XYZCharacter->SetActorLocation(XYZEntryLocation);
+	XYZMove->SetMovementMode(MOVE_Walking);
+	USkeletalMesh* XYZMesh = DuplicateObject<USkeletalMesh>(OriginalLoopFixtureMesh, XYZCharacter);
+	if (!TestNotNull(TEXT("XYZ fixture owns its mesh copy"), XYZMesh)) return false;
+	XYZMesh->SetFlags(RF_Transient);
+	XYZMesh->SetSkeleton(OriginalLoopFixtureSkeleton);
+	OriginalLoopFixtureSkeleton->RegisterSlotNode(TEXT("FullBody"));
+	XYZCharacter->GetMesh()->SetSkeletalMesh(XYZMesh);
+	XYZCharacter->GetMesh()->SetRelativeScale3D(FVector(2.0));
+	XYZCharacter->GetMesh()->SetRelativeRotation(FRotator(0.0, 180.0, 0.0));
+	XYZCharacter->GetMesh()->SetAnimInstanceClass(UAnimInstance::StaticClass());
+	XYZCharacter->GetMesh()->SetComponentTickEnabled(false);
+	XYZCharacter->GetMesh()->SetVisibility(false);
+	XYZCharacter->GetMesh()->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+	UAnimInstance* XYZAnim = XYZCharacter->GetMesh()->GetAnimInstance();
+	if (!TestNotNull(TEXT("XYZ fixture has its original native AnimInstance"), XYZAnim)) return false;
+	UAnimSequence* XYZSequence = NewObject<UAnimSequence>(XYZCharacter, NAME_None, RF_Transient);
+	XYZSequence->SetSkeleton(OriginalLoopFixtureSkeleton);
+	IAnimationDataController& XYZController = XYZSequence->GetController();
+	XYZController.InitializeModel();
+	{
+		// Publish the complete Model and its target sampling rate before native cache rebuilding.
+		IAnimationDataController::FScopedBracket XYZPopulationBracket(
+			XYZController, FText::FromString(TEXT("Populate XYZ action fixture")), false);
+		XYZController.SetFrameRate(FFrameRate(32, 1), false);
+		XYZController.SetNumberOfFrames(FFrameNumber(40), false);
+		const float XYZTimes[] = {0.0f, 0.25f, 0.5f, 1.0f, 1.25f};
+		const float XYZPositions[3][5] = {{47.0f, 52.0f, 57.0f, 67.0f, 67.0f},
+			{13.0f, 15.0f, 17.0f, 21.0f, 21.0f}, {5.0f, 25.0f, 45.0f, 5.0f, 5.0f}};
+		for (int32 XYZAxis = 0; XYZAxis < 3; ++XYZAxis)
+		{
+			TArray<FRichCurveKey> XYZKeys;
+			for (int32 XYZKeyIndex = 0; XYZKeyIndex < UE_ARRAY_COUNT(XYZTimes); ++XYZKeyIndex)
+			{
+				FRichCurveKey& XYZKey = XYZKeys.Emplace_GetRef(XYZTimes[XYZKeyIndex], XYZPositions[XYZAxis][XYZKeyIndex]);
+				XYZKey.InterpMode = RCIM_Linear;
+			}
+			const FAnimationCurveIdentifier XYZCurveId(OriginalLoopPositionCurveNames[XYZAxis], ERawCurveTrackTypes::RCT_Float);
+			if (!TestTrue(TEXT("XYZ original Model installs each authored cumulative axis"),
+				XYZController.AddCurve(XYZCurveId, 4, false) && XYZController.SetCurveKeys(XYZCurveId, XYZKeys, false))) return false;
+		}
+		XYZController.NotifyPopulated();
+	}
+	const IAnimationDataModel* XYZPopulatedModel = XYZSequence->GetDataModelInterface().GetInterface();
+	if (!TestTrue(TEXT("XYZ population publishes a coherent native sampling timeline"), XYZPopulatedModel
+		&& XYZSequence->GetSamplingFrameRate() == XYZPopulatedModel->GetFrameRate()
+		&& FMath::IsNearlyEqual(XYZSequence->GetPlayLength(), 1.25f))) return false;
+	UAnimMontage* XYZMontage = NewObject<UAnimMontage>(XYZCharacter, NAME_None, RF_Transient);
+	XYZMontage->SetSkeleton(OriginalLoopFixtureSkeleton);
+	XYZMontage->SetCompositeLength(1.25f);
+	XYZMontage->BlendIn.SetBlendTime(0.0f);
+	XYZMontage->BlendOut.SetBlendTime(0.0f);
+	XYZMontage->SlotAnimTracks.SetNum(1);
+	XYZMontage->SlotAnimTracks[0].SlotName = TEXT("FullBody");
+	FAnimSegment XYZSegment;
+	XYZSegment.SetAnimReference(XYZSequence);
+	XYZSegment.AnimStartTime = 0.0f;
+	XYZSegment.AnimEndTime = 1.25f;
+	XYZSegment.AnimPlayRate = 1.0f;
+	XYZSegment.LoopingCount = 1;
+	XYZMontage->SlotAnimTracks[0].AnimTrack.AnimSegments.Add(XYZSegment);
+	XYZMontage->AddAnimCompositeSection(TEXT("Main"), 0.0f);
+	XYZMontage->AddAnimCompositeSection(TEXT("End"), 1.0f);
+	XYZMontage->CompositeSections[0].NextSectionName = TEXT("End");
+	FGGYGOActionMotionSourceBindingPtr XYZBinding;
+	if (!TestTrue(TEXT("XYZ original Main binding resolves"),
+		GGYGOActionMotionSource::BuildSourceBinding(XYZMontage, TEXT("FullBody"), TEXT("Main"), XYZBinding, Error))) return false;
+	int32 XYZMontageInstanceId = INDEX_NONE;
+	const auto BeginXYZ = [&]() -> int32
+	{
+		if (!TestTrue(TEXT("XYZ native Montage playback starts"), XYZAnim->Montage_Play(XYZMontage) > 0.0f)) return INDEX_NONE;
+		FAnimMontageInstance* XYZInstance = XYZAnim->GetActiveInstanceForMontage(XYZMontage);
+		if (!TestNotNull(TEXT("XYZ playback has an actual original instance"), XYZInstance)) return INDEX_NONE;
+		int32 XYZHandle = INDEX_NONE;
+		if (!TestTrue(TEXT("XYZ execution accepts the original native instance"),
+			XYZMove->BeginMontageActionMotion(XYZBinding, XYZInstance->GetInstanceID(), XYZInstance->GetPosition(),
+				XYZInstance->GetPlayRate() * XYZMontage->RateScale, 1.0f, XYZHandle, Error))) return INDEX_NONE;
+		XYZMontageInstanceId = XYZInstance->GetInstanceID();
+		return XYZHandle;
+	};
+	const float XYZNativeStep = 0.125f;
+	const auto AdvanceXYZ = [&]() -> bool
+	{
+		FAnimMontageInstance* XYZOriginalInstance = XYZAnim->GetMontageInstanceForID(XYZMontageInstanceId);
+		if (!TestNotNull(TEXT("XYZ step retains the exact original Montage instance"), XYZOriginalInstance)) return false;
+		if (!TestTrue(TEXT("XYZ original instance remains native and playing"),
+			XYZOriginalInstance->Montage == XYZMontage && XYZOriginalInstance->IsActive() && XYZOriginalInstance->IsPlaying())) return false;
+		XYZOriginalInstance->UpdateWeight(XYZNativeStep);
+		XYZOriginalInstance->Advance(XYZNativeStep, nullptr, false);
+		XYZAnim->DispatchQueuedAnimEvents();
+		// Public native move entry reaches PerformMovement; the hidden mesh cannot advance twice.
+		XYZMove->MoveAutonomous(0.0f, XYZNativeStep, 0, FVector::ZeroVector);
+		return true;
+	};
+	const float XYZOriginalGravityScale = XYZMove->GravityScale;
+	const int32 XYZNaturalHandle = BeginXYZ();
+	if (!TestTrue(TEXT("XYZ original action receives a real token"), XYZNaturalHandle != INDEX_NONE)) return false;
+	const TSharedPtr<FRootMotionSource> XYZNaturalSource = XYZMove->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
+	if (!TestTrue(TEXT("XYZ native source overrides Z and enables sensitive liftoff"), XYZNaturalSource.IsValid()
+		&& !XYZNaturalSource->Settings.HasFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate)
+		&& XYZNaturalSource->Settings.HasFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck))) return false;
+	if (!AdvanceXYZ()) return false;
+	TestTrue(TEXT("Authored Z causes native Walking to Falling"), XYZMove->IsFalling());
+	TestTrue(TEXT("Legal liftoff keeps the same original action"), XYZMove->HasActiveActionMotion());
+	for (int32 XYZStepIndex = 1; XYZStepIndex < 4; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
+	TestTrue(TEXT("Actual capsule XYZ applies Actor basis and mesh scale exactly once"),
+		(XYZCharacter->GetActorLocation() - XYZEntryLocation).Equals(FVector(-8.0, 20.0, 80.0), 0.05));
+	for (int32 XYZStepIndex = 4; XYZStepIndex < 8; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
+	TestTrue(TEXT("Original native End releases the XYZ Main resource"),
+		XYZMove->ReleaseMontageActionMotion(XYZNaturalHandle, EGGYGOActionMotionReleaseReason::Completed, Error));
+	for (int32 XYZGravityStep = 0; XYZGravityStep < 3; ++XYZGravityStep)
+		XYZMove->MoveAutonomous(0.0f, XYZNativeStep, 0, FVector::ZeroVector);
+	TestTrue(TEXT("Native collision lands after the finite XYZ source releases gravity"), XYZMove->IsMovingOnGround());
+	TestEqual(TEXT("XYZ execution never mutates native GravityScale"), XYZMove->GravityScale, XYZOriginalGravityScale);
+
+	// A ceiling constrains the capsule, and landing during Main keeps that original action alive.
+	UBoxComponent* XYZCeiling = MakeXYZCollisionBox(
+		XYZEntryLocation + FVector(0.0, 0.0, XYZCapsuleHalfHeight + 60.0), FVector(1000.0, 1000.0, 10.0));
+	if (!TestNotNull(TEXT("XYZ fixture has a real blocking ceiling"), XYZCeiling)) return false;
+	XYZCharacter->SetActorLocation(XYZEntryLocation);
+	XYZMove->StopMovementImmediately();
+	XYZMove->SetMovementMode(MOVE_Walking);
+	const int32 XYZBlockedHandle = BeginXYZ();
+	if (!TestTrue(TEXT("Blocked XYZ action receives its own token"), XYZBlockedHandle != INDEX_NONE)) return false;
+	for (int32 XYZStepIndex = 0; XYZStepIndex < 4; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
+	TestTrue(TEXT("XYZ ascent respects the real capsule ceiling sweep"),
+		XYZCharacter->GetActorLocation().Z <= XYZEntryLocation.Z + 50.05);
+	TestTrue(TEXT("Blocked trajectory does not fabricate original action failure"), XYZMove->HasActiveActionMotion());
+	for (int32 XYZStepIndex = 4; XYZStepIndex < 7; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
+	TestTrue(TEXT("Native landing inside Main retains the original resource"),
+		XYZMove->IsMovingOnGround() && XYZMove->HasActiveActionMotion());
+	TestTrue(TEXT("Original blocked token can cancel without forcing another movement mode"),
+		XYZMove->ReleaseMontageActionMotion(XYZBlockedHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
+	XYZCeiling->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+
+	XYZCharacter->SetActorLocation(XYZEntryLocation);
+	XYZMove->StopMovementImmediately();
+	XYZMove->SetMovementMode(MOVE_Walking);
+	const int32 XYZCancelledHandle = BeginXYZ();
+	if (!TestTrue(TEXT("Air cancellation action receives its original token"), XYZCancelledHandle != INDEX_NONE)) return false;
+	if (!AdvanceXYZ()) return false;
+	const FVector XYZVelocityAtCancellation = XYZMove->Velocity;
+	TestTrue(TEXT("XYZ original airborne token cancels exactly"),
+		XYZMove->ReleaseMontageActionMotion(XYZCancelledHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
+	TestTrue(TEXT("Air cancellation releases its override and preserves physical mode and momentum"),
+		XYZMove->IsFalling() && !XYZMove->HasActiveActionMotion() && !XYZMove->CurrentRootMotion.HasOverrideVelocity()
+		&& XYZMove->Velocity.Equals(XYZVelocityAtCancellation));
+	XYZMove->MoveAutonomous(0.0f, XYZNativeStep, 0, FVector::ZeroVector);
+	TestTrue(TEXT("Native gravity resumes after airborne cancellation"), XYZMove->Velocity.Z < XYZVelocityAtCancellation.Z);
+	const int32 XYZSuccessorHandle = BeginXYZ();
+	if (!TestTrue(TEXT("An original XYZ successor can enter native Falling"),
+		XYZSuccessorHandle != INDEX_NONE && XYZSuccessorHandle != XYZCancelledHandle)) return false;
+	TestTrue(TEXT("Retired XYZ cancellation remains idempotent"),
+		XYZMove->ReleaseMontageActionMotion(XYZCancelledHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
+	TestTrue(TEXT("Retired XYZ token does not cancel its airborne successor"), XYZMove->HasActiveActionMotion());
+	TestTrue(TEXT("XYZ fixture releases its exact successor"),
+		XYZMove->ReleaseMontageActionMotion(XYZSuccessorHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
 #endif
 	return true;
 }

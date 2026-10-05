@@ -12,7 +12,7 @@ enum class EGGYGOActionCurveSourceMode : uint8
 	Profile, OriginalMontage
 };
 
-/** Finite ground action trajectory using native RMS time and original source ownership. */
+/** Original Montage XYZ trajectory or explicit ground Profile, using native RMS time and ownership. */
 USTRUCT()
 struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 {
@@ -27,6 +27,7 @@ struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 	EGGYGOActionCurveSourceMode SourceMode = EGGYGOActionCurveSourceMode::Profile;
 	FGGYGOActionMotionSourceBindingPtr OriginalBinding;
 	TSharedPtr<const FGGYGOActionMotionResource> OriginalResource;
+	/** Original Montage UE-local XYZ is transformed once by the captured Actor basis. */
 	FQuat EntryActorRotation = FQuat::Identity;
 	float MontageStartSeconds = 0.0f;
 	bool bCompletionRequested = false;

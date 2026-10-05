@@ -183,6 +183,28 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 #include "Serialization/ObjectAndNameAsStringProxyArchive.h"
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
+#if WITH_EDITOR
+#include "Character/Components/GGYGOHeroComponent.h"
+#include "Character/Data/GGYGOPawnData.h"
+#include "Editor.h"
+#include "Editor/EditorEngine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/GameViewportClient.h"
+#include "EnhancedInputSubsystems.h"
+#include "Framework/Application/SlateApplication.h"
+#include "GameFramework/GameModeBase.h"
+#include "GenericPlatform/GenericWindow.h"
+#include "Input/GGYGOInputConfig.h"
+#include "Input/GGYGOMovementInputOriginResource.h"
+#include "Input/GGYGOPlayerInput.h"
+#include "Player/GGYGOLocalPlayer.h"
+#include "Player/GGYGOPlayerController.h"
+#include "PlayInEditorDataTypes.h"
+#include "Settings/LevelEditorPlaySettings.h"
+#include "UObject/StrongObjectPtr.h"
+#include "Widgets/SViewport.h"
+#include "Widgets/SWindow.h"
+#endif
 
 /** Owns the synthetic components and is the single narrow friend used to inspect private GA resources. */
 struct FGGYGOPlayerComboLifecycleFixture
@@ -201,6 +223,38 @@ struct FGGYGOPlayerComboLifecycleFixture
 	FName TraceEndBone = NAME_None;
 	FGameplayAbilitySpecHandle AbilityHandle;
 	UGGYGOPlayerComboLifecycleTestAbility* Ability = nullptr;
+
+#if WITH_EDITOR
+	// Read-only access to the production ability. These helpers neither adopt its
+	// resources into the synthetic fixture nor change its native callbacks.
+	static UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetProductionMontageTask(
+		const UGGYGOPlayerComboAbility* Production)
+	{
+		return Production ? Production->MontageTask.Get() : nullptr;
+	}
+	static UGGYGOAbilityTask_WaitComboInput* GetProductionInputTask(const UGGYGOPlayerComboAbility* Production)
+	{
+		return Production ? Production->InputTask.Get() : nullptr;
+	}
+	static bool ReadProductionStep(const UGGYGOPlayerComboAbility* Production, FGGYGOComboStep& OutStep)
+	{
+		if (!Production || !Production->ComboSteps.IsValidIndex(Production->CurrentStep)) { return false; }
+		OutStep = Production->ComboSteps[Production->CurrentStep];
+		return true;
+	}
+	static bool ProductionResourcesReleased(const UGGYGOPlayerComboAbility* Production, UWorld* ProductionWorld)
+	{
+		return Production && ProductionWorld && !Production->StepMotionResources.IsValid()
+			&& !Production->ActiveMesh && !Production->MontageTask && !Production->InputTask
+			&& !Production->TraceComponent && !Production->TraceWindow.HasWindow()
+			&& !Production->ResourceActivation.HasActivation() && Production->OriginalWorld.IsExplicitlyNull()
+			&& !Production->MontageCallbackRegistration.IsValid() && !Production->InputCallbackRegistration.IsValid()
+			&& !Production->TraceHitSubscription.IsValid() && !Production->bChangedMeshTick
+			&& !Production->bAddedMeshPrerequisite && Production->CurrentStepToken == 0
+			&& Production->CurrentStep == INDEX_NONE
+			&& !ProductionWorld->GetTimerManager().TimerExists(Production->WatchdogHandle);
+	}
+#endif
 
 	bool Initialize(UWorld* InWorld)
 	{
@@ -1629,4 +1683,811 @@ bool FGGYGOPlayerComboRuntimeHitBuilderFailureTest::RunTest(const FString& Param
 {
 	return RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::InvalidRequiredSpec);
 }
+
+#if WITH_EDITOR
+namespace
+{
+	/** A finite production PIE smoke. Automation observes; UE alone runs input, animation and movement frames. */
+	class FComboEndProductionPIECommand : public IAutomationLatentCommand
+	{
+	public:
+		FComboEndProductionPIECommand(FAutomationTestBase& InTest, bool bInHeldDuringMain)
+			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), OuterWorld(GWorld),
+			OuterViewport(GEngine ? GEngine->GameViewport.Get() : nullptr) {}
+		virtual ~FComboEndProductionPIECommand() override
+		{
+			if (Stage != EStage::Done)
+			{
+				Fail(TEXT("automation aborted before owned PIE cleanup"));
+				Stage = EStage::Ending;
+				ReleaseGameplayObservations();
+				CloseOwnedPIE(true);
+			}
+			FEditorDelegates::PreBeginPIE.Remove(PreHandle);
+			FEditorDelegates::PostPIEStarted.Remove(PostHandle);
+		}
+
+		virtual bool Update() override
+		{
+			if (Stage == EStage::Done) { return true; }
+			if (Stage == EStage::Start) { StartPIE(); return false; }
+			if (Stage == EStage::Ending) { return UpdateEnding(); }
+			if (bFailed) { BeginEnding(); return false; }
+			if (FPlatformTime::Seconds() >= Deadline)
+			{
+				if (Stage == EStage::Locomotion) { LogLocomotionSnapshot(TEXT("LocomotionTimeout")); }
+				Fail(TEXT("bounded stage timeout; original input/section/cancellation/recovery condition not observed"));
+				BeginEnding();
+				return false;
+			}
+			if (Stage == EStage::Player)
+			{
+				if (bPIEStarted && !IsOwnedWorldCurrent()) { Fail(TEXT("original PIE context changed during startup")); }
+				else if (bPIEStarted) { TryStartAttack(); }
+				return false;
+			}
+			if (!IsProductionChainCurrent()) { Fail(TEXT("original world/player/pawn/input/ASC/mesh/scope or viewport focus changed")); return false; }
+			if (Stage == EStage::Main) { TryCaptureMain(); return false; }
+			if (Stage == EStage::End) { ObserveNaturalEnd(); return false; }
+			if (Stage == EStage::Cancel)
+			{
+				if (EndCount != 0 || CompletedCount != 0) { VerifyCancellation(); }
+				return false;
+			}
+			if (Stage == EStage::Locomotion) { ObserveLocomotion(); }
+			return false;
+		}
+
+	private:
+		enum class EStage : uint8 { Start, Player, Main, End, Cancel, Locomotion, Ending, Done };
+		void Fail(const FString& Reason)
+		{
+			if (bFailed) { return; }
+			bFailed = true;
+			Test.AddError(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Case=%s Stage=%u World=%s Pawn=%s GA=%s Instance=%d: %s"),
+				bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"), static_cast<uint32>(Stage),
+				*GetPathNameSafe(World.Get()), *GetPathNameSafe(Character.Get()), *GetPathNameSafe(Ability.Get()), InstanceId, *Reason));
+		}
+		int32 CountPIEWorlds() const
+		{
+			int32 Count = 0;
+			if (Editor.IsValid())
+			{
+				for (const FWorldContext& Context : Editor->GetWorldContexts())
+				{
+					if (Context.WorldType == EWorldType::PIE) { ++Count; }
+				}
+			}
+			return Count;
+		}
+		bool OwnsPIESession() const
+		{
+			if (!Editor.IsValid() || !RequestSettings.IsValid()) { return false; }
+			const TOptional<FPlayInEditorSessionInfo> Info = Editor->GetPlayInEditorSessionInfo();
+			return Info.IsSet() && Info->OriginalRequestParams.EditorPlaySettings == RequestSettings.Get()
+				&& Info->OriginalRequestParams.SessionDestination == EPlaySessionDestinationType::InProcess
+				&& !Info->OriginalRequestParams.GameModeOverride;
+		}
+		bool IsOwnedWorldCurrent() const
+		{
+			if (!OwnsPIESession() || CountPIEWorlds() != 1 || !World.IsValid() || !GameInstance.IsValid()
+				|| Editor->PlayWorld != World.Get() || Editor->ShouldEndPlayMap()) { return false; }
+			const FWorldContext* Context = Editor->GetWorldContextFromWorld(World.Get());
+			return Context && Context->ContextHandle == ContextHandle && Context->OwningGameInstance == GameInstance.Get();
+		}
+		void StartPIE()
+		{
+			Stage = EStage::Player;
+			Editor = Cast<UEditorEngine>(GEngine);
+			if (!Editor.IsValid() || Editor.Get() != GEditor || !FSlateApplication::IsInitialized())
+			{
+				Fail(TEXT("requires an interactive Editor and initialized native Slate")); return;
+			}
+			if (Editor->IsPlaySessionInProgress() || Editor->IsSettingUpPlayWorld() || Editor->PlayWorld
+				|| Editor->ShouldEndPlayMap() || CountPIEWorlds() != 0 || Editor->GetPlaySessionRequest().IsSet())
+			{
+				Fail(TEXT("existing or queued PIE is not owned by this test")); return;
+			}
+			UWorld* EditorWorld = Editor->GetEditorWorldContext().World();
+			if (!EditorWorld) { Fail(TEXT("no current production editor map")); return; }
+			EditorMap = EditorWorld->GetPackage()->GetName();
+			OuterWorld = GWorld;
+			OuterViewport = GEngine->GameViewport.Get();
+			PreviousFocus = FSlateApplication::Get().GetKeyboardFocusedWidget();
+			TStrongObjectPtr<ULevelEditorPlaySettings> Settings(NewObject<ULevelEditorPlaySettings>(GetTransientPackage()));
+			Settings->SetPlayNetMode(EPlayNetMode::PIE_Standalone);
+			Settings->SetRunUnderOneProcess(true);
+			Settings->SetPlayNumberOfClients(1);
+			Settings->bLaunchSeparateServer = false;
+			Settings->GameGetsMouseControl = true;
+			Settings->bShouldMinimizeEditorOnNonVRPIE = false;
+			FRequestPlaySessionParams Params;
+			Params.EditorPlaySettings = Settings.Get();
+			Params.bAllowOnlineSubsystem = false;
+			// Preserve the current production map, GameMode, Experience and spawn path.
+			PreHandle = FEditorDelegates::PreBeginPIE.AddLambda([this](bool bSimulating)
+			{
+				const TOptional<FRequestPlaySessionParams> Queued = Editor->GetPlaySessionRequest();
+				bSawPreBegin = Stage == EStage::Player && !bSimulating && Queued.IsSet()
+					&& Queued->EditorPlaySettings == RequestSettings.Get();
+				if (!bSawPreBegin) { Fail(TEXT("PreBeginPIE did not identify our original request")); }
+			});
+			PostHandle = FEditorDelegates::PostPIEStarted.AddLambda([this](bool bSimulating)
+			{
+				if (Stage != EStage::Player || bSimulating || !bSawPreBegin || !OwnsPIESession() || CountPIEWorlds() != 1)
+				{
+					Fail(TEXT("PostPIEStarted did not identify our sole native production session")); return;
+				}
+				const FWorldContext* Context = Editor->GetWorldContextFromWorld(Editor->PlayWorld);
+				if (!Context || !Context->World() || !Context->OwningGameInstance)
+				{
+					Fail(TEXT("original PIE world/GI unavailable")); return;
+				}
+				ContextHandle = Context->ContextHandle;
+				World = Context->World();
+				GameInstance = Context->OwningGameInstance.Get();
+				bPIEStarted = true;
+				if (UWorld::RemovePIEPrefix(World->GetPackage()->GetName()) != EditorMap)
+				{
+					Fail(TEXT("PIE changed the original production map"));
+				}
+			});
+			Deadline = FPlatformTime::Seconds() + 30.0;
+			Editor->RequestPlaySession(Params);
+			const TOptional<FRequestPlaySessionParams> Queued = Editor->GetPlaySessionRequest();
+			if (!Queued.IsSet() || !Queued->EditorPlaySettings)
+			{
+				Fail(TEXT("native PIE request did not retain its original settings")); return;
+			}
+			RequestSettings = Queued->EditorPlaySettings.Get();
+		}
+		void TryStartAttack()
+		{
+			if (!World->HasBegunPlay() || !World->GetAuthGameMode() || GameInstance->GetLocalPlayers().Num() != 1) { return; }
+			UGGYGOLocalPlayer* Player = Cast<UGGYGOLocalPlayer>(GameInstance->GetLocalPlayers()[0]);
+			AGGYGOPlayerController* PC = Player ? Cast<AGGYGOPlayerController>(Player->GetPlayerController(World.Get())) : nullptr;
+			ACharacter* Pawn = PC ? Cast<ACharacter>(PC->GetPawn()) : nullptr;
+			UGGYGOPlayerInput* Source = PC ? Cast<UGGYGOPlayerInput>(PC->PlayerInput) : nullptr;
+			UGGYGOPawnExtensionComponent* Extension = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Pawn);
+			UGGYGOAbilitySystemComponent* ProductionASC = Extension ? Extension->GetGGYGOAbilitySystemComponent() : nullptr;
+			UGGYGOCharacterMovementComponent* CMC = Pawn ? Cast<UGGYGOCharacterMovementComponent>(Pawn->GetCharacterMovement()) : nullptr;
+			if (!Player || !PC || !Pawn || !Source || !ProductionASC || !CMC || !UGGYGOHeroComponent::FindHeroComponent(Pawn)) { return; }
+			if (!PC->IsLocalController() || PC->GetLocalPlayer() != Player || !Pawn->IsLocallyControlled()
+				|| !ProductionASC->AbilityActorInfo.IsValid() || ProductionASC->AbilityActorInfo->AvatarActor.Get() != Pawn
+				|| ProductionASC->AbilityActorInfo->PlayerController.Get() != PC || !ProductionASC->AbilityActorInfo->IsLocallyControlled())
+			{
+				Fail(TEXT("production ASC retained different original local ActorInfo")); return;
+			}
+			FString Error;
+			FGGYGOMovementOwnerSyncScopeId CandidateScope;
+			if (!CMC->GetMovementOwnerSyncScope(CandidateScope, Error))
+			{
+				if (bStartupCaptured) { Fail(TEXT("original startup owner scope unavailable: ") + Error); }
+				return;
+			}
+			UEnhancedInputLocalPlayerSubsystem* Subsystem = Player->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>();
+			const UGGYGOPawnData* PawnData = Extension->GetPawnData<UGGYGOPawnData>();
+			const UGGYGOInputConfig* Config = PawnData ? PawnData->InputConfig.Get() : nullptr;
+			if (!Subsystem || !Config) { return; }
+			const UInputAction* MoveAction = Config->FindNativeInputActionForTag(GGYGOGameplayTags::InputTag_Move, false);
+			const UInputAction* AttackAction = Config->FindAbilityInputActionForTag(GGYGOGameplayTags::InputTag_Attack_Light, false);
+			if (!MoveAction || !AttackAction) { Fail(TEXT("production Move/Attack.Light action configuration missing")); return; }
+			const TArray<FKey> AttackKeys = Subsystem->QueryKeysMappedToAction(AttackAction);
+			if (!Subsystem->QueryKeysMappedToAction(MoveAction).Contains(EKeys::W) || AttackKeys.IsEmpty()) { return; }
+			TArray<FKey> NativeAttackKeys;
+			for (const FKey& Key : AttackKeys)
+			{
+				if (Key.IsValid() && !Key.IsGamepadKey() && !Key.IsAnalog()) { NativeAttackKeys.AddUnique(Key); }
+			}
+			if (NativeAttackKeys.IsEmpty() || AttackKeys.Contains(EKeys::W))
+			{
+				Fail(TEXT("smoke requires an actual digital keyboard/mouse Attack.Light mapping distinct from W")); return;
+			}
+			UGGYGOPlayerComboAbility* Combo = nullptr;
+			for (const FGameplayAbilitySpec& Spec : ProductionASC->GetActivatableAbilities())
+			{
+				if (Spec.GetDynamicSpecSourceTags().HasTagExact(GGYGOGameplayTags::InputTag_Attack_Light))
+				{
+					if (UGGYGOPlayerComboAbility* Candidate = Cast<UGGYGOPlayerComboAbility>(Spec.GetPrimaryInstance()))
+					{
+						if (Combo) { Fail(TEXT("multiple production combo abilities share Attack.Light")); return; }
+						Combo = Candidate;
+						SpecHandle = Spec.Handle;
+					}
+				}
+			}
+			if (!Combo) { Fail(TEXT("production Attack.Light has no granted instantiated player combo GA")); return; }
+			UGGYGOMovementInputOriginResource* Origin = Player->GetMovementInputOriginResource();
+			if (bStartupCaptured && (LocalPlayer.Get() != Player || Controller.Get() != PC || Character.Get() != Pawn
+				|| PlayerInput.Get() != Source || ASC.Get() != ProductionASC || Movement.Get() != CMC || Ability.Get() != Combo
+				|| OriginalOrigin.Get() != Origin || CandidateScope != Scope || Mesh.Get() != Pawn->GetMesh()
+				|| !Mesh.IsValid() || Mesh->GetAnimInstance() != AnimInstance.Get()
+				|| Trace.Get() != Pawn->FindComponentByClass<UGGYGOMeleeTraceComponent>() || !Viewport.IsValid()
+				|| World->GetGameViewport() != Viewport.Get() || Viewport->GetGameViewportWidget() != ViewportWidget
+				|| Viewport->GetGameViewport() != SceneViewport))
+			{
+				Fail(TEXT("captured startup production identity changed while waiting for native Ready")); return;
+			}
+			LocalPlayer = Player; Controller = PC; Character = Pawn; PlayerInput = Source;
+			ASC = ProductionASC; Movement = CMC; Ability = Combo;
+			Scope = CandidateScope;
+			OriginalOrigin = Origin;
+			Mesh = Pawn->GetMesh();
+			AnimInstance = Mesh.IsValid() ? Mesh->GetAnimInstance() : nullptr;
+			Trace = Pawn->FindComponentByClass<UGGYGOMeleeTraceComponent>();
+			Viewport = World->GetGameViewport();
+			ViewportWidget = Viewport.IsValid() ? Viewport->GetGameViewportWidget() : nullptr;
+			SceneViewport = Viewport.IsValid() ? Viewport->GetGameViewport() : nullptr;
+			if (ViewportWidget.IsValid() && (ViewportWidget->GetCachedGeometry().GetLocalSize().X <= 0
+				|| ViewportWidget->GetCachedGeometry().GetLocalSize().Y <= 0)) { return; } // Bounded native layout readiness.
+			FGGYGOQualifiedMovementIntent BeforePress;
+			const EGGYGOMovementInputOriginQualification Qualification = IsValid(Origin)
+				? Origin->GetQualification(Source) : EGGYGOMovementInputOriginQualification::Unavailable;
+			const EGGYGOQualifiedMovementIntentQueryResult BeforePressResult = CMC->QueryQualifiedMovementIntent(Scope, BeforePress, Error);
+			// Cold is unused original permission, not observed Neutral. Untouched input
+			// legitimately awaits its FIRST real press; KnownGap/flush retires Cold.
+			const bool bFirstPressStart = Qualification == EGGYGOMovementInputOriginQualification::Cold
+				&& (BeforePressResult == EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof
+					|| BeforePressResult == EGGYGOQualifiedMovementIntentQueryResult::NotHeld);
+			if (!Mesh.IsValid() || !AnimInstance.IsValid() || !Trace.IsValid() || !ViewportWidget.IsValid() || !SceneViewport
+				|| !bFirstPressStart
+				|| Combo->IsActive() || CMC->HasActiveActionMotion() || CMC->IsMovementBlockedByTag()
+				|| ProductionASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Attacking))
+			{
+				LogPreflight(TEXT("RejectedAssembly"), Qualification, BeforePressResult, Error);
+				Fail(TEXT("original Cold first-observation/assembly unavailable; no requalification or replacement")); return;
+			}
+			bStartupCaptured = true;
+			if (!OwnerSyncObserver.IsSet())
+			{
+				if (!CMC->SubscribeMovementOwnerSync(Scope, FGGYGOMovementOwnerSyncDelegate::CreateLambda(
+					[this](const FGGYGOMovementOwnerSyncObserverId& Observer, const FGGYGOMovementOwnerSyncNotice& Notice)
+					{
+						if (Observer.GetObserverSerial() != OwnerSyncObserver.GetObserverSerial()
+							|| Observer.GetScope() != Scope || !Notice.IsSet() || Notice.GetScope() != Scope)
+						{
+							Fail(TEXT("native owner notice did not identify the installed original observer/scope")); return;
+						}
+						OwnerNotice = Notice; // Read-only issuer snapshot, invalidated by its next original notice/scope loss.
+						Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeOwnerNotice Scope=%llu Observer=%llu State=%u Notice=%llu Generation=%llu Nonce=%llu InitialEligible=%d Reason=%s."),
+							static_cast<unsigned long long>(Scope.GetScopeSerial()), static_cast<unsigned long long>(Observer.GetObserverSerial()),
+							static_cast<uint32>(Notice.GetState()), static_cast<unsigned long long>(Notice.GetNoticeSerial()),
+							static_cast<unsigned long long>(Notice.GetServerOwnerGeneration()), static_cast<unsigned long long>(Notice.GetNativeResponseNonce()),
+							Notice.IsInitialSynchronizationEligible(), *Notice.GetReason().ToString()));
+						if (Notice.GetState() == EGGYGOMovementOwnerSyncState::Invalidated)
+						{
+							Fail(TEXT("original owner scope invalidated: ") + Notice.GetReason().ToString());
+						}
+					}), OwnerSyncObserver, Error))
+				{
+					Fail(TEXT("original owner observation installation rejected: ") + Error); return;
+				}
+			}
+			if (bFailed) { return; }
+			if (!OwnerNotice.IsSet() || OwnerNotice.GetState() != EGGYGOMovementOwnerSyncState::Ready)
+			{
+				if (!bLoggedOwnerWait)
+				{
+					LogPreflight(TEXT("WaitingForNativeOwnerReady"), Qualification, BeforePressResult, Error);
+					bLoggedOwnerWait = true;
+				}
+				return; // Existing 30-second deadline; observing Waiting neither grants Ready nor manufactures input.
+			}
+			AttackKey = NativeAttackKeys[0]; // An existing mapping of this same action; selected key is reported below.
+			for (const FKey& Key : { EKeys::W, AttackKey })
+			{
+				if (Key.IsMouseButton())
+				{
+					if (Key != EKeys::LeftMouseButton && Key != EKeys::RightMouseButton && Key != EKeys::MiddleMouseButton)
+					{
+						Fail(TEXT("unsupported configured mouse attack key: ") + Key.ToString()); return;
+					}
+					continue;
+				}
+				uint32 KeyCode = 0, CharacterCode = 0;
+				if (!ResolveNativeKeyboardCodes(Key, KeyCode, CharacterCode)) { return; }
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeKeyboardEncoding Key=%s KeyCode=%u CharacterCode=%u OriginalKeyRoundTrip=1."),
+					*Key.ToString(), KeyCode, CharacterCode));
+			}
+			for (const FKey& Key : { EKeys::W, EKeys::A, EKeys::S, EKeys::D, AttackKey })
+			{
+				if (Source->IsPressed(Key)) { Fail(TEXT("pre-existing pressed key is not owned by this smoke")); return; }
+			}
+			SavedTick = Mesh->VisibilityBasedAnimTickOption;
+			bSavedURO = Mesh->bEnableUpdateRateOptimizations;
+			SavedRootScale = Pawn->GetAnimRootMotionTranslationScale();
+			bSavedPrerequisite = HasMeshPrerequisite();
+			LogPreflight(TEXT("BeforeNativeFocus"), Qualification, BeforePressResult, Error);
+			NativeWindow = FSlateApplication::Get().FindWidgetWindow(ViewportWidget.ToSharedRef());
+			if (!NativeWindow.IsValid() || !NativeWindow->GetNativeWindow().IsValid())
+			{
+				Fail(TEXT("native production viewport/window unavailable")); return;
+			}
+			FSlateApplication& Slate = FSlateApplication::Get();
+			if (Slate.GetKeyboardFocusedWidget() != ViewportWidget)
+			{
+				Slate.SetKeyboardFocus(ViewportWidget, EFocusCause::SetDirectly);
+			}
+			// SetKeyboardFocus reports a change; false also means already focused.
+			if (Slate.GetKeyboardFocusedWidget() != ViewportWidget)
+			{
+				Fail(TEXT("native production viewport did not acquire the actual keyboard focus")); return;
+			}
+			NativeWindow->GetNativeWindow()->SetWindowFocus();
+			if (!IsProductionChainCurrent())
+			{
+				FGGYGOQualifiedMovementIntent RejectedIntent;
+				const EGGYGOMovementInputOriginQualification CurrentQualification = OriginalOrigin.IsValid() && PlayerInput.IsValid()
+					? OriginalOrigin->GetQualification(PlayerInput.Get()) : EGGYGOMovementInputOriginQualification::Unavailable;
+				const EGGYGOQualifiedMovementIntentQueryResult CurrentResult = Movement.IsValid()
+					? Movement->QueryQualifiedMovementIntent(Scope, RejectedIntent, Error) : EGGYGOQualifiedMovementIntentQueryResult::Unavailable;
+				LogPreflight(TEXT("NativeFocusIdentityLost"), CurrentQualification, CurrentResult, Error);
+				Fail(TEXT("native focus changed the captured original production chain")); return;
+			}
+			FGGYGOQualifiedMovementIntent AfterFocus;
+			const EGGYGOQualifiedMovementIntentQueryResult AfterFocusResult = Movement->QueryQualifiedMovementIntent(Scope, AfterFocus, Error);
+			const EGGYGOMovementInputOriginQualification AfterFocusQualification = OriginalOrigin->GetQualification(PlayerInput.Get());
+			LogPreflight(TEXT("AfterNativeFocus"), AfterFocusQualification, AfterFocusResult, Error);
+			if (!IsProductionChainCurrent() || AfterFocusQualification != EGGYGOMovementInputOriginQualification::Cold
+				|| (AfterFocusResult != EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof
+					&& AfterFocusResult != EGGYGOQualifiedMovementIntentQueryResult::NotHeld))
+			{
+				Fail(TEXT("native focus did not preserve the original Cold first-press/Ready chain")); return;
+			}
+			EndHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data) { ObserveAbilityEnd(Data); });
+			CompletedHandle = ProductionASC->OnAbilityTerminationCompleted().AddLambda([this](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+			{
+				if (OriginalActivation.HasActivation() && Notice.GetOriginal().GetOriginalActivation().HasSameActivation(OriginalActivation))
+				{
+					++CompletedCount; Completion = Notice;
+				}
+			});
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeSlateRoute Map=%s GameMode=%s PC=%s Pawn=%s GA=%s Source=%s Origin=%s InputConfig=%s AttackKey=%s Scope=%llu. Automated native events; no HID/network/Cook claim."),
+				*EditorMap, *GetPathNameSafe(World->GetAuthGameMode()), *PC->GetPathName(), *Pawn->GetPathName(), *Combo->GetPathName(),
+				*Source->GetPathName(), *Origin->GetPathName(), *Config->GetPathName(), *AttackKey.ToString(), static_cast<unsigned long long>(Scope.GetScopeSerial())));
+			Stage = EStage::Main;
+			Deadline = FPlatformTime::Seconds() + 10.0;
+			bAttackDown = true;
+			SendNativeKey(AttackKey, true);
+		}
+		void LogPreflight(const TCHAR* Boundary, EGGYGOMovementInputOriginQualification Qualification,
+			EGGYGOQualifiedMovementIntentQueryResult IntentResult, const FString& Diagnostic)
+		{
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Preflight Boundary=%s Mesh=%s Anim=%s Trace=%s Viewport=%s Widget=%d Scene=%d OriginalFocus=%d Origin=%s Qualification=%u IntentResult=%u Scope=%llu Binding=%llu OwnerNotice=%d OwnerState=%d OwnerSerial=%llu GAActive=%d ActionActive=%d CantMove=%d Attacking=%d Diagnostic=%s."),
+				Boundary, *GetPathNameSafe(Mesh.Get()), *GetPathNameSafe(AnimInstance.Get()), *GetPathNameSafe(Trace.Get()), *GetPathNameSafe(Viewport.Get()),
+				ViewportWidget.IsValid(), SceneViewport != nullptr,
+				FSlateApplication::IsInitialized() && FSlateApplication::Get().GetKeyboardFocusedWidget() == ViewportWidget,
+				*GetPathNameSafe(OriginalOrigin.Get()), static_cast<uint32>(Qualification),
+				static_cast<uint32>(IntentResult), static_cast<unsigned long long>(Scope.GetScopeSerial()),
+				Movement.IsValid() ? static_cast<unsigned long long>(Movement->GetMovementInputBindingSerial()) : 0ull,
+				OwnerNotice.IsSet(), OwnerNotice.IsSet() ? static_cast<int32>(OwnerNotice.GetState()) : -1,
+				static_cast<unsigned long long>(OwnerNotice.GetNoticeSerial()), Ability.IsValid() && Ability->IsActive(),
+				Movement.IsValid() && Movement->HasActiveActionMotion(), Movement.IsValid() && Movement->IsMovementBlockedByTag(),
+				ASC.IsValid() && ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Attacking), *Diagnostic));
+		}
+		bool HasMeshPrerequisite() const
+		{
+			return Trace.IsValid() && Mesh.IsValid() && Trace->PrimaryComponentTick.GetPrerequisites().ContainsByPredicate(
+				[this](const FTickPrerequisite& Prerequisite) { return Prerequisite.Get() == &Mesh->PrimaryComponentTick; });
+		}
+		bool IsProductionChainCurrent() const
+		{
+			FGGYGOMovementOwnerSyncScopeId CurrentScope;
+			FString Error;
+			UGGYGOPawnExtensionComponent* Extension = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Character.Get());
+			return IsOwnedWorldCurrent() && LocalPlayer.IsValid() && Controller.IsValid() && Character.IsValid()
+				&& PlayerInput.IsValid() && ASC.IsValid() && Ability.IsValid() && Movement.IsValid() && Mesh.IsValid()
+				&& AnimInstance.IsValid() && Trace.IsValid() && Viewport.IsValid() && ViewportWidget.IsValid()
+				&& OriginalOrigin.IsValid() && LocalPlayer->GetMovementInputOriginResource() == OriginalOrigin.Get()
+				&& OwnerNotice.IsSet() && OwnerNotice.GetScope() == Scope && OwnerNotice.GetState() == EGGYGOMovementOwnerSyncState::Ready
+				&& LocalPlayer->PlayerController == Controller.Get() && Controller->GetPawn() == Character.Get()
+				&& Character->GetController() == Controller.Get() && Controller->PlayerInput == PlayerInput.Get()
+				&& Character->GetMesh() == Mesh.Get() && Mesh->GetAnimInstance() == AnimInstance.Get()
+				&& Extension && Extension->GetGGYGOAbilitySystemComponent() == ASC.Get()
+				&& World->GetGameViewport() == Viewport.Get() && Viewport->GetGameViewport() == SceneViewport
+				&& Viewport->GetGameViewportWidget() == ViewportWidget
+				&& FSlateApplication::Get().GetKeyboardFocusedWidget() == ViewportWidget
+				&& Movement->GetMovementOwnerSyncScope(CurrentScope, Error) && CurrentScope == Scope;
+		}
+		bool ResolveNativeKeyboardCodes(const FKey& Key, uint32& OutKeyCode, uint32& OutCharacterCode)
+		{
+			const uint32* KeyCode = nullptr;
+			const uint32* CharacterCode = nullptr;
+			const FInputKeyManager& KeyManager = FInputKeyManager::Get();
+			KeyManager.GetCodesFromKey(Key, KeyCode, CharacterCode);
+			if (!KeyCode && !CharacterCode)
+			{
+				Fail(TEXT("configured keyboard key has no native platform encoding: ") + Key.ToString()); return false;
+			}
+			// Slate resolves the platform pair virtual-first, then character; either code may be absent.
+			OutKeyCode = KeyCode ? *KeyCode : 0;
+			OutCharacterCode = CharacterCode ? *CharacterCode : 0;
+			const FKey RoundTripKey = KeyManager.GetKeyFromCodes(OutKeyCode, OutCharacterCode);
+			if (RoundTripKey != Key)
+			{
+				Fail(FString::Printf(TEXT("native platform encoding did not resolve the original keyboard key: Key=%s KeyCode=%u CharacterCode=%u ResolvedKey=%s"),
+					*Key.ToString(), OutKeyCode, OutCharacterCode, *RoundTripKey.ToString())); return false;
+			}
+			return true;
+		}
+		bool SendNativeKey(const FKey& Key, bool bDown)
+		{
+			FSlateApplication& Slate = FSlateApplication::Get();
+			if (Key.IsMouseButton())
+			{
+				EMouseButtons::Type Button;
+				if (Key == EKeys::LeftMouseButton) { Button = EMouseButtons::Left; }
+				else if (Key == EKeys::RightMouseButton) { Button = EMouseButtons::Right; }
+				else if (Key == EKeys::MiddleMouseButton) { Button = EMouseButtons::Middle; }
+				else { Fail(TEXT("unsupported configured mouse attack key")); return false; }
+				if (!ViewportWidget.IsValid() || !NativeWindow.IsValid() || !NativeWindow->GetNativeWindow().IsValid()
+					|| ViewportWidget->GetCachedGeometry().GetLocalSize().X <= 0 || ViewportWidget->GetCachedGeometry().GetLocalSize().Y <= 0)
+				{
+					Fail(TEXT("native viewport geometry unavailable for mouse route")); return false;
+				}
+				const FVector2D Point = ViewportWidget->GetCachedGeometry().LocalToAbsolute(ViewportWidget->GetCachedGeometry().GetLocalSize() * 0.5f);
+				return bDown ? Slate.OnMouseDown(NativeWindow->GetNativeWindow(), Button, Point) : Slate.OnMouseUp(Button, Point);
+			}
+			uint32 KeyCode = 0, CharacterCode = 0;
+			if (!ResolveNativeKeyboardCodes(Key, KeyCode, CharacterCode)) { return false; }
+			return bDown ? Slate.OnKeyDown(KeyCode, CharacterCode, false)
+				: Slate.OnKeyUp(KeyCode, CharacterCode, false);
+		}
+		void TryCaptureMain()
+		{
+			if (EndCount != 0) { Fail(TEXT("attack ended before its original Main was observed")); return; }
+			if (!Ability->IsActive()) { return; }
+			FGGYGOComboStep Step;
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get());
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!FGGYGOPlayerComboLifecycleFixture::ReadProductionStep(Ability.Get(), Step)
+				|| !Task || !Task->TryGetOriginalSectionSnapshot(Snapshot)) { return; }
+			if (Snapshot.Montage != Step.Montage || Snapshot.SectionName != Step.MainSection || !Movement->HasActiveActionMotion())
+			{
+				Fail(TEXT("normal activation did not expose original Main and CMC action resource")); return;
+			}
+			Montage = Snapshot.Montage.Get();
+			InstanceId = Snapshot.MontageInstanceId;
+			MainSection = Step.MainSection; EndSection = Step.EndSection;
+			const int32 EndIndex = Montage->GetSectionIndex(EndSection);
+			if (EndIndex == INDEX_NONE) { Fail(TEXT("configured original End section missing")); return; }
+			Montage->GetSectionStartAndEndTime(EndIndex, EndStart, EndEnd);
+			if (!FMath::IsFinite(EndStart) || !FMath::IsFinite(EndEnd) || EndEnd <= EndStart)
+			{
+				Fail(TEXT("original End range invalid")); return;
+			}
+			MontageTask.Reset(Task);
+			InputTask.Reset(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()));
+			OriginalActivation = Ability->CaptureCurrentActivation();
+			if (!OriginalActivation.HasActivation() || !InputTask.IsValid()) { Fail(TEXT("original GA/input task identity unavailable")); return; }
+			SendNativeKey(AttackKey, false); bAttackDown = false;
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] OriginalMain Montage=%s Instance=%d Position=%.6f End=[%.6f,%.6f)."),
+				*Montage->GetPathName(), InstanceId, Snapshot.PositionSeconds, EndStart, EndEnd));
+			Stage = EStage::End;
+			Deadline = FPlatformTime::Seconds() + 10.0;
+			if (bHeldDuringMain) { bWDown = true; SendNativeKey(EKeys::W, true); }
+		}
+		void ObserveNaturalEnd()
+		{
+			if (EndCount != 0 || CompletedCount != 0) { VerifyCancellation(); return; }
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!Ability->IsActive() || !MontageTask.IsValid() || !MontageTask->TryGetOriginalSectionSnapshot(Snapshot)
+				|| Snapshot.Montage != Montage.Get() || Snapshot.MontageInstanceId != InstanceId
+				|| !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation))
+			{
+				Fail(TEXT("original active montage/GA observation lost before cancellation")); return;
+			}
+			FGGYGOQualifiedMovementIntent Intent;
+			FString Error;
+			const EGGYGOQualifiedMovementIntentQueryResult Result = Movement->QueryQualifiedMovementIntent(Scope, Intent, Error);
+			if (bHeldDuringMain && Snapshot.SectionName == MainSection)
+			{
+				if (Result == EGGYGOQualifiedMovementIntentQueryResult::Qualified
+					&& Intent.Provenance == EGGYGOQualifiedMovementIntentProvenance::LocalSourceHeld && PlayerInput->IsPressed(EKeys::W))
+				{
+					if (bSawQualifiedMain && !(Intent == MainIntent)) { Fail(TEXT("Held changed the original request during Main")); return; }
+					MainIntent = Intent; bSawQualifiedMain = true;
+				}
+				return;
+			}
+			if (Snapshot.SectionName != EndSection) { return; }
+			if (Snapshot.PositionSeconds < EndStart || Snapshot.PositionSeconds >= EndEnd)
+			{
+				Fail(TEXT("natural End has no remaining original timeline for new input")); return;
+			}
+			bSawNaturalEnd = true;
+			if (!bHeldDuringMain)
+			{
+				const EGGYGOMovementInputOriginQualification Qualification = OriginalOrigin->GetQualification(PlayerInput.Get());
+				LogPreflight(TEXT("NaturalEndBeforeFirstW"), Qualification, Result, Error);
+				if (Qualification != EGGYGOMovementInputOriginQualification::Cold || PlayerInput->IsPressed(EKeys::W)
+					|| (Result != EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof
+						&& Result != EGGYGOQualifiedMovementIntentQueryResult::NotHeld))
+				{
+					Fail(TEXT("new-press case lost original Cold first-observation state before natural End")); return;
+				}
+				bWDown = true; SendNativeKey(EKeys::W, true);
+			}
+			Stage = EStage::Cancel;
+		}
+		void ObserveAbilityEnd(const FAbilityEndedData& Data)
+		{
+			if (Data.AbilityThatEnded != Ability.Get()) { return; }
+			++EndCount; EndData = Data;
+			if (Data.AbilitySpecHandle != SpecHandle || !OriginalActivation.HasActivation())
+			{
+				Fail(TEXT("original activation/spec was unavailable at native ability end")); return;
+			}
+			FAnimMontageInstance* Instance = AnimInstance.IsValid() && Mesh.IsValid() && Mesh->GetAnimInstance() == AnimInstance.Get()
+				? AnimInstance->GetMontageInstanceForID(InstanceId) : nullptr;
+			// Stop does not normally delete this instance in the synchronous End stack.
+			// Legal reentrant destruction is an unavailable observation, never a cached successful End proof.
+			bEndSnapshotAvailable = Instance && Instance->Montage == Montage.Get();
+			if (bEndSnapshotAvailable)
+			{
+				EndPosition = Instance->GetPosition();
+				EndedSection = Instance->GetCurrentSection();
+				bStoppedAtEnd = Instance->IsStopped() || !Instance->IsActive();
+			}
+			FString Error;
+			EndIntentResult = Movement->QueryQualifiedMovementIntent(Scope, EndIntent, Error);
+			bResourcesRestoredAtEnd = ResourcesRestored();
+			PositionAtEnd = Character->GetActorLocation();
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeEnd Cancelled=%d Snapshot=%d Montage=%s Instance=%d Section=%s Position=%.6f EndEnd=%.6f Remaining=%.6f Stopped=%d Qualified=%u Session=%llu Request=%llu Execution=%llu ResourcesRestored=%d Diagnostic=%s."),
+				Data.bWasCancelled, bEndSnapshotAvailable, *GetPathNameSafe(Montage.Get()), InstanceId, *EndedSection.ToString(),
+				EndPosition, EndEnd, EndEnd - EndPosition, bStoppedAtEnd, static_cast<uint32>(EndIntentResult),
+				static_cast<unsigned long long>(EndIntent.SessionSerial), static_cast<unsigned long long>(EndIntent.RequestSerial),
+				static_cast<unsigned long long>(EndIntent.ExecutionRequestSerial), bResourcesRestoredAtEnd, *Error));
+		}
+		bool ResourcesRestored() const
+		{
+			return FGGYGOPlayerComboLifecycleFixture::ProductionResourcesReleased(Ability.Get(), World.Get())
+				&& Movement.IsValid() && !Movement->HasActiveActionMotion() && !Movement->IsMovementBlockedByTag()
+				&& MontageTask.IsValid() && MontageTask->GetState() == EGameplayTaskState::Finished
+				&& InputTask.IsValid() && InputTask->GetState() == EGameplayTaskState::Finished
+				&& !MontageTask->OnCompleted.IsBound() && !MontageTask->OnInterrupted.IsBound()
+				&& !MontageTask->OnCancelled.IsBound() && !MontageTask->OnBlendOut.IsBound()
+				&& !MontageTask->EventReceived.IsBound() && !MontageTask->SectionReceived.IsBound()
+				&& !InputTask->OnPress.IsBound() && Trace.IsValid() && !Trace->IsTracing()
+				&& Mesh.IsValid() && Mesh->VisibilityBasedAnimTickOption == SavedTick
+				&& Mesh->bEnableUpdateRateOptimizations == bSavedURO && HasMeshPrerequisite() == bSavedPrerequisite
+				&& Character.IsValid() && Character->GetAnimRootMotionTranslationScale() == SavedRootScale;
+		}
+		void VerifyCancellation()
+		{
+			if (EndCount != 1 || CompletedCount != 1 || !EndData.bWasCancelled || !Completion.HasCompletion()
+				|| Completion.GetReason() != EGGYGOAbilityTerminationReason::None || !bEndSnapshotAvailable
+				|| EndedSection != EndSection || !FMath::IsFinite(EndPosition) || EndPosition < EndStart || EndPosition >= EndEnd
+				|| !bStoppedAtEnd || EndIntentResult != EGGYGOQualifiedMovementIntentQueryResult::Qualified
+				|| EndIntent.Provenance != EGGYGOQualifiedMovementIntentProvenance::LocalSourceHeld
+				|| EndIntent.SessionSerial == 0 || EndIntent.RequestSerial == 0 || EndIntent.ExecutionRequestSerial == 0
+				|| (bHeldDuringMain ? (!bSawQualifiedMain || !(EndIntent == MainIntent)) : !bSawNaturalEnd)
+				|| !bResourcesRestoredAtEnd || !ResourcesRestored() || Ability->IsActive() || !PlayerInput->IsPressed(EKeys::W))
+			{
+				Fail(TEXT("strict original End-before-finish cancellation/source identity/resource proof failed; see NativeEnd and EndDiagnostics")); return;
+			}
+			const UGGYGOMovementSet* Set = Movement->GetMovementSet();
+			if (!Set || !FMath::IsFinite(Set->WalkToRunHoldSeconds) || Set->WalkToRunHoldSeconds <= 0.0f)
+			{
+				Fail(TEXT("normal configured Walk/Run hold policy unavailable")); return;
+			}
+			Stage = EStage::Locomotion;
+			Deadline = FPlatformTime::Seconds() + Set->WalkToRunHoldSeconds + 5.0;
+		}
+		void ObserveLocomotion()
+		{
+			FGGYGOQualifiedMovementIntent Intent;
+			FString Error;
+			if (Movement->QueryQualifiedMovementIntent(Scope, Intent, Error) != EGGYGOQualifiedMovementIntentQueryResult::Qualified
+				|| !(Intent == EndIntent) || !PlayerInput->IsPressed(EKeys::W) || Ability->IsActive() || !ResourcesRestored())
+			{
+				Fail(TEXT("same Held request or released GA resources changed during normal locomotion recovery: ") + Error); return;
+			}
+			const EGGYGOGait Gait = Movement->GetResolvedGait();
+			bSawWalk |= Gait == EGGYGOGait::Walk;
+			const bool bRun = Gait == EGGYGOGait::Run;
+			const UGGYGOMovementSet* Set = Movement->GetMovementSet();
+			if (bRun && Movement->HasMoveInput() && Movement->GetHorizontalSpeed() > 10.0f
+				&& FVector::Dist2D(Character->GetActorLocation(), PositionAtEnd) > 1.0f
+				&& Set && (!Set->bUseCurveDrivenSpeed || Movement->IsCurveDrivingSpeed()))
+			{
+				LogLocomotionSnapshot(TEXT("CancellationAndLocomotionObserved"));
+				BeginEnding();
+			}
+		}
+		void LogLocomotionSnapshot(const TCHAR* Boundary)
+		{
+			const UGGYGOCharacterMovementComponent* OriginalMovement = Movement.Get();
+			const ACharacter* OriginalCharacter = Character.Get();
+			const UGGYGOAbilitySystemComponent* OriginalASC = ASC.Get();
+			if (!OriginalMovement || !OriginalCharacter || !OriginalASC)
+			{
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] %s Case=%s Available=0 Movement=%s Character=%s ASC=%s; original locomotion objects unavailable."),
+					Boundary, bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"),
+					*GetPathNameSafe(OriginalMovement), *GetPathNameSafe(OriginalCharacter), *GetPathNameSafe(OriginalASC)));
+				return;
+			}
+			const UGGYGOMovementSet* Set = OriginalMovement->GetMovementSet();
+			const FString Policy = Set ? FString::Printf(TEXT("MovementSet=%s UseCurve=%d RootMotionScale=%.6f WalkToRunHoldSeconds=%.6f"),
+				*Set->GetPathName(), Set->bUseCurveDrivenSpeed, Set->RootMotionScale, Set->WalkToRunHoldSeconds)
+				: TEXT("MovementSet=Unavailable");
+			const FGGYGOLocomotionCurveSample Curve = OriginalMovement->GetCurveMotion();
+			const EGGYGOGait Gait = OriginalMovement->GetResolvedGait();
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] %s Case=%s Available=1 OriginalEndRemaining=%.6f WalkObserved=%d RunObserved=%d Gait=%u WalkRunAlpha=%.6f MotionType=%u Mode=%u Acceleration=%s HasMoveInput=%d Speed=%.3f Displacement=%.3f CurveSource=%d CurveSampleSpeed=%.6f CurveDriving=%d %s WalkTagCount=%d RunStartTagCount=%d RunLoopTagCount=%d; normal policy only, native teardown pending."),
+				Boundary, bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"), EndEnd - EndPosition, bSawWalk,
+				Gait == EGGYGOGait::Run, static_cast<uint32>(Gait), OriginalMovement->GetWalkRunBlendAlpha(),
+				static_cast<uint32>(OriginalMovement->GetLocomotionMotionType()), static_cast<uint32>(OriginalMovement->MovementMode),
+				*OriginalMovement->GetCurrentAcceleration().ToString(), OriginalMovement->HasMoveInput(), OriginalMovement->GetHorizontalSpeed(),
+				FVector::Dist2D(OriginalCharacter->GetActorLocation(), PositionAtEnd), Curve.bHasCurveSource, Curve.Speed,
+				OriginalMovement->IsCurveDrivingSpeed(), *Policy, OriginalASC->GetTagCount(GGYGOGameplayTags::State_WalkLoop),
+				OriginalASC->GetTagCount(GGYGOGameplayTags::State_RunStart), OriginalASC->GetTagCount(GGYGOGameplayTags::State_RunLoop)));
+		}
+		void ReleaseGameplayObservations()
+		{
+			if (OwnerSyncObserver.GetObserverSerial() != 0)
+			{
+				FString Error;
+				if (!Movement.IsValid() || !Movement->UnsubscribeMovementOwnerSync(OwnerSyncObserver, TEXT("EndProductionSmokeCleanup"), Error))
+				{
+					Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Original owner observer cleanup unavailable: ") + Error);
+					Fail(TEXT("original owner observer cleanup rejected; original native lifetime retains teardown responsibility"));
+				}
+				OwnerSyncObserver = {};
+			}
+			if (ASC.IsValid())
+			{
+				ASC->OnAbilityEnded.Remove(EndHandle);
+				ASC->OnAbilityTerminationCompleted().Remove(CompletedHandle);
+			}
+			EndHandle.Reset(); CompletedHandle.Reset();
+			MontageTask.Reset(); InputTask.Reset(); // Ended task observation roots never survive this finite smoke.
+			if (!FSlateApplication::IsInitialized()) { return; }
+			FSlateApplication& Slate = FSlateApplication::Get();
+			const TSharedPtr<SWidget> CurrentFocus = Slate.GetKeyboardFocusedWidget();
+			if (bAttackDown || bWDown)
+			{
+				if (IsOwnedWorldCurrent() && Viewport.IsValid() && Viewport->GetGameViewportWidget() == ViewportWidget
+					&& ViewportWidget.IsValid())
+				{
+					if (Slate.GetKeyboardFocusedWidget() != ViewportWidget)
+					{
+						Slate.SetKeyboardFocus(ViewportWidget, EFocusCause::SetDirectly);
+					}
+					if (Slate.GetKeyboardFocusedWidget() == ViewportWidget)
+					{
+						// Only return keys issued by this test to its still-original viewport.
+						if (bAttackDown) { SendNativeKey(AttackKey, false); bAttackDown = false; }
+						if (bWDown) { SendNativeKey(EKeys::W, false); bWDown = false; }
+					}
+					else { Fail(TEXT("owned key-up route did not acquire actual original viewport focus")); }
+				}
+				else { Fail(TEXT("owned key-up route unavailable; original PIE native teardown must release its input")); }
+			}
+			if (CurrentFocus.IsValid() && CurrentFocus != ViewportWidget) { Slate.SetKeyboardFocus(CurrentFocus, EFocusCause::SetDirectly); }
+			else if (PreviousFocus.IsValid()) { Slate.SetKeyboardFocus(PreviousFocus.Pin(), EFocusCause::SetDirectly); }
+		}
+		void CloseOwnedPIE(bool bSynchronous)
+		{
+			if (!Editor.IsValid()) { return; }
+			if (OwnsPIESession())
+			{
+				if (CountPIEWorlds() > 1) { Fail(TEXT("foreign PIE context prevents owned session teardown")); return; }
+				for (const FWorldContext& Context : Editor->GetWorldContexts())
+				{
+					if (Context.WorldType == EWorldType::PIE && !ContextHandle.IsNone() && Context.ContextHandle != ContextHandle)
+					{
+						Fail(TEXT("replacement PIE context prevents original session teardown")); return;
+					}
+				}
+				if (bSynchronous || !Editor->PlayWorld) { Editor->EndPlayMap(); }
+				else { Editor->RequestEndPlayMap(); }
+			}
+			else
+			{
+				const TOptional<FRequestPlaySessionParams> Queued = Editor->GetPlaySessionRequest();
+				if (Queued.IsSet() && RequestSettings.IsValid() && Queued->EditorPlaySettings == RequestSettings.Get())
+				{
+					Editor->CancelRequestPlaySession();
+				}
+			}
+		}
+		void BeginEnding()
+		{
+			Stage = EStage::Ending;
+			ReleaseGameplayObservations();
+			Deadline = FPlatformTime::Seconds() + 10.0;
+			CloseOwnedPIE(false);
+		}
+		bool UpdateEnding()
+		{
+			if (OwnsPIESession() || (Editor.IsValid() && CountPIEWorlds() != 0))
+			{
+				if (FPlatformTime::Seconds() < Deadline) { return false; }
+				Fail(TEXT("owned native PIE teardown timeout")); CloseOwnedPIE(true);
+			}
+			const bool bReleased = Test.TestTrue(TEXT("production smoke released its original PIE session/context"),
+				!OwnsPIESession() && CountPIEWorlds() == 0);
+			const bool bGlobalsRestored = Test.TestTrue(TEXT("native teardown restored outer world/viewport"),
+				GWorld == OuterWorld && GEngine && GEngine->GameViewport.Get() == OuterViewport);
+			if (!bFailed && bReleased && bGlobalsRestored)
+			{
+				Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] PASS: strict End cancellation, normal locomotion and original native PIE teardown observed."));
+			}
+			Stage = EStage::Done;
+			return true;
+		}
+
+		FAutomationTestBase& Test;
+		const bool bHeldDuringMain;
+		EStage Stage = EStage::Start;
+		bool bFailed = false, bSawPreBegin = false, bPIEStarted = false;
+		bool bStartupCaptured = false, bLoggedOwnerWait = false;
+		bool bAttackDown = false, bWDown = false, bSawQualifiedMain = false, bSawNaturalEnd = false, bSawWalk = false;
+		bool bEndSnapshotAvailable = false, bStoppedAtEnd = false, bResourcesRestoredAtEnd = false;
+		bool bSavedURO = false, bSavedPrerequisite = false;
+		double Deadline = 0.0;
+		float SavedRootScale = 0.0f, EndStart = 0.0f, EndEnd = 0.0f, EndPosition = 0.0f;
+		int32 InstanceId = INDEX_NONE, EndCount = 0, CompletedCount = 0;
+		EVisibilityBasedAnimTickOption SavedTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+		FString EditorMap;
+		FName ContextHandle, MainSection, EndSection, EndedSection;
+		FKey AttackKey;
+		FVector PositionAtEnd = FVector::ZeroVector;
+		FGameplayAbilitySpecHandle SpecHandle;
+		FGGYGOAbilityActivationHandle OriginalActivation;
+		FGGYGOMovementOwnerSyncScopeId Scope;
+		FGGYGOMovementOwnerSyncObserverId OwnerSyncObserver;
+		FGGYGOMovementOwnerSyncNotice OwnerNotice;
+		FGGYGOQualifiedMovementIntent MainIntent, EndIntent;
+		EGGYGOQualifiedMovementIntentQueryResult EndIntentResult = EGGYGOQualifiedMovementIntentQueryResult::Unavailable;
+		FAbilityEndedData EndData;
+		FGGYGOAbilityTerminationCompletedNotice Completion;
+		FDelegateHandle PreHandle, PostHandle, EndHandle, CompletedHandle;
+		TWeakObjectPtr<UEditorEngine> Editor;
+		TWeakObjectPtr<ULevelEditorPlaySettings> RequestSettings;
+		TWeakObjectPtr<UWorld> World;
+		TWeakObjectPtr<UGameInstance> GameInstance;
+		TWeakObjectPtr<UGGYGOLocalPlayer> LocalPlayer;
+		TWeakObjectPtr<AGGYGOPlayerController> Controller;
+		TWeakObjectPtr<ACharacter> Character;
+		TWeakObjectPtr<UGGYGOPlayerInput> PlayerInput;
+		TWeakObjectPtr<UGGYGOMovementInputOriginResource> OriginalOrigin;
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
+		TWeakObjectPtr<UGGYGOPlayerComboAbility> Ability;
+		TWeakObjectPtr<USkeletalMeshComponent> Mesh;
+		TWeakObjectPtr<UAnimInstance> AnimInstance;
+		TWeakObjectPtr<UGGYGOMeleeTraceComponent> Trace;
+		TWeakObjectPtr<UGameViewportClient> Viewport;
+		TWeakObjectPtr<UAnimMontage> Montage;
+		// Keep exact ended objects inspectable until assertions finish, without reactivating their lifecycle.
+		TStrongObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> MontageTask;
+		TStrongObjectPtr<UGGYGOAbilityTask_WaitComboInput> InputTask;
+		TSharedPtr<SViewport> ViewportWidget;
+		TSharedPtr<SWindow> NativeWindow;
+		TWeakPtr<SWidget> PreviousFocus;
+		FSceneViewport* SceneViewport = nullptr;
+		UWorld* OuterWorld = nullptr;
+		UGameViewportClient* OuterViewport = nullptr;
+	};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndProductionHeldTest,
+	"GGYGO.AbilitySystem.PlayerCombo.EndMovement.ProductionNativeHeld",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboEndProductionHeldTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, true));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndProductionNewPressTest,
+	"GGYGO.AbilitySystem.PlayerCombo.EndMovement.ProductionNativeNewPress",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboEndProductionNewPressTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false));
+	return true;
+}
+#endif // WITH_EDITOR
 #endif
