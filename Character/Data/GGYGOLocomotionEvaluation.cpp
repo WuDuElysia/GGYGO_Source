@@ -1,4 +1,5 @@
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
+#include "Character/Data/GGYGOAnimationSourceCurveEvaluation.h"
 
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Animation/BlendSpace1D.h"
@@ -58,23 +59,42 @@ namespace GGYGOLocomotionSourceEvaluation
 			|| !FMath::IsFinite(TimeRate) || TimeRate <= 0.0)
 			return Fail(Error, Sequence, TEXT("Interval"), TEXT("requires finite ordered non-negative times and positive time rate"));
 		const double Length = Source.PlayLength;
-		const auto Read = [Sequence](FName Name, double Time)
-		{ return Sequence->EvaluateCurveData(Name, FAnimExtractContext(Time, false), false); };
+		const auto ReadYaw = [Sequence, Error](double Time, float& OutYaw)
+		{
+			const FName Names[] = {YawName};
+			TArray<float> Values;
+			FString ReaderError;
+			if (!GGYGOAnimationSourceCurveEvaluation::EvaluateRequiredCurves(Sequence, Time, Names, Values, ReaderError))
+			{ if (Error) *Error = ReaderError; return false; }
+			OutYaw = Values[0];
+			return true;
+		};
 		const auto YawAt = [&](double Time, double& Value)
 		{
-			if (!Source.bLoop) { Value = Read(YawName, FMath::Min(Time, Length)); }
+			float PhaseYaw = 0.0f;
+			if (!Source.bLoop)
+			{
+				if (!ReadYaw(FMath::Min(Time, Length), PhaseYaw)) return false;
+				Value = PhaseYaw;
+			}
 			else
 			{
 				const double Cycles = FMath::FloorToDouble(Time / Length);
 				const double Phase = FMath::Fmod(Time, Length);
-				const double First = Read(YawName, 0.0), Last = Read(YawName, Length);
-				Value = Read(YawName, Phase) + (Last - First) * Cycles;
+				float FirstYaw = 0.0f, LastYaw = 0.0f;
+				if (!ReadYaw(0.0, FirstYaw) || !ReadYaw(Length, LastYaw) || !ReadYaw(Phase, PhaseYaw)) return false;
+				Value = PhaseYaw + (static_cast<double>(LastYaw) - FirstYaw) * Cycles;
 			}
-			return FMath::IsFinite(Value);
+			return true; // Reader failures retain their cause; the interval checks accumulated Yaw below.
 		};
 		const double EndPhase = Source.bLoop ? FMath::Fmod(End, Length) : FMath::Min(End, Length);
-		const float RawSpeed = Read(SpeedName, EndPhase);
-		const float X = Read(DirXName, EndPhase), Y = Read(DirYName, EndPhase);
+		const FName EndpointNames[] = {SpeedName, DirXName, DirYName};
+		TArray<float> EndpointValues;
+		FString ReaderError;
+		if (!GGYGOAnimationSourceCurveEvaluation::EvaluateRequiredCurves(Sequence, EndPhase, EndpointNames, EndpointValues, ReaderError))
+		{ if (Error) *Error = ReaderError; return false; }
+		const float RawSpeed = EndpointValues[0];
+		const float X = EndpointValues[1], Y = EndpointValues[2];
 		if (!FMath::IsFinite(RawSpeed) || RawSpeed < 0.0f)
 			return Fail(Error, Sequence, TEXT("RootMotion_Speed"), FString::Printf(TEXT("interval [%.9g, %.9g] has non-finite or negative endpoint speed"), Start, End));
 		if (!FMath::IsFinite(X) || !FMath::IsFinite(Y))
@@ -83,7 +103,8 @@ namespace GGYGOLocomotionSourceEvaluation
 		if (RawSpeed > 0.0f && !Out.bHasAuthoredDirection)
 			return Fail(Error, Sequence, TEXT("RootMotion_DirX/DirY"), FString::Printf(TEXT("interval [%.9g, %.9g]: positive speed requires nonzero authored direction"), Start, End));
 		double StartYaw = 0.0, EndYaw = 0.0;
-		if (!YawAt(Start, StartYaw) || !YawAt(End, EndYaw))
+		if (!YawAt(Start, StartYaw) || !YawAt(End, EndYaw)) return false;
+		if (!FMath::IsFinite(StartYaw) || !FMath::IsFinite(EndYaw))
 			return Fail(Error, Sequence, TEXT("RootMotion_Yaw"), TEXT("interval endpoint or loop accumulation is non-finite"));
 		if (!Store(static_cast<double>(RawSpeed) * TimeRate, Out.Speed, Sequence, TEXT("Speed"), Error)
 			|| !Store(EndYaw, Out.YawTotalDegrees, Sequence, TEXT("YawTotalDegrees"), Error)

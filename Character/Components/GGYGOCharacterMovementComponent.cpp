@@ -5,8 +5,11 @@
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
 #include "Character/Data/GGYGOActionMotionProfile.h"
+#include "Character/Data/GGYGOActionMotionEvaluation.h"
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/AnimMontage.h"
+#include "Input/GGYGOPlayerInput.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/Components/GGYGOCurveRootMotionSource.h"
@@ -24,6 +27,23 @@
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterMovementComponent)
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMovement, Log, All);
+
+bool FGGYGOQualifiedMovementIntent::operator==(const FGGYGOQualifiedMovementIntent& Other) const
+{
+	return Scope == Other.Scope && Provenance == Other.Provenance && BindingSerial == Other.BindingSerial
+		&& SessionSerial == Other.SessionSerial && RequestSerial == Other.RequestSerial
+		&& ExecutionRequestSerial == Other.ExecutionRequestSerial;
+}
+
+struct UGGYGOCharacterMovementComponent::FQualifiedMovementIntentObserver
+{
+	FGGYGOQualifiedMovementIntentObserverId Id;
+	FGGYGOQualifiedMovementIntentDelegate Callback;
+	EGGYGOQualifiedMovementIntentQueryResult LastResult = EGGYGOQualifiedMovementIntentQueryResult::Unavailable;
+	FGGYGOQualifiedMovementIntent LastIntent;
+	FString LastError;
+	bool bClosed = false;
+};
 
 namespace GGYGOMovementOwnerSync
 {
@@ -196,10 +216,13 @@ namespace
 {
 	bool IsRegisteredActionCurveSource(const FRootMotionSource& Source)
 	{
-		return Source.GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()
-			&& Source.InstanceName == GGYGOMovementConstants::ActionCurveSourceName
-			&& Source.Priority == GGYGOMovementConstants::ActionCurvePriority
-			&& Source.AccumulateMode == ERootMotionAccumulateMode::Override;
+		if (Source.GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()
+			|| Source.InstanceName != GGYGOMovementConstants::ActionCurveSourceName
+			|| Source.Priority != GGYGOMovementConstants::ActionCurvePriority) return false;
+		const auto& Typed = static_cast<const FRootMotionSource_GGYGOActionCurve&>(Source);
+		return Source.AccumulateMode == ERootMotionAccumulateMode::Override
+			|| (Typed.SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage
+				&& Typed.bExplicitlyCancelled && Source.AccumulateMode == ERootMotionAccumulateMode::Additive);
 	}
 
 	bool IsOwnedLocomotionCurveSource(const FRootMotionSource& Source)
@@ -1006,6 +1029,15 @@ void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPla
 	LastLocomotionSourceProducer.Reset();
 	LastLocomotionSourceConfigurationGeneration = 0;
 	ReleaseLocalAbilitySystemSubscription();
+	NeutralizeMontageActionSource(ActiveMontageActionResource);
+	NeutralizeMontageActionSource(CompletedMontageActionResource);
+	ActiveMontageActionResource.Reset();
+	CompletedMontageActionResource.Reset();
+	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
+	ActionMotionFailureResource.Reset();
+	ActiveActionMotionHandle = INDEX_NONE;
+	ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
+	ActionSkippedMovementTickTime = 0.0f;
 
 	if (bMovementInputBindingActive)
 	{
@@ -1263,8 +1295,11 @@ void UGGYGOCharacterMovementComponent::RetireMovementOwnerSyncScope(FName Reason
 		// It does not manufacture Source Released or revoke a successor request.
 		bMovementInputColdStartWindowOpen = false;
 	}
-	PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Invalidated,
-		Context->Notice.ServerOwnerGeneration, Context->Scope.ResponseNonce, false, Reason);
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	RetireQualifiedMovementIntent(Context->Scope, Reason);
+	if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get())
+		Self->PublishMovementOwnerSyncNotice(Context, EGGYGOMovementOwnerSyncState::Invalidated,
+			Context->Notice.ServerOwnerGeneration, Context->Scope.ResponseNonce, false, Reason);
 }
 
 void UGGYGOCharacterMovementComponent::RetireServerMovementOwner(FName Reason)
@@ -1604,7 +1639,201 @@ EGGYGOMovementInitialRequestAdmissionResult UGGYGOCharacterMovementComponent::Tr
 	// Hero verifies physical Held through Source; CMC neither polls nor synthesizes it.
 	LocomotionRequestAdmission = ELocomotionRequestAdmission::Admitted;
 	bMovementInputAdmissionDiagnosticReported = false;
+	PublishQualifiedMovementIntent();
 	return EResult::Admitted;
+}
+
+EGGYGOQualifiedMovementIntentQueryResult UGGYGOCharacterMovementComponent::QueryQualifiedMovementIntent(
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+	FGGYGOQualifiedMovementIntent& OutIntent, FString& OutError) const
+{
+	using EResult = EGGYGOQualifiedMovementIntentQueryResult;
+	OutIntent = {};
+	OutError.Reset();
+	const auto Reject = [this, &OriginalScope, &OutError](EResult Result, const FString& Reason)
+	{
+		OutError = FString::Printf(TEXT("[Movement.QualifiedIntent] Consumer='%s' Scope=%llu Execution=%llu Reason='%s'"),
+			*GetPathName(), static_cast<unsigned long long>(OriginalScope.GetScopeSerial()),
+			static_cast<unsigned long long>(LocomotionRequestSerial), *Reason);
+		return Result;
+	};
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!IsInGameThread() || !IsValid(this) || IsBeingDestroyed()
+		|| !OriginalScope.IsSet() || !IsMovementOwnerSyncContextCurrent(Context)
+		|| OriginalScope != Context->Scope || !IsValid(CharacterOwner))
+		return Reject(EResult::Unavailable, TEXT("original native owner scope is unavailable"));
+	// Replayed historical moves are never a new live cancellation grant.
+	if (CharacterOwner->bClientUpdating || PreparingLocomotionCurveReplayGroup)
+		return Reject(EResult::Unavailable, TEXT("historical movement replay has no live input grant"));
+	FGGYGOQualifiedMovementIntent Candidate;
+	Candidate.Scope = OriginalScope;
+	const bool bNativeRemote = CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled()
+		&& Cast<APlayerController>(CharacterOwner->GetController());
+	if (bNativeRemote)
+	{
+		const TSharedPtr<const FMovementInputNativeSource> Source = MovementInputNativeSource;
+		if (!Source.IsValid() || !IsMovementOwnerSyncReceiptCurrent(Source->Receipt)
+			|| Source->OwnerScope != OriginalScope || Source->ExecutionRequestSerial != LocomotionRequestSerial
+			|| Source->ExecutionRequestSerial == 0 || MovementInputRequestOwnerScope != OriginalScope)
+			return Reject(EResult::Unavailable, TEXT("original authenticated native request is unavailable"));
+		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed)
+			return Reject(EResult::ExecutionFailed, LocomotionRequestFailureReason);
+		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Released && !bMovementInputRequestOpen)
+			return EResult::NotHeld;
+		if (MovementInputSourceCheckpoint.bConsumerInvalidated
+			|| MovementInputSourceCheckpoint.SourceUnresolvedEventSerial > MovementInputSourceCheckpoint.RequestStartedEventSerial)
+			return Reject(EResult::AwaitingPhysicalProof, TEXT("native source checkpoint is unresolved or invalidated"));
+		if (!bMovementInputRequestOpen || LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
+			|| IsMovementInputRequestBlocked())
+			return Reject(EResult::WaitingForAdmission, TEXT("original native request has no current execution admission"));
+		Candidate.Provenance = EGGYGOQualifiedMovementIntentProvenance::AuthenticatedNativeRequest;
+		Candidate.BindingSerial = Source->StartCheckpoint.BindingSerial;
+		Candidate.SessionSerial = Source->StartCheckpoint.SessionSerial;
+		Candidate.RequestSerial = Source->StartCheckpoint.RequestSerial;
+	}
+	else
+	{
+		const UGGYGOPlayerInput* Producer = Cast<UGGYGOPlayerInput>(MovementInputBinding.SourceSession.Producer.Get());
+		if (!Producer || !IsMovementInputBindingCurrent(MovementInputBinding) || !bMovementInputSessionOpened)
+			return Reject(EResult::Unavailable, TEXT("original local Source session/binding is unavailable"));
+		FGGYGOMovementInputRequestIdentity SourceRequest;
+		FString SourceError;
+		const EGGYGOMovementInputRequestQueryResult SourceResult =
+			Producer->QueryMovementInputRequest(MovementInputBinding.SourceSession, SourceRequest, SourceError);
+		switch (SourceResult)
+		{
+		case EGGYGOMovementInputRequestQueryResult::NotHeld: return EResult::NotHeld;
+		case EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof:
+			return Reject(EResult::AwaitingPhysicalProof, SourceError);
+		case EGGYGOMovementInputRequestQueryResult::Unavailable: return Reject(EResult::Unavailable, SourceError);
+		case EGGYGOMovementInputRequestQueryResult::Held: break;
+		default: return Reject(EResult::Unavailable, TEXT("Source returned an unsupported query result"));
+		}
+		if (SourceRequest != MovementInputRequest || SourceRequest.RequestSerial == 0
+			|| MovementInputRequestOwnerScope != OriginalScope || LocomotionRequestSerial == 0)
+			return Reject(EResult::WaitingForAdmission, TEXT("real Held has not committed this original CMC request"));
+		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed)
+			return Reject(EResult::ExecutionFailed, LocomotionRequestFailureReason);
+		if (!bMovementInputRequestOpen || LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
+			|| IsMovementInputRequestBlocked())
+			return Reject(EResult::WaitingForAdmission, TEXT("real Held is waiting for original CMC admission"));
+		Candidate.Provenance = EGGYGOQualifiedMovementIntentProvenance::LocalSourceHeld;
+		Candidate.BindingSerial = MovementInputBinding.ConsumerBindingSerial;
+		Candidate.SessionSerial = SourceRequest.Session.SessionSerial;
+		Candidate.RequestSerial = SourceRequest.RequestSerial;
+	}
+	Candidate.ExecutionRequestSerial = LocomotionRequestSerial;
+	OutIntent = Candidate;
+	return EResult::Qualified;
+}
+
+bool UGGYGOCharacterMovementComponent::SubscribeQualifiedMovementIntent(
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FGGYGOQualifiedMovementIntentDelegate Observer,
+	FGGYGOQualifiedMovementIntentObserverId& OutObserver, FString& OutError)
+{
+	OutError.Reset();
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!IsInGameThread() || OutObserver.IsSet() || !Observer.IsBound() || !OriginalScope.IsSet()
+		|| !IsMovementOwnerSyncContextCurrent(Context) || Context->Scope != OriginalScope
+		|| QualifiedMovementIntentLastObserverSerial == MAX_uint64)
+	{
+		OutError = TEXT("[Movement.QualifiedIntent] subscription requires an empty output, original live scope, callback and non-exhausted identity");
+		return false;
+	}
+	const TSharedPtr<FQualifiedMovementIntentObserver> Record = MakeShared<FQualifiedMovementIntentObserver>();
+	Record->Id.Scope = OriginalScope;
+	Record->Id.ObserverSerial = ++QualifiedMovementIntentLastObserverSerial;
+	Record->Callback = MoveTemp(Observer);
+	Record->LastResult = QueryQualifiedMovementIntent(OriginalScope, Record->LastIntent, Record->LastError);
+	QualifiedMovementIntentObservers.Add(Record);
+	OutObserver = Record->Id; // Never write the caller's resource member after replay.
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	++QualifiedMovementIntentReplayDepth;
+	{
+		const FGGYGOQualifiedMovementIntentDelegate Callback = Record->Callback;
+		Callback.Execute(Record->Id, Record->LastResult, Record->LastIntent, Record->LastError);
+	}
+	if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get())
+	{
+		--Self->QualifiedMovementIntentReplayDepth;
+		// A real Source fact may commit during replay. Publish its latest original state
+		// after the outer replay, so admission changes do not wait for another input edge.
+		if (Self->QualifiedMovementIntentReplayDepth == 0 && Self->IsMovementOwnerSyncContextCurrent(Context))
+			Self->PublishQualifiedMovementIntent();
+	}
+	return true; // It was installed; the replay may already have closed it.
+}
+
+bool UGGYGOCharacterMovementComponent::UnsubscribeQualifiedMovementIntent(
+	const FGGYGOQualifiedMovementIntentObserverId& OriginalObserver, FName Reason, FString& OutError)
+{
+	OutError.Reset();
+	if (!IsInGameThread() || !OriginalObserver.IsSet() || Reason.IsNone())
+	{
+		OutError = TEXT("[Movement.QualifiedIntent] unsubscribe requires original identity, reason and game thread");
+		return false;
+	}
+	const int32 Index = QualifiedMovementIntentObservers.IndexOfByPredicate([&](const auto& Record)
+	{
+		return Record.IsValid() && Record->Id == OriginalObserver;
+	});
+	if (Index == INDEX_NONE) return true; // The exact record was already withdrawn; never search a successor.
+	const auto Record = QualifiedMovementIntentObservers[Index];
+	Record->bClosed = true;
+	QualifiedMovementIntentObservers.RemoveAt(Index);
+	const auto RetiredCallback = MoveTemp(Record->Callback); // No this/index access after capture destruction.
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::PublishQualifiedMovementIntent()
+{
+	if (QualifiedMovementIntentReplayDepth != 0 || PreparingLocomotionCurveReplayGroup
+		|| (CharacterOwner && CharacterOwner->bClientUpdating)) return;
+	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
+	if (!IsMovementOwnerSyncContextCurrent(Context)) return;
+	const uint64 Publication = ++QualifiedMovementIntentPublicationSerial;
+	FGGYGOQualifiedMovementIntent Intent;
+	FString Error;
+	const auto Result = QueryQualifiedMovementIntent(Context->Scope, Intent, Error);
+	const auto Records = QualifiedMovementIntentObservers;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	for (const auto& Record : Records)
+	{
+		if (!Record.IsValid() || Record->bClosed || Record->Id.Scope != Context->Scope
+			|| (Record->LastResult == Result && Record->LastIntent == Intent && Record->LastError == Error)) continue;
+		Record->LastResult = Result;
+		Record->LastIntent = Intent;
+		Record->LastError = Error;
+		{
+			const auto Callback = Record->Callback;
+			if (Callback.IsBound()) Callback.Execute(Record->Id, Result, Intent, Error);
+		}
+		UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+		if (!Self || Self->QualifiedMovementIntentPublicationSerial != Publication
+			|| !Self->IsMovementOwnerSyncContextCurrent(Context)) return;
+	}
+}
+
+void UGGYGOCharacterMovementComponent::RetireQualifiedMovementIntent(
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FName Reason)
+{
+	++QualifiedMovementIntentPublicationSerial; // Invalidates an in-flight original publication.
+	const auto Records = QualifiedMovementIntentObservers;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	const FString Error = FString::Printf(TEXT("[Movement.QualifiedIntent] Scope=%llu retired: %s"),
+		static_cast<unsigned long long>(OriginalScope.GetScopeSerial()), *Reason.ToString());
+	for (const auto& Record : Records)
+	{
+		if (!Record.IsValid() || Record->bClosed || Record->Id.Scope != OriginalScope) continue;
+		Record->bClosed = true;
+		QualifiedMovementIntentObservers.RemoveSingle(Record);
+		{
+			auto Callback = MoveTemp(Record->Callback);
+			if (Callback.IsBound()) Callback.Execute(Record->Id,
+				EGGYGOQualifiedMovementIntentQueryResult::Unavailable, FGGYGOQualifiedMovementIntent{}, Error);
+		}
+		if (!WeakSelf.IsValid()) return;
+	}
 }
 
 bool UGGYGOCharacterMovementComponent::BindMovementInputSession(
@@ -1941,6 +2170,7 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 				static_cast<unsigned long long>(MovementInputRequestOwnerScope.ScopeSerial),
 				static_cast<unsigned long long>(MovementInputRequestOwnerScope.ResponseNonce));
 		}
+		PublishQualifiedMovementIntent();
 		return EGGYGOMovementInputConsumeResult::Recorded;
 	}
 	case EGGYGOMovementInputFactKind::RequestReleased:
@@ -1992,12 +2222,17 @@ EGGYGOMovementInputConsumeResult UGGYGOCharacterMovementComponent::ConsumeMoveme
 		RevokeMovementInputRequest();
 		LastMovementInputFact = Fact;
 		RecordMovementInputSourceCheckpoint(Fact);
-		return Report(EGGYGOMovementInputConsumeResult::Recorded, *Fact.Reason.ToString());
+		{
+			const auto Result = Report(EGGYGOMovementInputConsumeResult::Recorded, *Fact.Reason.ToString());
+			PublishQualifiedMovementIntent();
+			return Result;
+		}
 	default:
 		return Report(EGGYGOMovementInputConsumeResult::Rejected, TEXT("unsupported fact kind"));
 	}
 	LastMovementInputFact = Fact;
 	RecordMovementInputSourceCheckpoint(Fact);
+	PublishQualifiedMovementIntent();
 	return EGGYGOMovementInputConsumeResult::Recorded;
 }
 
@@ -2190,13 +2425,377 @@ void UGGYGOCharacterMovementComponent::EnforceMovementInputLocomotionAdmission()
 	Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
 }
 
+bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
+	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
+	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
+	int32& OutHandle, FString& OutError)
+{
+	OutHandle = INDEX_NONE;
+	OutError.Reset();
+	const auto Reject = [this, &OriginalSource, &OutError](const FString& Reason)
+	{
+		OutError = FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' Slot='%s' Section='%s' Reason='%s'"),
+			*GetPathName(), OriginalSource.IsValid() ? *GetPathNameSafe(OriginalSource->Montage.Get()) : TEXT("None"),
+			OriginalSource.IsValid() ? *OriginalSource->SlotName.ToString() : TEXT("None"),
+			OriginalSource.IsValid() ? *OriginalSource->SectionName.ToString() : TEXT("None"), *Reason);
+		return false;
+	};
+	if (!IsInGameThread() || !IsValid(CharacterOwner) || IsBeingDestroyed() || !IsMovingOnGround()
+		|| (!CharacterOwner->HasAuthority() && (CharacterOwner->GetLocalRole() != ROLE_AutonomousProxy
+			|| !CharacterOwner->IsLocallyControlled())) || CharacterOwner->bClientUpdating)
+		return Reject(TEXT("a live authority or original autonomous owner on the ground is required"));
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	const TWeakObjectPtr<ACharacter> OriginalCharacter(CharacterOwner);
+	const auto OriginalOwnerContext = MovementOwnerSyncContext;
+	const int32 OriginalNextHandle = NextActionMotionHandle;
+	CleanupFinishedActionMotion();
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || !OriginalCharacter.IsValid()
+		|| Self->CharacterOwner != OriginalCharacter.Get() || Self->MovementOwnerSyncContext != OriginalOwnerContext
+		|| Self->NextActionMotionHandle != OriginalNextHandle)
+	{
+		OutError = TEXT("[Movement.ActionMotion] original owner/action slot changed during prior action retirement");
+		return false;
+	}
+	if (HasActiveActionMotion() || NextActionMotionHandle <= 0 || NextActionMotionHandle == MAX_int32)
+		return Reject(TEXT("action execution slot is occupied or original token allocator is exhausted"));
+	FString Error;
+	if (!OriginalSource.IsValid() || !GGYGOActionMotionEvaluation::ValidateSource(*OriginalSource, Error))
+		return Reject(Error.IsEmpty() ? TEXT("original source binding is missing") : Error);
+	if (!FMath::IsFinite(MontagePositionSeconds) || MontagePositionSeconds < OriginalSource->MontageStartSeconds
+		|| MontagePositionSeconds >= OriginalSource->MontageEndSeconds
+		|| !FMath::IsFinite(EffectiveMontagePlayRate) || EffectiveMontagePlayRate <= 0.0f
+		|| !FMath::IsFinite(TranslationScale) || TranslationScale < 0.0f)
+		return Reject(TEXT("original position must be in the section; rate positive and translation scale non-negative, all finite"));
+	USkeletalMeshComponent* Mesh = CharacterOwner->GetMesh();
+	UAnimInstance* Anim = Mesh ? Mesh->GetAnimInstance() : nullptr;
+	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(OriginalMontageInstanceId) : nullptr;
+	if (!IsValid(Mesh) || !IsValid(Anim) || !Instance || Instance->Montage != OriginalSource->Montage.Get()
+		|| !Instance->IsActive() || !Instance->IsPlaying() || Instance->GetCurrentSection() != OriginalSource->SectionName
+		|| !FMath::IsNearlyEqual(Instance->GetPosition(), MontagePositionSeconds, UE_KINDA_SMALL_NUMBER)
+		|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() <= 0.0f
+		|| !FMath::IsNearlyEqual(Instance->GetPlayRate() * OriginalSource->MontageRateScale,
+			EffectiveMontagePlayRate, UE_KINDA_SMALL_NUMBER) || CharacterOwner->IsPlayingRootMotion())
+		return Reject(TEXT("original Montage/instance/section/position/rate is not current or native animation RootMotion is active"));
+	const float Duration = (OriginalSource->MontageEndSeconds - MontagePositionSeconds) / EffectiveMontagePlayRate;
+	const FQuat Rotation = CharacterOwner->GetActorQuat();
+	const FVector Scale = Mesh->GetComponentScale() * TranslationScale; // Original avatar/Actor scale once; Actor basis, no Mesh rotation.
+	if (!FMath::IsFinite(Duration) || Duration <= 0.0f || Rotation.ContainsNaN()
+		|| !Rotation.IsNormalized() || Scale.ContainsNaN())
+		return Reject(TEXT("native duration or original Actor transform cannot be represented"));
+	const auto Resource = MakeShared<FGGYGOActionMotionResource>();
+	Resource->Owner = this;
+	Resource->Character = CharacterOwner;
+	Resource->Mesh = Mesh;
+	Resource->AnimInstance = Anim;
+	Resource->Source = OriginalSource;
+	Resource->MontageInstanceId = OriginalMontageInstanceId;
+	Resource->InstancePlayRate = Instance->GetPlayRate();
+	Resource->Handle = NextActionMotionHandle;
+	const auto Source = MakeShared<FRootMotionSource_GGYGOActionCurve>();
+	Source->SourceMode = EGGYGOActionCurveSourceMode::OriginalMontage;
+	Source->OriginalBinding = OriginalSource;
+	Source->OriginalResource = Resource;
+	Source->MontageStartSeconds = MontagePositionSeconds;
+	Source->EntryActorRotation = Rotation;
+	Source->TranslationScale = Scale;
+	Source->PlayRate = EffectiveMontagePlayRate;
+	Source->Duration = Duration;
+	Source->InstanceName = GGYGOMovementConstants::ActionCurveSourceName;
+	Source->Priority = GGYGOMovementConstants::ActionCurvePriority;
+	// Retire only the previous completed native tail before its successor enters this one execution slot.
+	if (CompletedMontageActionResource.IsValid()) LastRetiredMontageActionHandle = CompletedMontageActionResource->Handle;
+	NeutralizeMontageActionSource(CompletedMontageActionResource);
+	CompletedMontageActionResource.Reset();
+	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
+	ActionMotionFailureResource.Reset();
+	const uint16 Id = ApplyRootMotionSource(Source);
+	if (Id == static_cast<uint16>(ERootMotionSourceID::Invalid))
+		return Reject(TEXT("native ApplyRootMotionSource rejected the original source"));
+	ActiveMontageActionResource = Resource;
+	ActiveActionMotionHandle = Resource->Handle;
+	ActionMotionSourceID = Id;
+	++NextActionMotionHandle;
+	RetireLocomotionCurveRootMotion();
+	RemoveRootMotionSource(GGYGOMovementConstants::CurveBrakeSourceName);
+	RemoveRootMotionSource(GGYGOMovementConstants::CurveTurnBackSourceName);
+	ResetTurnBack();
+	bReplicatedTurnBackCurveDriven = false;
+	ResolvedGait = EGGYGOGait::None;
+	WalkHoldTimer = 0.0f;
+	CurveMotion.Reset();
+	StopMovementImmediately();
+	OutHandle = Resource->Handle;
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::ValidateMontageActionRuntime(
+	const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const
+{
+	OutError.Reset();
+	if (!IsValid(CharacterOwner) || !IsMovingOnGround() || !Source.OriginalBinding.IsValid()
+		|| CharacterOwner->IsPlayingRootMotion())
+	{
+		OutError = TEXT("ground action/source is unavailable or native animation RootMotion conflicts");
+		return false;
+	}
+	const auto Resource = Source.OriginalResource;
+	if (!Resource.IsValid())
+	{
+		// Native authoritative RMS replication may drive clients, never grant authority-side actions.
+		if (Source.bNativeImported && !CharacterOwner->HasAuthority()) return true;
+		OutError = TEXT("original local execution resource is missing; imported data cannot grant authority execution");
+		return false;
+	}
+	if (Resource->Owner.Get() != this || Resource->Character.Get() != CharacterOwner
+		|| Resource->Source != Source.OriginalBinding)
+	{
+		OutError = TEXT("source does not belong to its original CMC, Character and immutable binding");
+		return false;
+	}
+	// The saved native source already captures the original validated mapping and release state.
+	// Replay never borrows today's AnimInstance/Montage position or a successor's resource.
+	if (CharacterOwner->bClientUpdating) return true;
+	UAnimInstance* Anim = Resource->AnimInstance.Get();
+	USkeletalMeshComponent* Mesh = Resource->Mesh.Get();
+	if (!IsValid(Mesh) || Mesh != CharacterOwner->GetMesh() || !IsValid(Anim) || Mesh->GetAnimInstance() != Anim)
+	{
+		OutError = TEXT("original Mesh/AnimInstance membership was retired or replaced");
+		return false;
+	}
+	// Completed was verified against the original instance before release. Its finite native
+	// tail survives that instance's normal retirement without looking up a newer instance.
+	if (Source.bCompletionRequested && CompletedMontageActionResource == Resource) return true;
+	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(Resource->MontageInstanceId) : nullptr;
+	if (!Instance || Instance->Montage != Source.OriginalBinding->Montage.Get()
+		|| !FMath::IsFinite(Instance->GetPosition())
+		|| (Instance->GetPosition() < Source.OriginalBinding->MontageEndSeconds
+			&& (!Instance->IsActive() || !Instance->IsPlaying()
+				|| Instance->GetCurrentSection() != Source.OriginalBinding->SectionName))
+		|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() != Resource->InstancePlayRate
+		|| (!Source.bCompletionRequested && ActiveMontageActionResource != Resource))
+	{
+		OutError = TEXT("original runtime identity/playback/rate was retired, replaced, paused or dynamically changed");
+		return false;
+	}
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::ObserveMontageActionMotionFailure(
+	int32 OriginalHandle, FGGYGOActionMotionFailureDelegate Callback, FString& OutError)
+{
+	OutError.Reset();
+	if (!IsInGameThread() || !ActiveMontageActionResource.IsValid()
+		|| ActiveMontageActionResource->Handle != OriginalHandle || !HasActiveActionMotion()
+		|| !Callback.IsBound() || ActionMotionFailureCallback.IsBound() || ActionMotionFailureResource.IsValid())
+	{
+		OutError = TEXT("[Movement.ActionMotion] failure observer requires the original live action and its sole callback; no replacement");
+		return false;
+	}
+	ActionMotionFailureResource = ActiveMontageActionResource;
+	ActionMotionFailureCallback = MoveTemp(Callback);
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::FailMontageActionMotion(
+	const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource, const FString& Error)
+{
+	if (!OriginalResource.IsValid() || (CharacterOwner && CharacterOwner->bClientUpdating)
+		|| (ActiveMontageActionResource != OriginalResource && CompletedMontageActionResource != OriginalResource)) return;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	++MontageActionFailurePreparationDepth;
+	{
+		FGGYGOActionMotionFailureDelegate Callback;
+		if (ActionMotionFailureResource == OriginalResource)
+		{
+			Callback = MoveTemp(ActionMotionFailureCallback);
+			ActionMotionFailureResource.Reset();
+		}
+		FString ReleaseError;
+		ReleaseMontageActionMotion(OriginalResource->Handle, EGGYGOActionMotionReleaseReason::OwnerInvalidated, ReleaseError);
+		if (Callback.IsBound()) Callback.Execute(OriginalResource->Handle, Error);
+	} // Destroy captures while native Prepare remains protected.
+	if (UGGYGOCharacterMovementComponent* Self = WeakSelf.Get()) --Self->MontageActionFailurePreparationDepth;
+}
+
+void UGGYGOCharacterMovementComponent::NeutralizeMontageActionSource(
+	const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource)
+{
+	if (!OriginalResource.IsValid()) return;
+	const auto Retire = [&OriginalResource](const auto& Sources)
+	{
+		for (const auto& Base : Sources)
+		{
+			if (!Base.IsValid() || Base->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()) continue;
+			auto* Source = static_cast<FRootMotionSource_GGYGOActionCurve*>(Base.Get());
+			if (Source->OriginalResource != OriginalResource) continue;
+			Source->bExplicitlyCancelled = true;
+			Source->RootMotionParams.Set(FTransform::Identity);
+			Source->AccumulateMode = ERootMotionAccumulateMode::Additive;
+			Source->Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+		}
+	};
+	Retire(CurrentRootMotion.RootMotionSources);
+	Retire(CurrentRootMotion.PendingAddRootMotionSources);
+	if (MontageActionFailurePreparationDepth != 0) return; // Native Prepare is still deriving group flags.
+	// Native Prepare recalculates these flags. Also recompute them for a contribution cancelled after Prepare.
+	CurrentRootMotion.bHasOverrideSources = false;
+	CurrentRootMotion.bHasOverrideSourcesWithIgnoreZAccumulate = false;
+	CurrentRootMotion.bHasAdditiveSources = false;
+	for (const auto& Base : CurrentRootMotion.RootMotionSources)
+	{
+		if (!Base.IsValid() || !Base->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared)) continue;
+		if (Base->AccumulateMode == ERootMotionAccumulateMode::Override)
+		{
+			CurrentRootMotion.bHasOverrideSources = true;
+			CurrentRootMotion.bHasOverrideSourcesWithIgnoreZAccumulate |=
+				Base->Settings.HasFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
+		}
+		else CurrentRootMotion.bHasAdditiveSources = true;
+	}
+}
+
+bool UGGYGOCharacterMovementComponent::ReleaseMontageActionMotion(
+	int32 OriginalHandle, EGGYGOActionMotionReleaseReason Reason, FString& OutError)
+{
+	OutError.Reset();
+	if (!IsInGameThread() || OriginalHandle == INDEX_NONE
+		|| static_cast<uint8>(Reason) > static_cast<uint8>(EGGYGOActionMotionReleaseReason::OwnerInvalidated))
+	{
+		OutError = TEXT("[Movement.ActionMotion] release requires the original issued token, valid reason and game thread");
+		return false;
+	}
+	const auto Resource = ActiveMontageActionResource.IsValid() && ActiveMontageActionResource->Handle == OriginalHandle
+		? ActiveMontageActionResource : (CompletedMontageActionResource.IsValid()
+			&& CompletedMontageActionResource->Handle == OriginalHandle ? CompletedMontageActionResource : nullptr);
+	if (!Resource.IsValid())
+	{
+		if (OriginalHandle == LastRetiredMontageActionHandle) return true;
+		OutError = FString::Printf(TEXT("[Movement.ActionMotion] token=%d is not the original active/completed resource"), OriginalHandle);
+		return false;
+	}
+	FGGYGOActionMotionFailureDelegate RetiredCallback;
+	if (Reason != EGGYGOActionMotionReleaseReason::Completed && ActionMotionFailureResource == Resource)
+	{
+		RetiredCallback = MoveTemp(ActionMotionFailureCallback);
+		ActionMotionFailureResource.Reset();
+	}
+	if (Reason == EGGYGOActionMotionReleaseReason::Completed)
+	{
+		if (CompletedMontageActionResource == Resource) return true;
+		UAnimInstance* Anim = Resource->AnimInstance.Get();
+		FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(Resource->MontageInstanceId) : nullptr;
+		if (!Instance || Instance->Montage != Resource->Source->Montage.Get()
+			|| Instance->GetPosition() < Resource->Source->MontageEndSeconds)
+		{
+			OutError = TEXT("[Movement.ActionMotion] Completed requires the original instance to reach the original section end");
+			return false;
+		}
+		const auto Complete = [&Resource](const auto& Sources)
+		{
+			for (const auto& Base : Sources)
+				if (Base.IsValid() && Base->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct())
+				{
+					auto* Source = static_cast<FRootMotionSource_GGYGOActionCurve*>(Base.Get());
+					if (Source->OriginalResource == Resource) Source->bCompletionRequested = true;
+				}
+		};
+		Complete(CurrentRootMotion.RootMotionSources);
+		Complete(CurrentRootMotion.PendingAddRootMotionSources);
+		CompletedMontageActionResource = Resource; // Keep the genuine final native interval and the GA's End identity.
+	}
+	else
+	{
+		NeutralizeMontageActionSource(Resource);
+		LastRetiredMontageActionHandle = OriginalHandle;
+		if (CompletedMontageActionResource == Resource) CompletedMontageActionResource.Reset();
+	}
+	if (ActiveMontageActionResource == Resource)
+	{
+		ActiveMontageActionResource.Reset();
+		ActiveActionMotionHandle = INDEX_NONE;
+		ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
+		CurveMotion.Reset();
+	}
+	// Completed identity remains bounded until the next original action or owner teardown.
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::CancelMontageActionMotionForMovement(
+	int32 OriginalHandle, const FGGYGOQualifiedMovementIntent& OriginalIntent, FString& OutError)
+{
+	FGGYGOQualifiedMovementIntent CurrentIntent;
+	if (QueryQualifiedMovementIntent(OriginalIntent.Scope, CurrentIntent, OutError)
+		!= EGGYGOQualifiedMovementIntentQueryResult::Qualified || !(CurrentIntent == OriginalIntent))
+	{
+		if (OutError.IsEmpty()) OutError = TEXT("[Movement.ActionMotion] original movement intent is no longer qualified/current");
+		return false;
+	}
+	const bool bWasActive = ActiveMontageActionResource.IsValid() && ActiveMontageActionResource->Handle == OriginalHandle;
+	const auto OriginalResource = bWasActive ? ActiveMontageActionResource
+		: (CompletedMontageActionResource.IsValid() && CompletedMontageActionResource->Handle == OriginalHandle
+			? CompletedMontageActionResource : nullptr);
+	const auto HasUnconsumedTail = [&OriginalResource](const auto& Sources)
+	{
+		return Sources.ContainsByPredicate([&OriginalResource](const auto& Base)
+		{
+			if (!Base.IsValid() || Base->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()) return false;
+			const auto& Source = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*Base);
+			return OriginalResource.IsValid() && Source.OriginalResource == OriginalResource
+				&& !Source.bExplicitlyCancelled && !Source.bPreparedContributionConsumed;
+		});
+	};
+	const bool bHadUnconsumedTail = HasUnconsumedTail(CurrentRootMotion.RootMotionSources)
+		|| HasUnconsumedTail(CurrentRootMotion.PendingAddRootMotionSources);
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	const TWeakObjectPtr<ACharacter> OriginalCharacter(CharacterOwner);
+	const int32 OriginalNextHandle = NextActionMotionHandle;
+	if (!ReleaseMontageActionMotion(OriginalHandle, EGGYGOActionMotionReleaseReason::Cancelled, OutError)) return false;
+	// Delegate capture destruction during release can replace the owner or install and end
+	// a successor. Only clear this original cancellation's residual on the unchanged owner.
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	FGGYGOQualifiedMovementIntent AfterReleaseIntent;
+	FString AfterReleaseError;
+	if (Self && !Self->IsBeingDestroyed() && OriginalCharacter.IsValid()
+		&& Self->CharacterOwner == OriginalCharacter.Get() && Self->NextActionMotionHandle == OriginalNextHandle
+		&& Self->ActiveActionMotionHandle == INDEX_NONE && !Self->ActiveMontageActionResource.IsValid()
+		&& (bWasActive || bHadUnconsumedTail)
+		&& Self->QueryQualifiedMovementIntent(OriginalIntent.Scope, AfterReleaseIntent, AfterReleaseError)
+			== EGGYGOQualifiedMovementIntentQueryResult::Qualified && AfterReleaseIntent == OriginalIntent)
+	{
+		Self->Velocity.X = 0.0; Self->Velocity.Y = 0.0;
+		Self->CurveMotion.Reset();
+	}
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::ResumeLocomotionAfterAction()
+{
+	if (ActionSkippedMovementTickTime <= 0.0f || HasRegisteredActionCurveSource()) return;
+	const float OriginalTickTime = ActionSkippedMovementTickTime;
+	ActionSkippedMovementTickTime = 0.0f; // The skipped original Before interval can be consumed only once.
+	if (CharacterOwner && CharacterOwner->GetLocalRole() != ROLE_SimulatedProxy
+		&& HasAcceptedMovementSet() && !ShouldRejectMovementInputGroundLocomotion()
+		&& !ShouldRejectUnownedCurveGroundLocomotion())
+		TryUpdateLocomotion(OriginalTickTime, true, bPreviousHasMoveInput, ResolvedGait);
+}
+
 int32 UGGYGOCharacterMovementComponent::BeginActionMotion(const UGGYGOActionMotionProfile* Profile, float PlayRate)
 {
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	const TWeakObjectPtr<ACharacter> OriginalCharacter(CharacterOwner);
+	const auto OriginalOwnerContext = MovementOwnerSyncContext;
+	const int32 OriginalNextHandle = NextActionMotionHandle;
 	CleanupFinishedActionMotion();
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->CharacterOwner != OriginalCharacter.Get()
+		|| Self->MovementOwnerSyncContext != OriginalOwnerContext || Self->NextActionMotionHandle != OriginalNextHandle)
+		return INDEX_NONE;
 	FString Error;
 	USkeletalMeshComponent* Mesh = CharacterOwner ? CharacterOwner->GetMesh() : nullptr;
 	if (!CharacterOwner || !CharacterOwner->HasAuthority() || !Mesh || !IsMovingOnGround()
 		|| HasActiveActionMotion() || CharacterOwner->IsPlayingRootMotion()
+		|| NextActionMotionHandle <= 0 || NextActionMotionHandle == MAX_int32
 		|| !Profile || !Profile->ValidateMotion(Error) || !FMath::IsFinite(PlayRate) || PlayRate <= UE_SMALL_NUMBER
 		|| !FMath::IsFinite(Profile->Duration / PlayRate))
 	{
@@ -2211,11 +2810,16 @@ int32 UGGYGOCharacterMovementComponent::BeginActionMotion(const UGGYGOActionMoti
 	Source->PlayRate = PlayRate;
 	Source->EntryMeshRotation = Mesh->GetComponentQuat();
 	Source->TranslationScale = Profile->TranslationScale * Mesh->GetComponentScale();
+	if (CompletedMontageActionResource.IsValid()) LastRetiredMontageActionHandle = CompletedMontageActionResource->Handle;
+	NeutralizeMontageActionSource(CompletedMontageActionResource);
+	CompletedMontageActionResource.Reset();
+	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
+	ActionMotionFailureResource.Reset();
 	ActionMotionSourceID = ApplyRootMotionSource(Source);
 	if (ActionMotionSourceID == static_cast<uint16>(ERootMotionSourceID::Invalid)) return INDEX_NONE;
 
 	ActiveActionMotionHandle = NextActionMotionHandle;
-	NextActionMotionHandle = NextActionMotionHandle == MAX_int32 ? 1 : NextActionMotionHandle + 1;
+	++NextActionMotionHandle;
 	RemoveRootMotionSource(GGYGOMovementConstants::CurveBrakeSourceName);
 	RemoveRootMotionSource(GGYGOMovementConstants::CurveTurnBackSourceName);
 	ResetTurnBack();
@@ -2244,6 +2848,12 @@ bool UGGYGOCharacterMovementComponent::HasActiveActionMotion() const
 void UGGYGOCharacterMovementComponent::EndActionMotion(int32 Handle)
 {
 	if (Handle == INDEX_NONE || Handle != ActiveActionMotionHandle) return;
+	if (ActiveMontageActionResource.IsValid() && ActiveMontageActionResource->Handle == Handle)
+	{
+		FString Error;
+		ReleaseMontageActionMotion(Handle, EGGYGOActionMotionReleaseReason::Cancelled, Error);
+		return;
+	}
 	const TSharedPtr<FRootMotionSource> Source = GetRootMotionSourceByID(ActionMotionSourceID);
 	if (Source.IsValid() && Source->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct())
 	{
@@ -2259,6 +2869,27 @@ void UGGYGOCharacterMovementComponent::EndActionMotion(int32 Handle)
 
 void UGGYGOCharacterMovementComponent::CleanupFinishedActionMotion()
 {
+	if (ActiveMontageActionResource.IsValid())
+	{
+		const auto Resource = ActiveMontageActionResource;
+		if (!IsMovingOnGround())
+		{
+			const FString Error = FString::Printf(
+				TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' token=%d: original ground action left the ground"),
+				*GetPathName(), *GetPathNameSafe(Resource->Source->Montage.Get()), Resource->Handle);
+			UE_LOG(LogGGYGOMovement, Error, TEXT("%s"), *Error);
+			FailMontageActionMotion(Resource, Error);
+		}
+		else if (!HasActiveActionMotion())
+		{
+			// Natural expiry does not zero/retire an original Prepared final contribution.
+			CompletedMontageActionResource = Resource;
+			ActiveMontageActionResource.Reset();
+			ActiveActionMotionHandle = INDEX_NONE;
+			ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
+		}
+		return;
+	}
 	if (ActiveActionMotionHandle != INDEX_NONE && (!HasActiveActionMotion() || !IsMovingOnGround()))
 	{
 		EndActionMotion(ActiveActionMotionHandle);
@@ -2272,6 +2903,8 @@ void UGGYGOCharacterMovementComponent::TickComponent(float DeltaTime, ELevelTick
 	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
 	if (!Self || Self->bMovementOwnerSyncClosed) return;
 	CleanupFinishedActionMotion();
+	Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->bMovementOwnerSyncClosed) return;
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
 }
 
@@ -2614,6 +3247,7 @@ bool UGGYGOCharacterMovementComponent::HasRegisteredActionCurveSource() const
 	const auto IsLiveActionCurve = [](const TSharedPtr<FRootMotionSource>& Source)
 	{
 		return Source.IsValid() && IsRegisteredActionCurveSource(*Source)
+			&& Source->AccumulateMode == ERootMotionAccumulateMode::Override
 			&& !Source->Status.HasFlag(ERootMotionSourceStatusFlags::Finished)
 			&& !Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
 	};
@@ -2622,6 +3256,7 @@ bool UGGYGOCharacterMovementComponent::HasRegisteredActionCurveSource() const
 	{
 		return IsLiveActionCurve(Source)
 			|| (Source.IsValid() && IsRegisteredActionCurveSource(*Source)
+				&& Source->AccumulateMode == ERootMotionAccumulateMode::Override
 				&& Source->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared)
 				&& bHasPreparedOverride);
 	};
@@ -2718,6 +3353,7 @@ void UGGYGOCharacterMovementComponent::EnforceGroundLocomotionAdmission()
 
 void UGGYGOCharacterMovementComponent::CalcVelocity(float DeltaTime, float Friction, bool bFluid, float BrakingDeceleration)
 {
+	ResumeLocomotionAfterAction();
 	if (ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
 		|| ShouldRejectUnownedCurveGroundLocomotion())
 	{
@@ -2738,6 +3374,12 @@ void UGGYGOCharacterMovementComponent::ApplyRootMotionToVelocity(float DeltaTime
 		return;
 	}
 	Super::ApplyRootMotionToVelocity(DeltaTime);
+	for (const auto& Base : CurrentRootMotion.RootMotionSources)
+	{
+		if (Base.IsValid() && Base->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()
+			&& Base->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared))
+			static_cast<FRootMotionSource_GGYGOActionCurve*>(Base.Get())->bPreparedContributionConsumed = true;
+	}
 	EnforceGroundLocomotionAdmission();
 }
 
@@ -2836,14 +3478,26 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 	LastLocomotionCurvePrepared.Reset();
 	ConsumedLocomotionCurvePrepared.Reset();
 	PendingLocomotionCurveInput.Reset();
+	ActionSkippedMovementTickTime = 0.0f;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	const TWeakObjectPtr<ACharacter> OriginalCharacter(CharacterOwner);
+	const auto OriginalOwnerContext = MovementOwnerSyncContext;
 	if (bMovementInputBindingActive && !MovementInputBinding.SourceSession.Producer.IsValid())
 	{
 		FString Error;
 		InvalidateMovementInputSession(MovementInputBinding, FName(TEXT("ProducerDestroyed")), Error);
 	}
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->CharacterOwner != OriginalCharacter.Get()
+		|| Self->MovementOwnerSyncContext != OriginalOwnerContext) return;
 	CleanupFinishedActionMotion();
+	Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->CharacterOwner != OriginalCharacter.Get()
+		|| Self->MovementOwnerSyncContext != OriginalOwnerContext) return;
 	if (HasActiveActionMotion() || HasIndependentGroundRootMotion())
 	{
+		if (ActiveMontageActionResource.IsValid() || CompletedMontageActionResource.IsValid())
+			ActionSkippedMovementTickTime = DeltaSeconds;
 		RetireLocomotionCurveRootMotion();
 		CurveMotion.Reset();
 		Super::UpdateCharacterStateBeforeMovement(DeltaSeconds);
@@ -4438,6 +5092,17 @@ void UGGYGOCharacterMovementComponent::MoveAutonomous(
 		}
 	}
 	const bool bOriginalReplay = CharacterOwner && CharacterOwner->bClientUpdating && MovementInputReplayCapture.IsSet();
+	if (Frame && Frame->bEnteredNativeSimulation && !bOriginalReplay)
+	{
+		const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+		const uint64 OriginalExecution = LocomotionRequestSerial;
+		const auto OriginalSource = MovementInputNativeSource;
+		PublishQualifiedMovementIntent(); // Only after the original native applicability bit was committed.
+		UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+		if (!Self || Self->ActiveMovementOwnerSyncNativeMove != Frame
+			|| Self->LocomotionRequestSerial != OriginalExecution || Self->MovementInputNativeSource != OriginalSource
+			|| Self->bMovementOwnerSyncClosed) return;
+	}
 	if ((Frame || bOriginalReplay) && IsMovementInputRequestBlocked() && IsMovingOnGround()
 		&& !HasIndependentGroundRootMotion() && !CharacterOwner->IsPlayingNetworkedRootMotionMontage()
 		&& (LocomotionRequestSerial != 0 || bOriginalReplay))

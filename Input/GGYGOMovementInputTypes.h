@@ -42,6 +42,19 @@ struct FGGYGOMovementInputRequestIdentity
 	}
 };
 
+/** Read-only qualification of the original Source request; never CMC admission or execution. */
+enum class EGGYGOMovementInputRequestQueryResult : uint8
+{
+	/** The original session, route or attached receiver is unavailable. */
+	Unavailable = 0,
+	/** An allocated original request is still proven physically Held. */
+	Held,
+	/** Real Neutral with no active or unresolved request. */
+	NotHeld,
+	/** Original assembly is live, but observation/press/release proof is not sufficient. */
+	AwaitingPhysicalProof
+};
+
 /** CMC 发行的消费绑定身份；原来源会话也是绑定身份的一部分。 */
 struct FGGYGOMovementInputConsumerBindingId
 {

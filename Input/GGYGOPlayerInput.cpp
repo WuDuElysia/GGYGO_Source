@@ -982,26 +982,47 @@ void UGGYGOPlayerInput::EndMovementInputSession(const FGGYGOMovementInputSession
 bool UGGYGOPlayerInput::GetMovementInputRequest(const FGGYGOMovementInputSessionIdentity& Session,
 	FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const
 {
+	const EGGYGOMovementInputRequestQueryResult Result = QueryMovementInputRequest(Session, OutRequest, OutError);
+	if (Result == EGGYGOMovementInputRequestQueryResult::NotHeld)
+	{
+		// The typed query treats real Neutral as normal; this legacy entry retains its false diagnostic.
+		OutError = MakeError(TEXT("No attached, proven physical movement request is held in this session.") + DescribeSourceProof());
+	}
+	return Result == EGGYGOMovementInputRequestQueryResult::Held;
+}
+
+EGGYGOMovementInputRequestQueryResult UGGYGOPlayerInput::QueryMovementInputRequest(
+	const FGGYGOMovementInputSessionIdentity& OriginalSession,
+	FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const
+{
+	using EResult = EGGYGOMovementInputRequestQueryResult;
 	OutRequest = {};
-	if (!IsCurrentSession(Session))
+	OutError.Reset();
+	if (!IsCurrentSession(OriginalSession))
 	{
 		OutError = MakeError(TEXT("Request lookup refers to a stale or foreign source session."));
-		return false;
+		return EResult::Unavailable;
 	}
 	if (!ValidateCurrentRoute(OutError))
 	{
-		return false;
+		return EResult::Unavailable;
 	}
-	if (!FactReceiver.IsBound() || !ReceiverBinding.Consumer.IsValid() || ActiveRequestSerial == 0
-		|| bRequestSourceUnresolved || ReadSourceProof() != ESourceProof::Held)
+	const bool bHasOriginalReceiver = FactReceiver.IsBound() && ReceiverBinding.Consumer.IsValid();
+	const ESourceProof Proof = bHasOriginalReceiver ? ReadSourceProof() : ESourceProof::Unknown;
+	if (!bHasOriginalReceiver || ActiveRequestSerial == 0 || bRequestSourceUnresolved || Proof != ESourceProof::Held)
 	{
+		if (bHasOriginalReceiver && ActiveRequestSerial == 0 && !bRequestSourceUnresolved && Proof == ESourceProof::Neutral)
+		{
+			return EResult::NotHeld;
+		}
 		OutError = MakeError(TEXT("No attached, proven physical movement request is held in this session.") + DescribeSourceProof());
-		return false;
+		// Unknown includes the ordinary first observation wait. Held without an allocated request
+		// also requires original release/press proof; neither condition is real Neutral.
+		return bHasOriginalReceiver ? EResult::AwaitingPhysicalProof : EResult::Unavailable;
 	}
-	OutRequest.Session = Session;
+	OutRequest.Session = OriginalSession;
 	OutRequest.RequestSerial = ActiveRequestSerial;
-	OutError.Reset();
-	return true;
+	return EResult::Held;
 }
 
 UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysicalInput(const FInputKeyEventArgs& Params)

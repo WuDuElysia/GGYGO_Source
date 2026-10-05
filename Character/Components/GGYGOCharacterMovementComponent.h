@@ -14,6 +14,7 @@
 
 #include "Character/Data/GGYGOMovementTypes.h"
 #include "Animation/Data/GGYGOLocomotionSourceBinding.h"
+#include "Animation/Data/GGYGOActionMotionSourceBinding.h"
 #include "Input/GGYGOMovementInputTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/CharacterMovementReplication.h"
@@ -36,7 +37,10 @@ class UGGYGOMovementSet;
 class UGGYGOActionMotionProfile;
 class UObject;
 class UGGYGOCharacterMovementComponent;
+class UAnimInstance;
+class USkeletalMeshComponent;
 struct FRootMotionSource_GGYGOCurve;
+struct FRootMotionSource_GGYGOActionCurve;
 struct FGGYGOCurveRootMotionMoveInput;
 struct FGGYGOLocomotionPreparedState;
 
@@ -108,6 +112,65 @@ private:
 
 DECLARE_DELEGATE_TwoParams(FGGYGOMovementOwnerSyncDelegate,
 	const FGGYGOMovementOwnerSyncObserverId&, const FGGYGOMovementOwnerSyncNotice&);
+
+enum class EGGYGOActionMotionReleaseReason : uint8
+{
+	Completed, Cancelled, Replaced, OwnerInvalidated
+};
+
+enum class EGGYGOQualifiedMovementIntentQueryResult : uint8
+{
+	Unavailable = 0, Qualified, NotHeld, AwaitingPhysicalProof, WaitingForAdmission, ExecutionFailed
+};
+
+enum class EGGYGOQualifiedMovementIntentProvenance : uint8
+{
+	Unavailable = 0, LocalSourceHeld, AuthenticatedNativeRequest
+};
+
+struct GGYGO_API FGGYGOQualifiedMovementIntent
+{
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	EGGYGOQualifiedMovementIntentProvenance Provenance = EGGYGOQualifiedMovementIntentProvenance::Unavailable;
+	uint64 BindingSerial = 0;
+	uint64 SessionSerial = 0;
+	uint64 RequestSerial = 0;
+	uint64 ExecutionRequestSerial = 0;
+	bool operator==(const FGGYGOQualifiedMovementIntent& Other) const;
+};
+
+struct GGYGO_API FGGYGOQualifiedMovementIntentObserverId
+{
+	bool IsSet() const { return Scope.IsSet() && ObserverSerial != 0; }
+	const FGGYGOMovementOwnerSyncScopeId& GetScope() const { return Scope; }
+	bool operator==(const FGGYGOQualifiedMovementIntentObserverId& Other) const
+	{
+		return Scope == Other.Scope && ObserverSerial == Other.ObserverSerial;
+	}
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	uint64 ObserverSerial = 0;
+};
+
+DECLARE_DELEGATE_FourParams(FGGYGOQualifiedMovementIntentDelegate,
+	const FGGYGOQualifiedMovementIntentObserverId&, EGGYGOQualifiedMovementIntentQueryResult,
+	const FGGYGOQualifiedMovementIntent&, const FString&);
+
+DECLARE_DELEGATE_TwoParams(FGGYGOActionMotionFailureDelegate, int32, const FString&);
+
+/** Immutable original action identity; native RMS owns time and per-move release state. */
+struct FGGYGOActionMotionResource
+{
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Owner;
+	TWeakObjectPtr<ACharacter> Character;
+	TWeakObjectPtr<USkeletalMeshComponent> Mesh;
+	TWeakObjectPtr<UAnimInstance> AnimInstance;
+	FGGYGOActionMotionSourceBindingPtr Source;
+	int32 MontageInstanceId = INDEX_NONE;
+	int32 Handle = INDEX_NONE;
+	float InstancePlayRate = 0.0f;
+};
 
 enum class EGGYGOMovementInitialRequestAdmissionResult : uint8
 {
@@ -475,6 +538,25 @@ public:
 	/** Only the current token can remove its source. Safe after natural completion or repeated cleanup. */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement|Action Motion")
 	void EndActionMotion(int32 Handle);
+
+	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
+		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
+		float TranslationScale, int32& OutHandle, FString& OutError);
+	bool ReleaseMontageActionMotion(int32 OriginalHandle, EGGYGOActionMotionReleaseReason Reason, FString& OutError);
+	bool CancelMontageActionMotionForMovement(int32 OriginalHandle,
+		const FGGYGOQualifiedMovementIntent& OriginalIntent, FString& OutError);
+	/** Sole original GA failure recipient; release removes it before external cleanup. */
+	bool ObserveMontageActionMotionFailure(int32 OriginalHandle,
+		FGGYGOActionMotionFailureDelegate Callback, FString& OutError);
+	EGGYGOQualifiedMovementIntentQueryResult QueryQualifiedMovementIntent(
+		const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+		FGGYGOQualifiedMovementIntent& OutIntent, FString& OutError) const;
+	/** Writes the original handle before synchronous replay; replay may retire it. */
+	bool SubscribeQualifiedMovementIntent(const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+		FGGYGOQualifiedMovementIntentDelegate Observer,
+		FGGYGOQualifiedMovementIntentObserverId& OutObserver, FString& OutError);
+	bool UnsubscribeQualifiedMovementIntent(const FGGYGOQualifiedMovementIntentObserverId& OriginalObserver,
+		FName Reason, FString& OutError);
 
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement|Action Motion")
 	bool HasActiveActionMotion() const;
@@ -952,6 +1034,28 @@ protected:
 
 	/** Release the owner token and locomotion gates when the RMS naturally expires or is removed. */
 	void CleanupFinishedActionMotion();
+
+	friend struct FRootMotionSource_GGYGOActionCurve;
+	bool ValidateMontageActionRuntime(const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const;
+	void FailMontageActionMotion(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource, const FString& Error);
+	void NeutralizeMontageActionSource(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource);
+	void ResumeLocomotionAfterAction();
+	void PublishQualifiedMovementIntent();
+	void RetireQualifiedMovementIntent(const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FName Reason);
+	struct FQualifiedMovementIntentObserver;
+	TArray<TSharedPtr<FQualifiedMovementIntentObserver>> QualifiedMovementIntentObservers;
+	uint64 QualifiedMovementIntentLastObserverSerial = 0;
+	uint64 QualifiedMovementIntentPublicationSerial = 0;
+	int32 QualifiedMovementIntentReplayDepth = 0;
+	TSharedPtr<const FGGYGOActionMotionResource> ActiveMontageActionResource;
+	/** At most the last completed resource, retained for its GA's End cancellation; no historical lookup. */
+	TSharedPtr<const FGGYGOActionMotionResource> CompletedMontageActionResource;
+	float ActionSkippedMovementTickTime = 0.0f;
+	FGGYGOActionMotionFailureDelegate ActionMotionFailureCallback;
+	TSharedPtr<const FGGYGOActionMotionResource> ActionMotionFailureResource;
+	int32 MontageActionFailurePreparationDepth = 0;
+	/** Exact last terminal token for idempotent release, without retaining a historical resource. */
+	int32 LastRetiredMontageActionHandle = INDEX_NONE;
 
 	/**
 	 * 曲线是否正在接管转身的朝向与位移方向（`Turning` 或 `Braking`）。

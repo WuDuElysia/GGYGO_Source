@@ -14,11 +14,14 @@ class USkeletalMeshComponent;
 class UWorld;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOPlayerComboLifecycleFixture;
+struct FGGYGOMontageSectionFact;
+enum class EGGYGOActionMotionReleaseReason : uint8;
 
 UCLASS(Blueprintable)
 class GGYGO_API UGGYGOPlayerComboAbility : public UGGYGOGameplayAbility
 {
 	GENERATED_BODY()
+	struct FStepMotionResources;
 public:
 	UGGYGOPlayerComboAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	/** ASC 只向匹配本次激活预测键的实例转发服务器纠正。 */
@@ -58,6 +61,12 @@ protected:
 	bool IsActivationCurrent(const FGGYGOAbilityActivationHandle& Original) const;
 	bool IsStepCurrent(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ExpectedTask) const;
+	bool IsMotionResourceCurrent(const TSharedPtr<FStepMotionResources>& Resource) const;
+	bool InitializeStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
+	void HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageSectionFact& Fact);
+	void EnterStepEnd(const TSharedPtr<FStepMotionResources>& Resource);
+	void FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
+	void ReleaseStepMotion(EGGYGOActionMotionReleaseReason Reason);
 	void HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId);
 	void HandleMontageEvent(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
 	void HandleMontageCompleted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
@@ -99,6 +108,8 @@ private:
 	TObjectPtr<USkeletalMeshComponent> ActiveMesh;
 	/** Copies of issuer-owned identity and our resources, never another activation/end state machine. */
 	FGGYGOAbilityActivationHandle ResourceActivation;
+	/** 本段持有的原 CMC 资源与来源；不复制 CMC 状态或 Montage 时钟。 */
+	TSharedPtr<FStepMotionResources> StepMotionResources;
 	FDelegateHandle MontageCallbackRegistration;
 	FDelegateHandle InputCallbackRegistration;
 	FGGYGOMeleeTraceWindowHandle TraceWindow;

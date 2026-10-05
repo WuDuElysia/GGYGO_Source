@@ -53,6 +53,12 @@ public:
 		const FGGYGOMovementInputConsumerBindingId& Binding,
 		FGGYGOMovementInputFactDelegate Receiver, FString& OutError);
 	void EndMovementInputSession(const FGGYGOMovementInputSessionIdentity& Session, FName Reason);
+	/** Queries only this original session. Non-Held results clear OutRequest; NotHeld clears OutError.
+	 *  AwaitingPhysicalProof does not prove release or authorize a request. No callbacks or state writes. */
+	EGGYGOMovementInputRequestQueryResult QueryMovementInputRequest(
+		const FGGYGOMovementInputSessionIdentity& OriginalSession,
+		FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const;
+	/** Legacy Held-only lookup; preserves its original false diagnostics. */
 	bool GetMovementInputRequest(const FGGYGOMovementInputSessionIdentity& Session,
 		FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const;
 

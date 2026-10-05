@@ -43,6 +43,47 @@ struct FAnimMontageInstance;
 struct FGameplayAbilityActorInfo;
 struct FGameplayEventData;
 
+/** Historical section notification from this task's exact original montage instance.
+ * The engine does not retain the position at which a queued section event occurred. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOMontageSectionFact
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	TObjectPtr<UAnimMontage> Montage = nullptr;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	int32 MontageInstanceId = INDEX_NONE;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	FName SectionName = NAME_None;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	bool bLooped = false;
+};
+
+/** Instantaneous read of the original instance, including after a nonzero start position.
+ * Neither this snapshot nor a section fact grants authority over the current GA/ASC resource. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOMontageSectionSnapshot
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	TObjectPtr<UAnimMontage> Montage = nullptr;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	int32 MontageInstanceId = INDEX_NONE;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	FName SectionName = NAME_None;
+	/** Actual montage timeline position; never the position of an earlier queued event. */
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	float PositionSeconds = 0.0f;
+	/** Raw instance rate, excluding Montage.RateScale; not TimeStretch's actual advancement. */
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	float InstancePlayRate = 0.0f;
+};
+
+DECLARE_DELEGATE_OneParam(FGGYGOMontageSectionFactDelegate, const FGGYGOMontageSectionFact&);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOMontageSectionFactBPDelegate, FGGYGOMontageSectionFact, SectionFact);
+
 /**
  * Montage 任务的回调。
  *
@@ -70,6 +111,7 @@ public:
 		FGGYGOPlayMontageAndWaitForEventDelegate OnInterrupted;
 		FGGYGOPlayMontageAndWaitForEventDelegate OnCancelled;
 		FGGYGOPlayMontageAndWaitForEventDelegate EventReceived;
+		FGGYGOMontageSectionFactDelegate SectionReceived;
 	};
 
 	/** One nonempty registration, only in native AwaitingActivation before ReadyForActivation.
@@ -79,8 +121,14 @@ public:
 	bool UnregisterNativeCallbacks(FDelegateHandle Registration);
 	/** 统一计算 Montage Task 速率快照：TaskRate 只含一次全局缩放，EffectiveRate 再乘资产 RateScale。 */
 	static bool ResolvePlayRate(const UAnimMontage* Montage, float RequestedRate, float& OutTaskPlayRate, float& OutEffectivePlayRate);
-	/** 返回此任务准备播放的有效速率快照，供同一次播放的 watchdog 使用。 */
+	/** 同次播放的名义速率乘积，供 watchdog 使用；不表达动态 instance rate 或 TimeStretch 推进。 */
 	float GetEffectivePlayRate() const { return EffectivePlayRate; }
+	/** Read after ReadyForActivation and rechecking the caller's original activation/step/task.
+	 * False clears the output; no cached replay or lookup through a same-asset successor.
+	 * An extant original instance remains readable during blend-out; this is not playback authority.
+	 * NAME_None and finite zero/negative rates are raw facts for the caller to interpret. */
+	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Ability|Tasks")
+	bool TryGetOriginalSectionSnapshot(FGGYGOMontageSectionSnapshot& OutSnapshot) const;
 
 	virtual void Activate() override;
 	virtual void ExternalCancel() override;
@@ -131,6 +179,10 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOPlayMontageAndWaitForEventBPDelegate EventReceived;
 
+	/** Original instance section fact, possibly queued before blend-out; not current playback authority. */
+	UPROPERTY(BlueprintAssignable)
+	FGGYGOMontageSectionFactBPDelegate SectionReceived;
+
 private:
 	friend class FGGYGOMontageTaskLifecycleTest;
 	struct FInFlightMontagePlayCleanup;
@@ -138,8 +190,12 @@ private:
 	enum class ENativeCallback : uint8 { Completed, BlendOut, Interrupted, Cancelled, EventReceived };
 	/** Path-specific original task facts; cancellation may precede ActorInfo/Guard installation. */
 	bool CanDispatchOriginalCallback(ENativeCallback Kind, const FGGYGOMontagePlayGuardIdentity& Original) const;
+	/** Common original-source envelope for Ended/blend-out/section facts, including queued facts. */
+	bool CanDispatchOriginalInstanceFact(const FGGYGOMontagePlayGuardIdentity& Original) const;
 	/** Native snapshot first, then recheck the original task before its existing BP callback. */
 	void DispatchOriginalCallback(ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData);
+	void DispatchOriginalSectionFact(const FGGYGOMontageSectionFact& Fact,
+		const FGGYGOMontagePlayGuardIdentity& Original);
 
 	/** 当前 Montage 是否仍由本任务驱动。 */
 	bool IsNotifyValid() const;
@@ -166,6 +222,8 @@ private:
 	/** Montage 结束回调。 */
 	void OnMontageEnded(UAnimMontage* Montage, bool bInterrupted);
 	void OnMontageEndedForInstance(UAnimMontage* Montage, bool bInterrupted,
+		FGGYGOMontagePlayGuardIdentity Original);
+	void OnMontageSectionChangedForInstance(UAnimMontage* Montage, FName SectionName, bool bLooped,
 		FGGYGOMontagePlayGuardIdentity Original);
 
 	/** 能力被取消回调。 */
@@ -219,6 +277,7 @@ private:
 
 	/** Montage 结束委托。 */
 	FOnMontageEnded MontageEndedDelegate;
+	FOnMontageSectionChanged MontageSectionChangedDelegate;
 	float StartTimeSeconds = 0.0f;
 	int32 MontageInstanceId = INDEX_NONE;
 	bool bEndingTask = false;

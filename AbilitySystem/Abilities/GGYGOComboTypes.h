@@ -19,6 +19,12 @@ struct GGYGO_API FGGYGOComboStep
 	FName MainSection = TEXT("Main");
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
 	FName EndSection = TEXT("End");
+	/** 原 Montage 动作曲线所在 Slot；必须显式配置，不选择第一个或默认 Slot。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion")
+	FName MotionSlotName = NAME_None;
+	/** 原动画厘米位移的显式倍率；Avatar 实际缩放由 CMC 仅应用一次。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion", meta = (ClampMin = "0.001"))
+	float MotionTranslationScale = 1.0f;
 	/** INDEX_NONE 表示终段；首版仅允许指向后面的段，避免意外循环。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
 	int32 NextStepIndex = INDEX_NONE;

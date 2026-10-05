@@ -2,10 +2,15 @@
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Tests/GGYGOLocomotionMovementTestTypes.h"
+#include "Character/Data/GGYGOAnimationSourceCurveEvaluation.h"
 
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "Curves/RichCurve.h"
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "Animation/AnimData/IAnimationDataModel.h"
+#include "Engine/SkeletalMesh.h"
+#include "UObject/UnrealType.h"
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/UObjectGlobals.h"
@@ -135,33 +140,71 @@ namespace GGYGOLocomotionEvaluationT1
 	bool CheckOriginalAnimationSources(FAutomationTestBase& Test)
 	{
 		using namespace GGYGOLocomotionEvaluation;
-		const auto MakeSource = [](EGGYGOLocomotionMotionType Type, bool bLoop, float Speed, float DirectionX)
+#if WITH_EDITOR
+		USkeletalMesh* NativeFixtureMesh = LoadObject<USkeletalMesh>(nullptr, TEXT("/Engine/EngineMeshes/SkeletalCube.SkeletalCube"));
+		if (!Test.TestNotNull(TEXT("Original locomotion model fixture requires its real mesh"), NativeFixtureMesh)
+			|| !Test.TestNotNull(TEXT("Original locomotion model fixture requires its real skeleton"), NativeFixtureMesh->GetSkeleton())) return false;
+		TStrongObjectPtr<USkeleton> NativeFixtureSkeleton(DuplicateObject<USkeleton>(NativeFixtureMesh->GetSkeleton(), GetTransientPackage()));
+		if (!Test.TestNotNull(TEXT("Original locomotion model fixture owns its skeleton copy"), NativeFixtureSkeleton.Get())) return false;
+		NativeFixtureSkeleton->SetFlags(RF_Transient);
+		if (!Test.TestTrue(TEXT("Original locomotion model fixture preserves real bones on a private skeleton"),
+			NativeFixtureSkeleton.Get() != NativeFixtureMesh->GetSkeleton()
+			&& NativeFixtureSkeleton->GetReferenceSkeleton().GetNum() > 0)) return false;
+		const auto MakeSource = [&Test, &NativeFixtureSkeleton](EGGYGOLocomotionMotionType Type, bool bLoop, float Speed, float DirectionX,
+			FGGYGOLocomotionSequenceSource& Source)
 		{
-			UGGYGOLocomotionTestSequence* Sequence = NewObject<UGGYGOLocomotionTestSequence>(GetTransientPackage());
+			Source = {};
+			UAnimSequence* Sequence = NewObject<UAnimSequence>(GetTransientPackage(), NAME_None, RF_Transient);
+			Sequence->SetSkeleton(NativeFixtureSkeleton.Get());
+			IAnimationDataController& SourceController = Sequence->GetController();
+			SourceController.InitializeModel();
+			SourceController.SetFrameRate(FFrameRate(30, 1), false);
+			SourceController.SetNumberOfFrames(FFrameNumber(30), false);
 			for (const TPair<FName, float>& Curve : {TPair<FName, float>(TEXT("RootMotion_Speed"), Speed),
 				TPair<FName, float>(TEXT("RootMotion_DirX"), DirectionX), TPair<FName, float>(TEXT("RootMotion_DirY"), 0.0f),
 				TPair<FName, float>(TEXT("RootMotion_Yaw"), 0.0f)})
 			{
-				FRichCurve Data; Data.AddKey(0.0f, Curve.Value); Sequence->TestCurves.Add(Curve.Key, Data);
+				const FAnimationCurveIdentifier CurveId(Curve.Key, ERawCurveTrackTypes::RCT_Float);
+				if (!Test.TestTrue(TEXT("Original locomotion source model installs its authored constant curve"),
+					SourceController.AddCurve(CurveId, 4, false)
+					&& SourceController.SetCurveKeys(CurveId, {FRichCurveKey(0.0f, Curve.Value)}, false))) return false;
 			}
+			SourceController.NotifyPopulated();
 			Sequence->RateScale = 1.0f;
-			FGGYGOLocomotionSequenceSource Source;
 			Source.MotionType = Type; Source.RouteKey = TEXT("OriginalFixture"); Source.Sequence.Reset(Sequence);
 			Source.bLoop = bLoop; Source.PlayLength = 1.0f; Source.SequenceRateScale = 1.0f;
-			return Source;
+			return true;
 		};
 		FGGYGOLocomotionSourceBinding Binding;
 		Binding.Status = EGGYGOLocomotionSourceStatus::Available;
 		for (EGGYGOLocomotionMotionType Type : {EGGYGOLocomotionMotionType::WalkStart, EGGYGOLocomotionMotionType::StartStop,
 			EGGYGOLocomotionMotionType::WalkStop, EGGYGOLocomotionMotionType::RunStop, EGGYGOLocomotionMotionType::TurnBack})
-			Binding.SingleSources.Add(MakeSource(Type, false, 8.0f, 1.0f));
+		{
+			FGGYGOLocomotionSequenceSource Source;
+			if (!MakeSource(Type, false, 8.0f, 1.0f, Source)) return false;
+			Binding.SingleSources.Add(MoveTemp(Source));
+		}
 		FGGYGOLocomotionBlendSpaceSampleSource Walk, Run;
-		Walk.Source = MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, 1.0f);
-		Run.Source = MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, -1.0f);
+		if (!MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, 1.0f, Walk.Source)
+			|| !MakeSource(EGGYGOLocomotionMotionType::WalkRun, true, 8.0f, -1.0f, Run.Source)) return false;
 		Walk.SampleIndex = 0; Run.SampleIndex = 1; Walk.SampleRateScale = Run.SampleRateScale = 1.0f;
 		Run.SampleValue = FVector(1.0, 0.0, 0.0);
 		FString FixtureError;
-		UBlendSpace1D* BS = MakeGGYGOLocomotionTestBlendSpace(GetTransientPackage(), Walk.Source.Sequence.Get(), Run.Source.Sequence.Get(), FixtureError);
+		UBlendSpace1D* BS = NewObject<UBlendSpace1D>(GetTransientPackage(), NAME_None, RF_Transient);
+		FStructProperty* NativeAxisProperty = FindFProperty<FStructProperty>(UBlendSpace::StaticClass(), TEXT("BlendParameters"));
+		if (!Test.TestTrue(TEXT("Original native BlendSpace fixture exposes the real axis configuration"),
+			NativeAxisProperty && NativeAxisProperty->ArrayDim >= 1 && NativeAxisProperty->Struct
+			&& NativeAxisProperty->Struct->GetFName() == FName(TEXT("BlendParameter"))
+			&& NativeAxisProperty->Struct->GetStructureSize() == sizeof(FBlendParameter))) return false;
+		FBlendParameter* NativeAxis = NativeAxisProperty->ContainerPtrToValuePtr<FBlendParameter>(BS, 0);
+		NativeAxis->Min = 0.0f; NativeAxis->Max = 1.0f; NativeAxis->GridNum = 1;
+		BS->SetSkeleton(NativeFixtureSkeleton.Get());
+		if (!Test.TestTrue(TEXT("Original native BlendSpace fixture accepts both original model sources"),
+			BS->AddSample(Walk.Source.Sequence.Get(), FVector::ZeroVector) == 0
+			&& BS->AddSample(Run.Source.Sequence.Get(), FVector(1.0, 0.0, 0.0)) == 1)) return false;
+		BS->ResampleData();
+		if (BS->GetBlendSamples().Num() != 2 || BS->GetBlendSpaceData().Segments.IsEmpty())
+			FixtureError = TEXT("Original native BlendSpace did not generate its two-sample 1D topology.");
 		if (!Test.TestTrue(FString::Printf(TEXT("Native BlendSpace fixture is authored successfully (Error='%s')"), *FixtureError), BS != nullptr && FixtureError.IsEmpty())) return false;
 		Binding.WalkRunKey = TEXT("walkRun"); Binding.WalkRunBlendSpace.Reset(BS); Binding.bWalkRunLoop = true;
 		Binding.WalkRunSamples = {Walk, Run};
@@ -177,11 +220,22 @@ namespace GGYGOLocomotionEvaluationT1
 		CheckFailure(Test, TEXT("Missing original publication"), Mixed, Error);
 		if (!Test.TestTrue(TEXT("Missing publication retains its original cause"), Error.Contains(Missing.Error))) return false;
 		FGGYGOLocomotionSequenceSource& Single = Binding.SingleSources[0];
-		UGGYGOLocomotionTestSequence* Sequence = CastChecked<UGGYGOLocomotionTestSequence>(Single.Sequence.Get());
-		Sequence->TestCurves.Remove(TEXT("RootMotion_DirX"));
+		UAnimSequence* Sequence = Single.Sequence.Get();
+		IAnimationDataController& NativeSourceController = Sequence->GetController();
+		const FAnimationCurveIdentifier DirectionCurveId(TEXT("RootMotion_DirX"), ERawCurveTrackTypes::RCT_Float);
+		if (!Test.TestTrue(TEXT("Missing original direction is authored on the real model"), NativeSourceController.RemoveCurve(DirectionCurveId, false))) return false;
 		if (!Test.TestFalse(TEXT("Missing original curve rejects the real source contract"), ValidateBinding(Binding, Error))
 			|| !Test.TestTrue(TEXT("Missing curve error identifies original asset and curve"), Error.Contains(Sequence->GetPathName()) && Error.Contains(TEXT("RootMotion_DirX")))) return false;
-		FRichCurve TinyDirection; TinyDirection.AddKey(0.0f, 1.e-30f); Sequence->TestCurves.Add(TEXT("RootMotion_DirX"), TinyDirection);
+		TArray<float> MissingDirectionValues = {37.0f};
+		const FName MissingDirectionNames[] = {TEXT("RootMotion_DirX")};
+		if (!Test.TestFalse(TEXT("Native collection reader refuses an absent required model curve"),
+			GGYGOAnimationSourceCurveEvaluation::EvaluateRequiredCurves(Sequence, 0.25, MissingDirectionNames, MissingDirectionValues, Error))
+			|| !Test.TestTrue(TEXT("Absent native curve has atomic empty output and original asset/name/time"),
+				MissingDirectionValues.IsEmpty() && Error.Contains(Sequence->GetPathName())
+				&& Error.Contains(TEXT("RootMotion_DirX")) && Error.Contains(TEXT("Time=0.25")))) return false;
+		if (!Test.TestTrue(TEXT("Tiny original direction is authored on the real model"),
+			NativeSourceController.AddCurve(DirectionCurveId, 4, false)
+			&& NativeSourceController.SetCurveKeys(DirectionCurveId, {FRichCurveKey(0.0f, 1.e-30f)}, false))) return false;
 		Single.bLoop = true;
 		if (!Test.TestFalse(TEXT("Wrong-loop original single route rejects at binding admission"), ValidateBinding(Binding, Error))
 			|| !Test.TestTrue(TEXT("Loop rejection identifies bLoop"), Error.Contains(TEXT("bLoop")))) return false;
@@ -189,11 +243,23 @@ namespace GGYGOLocomotionEvaluationT1
 		FGGYGOLocomotionEvaluationResult Motion = MakeDirtyMotion();
 		if (!Test.TestTrue(TEXT("Tiny nonzero original direction remains valid"), EvaluateSingleInterval(Single, 0.0f, 0.1f, 1.0f, Motion, &Error))
 			|| !Test.TestTrue(TEXT("Tiny direction normalizes without tolerance loss"), Motion.Sample.Direction == FVector::ForwardVector)) return false;
-		Sequence->TestCurves.FindChecked(TEXT("RootMotion_Speed")).SetKeys({FRichCurveKey(0.0f, -1.0f)});
+		const IAnimationDataModel* NativeSourceModel = Sequence->GetDataModelInterface().GetInterface();
+		const FFloatCurve* NativeSourceSpeedCurve = NativeSourceModel
+			? NativeSourceModel->FindFloatCurve(FAnimationCurveIdentifier(TEXT("RootMotion_Speed"), ERawCurveTrackTypes::RCT_Float)) : nullptr;
+		if (!Test.TestTrue(TEXT("Real model and native locomotion evaluation retain authored nonzero speed"),
+			NativeSourceSpeedCurve && NativeSourceSpeedCurve->Evaluate(0.1f) == 8.0f
+			&& Motion.Sample.Speed == 8.0f && Error.IsEmpty())) return false;
+		if (!Test.TestTrue(TEXT("Negative original speed is authored on the real model"),
+			NativeSourceController.SetCurveKeys(FAnimationCurveIdentifier(TEXT("RootMotion_Speed"), ERawCurveTrackTypes::RCT_Float),
+				{FRichCurveKey(0.0f, -1.0f)}, false))) return false;
 		Motion = MakeDirtyMotion();
 		if (!Test.TestFalse(TEXT("Negative actual source speed rejects evaluation"), EvaluateSingleInterval(Single, 0.0f, 0.1f, 1.0f, Motion, &Error))) return false;
 		CheckFailure(Test, TEXT("Original negative speed"), Motion, Error);
 		return Test.TestTrue(TEXT("Negative source diagnosis identifies runtime speed and original asset"), Error.Contains(TEXT("RootMotion_Speed")) && Error.Contains(Sequence->GetPathName()));
+#else
+		Test.AddError(TEXT("Original locomotion model fixture requires Editor model authoring."));
+		return false;
+#endif
 	}
 }
 

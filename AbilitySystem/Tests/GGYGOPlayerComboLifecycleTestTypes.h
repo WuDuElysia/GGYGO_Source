@@ -3,11 +3,31 @@
 #include "AbilitySystem/Abilities/GGYGOPlayerComboAbility.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "GameplayEffect.h"
+#include "GameFramework/Character.h"
+#include "GameFramework/PlayerController.h"
 
 #include "GGYGOPlayerComboLifecycleTestTypes.generated.h"
 
 class UAnimMontage;
 class UFunction;
+
+/** The real CMC entry is part of the Combo prerequisite; no motion gate is bypassed for tests. */
+UCLASS(Transient)
+class AGGYGOPlayerComboLifecycleTestCharacter : public ACharacter
+{
+	GENERATED_BODY()
+public:
+	AGGYGOPlayerComboLifecycleTestCharacter(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+};
+
+/** Native input is explicit for this GAS lifecycle fixture; it creates no physical Source request. */
+UCLASS(Transient)
+class AGGYGOPlayerComboLifecycleTestController : public APlayerController
+{
+	GENERATED_BODY()
+public:
+	AGGYGOPlayerComboLifecycleTestController(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+};
 
 /** Native fixture that routes the real GAS Blueprint activation dispatch through ProcessEvent. */
 UCLASS(Transient)

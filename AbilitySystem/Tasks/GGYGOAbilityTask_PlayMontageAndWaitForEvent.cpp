@@ -73,6 +73,10 @@ namespace
 		{
 			Instance->OnMontageBlendingOutStarted.Unbind();
 		}
+		if (Task && Instance->OnMontageSectionChanged.GetUObject() == Task)
+		{
+			Instance->OnMontageSectionChanged.Unbind();
+		}
 
 		UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(OriginalASC.Get());
 		const FAnimMontageInstance* ActiveInstance = Guard->GetActiveInstanceForMontage(Montage);
@@ -114,7 +118,8 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 	}
 	else if (NativeCallbackRegistration.IsValid()) { Reason = TEXT("a native callback package is already registered"); }
 	else if (!Callbacks.OnCompleted.IsBound() && !Callbacks.OnBlendOut.IsBound()
-		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound() && !Callbacks.EventReceived.IsBound())
+		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound()
+		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound())
 	{
 		Reason = TEXT("the native callback package has no bound callbacks");
 	}
@@ -168,8 +173,18 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalCallback(
 	if (Kind == ENativeCallback::EventReceived) { return IsNotifyValid(); }
 	if (Kind != ENativeCallback::Completed && Kind != ENativeCallback::BlendOut
 		&& Kind != ENativeCallback::Interrupted) { return false; }
+	return CanDispatchOriginalInstanceFact(Original);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalInstanceFact(
+	const FGGYGOMontagePlayGuardIdentity& Original) const
+{
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+		|| GetState() == EGameplayTaskState::Finished || !ShouldBroadcastAbilityTaskDelegates()
+		|| !MatchesOriginalMontageCallback(Original)) { return false; }
 	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
-	// Natural Ended remains a fact after blend-out retired ASC ownership or released the instance.
+	// The engine dispatches queued section facts after blend-out and before Ended. These facts,
+	// like natural Ended, do not require current ASC playback ownership or a surviving instance.
 	return Guard && Guard->IsMontagePlayGuardIdentityCurrent(Original) && IsActivatedActorInfoCurrent();
 }
 
@@ -217,6 +232,50 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalCallback(
 	case ENativeCallback::EventReceived: Task->EventReceived.Broadcast(EventTag, EventData); break;
 	}
 	// No member access after BP. Callers with an old cleanup tail reacquire their weak original task.
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalSectionFact(
+	const FGGYGOMontageSectionFact& Fact, const FGGYGOMontagePlayGuardIdentity& Original)
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
+	const auto Recheck = [&]() -> UGGYGOAbilityTask_PlayMontageAndWaitForEvent*
+	{
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+		return Task && OriginalAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Task->Ability))
+			&& OriginalASC.HasSameIndexAndSerialNumber(TWeakObjectPtr<UAbilitySystemComponent>(Task->AbilitySystemComponent.Get()))
+			&& Fact.Montage == Task->MontageToPlay && Fact.MontageInstanceId == Original.CreatedInstanceId
+			&& Task->CanDispatchOriginalInstanceFact(Original) ? Task : nullptr;
+	};
+	if (!Recheck()) { return; }
+	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = NativeCallbackRegistration;
+	if (NativeSnapshot.IsValid()) { NativeSnapshot->Callbacks.SectionReceived.ExecuteIfBound(Fact); }
+	NativeSnapshot.Reset(); // Capture destruction is external code too.
+	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Recheck())
+	{
+		Task->SectionReceived.Broadcast(Fact);
+	}
+	// No member access after BP; the original task may have ended or launched a successor.
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalSectionSnapshot(
+	FGGYGOMontageSectionSnapshot& OutSnapshot) const
+{
+	check(IsInGameThread());
+	OutSnapshot = {};
+	if (!CanDispatchOriginalInstanceFact(OriginalGuardIdentity)) { return false; }
+	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
+	if (!Instance) { return false; } // The exact instance may be blending out after ASC ownership retired.
+	const float Position = Instance->GetPosition();
+	const float InstanceRate = Instance->GetPlayRate();
+	if (!FMath::IsFinite(Position) || !FMath::IsFinite(InstanceRate)) { return false; }
+	OutSnapshot.Montage = MontageToPlay;
+	OutSnapshot.MontageInstanceId = Instance->GetInstanceID();
+	OutSnapshot.SectionName = Instance->GetCurrentSection();
+	OutSnapshot.PositionSeconds = Position;
+	OutSnapshot.InstancePlayRate = InstanceRate;
+	return true;
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(
@@ -394,10 +453,17 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		return;
 	}
 	// Bind the result's exact instance, never the current instance found by asset.
+	if (Instance->OnMontageSectionChanged.IsBound() && Instance->OnMontageSectionChanged.GetUObject() != Task)
+	{
+		Task->FailAndEndTask(TEXT("原实例 Section 委托已由其它对象持有，未覆盖其注册"));
+		return;
+	}
 	Task->BlendingOutDelegate.BindUObject(Task, &ThisClass::OnMontageBlendingOutForInstance, Result.Guard.Identity);
 	Instance->OnMontageBlendingOutStarted = Task->BlendingOutDelegate;
 	Task->MontageEndedDelegate.BindUObject(Task, &ThisClass::OnMontageEndedForInstance, Result.Guard.Identity);
 	Instance->OnMontageEnded = Task->MontageEndedDelegate;
+	Task->MontageSectionChangedDelegate.BindUObject(Task, &ThisClass::OnMontageSectionChangedForInstance, Result.Guard.Identity);
+	Instance->OnMontageSectionChanged = Task->MontageSectionChangedDelegate;
 
 	if (ACharacter* Character = Task->ActivatedCharacter.Get())
 	{
@@ -449,6 +515,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	UnbindTaskMontageDelegates(GetTaskMontageInstance());
 	BlendingOutDelegate.Unbind();
 	MontageEndedDelegate.Unbind();
+	MontageSectionChangedDelegate.Unbind();
 	ReleaseRootMotionScaleLease();
 	if (AbilityEnded && bStopWhenAbilityEnds) { StopPlayingMontage(); }
 	Super::OnDestroy(AbilityEnded);
@@ -513,6 +580,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::UnbindTaskMontageDelegates(FA
 	if (!Instance) { return; }
 	if (Instance->OnMontageBlendingOutStarted.GetUObject() == this) { Instance->OnMontageBlendingOutStarted.Unbind(); }
 	if (Instance->OnMontageEnded.GetUObject() == this) { Instance->OnMontageEnded.Unbind(); }
+	if (Instance->OnMontageSectionChanged.GetUObject() == this) { Instance->OnMontageSectionChanged.Unbind(); }
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RequestInFlightMontageStop()
@@ -615,6 +683,18 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEndedForInstance(
 	UAnimMontage* Montage, bool bInterrupted, FGGYGOMontagePlayGuardIdentity Original)
 {
 	if (MatchesOriginalMontageCallback(Original)) { OnMontageEnded(Montage, bInterrupted); }
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageSectionChangedForInstance(
+	UAnimMontage* Montage, FName SectionName, bool bLooped, FGGYGOMontagePlayGuardIdentity Original)
+{
+	if (Montage != MontageToPlay || !MatchesOriginalMontageCallback(Original)) { return; }
+	FGGYGOMontageSectionFact Fact;
+	Fact.Montage = Montage;
+	Fact.MontageInstanceId = Original.CreatedInstanceId;
+	Fact.SectionName = SectionName;
+	Fact.bLooped = bLooped;
+	DispatchOriginalSectionFact(Fact, Original);
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* Montage, bool bInterrupted)

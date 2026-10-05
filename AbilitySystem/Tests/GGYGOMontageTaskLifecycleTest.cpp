@@ -254,7 +254,7 @@ namespace
 		ACharacter* OriginalAvatar = nullptr;
 		ACharacter* NewAvatar = nullptr;
 		USkeletalMeshComponent* OriginalMesh = nullptr;
-		UGGYGOMontageTaskTestAnimInstance* AnimInstance = nullptr;
+		UGGYGOMontageGuardAnimInstance* AnimInstance = nullptr;
 		UGGYGOAbilitySystemComponent* ASC = nullptr;
 		UGGYGOMontageTaskTestAbility* Ability = nullptr;
 		UAnimMontage* Montage = nullptr;
@@ -298,6 +298,8 @@ namespace
 #if WITH_EDITOR
 			if (Montage->AddAnimCompositeSection(TEXT("Main"), 0.0f) == INDEX_NONE
 				|| Montage->AddAnimCompositeSection(TEXT("End"), 0.5f) == INDEX_NONE) { return false; }
+			Montage->CompositeSections[Montage->GetSectionIndex(TEXT("Main"))].NextSectionName = TEXT("End");
+			Montage->CompositeSections[Montage->GetSectionIndex(TEXT("End"))].NextSectionName = NAME_None;
 #else
 			return false;
 #endif
@@ -334,10 +336,11 @@ namespace
 				Mesh->bEnableUpdateRateOptimizations = true;
 				// Use the built-in, prebuilt test mesh so animation initialization has real LOD data.
 				Mesh->SetSkinnedAssetAndUpdate(MeshAsset);
-				Mesh->SetAnimInstanceClass(UGGYGOMontageTaskTestAnimInstance::StaticClass());
+				Mesh->SetAnimInstanceClass(UGGYGOGuardedMontageStartedTestAnimInstance::StaticClass());
 			}
-			AnimInstance = Cast<UGGYGOMontageTaskTestAnimInstance>(OriginalMesh->GetAnimInstance());
-			if (!AnimInstance || !NewAvatarMesh->GetAnimInstance()) { return false; }
+			AnimInstance = Cast<UGGYGOMontageGuardAnimInstance>(OriginalMesh->GetAnimInstance());
+			UGGYGOMontageGuardAnimInstance* NewAvatarAnim = Cast<UGGYGOMontageGuardAnimInstance>(NewAvatarMesh->GetAnimInstance());
+			if (!AnimInstance || !AnimInstance->IsInitialized() || !NewAvatarAnim || !NewAvatarAnim->IsInitialized()) { return false; }
 
 			ASC = NewObject<UGGYGOAbilitySystemComponent>(OriginalAvatar);
 			if (!ASC) { return false; }
@@ -358,6 +361,174 @@ namespace
 			? UGGYGOAbilityTask_PlayMontageAndWaitForEvent::PlayMontageAndWaitForEvent(
 				Ability, InstanceName, Montage, FGameplayTagContainer(), Rate, NAME_None, bStopWhenAbilityEnds, RootMotionScale)
 			: nullptr;
+	}
+}
+
+namespace
+{
+	// Necessary section-source checks reuse this fixture and the existing guarded leaf.
+	// The original native/synthetic lifecycle assertions and diagnostic matrix stay intact.
+	bool RunGGYGOMontageTaskSectionContract(FAutomationTestBase& Test)
+	{
+		FScopedMontageTaskTestWorld TestWorld(GEngine);
+		if (!Test.TestNotNull(TEXT("Section 测试世界"), TestWorld.World)) { return false; }
+		FGGYGOMontageTaskTestFixture SectionFixture;
+		if (!Test.TestTrue(TEXT("Section 原实例夹具初始化"), SectionFixture.Initialize(TestWorld.World))) { return false; }
+		FScopedActiveMontageTestAbility SectionAbilityCleanup{SectionFixture.Ability};
+		SectionFixture.OriginalMesh->SetAnimInstanceClass(UGGYGOGuardedMontageStartedTestAnimInstance::StaticClass());
+		UGGYGOMontageGuardAnimInstance* SectionAnim = Cast<UGGYGOMontageGuardAnimInstance>(
+			SectionFixture.OriginalMesh->GetAnimInstance());
+		if (!Test.TestTrue(TEXT("Section 使用真实已初始化 Guard"), SectionAnim && SectionAnim->IsInitialized())) { return false; }
+		UAnimMontage* SectionMontage = SectionFixture.Montage;
+		SectionMontage->CompositeSections[SectionMontage->GetSectionIndex(TEXT("Main"))].NextSectionName = TEXT("End");
+		SectionMontage->CompositeSections[SectionMontage->GetSectionIndex(TEXT("End"))].NextSectionName = NAME_None;
+		SectionMontage->BlendOut.SetBlendTime(0.25f);
+		SectionMontage->BlendOutTriggerTime = -1.0f;
+		SectionMontage->bEnableAutoBlendOut = true;
+		auto StartSectionTask = [&](FName InstanceName, float StartTime,
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks)
+		{
+			SectionFixture.Ability->FinishForTest();
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Started = nullptr;
+			SectionFixture.Ability->SetK2ActivateActionForTest(
+				[&, InstanceName, StartTime, Callbacks = MoveTemp(Callbacks)]() mutable
+				{
+					Started = CreateMontageTask(SectionFixture.Ability, SectionMontage, InstanceName);
+					if (!Started) { return; }
+					Test.TestTrue(TEXT("Section-only native 包可按原契约注册"),
+						Started->RegisterNativeCallbacks(MoveTemp(Callbacks)).IsValid());
+					Started->SetStartTimeSeconds(StartTime);
+					Started->ReadyForActivation();
+				});
+			Test.TestTrue(TEXT("Section 原能力真实激活"), SectionFixture.ASC->TryActivateAbility(SectionFixture.AbilityHandle));
+			Test.TestTrue(TEXT("Section Task 原 Ready 播放成功"), Started && Started->IsActive());
+			return Started;
+		};
+
+		TArray<FName> SectionOrder;
+		FGGYGOMontageSectionFact LastSectionFact;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks SectionCallbacks;
+		SectionCallbacks.OnBlendOut.BindLambda([&](FGameplayTag, FGameplayEventData) { SectionOrder.Add(TEXT("BlendOut")); });
+		SectionCallbacks.SectionReceived.BindLambda([&](const FGGYGOMontageSectionFact& Fact)
+		{
+			LastSectionFact = Fact;
+			SectionOrder.Add(Fact.SectionName);
+		});
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* SectionTask = StartSectionTask(
+			TEXT("NaturalSectionFact"), 0.0f, MoveTemp(SectionCallbacks));
+		if (!Test.TestNotNull(TEXT("自然转段 Task"), SectionTask)) { return false; }
+		FGGYGOMontageSectionSnapshot SectionBefore;
+		if (!Test.TestTrue(TEXT("Ready 后原 Main 快照可读"), SectionTask->TryGetOriginalSectionSnapshot(SectionBefore))) { return false; }
+		Test.TestEqual(TEXT("初始原区段 Main"), SectionBefore.SectionName, FName(TEXT("Main")));
+		Test.TestEqual(TEXT("初始原位置 0"), SectionBefore.PositionSeconds, 0.0f);
+		// Real engine tick queues BlendOut before SectionChanged in this same-frame crossing.
+		SectionAnim->TickMontageOnly(0.9f / SectionTask->GetEffectivePlayRate());
+		Test.TestTrue(TEXT("自然 Main→End 原事实送达"), SectionOrder.Contains(TEXT("End")));
+		Test.TestTrue(TEXT("同帧混出后仍接原 Section 事实"), SectionOrder.Contains(TEXT("BlendOut"))
+			&& SectionOrder.IndexOfByKey(FName(TEXT("BlendOut"))) < SectionOrder.IndexOfByKey(FName(TEXT("End"))));
+		Test.TestEqual(TEXT("Section 事实来自原 Montage"), LastSectionFact.Montage.Get(), SectionMontage);
+		Test.TestEqual(TEXT("Section 事实来自原 instance ID"), LastSectionFact.MontageInstanceId, SectionBefore.MontageInstanceId);
+		Test.TestFalse(TEXT("自然跨段不是 loop"), LastSectionFact.bLooped);
+		FGGYGOMontageSectionSnapshot BlendOutSnapshot;
+		Test.TestTrue(TEXT("原混出尾部快照仍可读"), SectionTask->TryGetOriginalSectionSnapshot(BlendOutSnapshot));
+		Test.TestTrue(TEXT("尾部快照仍为原实例 End"), BlendOutSnapshot.MontageInstanceId == SectionBefore.MontageInstanceId
+			&& BlendOutSnapshot.SectionName == FName(TEXT("End")));
+		SectionFixture.Ability->FinishForTest();
+
+		int32 InitialSectionEvents = 0;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks InitialCallbacks;
+		InitialCallbacks.SectionReceived.BindLambda([&](const FGGYGOMontageSectionFact&) { ++InitialSectionEvents; });
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* InitialEndTask = StartSectionTask(
+			TEXT("InitialEndSnapshot"), 0.75f, MoveTemp(InitialCallbacks));
+		if (!Test.TestNotNull(TEXT("非零位置 Task"), InitialEndTask)) { return false; }
+		FGGYGOMontageSectionSnapshot InitialEnd;
+		if (!Test.TestTrue(TEXT("非零位置 Ready 原快照可读"), InitialEndTask->TryGetOriginalSectionSnapshot(InitialEnd))) { return false; }
+		Test.TestEqual(TEXT("初始真实区段 End，不假报 Main"), InitialEnd.SectionName, FName(TEXT("End")));
+		Test.TestEqual(TEXT("初始真实位置 0.75"), InitialEnd.PositionSeconds, 0.75f);
+		Test.TestEqual(TEXT("原 instance rate 不含资产 RateScale"), InitialEnd.InstancePlayRate, InitialEndTask->GetEffectivePlayRate() / SectionMontage->RateScale);
+		Test.TestEqual(TEXT("初始快照未伪造 section-change 事件"), InitialSectionEvents, 0);
+		FAnimMontageInstance* InitialInstance = SectionAnim->GetMontageInstanceForID(InitialEnd.MontageInstanceId);
+		if (!Test.TestNotNull(TEXT("非零位置精确原实例"), InitialInstance)) { return false; }
+		InitialInstance->SetPlayRate(0.0f);
+		Test.TestTrue(TEXT("原实例暂停仍可读事实"), InitialEndTask->TryGetOriginalSectionSnapshot(InitialEnd));
+		Test.TestEqual(TEXT("零 instance rate 如实报告，不回落名义速率"), InitialEnd.InstancePlayRate, 0.0f);
+		SectionFixture.Ability->FinishForTest();
+		Test.TestFalse(TEXT("结束 Task 不重放初始快照"), InitialEndTask->TryGetOriginalSectionSnapshot(InitialEnd));
+		Test.TestTrue(TEXT("失败快照清空原源"), InitialEnd.Montage == nullptr && InitialEnd.MontageInstanceId == INDEX_NONE);
+
+		int32 RetiredSectionEvents = 0;
+		int32 SuccessorSectionEvents = 0;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks RetiredCallbacks;
+		RetiredCallbacks.SectionReceived.BindLambda([&](const FGGYGOMontageSectionFact&) { ++RetiredSectionEvents; });
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* RetiredTask = StartSectionTask(
+			TEXT("QueuedOriginalSection"), 0.0f, MoveTemp(RetiredCallbacks));
+		if (!Test.TestNotNull(TEXT("待退休原 Task"), RetiredTask)) { return false; }
+		FGGYGOMontageSectionSnapshot RetiredSnapshot;
+		if (!Test.TestTrue(TEXT("退休前原快照"), RetiredTask->TryGetOriginalSectionSnapshot(RetiredSnapshot))) { return false; }
+		FAnimMontageInstance* RetiredInstance = SectionAnim->GetMontageInstanceForID(RetiredSnapshot.MontageInstanceId);
+		if (!Test.TestNotNull(TEXT("退休前精确原实例"), RetiredInstance)) { return false; }
+		// Retain exactly the delegate copy that an engine queued event retains, then dispatch
+		// it through the engine queue entry after unregister/owner end and same-asset successor.
+		const FQueuedMontageSectionChangedEvent RetiredQueuedFact(SectionMontage,
+			RetiredSnapshot.MontageInstanceId, TEXT("End"), false, RetiredInstance->OnMontageSectionChanged);
+		RetiredTask->TaskOwnerEnded();
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks SuccessorCallbacks;
+		SuccessorCallbacks.SectionReceived.BindLambda([&](const FGGYGOMontageSectionFact&) { ++SuccessorSectionEvents; });
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* SectionSuccessor = StartSectionTask(
+			TEXT("SameAssetSectionSuccessor"), 0.75f, MoveTemp(SuccessorCallbacks));
+		if (!Test.TestNotNull(TEXT("同资产后继 Task"), SectionSuccessor)) { return false; }
+		FGGYGOMontageSectionSnapshot SuccessorBefore;
+		if (!Test.TestTrue(TEXT("后继原快照"), SectionSuccessor->TryGetOriginalSectionSnapshot(SuccessorBefore))) { return false; }
+		SectionAnim->QueueMontageSectionChangedEvent(RetiredQueuedFact);
+		// Public native dispatch processes the retained queue without advancing the successor.
+		SectionAnim->DispatchQueuedAnimEvents();
+		FGGYGOMontageSectionSnapshot SuccessorAfter;
+		Test.TestTrue(TEXT("旧队列派发后后继仍可读"), SectionSuccessor->TryGetOriginalSectionSnapshot(SuccessorAfter));
+		Test.TestEqual(TEXT("退休原包未收到旧队列"), RetiredSectionEvents, 0);
+		Test.TestEqual(TEXT("旧队列未冒认同资产后继"), SuccessorSectionEvents, 0);
+		Test.TestTrue(TEXT("后继 instance/区段/位置/rate 保持"), SuccessorAfter.MontageInstanceId != RetiredSnapshot.MontageInstanceId
+			&& SuccessorAfter.MontageInstanceId == SuccessorBefore.MontageInstanceId
+			&& SuccessorAfter.SectionName == SuccessorBefore.SectionName
+			&& SuccessorAfter.PositionSeconds == SuccessorBefore.PositionSeconds
+			&& SuccessorAfter.InstancePlayRate == SuccessorBefore.InstancePlayRate);
+		SectionFixture.Ability->FinishForTest();
+
+		int32 ReentrantSectionEvents = 0;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ReentrantSectionTask = nullptr;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ReentrantSectionSuccessor = nullptr;
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks ReentrantCallbacks;
+		ReentrantCallbacks.SectionReceived.BindLambda([&](const FGGYGOMontageSectionFact&)
+		{
+			++ReentrantSectionEvents;
+			ReentrantSectionTask->TaskOwnerEnded();
+			ReentrantSectionSuccessor = CreateMontageTask(SectionFixture.Ability, SectionMontage, TEXT("SectionCallbackSuccessor"));
+			if (ReentrantSectionSuccessor)
+			{
+				ReentrantSectionSuccessor->SetStartTimeSeconds(0.75f);
+				ReentrantSectionSuccessor->ReadyForActivation();
+			}
+		});
+		ReentrantSectionTask = StartSectionTask(TEXT("SectionCallbackOwnerEnd"), 0.0f, MoveTemp(ReentrantCallbacks));
+		if (!Test.TestNotNull(TEXT("区段回调重入 Task"), ReentrantSectionTask)) { return false; }
+		FGGYGOMontageSectionSnapshot ReentrantBefore;
+		if (!Test.TestTrue(TEXT("重入前原快照"), ReentrantSectionTask->TryGetOriginalSectionSnapshot(ReentrantBefore))) { return false; }
+		FAnimMontageInstance* ReentrantInstance = SectionAnim->GetMontageInstanceForID(ReentrantBefore.MontageInstanceId);
+		if (!Test.TestNotNull(TEXT("重入前原实例"), ReentrantInstance)) { return false; }
+		const FQueuedMontageSectionChangedEvent ReentrantQueuedFact(SectionMontage,
+			ReentrantBefore.MontageInstanceId, TEXT("End"), false, ReentrantInstance->OnMontageSectionChanged);
+		SectionAnim->QueueMontageSectionChangedEvent(ReentrantQueuedFact);
+		SectionAnim->DispatchQueuedAnimEvents();
+		Test.TestEqual(TEXT("原区段回调仅一次"), ReentrantSectionEvents, 1);
+		Test.TestTrue(TEXT("原回调结束原 Task"), ReentrantSectionTask->IsFinished());
+		FGGYGOMontageSectionSnapshot ReentrantAfter;
+		Test.TestTrue(TEXT("回调后后继保持独立原资源"), ReentrantSectionSuccessor
+			&& ReentrantSectionSuccessor->TryGetOriginalSectionSnapshot(ReentrantAfter)
+			&& ReentrantAfter.MontageInstanceId != ReentrantBefore.MontageInstanceId
+			&& ReentrantAfter.SectionName == FName(TEXT("End")) && ReentrantAfter.PositionSeconds == 0.75f);
+		Test.TestFalse(TEXT("重入后原快照资格关闭"), ReentrantSectionTask->TryGetOriginalSectionSnapshot(ReentrantBefore));
+		SectionFixture.Ability->FinishForTest();
+
+		return true;
 	}
 }
 
@@ -383,8 +554,15 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 		|| !TestNotNull(TEXT("由 Mesh 所有的原 AnimInstance"), Fixture.AnimInstance)
 			|| !TestNotNull(TEXT("有效 SkeletalMesh/Skeleton Montage"), Fixture.Montage)) { return false; }
 	UAnimMontage* Montage = Fixture.Montage;
-	UGGYGOMontageTaskTestAnimInstance* AnimInstance = Fixture.AnimInstance;
-	FScopedMontageInstances MontageInstances(AnimInstance);
+	UGGYGOMontageGuardAnimInstance* AnimInstance = Fixture.AnimInstance;
+	UGGYGOMontageStartedDiagnosticObserver* StartedObserver = NewObject<UGGYGOMontageStartedDiagnosticObserver>(OriginalAvatar);
+	if (!TestNotNull(TEXT("原生创建回调观察器"), StartedObserver)) { return false; }
+	struct FScopedLifecycleStartedObserver
+	{
+		UGGYGOMontageStartedDiagnosticObserver* Observer;
+		~FScopedLifecycleStartedObserver() { if (IsValid(Observer)) { Observer->DisarmForTest(); } }
+	} StartedObserverCleanup{StartedObserver};
+	int32 NativeCreatedPlayCount = 0;
 
 	// Use a non-one engine cvar and restore its value and priority through RAII.
 	Montage->RateScale = 0.5f;
@@ -496,21 +674,23 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	}
 	Ability->FinishForTest();
 
-	// End the owning ability from Montage_PlayInternal after Super has created its instance.
+	// Real engine Started runs inside Montage_PlayInternal after creation, before the guarded
+	// native return. The legacy unguarded after-Super hook is not a legal Task play source.
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* SynchronousEndTask = nullptr;
 	Ability->SetK2ActivateActionForTest([&]
 	{
 		SynchronousEndTask = CreateMontageTask(Ability, Montage, TEXT("SynchronousOwnerEnd"));
 		if (SynchronousEndTask) { SynchronousEndTask->ReadyForActivation(); }
 	});
-	AnimInstance->SetAfterSuperMontagePlayActionForTest([&]
+	StartedObserver->ArmForTest(AnimInstance, Montage, [&]
 	{
+		++NativeCreatedPlayCount;
 		Ability->FinishForTest();
 	});
-	const int32 PlayCountBeforeSynchronousEnd = AnimInstance->GetSuccessfulSuperMontagePlayCountForTest();
+	const int32 PlayCountBeforeSynchronousEnd = NativeCreatedPlayCount;
 	ASC->TryActivateAbility(Fixture.AbilityHandle);
 	TestEqual(TEXT("同步结束用例进入真实 Super Montage_PlayInternal"),
-		AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), PlayCountBeforeSynchronousEnd + 1);
+		NativeCreatedPlayCount, PlayCountBeforeSynchronousEnd + 1);
 	TestFalse(TEXT("真实回调中结束的 ability 保持结束"), Ability->IsActive());
 	TestFalse(TEXT("无嵌套后继的同步 TaskOwnerEnded 清理刚创建的孤儿播放"),
 		AnimInstance->Montage_IsActive(Montage));
@@ -526,19 +706,21 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 		if (OuterReentrantTask) { OuterReentrantTask->ReadyForActivation(); }
 	});
 	bool bReactivatedDuringOuterPlay = false;
-	AnimInstance->SetAfterSuperMontagePlayActionForTest([&]
+	StartedObserver->ArmForTest(AnimInstance, Montage, [&]
 	{
+		++NativeCreatedPlayCount;
+		StartedObserver->ArmForTest(AnimInstance, Montage, [&] { ++NativeCreatedPlayCount; });
 		bReactivatedDuringOuterPlay = Ability->EndAndReactivateForTest([&]
 		{
 			NestedSuccessorTask = CreateMontageTask(Ability, Montage, TEXT("NestedSuccessor"), 1.0f, true, 0.55f);
 			if (NestedSuccessorTask) { NestedSuccessorTask->ReadyForActivation(); }
 		});
 	});
-	const int32 PlayCountBeforeNestedReactivation = AnimInstance->GetSuccessfulSuperMontagePlayCountForTest();
+	const int32 PlayCountBeforeNestedReactivation = NativeCreatedPlayCount;
 	ASC->TryActivateAbility(Fixture.AbilityHandle);
 	TestTrue(TEXT("Montage_PlayInternal 回调同步 End 并重激活成功"), bReactivatedDuringOuterPlay);
 	TestEqual(TEXT("外层与嵌套任务均通过真实 Montage_PlayInternal"),
-		AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), PlayCountBeforeNestedReactivation + 2);
+		NativeCreatedPlayCount, PlayCountBeforeNestedReactivation + 2);
 	TestNotNull(TEXT("嵌套 successor task 建立"), NestedSuccessorTask);
 	if (NestedSuccessorTask)
 	{
@@ -555,43 +737,49 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	Ability->FinishForTest();
 	TestEqual(TEXT("结束 successor 后恢复原 root scale"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
 
-	// Rebind the ASC to the new avatar while keeping all cleanup assertions on the original mesh.
-	ASC->InitAbilityActorInfo(OriginalAvatar, NewAvatar);
+	// Obtain each cleanup resource from a real Ready call before invalidating its ActorInfo.
+	// A same-asset successor plays on the new Avatar's actual mesh, so both exact instances
+	// can coexist legally without manufacturing an engine instance ID or guard identity.
+	auto StartOriginalCleanupTask = [&](FName InstanceName, float RootScale)
+	{
+		Ability->FinishForTest();
+		ASC->InitAbilityActorInfo(OriginalAvatar, OriginalAvatar);
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Started = nullptr;
+		Ability->SetK2ActivateActionForTest([&, InstanceName, RootScale]
+		{
+			Started = CreateMontageTask(Ability, Montage, InstanceName, 1.0f, true, RootScale);
+			if (Started) { Started->ReadyForActivation(); }
+		});
+		TestTrue(TEXT("清理夹具原能力真实激活"), ASC->TryActivateAbility(Fixture.AbilityHandle));
+		TestTrue(TEXT("清理夹具原 Task 有原生签发身份"), Started && Started->IsActive()
+			&& Started->OriginalGuardIdentity.CallId != 0
+			&& AnimInstance->IsMontagePlayGuardIdentityCurrent(Started->OriginalGuardIdentity)
+			&& Started->GetTaskMontageInstance());
+		return Started;
+	};
+	auto StartNewAvatarSuccessor = [&](FName InstanceName)
+	{
+		ASC->InitAbilityActorInfo(OriginalAvatar, NewAvatar);
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Successor = CreateMontageTask(
+			Ability, Montage, InstanceName, 1.0f, true, 0.75f);
+		if (Successor) { Successor->ReadyForActivation(); }
+		TestTrue(TEXT("同资产后继在新 Avatar 有真实播放身份"), Successor && Successor->IsActive()
+			&& Successor->GetTaskMontageInstance()
+			&& Successor->ActivatedAnimInstance.Get() == NewAvatar->GetMesh()->GetAnimInstance());
+		return Successor;
+	};
+
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* EndTaskOwner = StartOriginalCleanupTask(
+		TEXT("EndTaskKeepsMontage"), 0.25f);
+	if (!TestNotNull(TEXT("EndTask 生命周期夹具"), EndTaskOwner)) { return false; }
+	FAnimMontageInstance* OldInstance = EndTaskOwner->GetTaskMontageInstance();
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* SameAssetSuccessorTask = StartNewAvatarSuccessor(TEXT("EndTaskSameAssetSuccessor"));
+	FAnimMontageInstance* SameAssetSuccessor = SameAssetSuccessorTask ? SameAssetSuccessorTask->GetTaskMontageInstance() : nullptr;
+	if (!TestNotNull(TEXT("旧 Montage instance"), OldInstance)
+		|| !TestNotNull(TEXT("同資產新 instance"), SameAssetSuccessor)) { return false; }
 	TestTrue(TEXT("ASC 已绑定新 Avatar 与新 AnimInstance"),
 		ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->AvatarActor.Get() == NewAvatar
 			&& ASC->AbilityActorInfo->GetAnimInstance() == NewAvatar->GetMesh()->GetAnimInstance());
-
-	// Manually owned instances below isolate exact-ID cleanup from ASC playback state.
-	FAnimMontageInstance* OldInstance = MontageInstances.Add(Montage);
-	FAnimMontageInstance* SameAssetSuccessor = MontageInstances.Add(Montage);
-	if (!TestNotNull(TEXT("旧 Montage instance"), OldInstance)
-		|| !TestNotNull(TEXT("同資產新 instance"), SameAssetSuccessor)) { return false; }
-
-	auto PrepareCapturedTask = [&](UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task,
-		FAnimMontageInstance* Instance, bool bBindDelegates)
-	{
-		Task->ActivatedAvatarActor = OriginalAvatar;
-		Task->ActivatedCharacter = OriginalAvatar;
-		Task->ActivatedAnimInstance = AnimInstance;
-		Task->ActivatedASC = ASC;
-		Task->MontageInstanceId = Instance ? Instance->GetInstanceID() : INDEX_NONE;
-		Task->bStopWhenAbilityEnds = true;
-		if (bBindDelegates && Instance)
-		{
-			Task->BlendingOutDelegate.BindUObject(Task,
-				&UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut);
-			Task->MontageEndedDelegate.BindUObject(Task,
-				&UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded);
-			Instance->OnMontageBlendingOutStarted = Task->BlendingOutDelegate;
-			Instance->OnMontageEnded = Task->MontageEndedDelegate;
-		}
-	};
-
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* EndTaskOwner = CreateMontageTask(
-		Ability, Montage, TEXT("EndTaskKeepsMontage"));
-	if (!TestNotNull(TEXT("EndTask 生命周期夹具"), EndTaskOwner)) { return false; }
-	PrepareCapturedTask(EndTaskOwner, OldInstance, true);
-	EndTaskOwner->RootMotionScaleLeaseToken = FGGYGORootMotionScaleLease::Acquire(OriginalAvatar, EndTaskOwner, 0.25f);
 	TestFalse(TEXT("ActorInfo 已切换到新 Avatar"), EndTaskOwner->IsActivatedActorInfoCurrent());
 	EndTaskOwner->EndTask();
 	TestTrue(TEXT("普通 EndTask 结束 Task"), EndTaskOwner->IsFinished());
@@ -606,11 +794,14 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("清理未覆盖 ASC 的新 Avatar ActorInfo"),
 		ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->AvatarActor.Get() == NewAvatar);
 
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* CancelTask = CreateMontageTask(
-		Ability, Montage, TEXT("CancelExactInstance"));
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* CancelTask = StartOriginalCleanupTask(
+		TEXT("CancelExactInstance"), 0.4f);
 	if (!TestNotNull(TEXT("取消夹具"), CancelTask)) { return false; }
-	PrepareCapturedTask(CancelTask, OldInstance, true);
-	CancelTask->RootMotionScaleLeaseToken = FGGYGORootMotionScaleLease::Acquire(OriginalAvatar, CancelTask, 0.4f);
+	OldInstance = CancelTask->GetTaskMontageInstance();
+	SameAssetSuccessorTask = StartNewAvatarSuccessor(TEXT("CancelSameAssetSuccessor"));
+	SameAssetSuccessor = SameAssetSuccessorTask ? SameAssetSuccessorTask->GetTaskMontageInstance() : nullptr;
+	if (!TestNotNull(TEXT("取消前精确旧原实例"), OldInstance)
+		|| !TestNotNull(TEXT("取消前新 Avatar 后继实例"), SameAssetSuccessor)) { return false; }
 	CancelTask->ExternalCancel();
 	TestTrue(TEXT("ExternalCancel 结束 Task"), CancelTask->IsFinished());
 	TestTrue(TEXT("Avatar 切换后取消旧 instance"), OldInstance->IsStopped());
@@ -618,13 +809,14 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("取消释放原角色 scale"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
 	TestEqual(TEXT("取消不改新 Avatar scale"), NewAvatar->GetAnimRootMotionTranslationScale(), 0.75f);
 
-	FAnimMontageInstance* NestedSameAssetSuccessor = MontageInstances.Add(Montage);
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* AbilityEndedTask = CreateMontageTask(
-		Ability, Montage, TEXT("AbilityEndedExactInstance"));
-	if (!TestNotNull(TEXT("能力结束夹具"), AbilityEndedTask)
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* AbilityEndedTask = StartOriginalCleanupTask(
+		TEXT("AbilityEndedExactInstance"), 0.3f);
+	if (!TestNotNull(TEXT("能力结束夹具"), AbilityEndedTask)) { return false; }
+	SameAssetSuccessor = AbilityEndedTask->GetTaskMontageInstance();
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* NestedSameAssetSuccessorTask = StartNewAvatarSuccessor(TEXT("OwnerEndSameAssetSuccessor"));
+	FAnimMontageInstance* NestedSameAssetSuccessor = NestedSameAssetSuccessorTask ? NestedSameAssetSuccessorTask->GetTaskMontageInstance() : nullptr;
+	if (!TestNotNull(TEXT("能力结束前原实例"), SameAssetSuccessor)
 		|| !TestNotNull(TEXT("嵌套同資產 successor"), NestedSameAssetSuccessor)) { return false; }
-	PrepareCapturedTask(AbilityEndedTask, SameAssetSuccessor, true);
-	AbilityEndedTask->RootMotionScaleLeaseToken = FGGYGORootMotionScaleLease::Acquire(OriginalAvatar, AbilityEndedTask, 0.3f);
 	AbilityEndedTask->TaskOwnerEnded();
 	TestTrue(TEXT("能力结束清理 Task"), AbilityEndedTask->IsFinished());
 	TestTrue(TEXT("AbilityEnded 停止本任务的准确旧 instance"), SameAssetSuccessor->IsStopped());
@@ -632,20 +824,16 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("AbilityEnded 释放原角色 scale"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
 	TestEqual(TEXT("AbilityEnded 不改新 Avatar scale"), NewAvatar->GetAnimRootMotionTranslationScale(), 0.75f);
 
-	FAnimMontageInstance* NaturalInstance = MontageInstances.Add(Montage);
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* NaturalEndTask = CreateMontageTask(
-		Ability, Montage, TEXT("NaturalBlendOut"));
-	if (!TestNotNull(TEXT("自然混出夹具"), NaturalEndTask)
-		|| !TestNotNull(TEXT("自然结束 Montage instance"), NaturalInstance)) { return false; }
-	PrepareCapturedTask(NaturalEndTask, NaturalInstance, true);
-	NaturalEndTask->RootMotionScaleLeaseToken = FGGYGORootMotionScaleLease::Acquire(
-		OriginalAvatar, NaturalEndTask, 0.6f);
-	NaturalEndTask->OnMontageBlendingOut(Montage, false);
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* NaturalEndTask = StartOriginalCleanupTask(
+		TEXT("NaturalBlendOut"), 0.6f);
+	if (!TestNotNull(TEXT("自然混出夹具"), NaturalEndTask)) { return false; }
+	FAnimMontageInstance* NaturalInstance = NaturalEndTask->GetTaskMontageInstance();
+	if (!TestNotNull(TEXT("自然结束 Montage instance"), NaturalInstance)) { return false; }
+	AnimInstance->TickMontageOnly(0.9f / NaturalEndTask->GetEffectivePlayRate());
 	TestEqual(TEXT("自然混出立刻释放 root scale"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
-	NaturalEndTask->OnMontageEnded(Montage, false);
+	AnimInstance->TickMontageOnly(0.5f / NaturalEndTask->GetEffectivePlayRate());
 	TestTrue(TEXT("自然结束结束 Task"), NaturalEndTask->IsFinished());
 	TestEqual(TEXT("自然结束重复释放安全"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
-
 	return true;
 }
 
@@ -1247,6 +1435,7 @@ bool FGuardedMontageStartedSuccessorPreservationTest::RunTest(const FString& Par
 	bool bPreserved = RunGuardedMontageStartedScenario(*this, false);
 	// &= evaluates the isolated same-asset case even when the different-asset case failed.
 	bPreserved &= RunGuardedMontageStartedScenario(*this, true);
+	bPreserved &= RunGGYGOMontageTaskSectionContract(*this);
 	return bPreserved;
 }
 #endif

@@ -3,6 +3,7 @@
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/BlendSpace1D.h"
+#include "Animation/AnimCurveTypes.h"
 #include "Curves/RichCurve.h"
 #include "GameFramework/Character.h"
 #if WITH_DEV_AUTOMATION_TESTS
@@ -12,7 +13,7 @@
 
 #include "GGYGOLocomotionMovementTestTypes.generated.h"
 
-/** Test data implements the actual public Sequence curve contract; production never reads these copies. */
+/** Mock values implement public scalar/collection contracts; real Model evidence uses native UAnimSequence. */
 UCLASS(Transient)
 class UGGYGOLocomotionTestSequence : public UAnimSequence
 {
@@ -26,6 +27,12 @@ public:
 	{
 		const FRichCurve* Curve = TestCurves.Find(Name);
 		return Curve ? Curve->Eval(static_cast<float>(Context.CurrentTime)) : 0.0f;
+	}
+	virtual void EvaluateCurveData(FBlendedCurve& OutCurve, const FAnimExtractContext& Context, bool bForceUseRawData) const override
+	{
+		OutCurve.Empty();
+		for (const TPair<FName, FRichCurve>& Curve : TestCurves)
+			OutCurve.Set(Curve.Key, Curve.Value.Eval(static_cast<float>(Context.CurrentTime)));
 	}
 };
 

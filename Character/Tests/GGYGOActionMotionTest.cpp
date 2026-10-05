@@ -2,11 +2,18 @@
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
 #include "Character/Data/GGYGOActionMotionProfile.h"
+#include "Character/Data/GGYGOActionMotionEvaluation.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "Animation/AnimData/IAnimationDataModel.h"
+#include "Animation/Skeleton.h"
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Curves/CurveVector.h"
+#include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "Misc/AutomationTest.h"
@@ -216,6 +223,101 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	EndedMove->PhysicsRotation(NativeTick);
 	TestTrue(TEXT("Prepared finished marked final frame keeps heading after explicit owner cleanup"),
 		EndedCharacter->GetActorRotation().Equals(EndedHeading, .001));
+
+	// The new mode reads the original sequence, including a nonzero cumulative origin and loop boundary.
+	// Keep this in the original timing/ownership leaf; none of the legacy final-frame assertions are replaced.
+#if WITH_EDITOR
+	USkeletalMesh* OriginalLoopFixtureMesh = LoadObject<USkeletalMesh>(nullptr,
+		TEXT("/Engine/EngineMeshes/SkeletalCube.SkeletalCube"));
+	if (!TestNotNull(TEXT("Original sequence fixture requires a real skeletal mesh"), OriginalLoopFixtureMesh)) return false;
+	USkeleton* OriginalLoopSourceSkeleton = OriginalLoopFixtureMesh->GetSkeleton();
+	if (!TestNotNull(TEXT("Original sequence fixture requires the mesh skeleton"), OriginalLoopSourceSkeleton)) return false;
+	// Curve model edits and slot registration must never change the loaded Engine skeleton.
+	USkeleton* OriginalLoopFixtureSkeleton = DuplicateObject<USkeleton>(OriginalLoopSourceSkeleton, Character);
+	if (!TestNotNull(TEXT("Original sequence fixture owns a skeleton copy"), OriginalLoopFixtureSkeleton)) return false;
+	OriginalLoopFixtureSkeleton->SetFlags(RF_Transient);
+	if (!TestTrue(TEXT("Original sequence fixture has real reference bones on its private skeleton"),
+		OriginalLoopFixtureSkeleton != OriginalLoopSourceSkeleton
+		&& OriginalLoopFixtureSkeleton->GetReferenceSkeleton().GetNum() > 0)) return false;
+	UAnimSequence* OriginalSequence = NewObject<UAnimSequence>(Character, NAME_None, RF_Transient);
+	OriginalSequence->SetSkeleton(OriginalLoopFixtureSkeleton);
+	IAnimationDataController& Controller = OriginalSequence->GetController();
+	Controller.InitializeModel();
+	Controller.SetFrameRate(FFrameRate(30, 1), false);
+	Controller.SetNumberOfFrames(FFrameNumber(30), false);
+	const FName OriginalLoopPositionCurveNames[] = {TEXT("RootMotion_PosX"), TEXT("RootMotion_PosY"), TEXT("RootMotion_PosZ")};
+	for (int32 Axis = 0; Axis < 3; ++Axis)
+	{
+		const FAnimationCurveIdentifier Id(OriginalLoopPositionCurveNames[Axis], ERawCurveTrackTypes::RCT_Float);
+		FRichCurveKey OriginalPositionStartKey(0.0f, Axis == 0 ? 47.0f : 0.0f);
+		FRichCurveKey OriginalPositionEndKey(1.0f, Axis == 0 ? 147.0f : 0.0f);
+		OriginalPositionStartKey.InterpMode = OriginalPositionEndKey.InterpMode = RCIM_Linear;
+		if (!TestTrue(TEXT("Original cumulative source curve is installed"),
+			Controller.AddCurve(Id, 4, false) && Controller.SetCurveKeys(Id, {OriginalPositionStartKey, OriginalPositionEndKey}, false))) return false;
+	}
+	Controller.NotifyPopulated();
+	UAnimMontage* OriginalMontage = NewObject<UAnimMontage>(Character, NAME_None, RF_Transient);
+	OriginalMontage->SetSkeleton(OriginalLoopFixtureSkeleton);
+	OriginalMontage->SetCompositeLength(2.0f);
+	OriginalMontage->SlotAnimTracks.SetNum(1);
+	OriginalMontage->SlotAnimTracks[0].SlotName = TEXT("FullBody");
+	FAnimSegment Segment;
+	Segment.SetAnimReference(OriginalSequence);
+	Segment.StartPos = 0.0f;
+	Segment.AnimStartTime = 0.0f;
+	Segment.AnimEndTime = 1.0f;
+	Segment.AnimPlayRate = 1.0f;
+	Segment.LoopingCount = 2;
+	OriginalMontage->SlotAnimTracks[0].AnimTrack.AnimSegments.Add(Segment);
+	OriginalMontage->AddAnimCompositeSection(TEXT("Main"), 0.0f);
+	FGGYGOActionMotionSourceBindingPtr OriginalBinding;
+	if (!TestTrue(TEXT("Original looped montage source resolves without a curve copy"),
+		GGYGOActionMotionSource::BuildSourceBinding(OriginalMontage, TEXT("FullBody"), TEXT("Main"), OriginalBinding, Error))) return false;
+	FVector OriginalDelta;
+	TestTrue(TEXT("Original cumulative loop boundary evaluates"),
+		GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, 0.5f, 1.5f, OriginalDelta, Error));
+	if (!OriginalDelta.Equals(FVector(100.0, 0.0, 0.0), .001))
+	{
+		AddInfo(FString::Printf(TEXT("Action loop actual delta=(%.9g,%.9g,%.9g), expected=(100,0,0); evaluation=%s"),
+			OriginalDelta.X, OriginalDelta.Y, OriginalDelta.Z, *Error));
+		const IAnimationDataModel* OriginalLoopModel = OriginalSequence->GetDataModelInterface().GetInterface();
+		for (FName OriginalLoopCurveName : OriginalLoopPositionCurveNames)
+		{
+			const FFloatCurve* OriginalLoopModelCurve = OriginalLoopModel
+				? OriginalLoopModel->FindFloatCurve(FAnimationCurveIdentifier(OriginalLoopCurveName, ERawCurveTrackTypes::RCT_Float)) : nullptr;
+			AddInfo(FString::Printf(TEXT("Action loop model=%s curve=%s present=%d"),
+				*GetPathNameSafe(OriginalSequence->GetDataModelInterface().GetObject()), *OriginalLoopCurveName.ToString(), OriginalLoopModelCurve != nullptr));
+			if (OriginalLoopModelCurve)
+				for (const FRichCurveKey& OriginalLoopModelKey : OriginalLoopModelCurve->FloatCurve.GetConstRefOfKeys())
+					AddInfo(FString::Printf(TEXT("Action loop curve=%s key time=%.9g value=%.9g interpolation=%d"),
+						*OriginalLoopCurveName.ToString(), OriginalLoopModelKey.Time, OriginalLoopModelKey.Value, static_cast<int32>(OriginalLoopModelKey.InterpMode)));
+			for (double OriginalLoopSampleTime : {0.0, 0.5, 1.0})
+			{
+				const float OriginalLoopNativeValue = OriginalSequence->EvaluateCurveData(OriginalLoopCurveName, FAnimExtractContext(OriginalLoopSampleTime, false), false);
+				const float OriginalLoopRawValue = OriginalSequence->EvaluateCurveData(OriginalLoopCurveName, FAnimExtractContext(OriginalLoopSampleTime, false), true);
+				AddInfo(FString::Printf(TEXT("Action loop curve=%s time=%.9g native=%.9g raw=%.9g model=%s"),
+					*OriginalLoopCurveName.ToString(), OriginalLoopSampleTime, OriginalLoopNativeValue, OriginalLoopRawValue,
+					OriginalLoopModelCurve ? *FString::Printf(TEXT("%.9g"), OriginalLoopModelCurve->Evaluate(static_cast<float>(OriginalLoopSampleTime))) : TEXT("missing")));
+			}
+		}
+		TArray<FGGYGOActionMotionSourceInterval> OriginalLoopMappedPieces;
+		FString OriginalLoopMapError;
+		if (GGYGOActionMotionSource::MapMontageInterval(*OriginalBinding, 0.5f, 1.5f, OriginalLoopMappedPieces, OriginalLoopMapError))
+			for (const FGGYGOActionMotionSourceInterval& OriginalLoopPiece : OriginalLoopMappedPieces)
+				AddInfo(FString::Printf(TEXT("Action loop mapped segment=%d loop=%d montage=[%.9g,%.9g] sequence=[%.9g,%.9g] rate=%.9g"),
+					OriginalLoopPiece.BindingSegmentIndex, OriginalLoopPiece.LoopIndex, OriginalLoopPiece.MontageStartSeconds,
+					OriginalLoopPiece.MontageEndSeconds, OriginalLoopPiece.SequenceStartSeconds, OriginalLoopPiece.SequenceEndSeconds,
+					OriginalLoopPiece.SourceSecondsPerMontageSecond));
+		else AddInfo(FString::Printf(TEXT("Action loop mapping failed: %s"), *OriginalLoopMapError));
+	}
+	TestTrue(TEXT("Per-loop differences preserve displacement and remove original origin only through differencing"),
+		OriginalDelta.Equals(FVector(100.0, 0.0, 0.0), .001));
+	OriginalSequence->bEnableRootMotion = true;
+	OriginalDelta = FVector(17.0);
+	TestFalse(TEXT("Native animation root motion cannot also execute position curves"),
+		GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, 0.5f, 1.5f, OriginalDelta, Error));
+	TestTrue(TEXT("Rejected original interval has no partial output"), OriginalDelta.IsZero());
+#endif
 	return true;
 }
 #endif

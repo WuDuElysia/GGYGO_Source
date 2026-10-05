@@ -4,15 +4,24 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_WaitComboInput.h"
-#include "Animation/AnimComposite.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "Animation/AnimData/CurveIdentifier.h"
+#include "Animation/AnimCurveTypes.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/Skeleton.h"
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "Character/Data/GGYGOMovementSet.h"
 #include "Engine/Engine.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/PlayerController.h"
+#include "GameFramework/PlayerInput.h"
 #include "ReferenceSkeleton.h"
 #include "Rendering/SkeletalMeshRenderData.h"
 #include "System/GGYGOGameplayTags.h"
@@ -22,6 +31,18 @@
 #include <limits>
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOPlayerComboLifecycleTestTypes)
+
+AGGYGOPlayerComboLifecycleTestCharacter::AGGYGOPlayerComboLifecycleTestCharacter(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer.SetDefaultSubobjectClass<UGGYGOCharacterMovementComponent>(ACharacter::CharacterMovementComponentName))
+{
+	CreateDefaultSubobject<UGGYGOPawnExtensionComponent>(TEXT("PawnExtension"));
+}
+
+AGGYGOPlayerComboLifecycleTestController::AGGYGOPlayerComboLifecycleTestController(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	OverridePlayerInputClass = UPlayerInput::StaticClass();
+}
 
 UGGYGOPlayerComboLifecycleTestAbility::UGGYGOPlayerComboLifecycleTestAbility(
 	const FObjectInitializer& ObjectInitializer)
@@ -41,6 +62,7 @@ void UGGYGOPlayerComboLifecycleTestAbility::ConfigureStepsForTest(
 		Step.Montage = Montage;
 		Step.MainSection = TEXT("Main");
 		Step.EndSection = TEXT("End");
+		Step.MotionSlotName = TEXT("DefaultSlot");
 		Step.NextStepIndex = Index == 0 ? 1 : INDEX_NONE;
 		Step.PlayRate = Index == 0 ? FirstPlayRate : 1.0f;
 		Step.TraceShape.Mode = EGGYGOMeleeTraceShapeMode::SocketChains;
@@ -167,6 +189,9 @@ struct FGGYGOPlayerComboLifecycleFixture
 {
 	UWorld* World = nullptr;
 	ACharacter* Character = nullptr;
+	APlayerController* Controller = nullptr;
+	ULocalPlayer* LocalPlayer = nullptr;
+	UGGYGOCharacterMovementComponent* Movement = nullptr;
 	UGGYGOAbilitySystemComponent* ASC = nullptr;
 	UGGYGOMeleeTraceComponent* Trace = nullptr;
 	USkeletalMeshComponent* Mesh = nullptr;
@@ -180,12 +205,31 @@ struct FGGYGOPlayerComboLifecycleFixture
 	bool Initialize(UWorld* InWorld)
 	{
 		World = InWorld;
-		Character = World ? World->SpawnActor<ACharacter>() : nullptr;
+		Character = World ? World->SpawnActor<AGGYGOPlayerComboLifecycleTestCharacter>() : nullptr;
 		if (!Character) { return false; }
+		Movement = Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement());
+		Controller = World->SpawnActor<AGGYGOPlayerComboLifecycleTestController>();
+		if (!Movement || !Controller) { return false; }
+		// UE 5.8 requires a real local player for a PC with no NetDriver to be local.
+		// SetPlayer initializes native input/ownership; do not override GAS locality or policy.
+		LocalPlayer = NewObject<ULocalPlayer>(GEngine);
+		if (!LocalPlayer) { return false; }
+		Controller->SetPlayer(LocalPlayer);
+		Controller->Possess(Character);
+		Movement->SetMovementMode(MOVE_Walking);
+		UGGYGOMovementSet* MovementSet = NewObject<UGGYGOMovementSet>(Character);
+		MovementSet->bUseCurveDrivenSpeed = false; // Explicit fixed locomotion fixture; action still reads real original curves.
+		FString MovementError;
+		if (!Movement->SetMovementSet(MovementSet, &MovementError)) { return false; }
+		// Enter the real component lifecycle for its native owner scope; no private identity is forged.
+		Movement->BeginPlay();
+		FGGYGOMovementOwnerSyncScopeId OwnerScope;
+		if (!Movement->GetMovementOwnerSyncScope(OwnerScope, MovementError)) { return false; }
 
 		USkeletalMesh* MeshAsset = LoadObject<USkeletalMesh>(nullptr,
 			TEXT("/Engine/EngineMeshes/SkeletalCube.SkeletalCube"));
-		USkeleton* Skeleton = MeshAsset ? MeshAsset->GetSkeleton() : nullptr;
+		USkeleton* Skeleton = MeshAsset && MeshAsset->GetSkeleton()
+			? DuplicateObject<USkeleton>(MeshAsset->GetSkeleton(), Character) : nullptr;
 		FSkeletalMeshRenderData* MeshRenderData = MeshAsset ? MeshAsset->GetResourceForRendering() : nullptr;
 		if (!MeshAsset || !Skeleton || !MeshRenderData || MeshRenderData->LODRenderData.Num() == 0
 			|| !Skeleton->IsCompatibleMesh(MeshAsset)) { return false; }
@@ -202,10 +246,26 @@ struct FGGYGOPlayerComboLifecycleFixture
 		if (Montage->SlotAnimTracks.Num() != 1) { return false; }
 		FSlotAnimationTrack& SlotTrack = Montage->SlotAnimTracks[0];
 		SlotTrack.SlotName = FName(TEXT("DefaultSlot"));
-		UAnimComposite* SegmentAsset = NewObject<UAnimComposite>(Montage);
+		UAnimSequence* SegmentAsset = NewObject<UAnimSequence>(Montage);
 		if (!SegmentAsset) { return false; }
 		SegmentAsset->SetSkeleton(Skeleton);
-		SegmentAsset->SetCompositeLength(1.0f);
+#if WITH_EDITOR
+		IAnimationDataController& DataController = SegmentAsset->GetController();
+		DataController.InitializeModel();
+		DataController.SetFrameRate(FFrameRate(30, 1), false);
+		DataController.SetNumberOfFrames(FFrameNumber(30), false);
+		for (const FName CurveName : {FName(TEXT("RootMotion_PosX")), FName(TEXT("RootMotion_PosY")), FName(TEXT("RootMotion_PosZ"))})
+		{
+			const FAnimationCurveIdentifier CurveId(CurveName, ERawCurveTrackTypes::RCT_Float);
+			FRichCurveKey First(0.0f, 0.0f);
+			FRichCurveKey Last(1.0f, CurveName == FName(TEXT("RootMotion_PosX")) ? 100.0f : 0.0f);
+			First.InterpMode = RCIM_Linear;
+			if (!DataController.AddCurve(CurveId, 4, false) || !DataController.SetCurveKeys(CurveId, {First, Last}, false)) { return false; }
+		}
+		DataController.NotifyPopulated();
+#else
+		return false;
+#endif
 		if (SegmentAsset->GetPlayLength() <= 0.0f) { return false; }
 		FAnimSegment Segment;
 		Segment.SetAnimReference(SegmentAsset, true);
@@ -267,7 +327,21 @@ struct FGGYGOPlayerComboLifecycleFixture
 		return true;
 	}
 
+	bool HasOriginalLocalActorInfo() const
+	{
+		return LocalPlayer && Controller && Character && ASC && ASC->AbilityActorInfo.IsValid()
+			&& Controller->GetLocalPlayer() == LocalPlayer && LocalPlayer->PlayerController == Controller
+			&& Controller->GetPawn() == Character && Character->GetController() == Controller
+			&& Controller->PlayerInput && Controller->PlayerInput->GetClass() == UPlayerInput::StaticClass()
+			&& Controller->IsLocalController() && Character->IsLocallyControlled()
+			&& ASC->AbilityActorInfo->PlayerController.Get() == Controller
+			&& ASC->AbilityActorInfo->OwnerActor.Get() == Character
+			&& ASC->AbilityActorInfo->AvatarActor.Get() == Character
+			&& ASC->AbilityActorInfo->IsLocallyControlled();
+	}
+
 	bool HasActiveMesh() const { return Ability && Ability->ActiveMesh != nullptr; }
+	bool HasStepMotionResources() const { return Ability && Ability->StepMotionResources.IsValid(); }
 	FGGYGOComboStep& GetFirstStepForTest() const
 	{
 		check(Ability && Ability->ComboSteps.IsValidIndex(0));
@@ -277,7 +351,8 @@ struct FGGYGOPlayerComboLifecycleFixture
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* EndingMontageTask,
 		const UGGYGOAbilityTask_WaitComboInput* EndingInputTask) const
 	{
-		return Ability && !Ability->ActiveMesh && !Ability->MontageTask && !Ability->InputTask
+		return Ability && !Ability->StepMotionResources.IsValid() && !Ability->ActiveMesh && !Ability->MontageTask && !Ability->InputTask
+			&& Movement && !Movement->HasActiveActionMotion()
 			&& Ability->GetCurrentComboStep() == INDEX_NONE
 			&& Ability->GetActiveTaskCountForTest() == 0
 			&& Trace && !Trace->IsTracing()
@@ -287,6 +362,7 @@ struct FGGYGOPlayerComboLifecycleFixture
 			&& !EndingMontageTask->OnCancelled.IsBound()
 			&& !EndingMontageTask->OnBlendOut.IsBound()
 			&& !EndingMontageTask->EventReceived.IsBound()
+			&& !EndingMontageTask->SectionReceived.IsBound()
 			&& EndingInputTask && !EndingInputTask->IsActive()
 			&& !EndingInputTask->OnPress.IsBound()
 			&& Mesh && Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered
@@ -351,6 +427,7 @@ struct FGGYGOPlayerComboLifecycleFixture
 		}
 		const bool bMeshCleared = !Ability->ActiveMesh;
 		const bool bMontageTaskCleared = !Ability->MontageTask;
+		const bool bStepMotionCleared = !Ability->StepMotionResources.IsValid();
 		const bool bInputTaskCleared = !Ability->InputTask;
 		const bool bTraceCleared = !Ability->TraceComponent;
 		const bool bActivationCleared = !Ability->ResourceActivation.HasActivation();
@@ -364,7 +441,10 @@ struct FGGYGOPlayerComboLifecycleFixture
 			bMeshCleared, bMontageTaskCleared, bInputTaskCleared, bTraceCleared, bActivationCleared, bWorldCleared,
 			bMontageCallbackCleared, bInputCallbackCleared, bHitSubscriptionCleared, bMeshRestoreFlagCleared,
 			bPrerequisiteFlagCleared, static_cast<unsigned long long>(Ability->CurrentStepToken));
-		return bMeshCleared && bMontageTaskCleared && bInputTaskCleared && bTraceCleared && bActivationCleared
+		OutDiagnostic += FString::Printf(TEXT(" StepMotionCleared=%d ActionActive=%d"), bStepMotionCleared,
+			Movement ? Movement->HasActiveActionMotion() : false);
+		return bStepMotionCleared && Movement && !Movement->HasActiveActionMotion()
+			&& bMeshCleared && bMontageTaskCleared && bInputTaskCleared && bTraceCleared && bActivationCleared
 			&& bWorldCleared && bMontageCallbackCleared && bInputCallbackCleared && bHitSubscriptionCleared
 			&& bMeshRestoreFlagCleared && bPrerequisiteFlagCleared && Ability->CurrentStepToken == 0;
 	}
@@ -427,7 +507,9 @@ namespace
 	return Test.TestNotNull(TEXT("GEngine"), GEngine)
 		&& Test.TestNotNull(TEXT("registered transient test World"), TestWorld.World)
 		&& Test.TestTrue(TEXT("valid Character/Engine SkeletalMesh/Montage/ASC/Trace fixture"),
-			Fixture.Initialize(TestWorld.World));
+			Fixture.Initialize(TestWorld.World))
+		&& Test.TestTrue(TEXT("native LocalPlayer/Possess and original GAS ActorInfo are locally controlled"),
+			Fixture.HasOriginalLocalActorInfo());
 	}
 
 	FGameplayAbilityTargetDataHandle MakeComboCorrection(int32 Revision, int32 RequestId, int32 ServerStep,
@@ -462,6 +544,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	Original.TraceStartSocket = TEXT("StoredLegacyStart");
 	Original.TraceEndSocket = TEXT("StoredLegacyEnd");
 	Original.TraceRadius = 37.25f;
+	Original.MotionSlotName = TEXT("StoredMotionSlot");
+	Original.MotionTranslationScale = 0.75f;
 	Original.TraceShape.Mode = EGGYGOMeleeTraceShapeMode::SocketChains;
 	FGGYGOMeleeTraceChain& StoredChain = Original.TraceShape.Chains.AddDefaulted_GetRef();
 	StoredChain.Points = { FName(TEXT("StoredPoint0")), FName(TEXT("StoredPoint1")), FName(TEXT("StoredPoint2")) };
@@ -483,6 +567,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	TestEqual(TEXT("历史起点非默认值留存"), RoundTrip.TraceStartSocket, Original.TraceStartSocket);
 	TestEqual(TEXT("历史终点非默认值留存"), RoundTrip.TraceEndSocket, Original.TraceEndSocket);
 	TestEqual(TEXT("历史半径非默认值留存"), RoundTrip.TraceRadius, Original.TraceRadius);
+	TestEqual(TEXT("显式动作Slot留存"), RoundTrip.MotionSlotName, Original.MotionSlotName);
+	TestEqual(TEXT("显式动作位移倍率留存"), RoundTrip.MotionTranslationScale, Original.MotionTranslationScale);
 	TestTrue(TEXT("新 Shape 模式留存"), RoundTrip.TraceShape.Mode == Original.TraceShape.Mode);
 	if (!TestEqual(TEXT("新 Shape 链数量留存"), RoundTrip.TraceShape.Chains.Num(), 1)) { return false; }
 	TestTrue(TEXT("新 Shape 有序点留存"), RoundTrip.TraceShape.Chains[0].Points == StoredChain.Points);
@@ -496,6 +582,14 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	Step.TraceEndSocket = NAME_None;
 	Step.TraceRadius = std::numeric_limits<float>::quiet_NaN();
 	FString Error(TEXT("stale diagnostic"));
+	const FName ConfiguredMotionSlot = Step.MotionSlotName;
+	Step.MotionSlotName = NAME_None;
+	TestFalse(TEXT("缺失动作Slot不从第一Slot或默认Slot补齐"), Fixture.Ability->ValidateComboConfiguration(Error));
+	TestTrue(TEXT("缺失动作Slot诊断可定位必需配置"), Error.Contains(TEXT("MotionSlotName")));
+	Step.MotionSlotName = ConfiguredMotionSlot;
+	Step.MotionTranslationScale = 0.0f;
+	TestFalse(TEXT("非法动作位移倍率不换成固定倍率"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MotionTranslationScale = 1.0f;
 	TestTrue(TEXT("合法新 Shape 不读取非法历史值"), Fixture.Ability->ValidateComboConfiguration(Error));
 	TestTrue(TEXT("成功验证清空诊断"), Error.IsEmpty());
 	int32 CommitCount = 0;
@@ -515,6 +609,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	TestEqual(TEXT("正常路径提交一次"), CommitCount, 1);
 	TestEqual(TEXT("正常路径实际 Montage 播放一次"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 1);
 	TestEqual(TEXT("正常路径保留原 Montage 与 Input 两任务"), Fixture.Ability->GetActiveTaskCountForTest(), 2);
+	TestTrue(TEXT("正常Main已取得真实CMC原动作资源"), Fixture.Movement->HasActiveActionMotion());
+	TestEqual(TEXT("Main动作接管时普通Walk/Run速度上限为0"), Fixture.Movement->GetMaxSpeed(), 0.0f);
 	const FGGYGOAbilityTerminationResult ShapeEnd =
 		Fixture.Ability->RequestAbilityEnd(ShapeActivation.OriginalActivation, false, false);
 	TestTrue(TEXT("新 Shape 普通结束取得真实 Completed"), ShapeEnd.Outcome == EGGYGOAbilityTerminationOutcome::Completed
@@ -525,6 +621,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 		&& !ShapeEnd.Original.GetReplicateEndAbility() && !ShapeEnd.Original.WasCancelled());
 	TestFalse(TEXT("正常结束关闭 Trace"), Fixture.Trace->IsTracing());
 	TestEqual(TEXT("正常结束清空任务"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
+	TestFalse(TEXT("正常结束释放GA原段动作资源"), Fixture.HasStepMotionResources());
+	TestFalse(TEXT("正常结束精确退出CMC原动作资源"), Fixture.Movement->HasActiveActionMotion());
 	AddInfo(TEXT("成员往返仅证明序列化留存，不代表未知旧 Blueprint Pin/地图消费者已迁移。"));
 	return true;
 }
@@ -834,6 +932,7 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 			Fixture.AnimInstance->Montage_GetPosition(Fixture.Montage), ExpectedStartPosition, 0.02f));
 		bPassed &= Check(TEXT("实际 Montage section 为 Main"),
 			Fixture.AnimInstance->Montage_GetCurrentSection(Fixture.Montage) == FName(TEXT("Main")));
+		bPassed &= Check(TEXT("明确起播位置对应真实原CMC动作资源"), Fixture.Movement && Fixture.Movement->HasActiveActionMotion());
 		bPassed &= Check(TEXT("Mesh 刷新和 URO 接管已建立"), Fixture.HasActiveMesh()
 			&& Fixture.Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones
 			&& !Fixture.Mesh->bEnableUpdateRateOptimizations);
