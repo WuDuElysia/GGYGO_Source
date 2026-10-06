@@ -456,7 +456,7 @@ FGGYGOAbilityMontagePlaybackResult UGGYGOAbilitySystemComponent::TryPlayMontageW
 	{
 		return Result;
 	}
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		Result.Outcome = EOutcome::Busy;
 		Result.Reason = EReason::NativeWriteBusy;
@@ -497,7 +497,7 @@ FGGYGOAbilityMontagePlaybackResult UGGYGOAbilitySystemComponent::TryPlayMontageW
 void UGGYGOAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor)
 {
 	check(IsInGameThread());
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		LogLegacyAvatarActorInfoWriteRejected(TEXT("InitAbilityActorInfo"), EGGYGOAvatarBindingReason::NativeWriteBusy);
 		return;
@@ -578,7 +578,7 @@ void UGGYGOAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AA
 void UGGYGOAbilitySystemComponent::ClearActorInfo()
 {
 	check(IsInGameThread());
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		LogLegacyAvatarActorInfoWriteRejected(TEXT("ClearActorInfo"), EGGYGOAvatarBindingReason::NativeWriteBusy);
 		return;
@@ -603,7 +603,7 @@ void UGGYGOAbilitySystemComponent::ClearActorInfo()
 void UGGYGOAbilitySystemComponent::RefreshAbilityActorInfo()
 {
 	check(IsInGameThread());
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		LogLegacyAvatarActorInfoWriteRejected(TEXT("RefreshAbilityActorInfo"), EGGYGOAvatarBindingReason::NativeWriteBusy);
 		return;
@@ -932,6 +932,7 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 {
 	using EReason = EGGYGOAbilityActivationRequestReason;
 	if (!IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return EReason::InvalidASC; }
+	if (AvatarSwitchAbilityExitScope) { return EReason::TerminationInProgress; }
 	const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Call.Handle);
 	if (!Spec || Spec->PendingRemove || !IsValid(Spec->Ability.Get())
 		|| Spec->Ability.Get() != Call.SpecAbility.Get()) { return EReason::InvalidSpec; }
@@ -3816,7 +3817,8 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::ExpectedContextMismatch);
 	}
-	if (IsAvatarBindingNativeWriteBusy() || ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope
+		|| ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity())
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
@@ -3958,7 +3960,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 	OutPublication = FGGYGOAvatarBindingPublicationReceipt{};
 	FGGYGOAvatarBindingResult Result;
 	check(IsInGameThread());
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
@@ -4448,6 +4450,236 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::PublishAvatarBindingNoti
 	return Result;
 }
 
+UGGYGOAbilitySystemComponent::FScopedAvatarSwitchAbilityExit::FScopedAvatarSwitchAbilityExit(
+	UGGYGOAbilitySystemComponent* InASC, const TArray<FAvatarSwitchAbilityExitCandidate>& InCandidates)
+	: Candidates(InCandidates), ASC(InASC)
+{
+	check(InASC && !InASC->AvatarSwitchAbilityExitScope);
+	InASC->AvatarSwitchAbilityExitScope = this;
+}
+
+UGGYGOAbilitySystemComponent::FScopedAvatarSwitchAbilityExit::~FScopedAvatarSwitchAbilityExit()
+{
+	if (UGGYGOAbilitySystemComponent* OriginalASC = ASC.GetEvenIfUnreachable())
+	{
+		if (OriginalASC->AvatarSwitchAbilityExitScope == this) { OriginalASC->AvatarSwitchAbilityExitScope = nullptr; }
+	}
+}
+
+bool UGGYGOAbilitySystemComponent::IsAvatarSwitchCancellationReserved(const UGGYGOGameplayAbility* Ability) const
+{
+	if (!AvatarSwitchAbilityExitScope || !AvatarSwitchAbilityExitScope->bCancellationReservationsActive) { return false; }
+	for (const FAvatarSwitchAbilityExitCandidate& Candidate : AvatarSwitchAbilityExitScope->Candidates)
+	{
+		if (Candidate.Policy == EGGYGOAbilityAvatarExitPolicy::Cancel && Candidate.Ability.Get() == Ability
+			&& Ability && Ability->IsActive() && Candidate.Original.HasSameActivation(Ability->CurrentControlledActivation))
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+bool UGGYGOAbilitySystemComponent::CollectAvatarSwitchAbilityExitCandidates(
+	const FGGYGOAvatarBindingContext& Expected, bool bRequireExited,
+	TArray<FAvatarSwitchAbilityExitCandidate>& OutCandidates, FGGYGOAvatarSwitchAbilityExitResult& OutResult) const
+{
+	using EOutcome = EGGYGOAvatarSwitchAbilityExitOutcome;
+	using EReason = EGGYGOAvatarSwitchAbilityExitReason;
+	OutCandidates.Reset();
+	OutResult = {};
+	if (!IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		OutResult.Reason = EReason::InvalidASC;
+		return false;
+	}
+	if (!IsOwnerActorAuthoritative()) { OutResult.Reason = EReason::NotAuthority; return false; }
+	if (!IsAvatarBindingNewWorkLifecycleOpen(OutResult.BindingReason)
+		|| CheckAvatarBindingContext(Expected, OutResult.BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded)
+	{
+		OutResult.Outcome = EOutcome::Stale;
+		OutResult.Reason = EReason::BindingChanged;
+		return false;
+	}
+	if (AbilityScopeLockCount > 0 || bAbilityPendingClearAll || !AbilityPendingAdds.IsEmpty()
+		|| !AbilityPendingRemoves.IsEmpty() || NativeAbilityCleanupScope)
+	{
+		OutResult.Outcome = EOutcome::Busy;
+		OutResult.Reason = EReason::PendingAbilityChanges;
+		return false;
+	}
+	if (ControlledAbilityActivationCall || !AbilityActivationEvaluations.IsEmpty())
+	{
+		OutResult.Outcome = EOutcome::Busy;
+		OutResult.Reason = EReason::AbilityNotReady;
+		OutResult.TerminationReason = EGGYGOAbilityTerminationReason::ActivationCallInProgress;
+		return false;
+	}
+	for (const FGameplayAbilitySpec& Spec : ActivatableAbilities.Items)
+	{
+		bool bHasActiveInstance = false;
+		for (UGameplayAbility* NativeInstance : Spec.GetAbilityInstances())
+		{
+			if (!NativeInstance || !NativeInstance->IsActive()) { continue; }
+			bHasActiveInstance = true;
+			OutResult.BlockingSpec = Spec.Handle;
+			UGGYGOGameplayAbility* Ability = Cast<UGGYGOGameplayAbility>(NativeInstance);
+			if (!IsValid(Ability)) { OutResult.Reason = EReason::UnsupportedAbility; return false; }
+			if (Spec.PendingRemove)
+			{
+				OutResult.Outcome = EOutcome::Busy;
+				OutResult.Reason = EReason::PendingAbilityChanges;
+				return false;
+			}
+			const EGGYGOAbilityAvatarExitPolicy Policy = Ability->GetAvatarExitPolicy();
+			if (Policy != EGGYGOAbilityAvatarExitPolicy::Cancel && Policy != EGGYGOAbilityAvatarExitPolicy::ContinueInBackground)
+			{
+				OutResult.Reason = EReason::InvalidExitPolicy;
+				UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("AbilitySystem Avatar switch [%s] Ability [%s] Spec [%s] has invalid AvatarExitPolicy=%d."),
+					*GetPathName(), *Ability->GetPathName(), *Spec.Handle.ToString(), static_cast<int32>(Policy));
+				return false;
+			}
+			if (bRequireExited && Policy == EGGYGOAbilityAvatarExitPolicy::Cancel)
+			{
+				OutResult.Reason = EReason::ActiveCancellationRequired;
+				return false;
+			}
+			if (Ability->GetCurrentAbilitySpecHandle() != Spec.Handle || Ability->GetCurrentActorInfo() != AbilityActorInfo.Get())
+			{
+				OutResult.Outcome = EOutcome::Stale;
+				OutResult.Reason = EReason::ActivationChanged;
+				return false;
+			}
+			FGGYGOAbilityActivationHandle Original;
+			OutResult.TerminationReason = Ability->CheckAvatarSwitchExitPreflight(Policy == EGGYGOAbilityAvatarExitPolicy::Cancel, Original);
+			if (OutResult.TerminationReason != EGGYGOAbilityTerminationReason::None)
+			{
+				OutResult.Outcome = OutResult.TerminationReason == EGGYGOAbilityTerminationReason::TerminationInProgress
+					|| OutResult.TerminationReason == EGGYGOAbilityTerminationReason::ActivationCallInProgress
+					|| OutResult.TerminationReason == EGGYGOAbilityTerminationReason::ScopeLocked ? EOutcome::Busy : EOutcome::Rejected;
+				OutResult.Reason = EReason::AbilityNotReady;
+				return false;
+			}
+			FAvatarSwitchAbilityExitCandidate& Candidate = OutCandidates.AddDefaulted_GetRef();
+			Candidate.Ability = Ability;
+			Candidate.Spec = Spec.Handle;
+			Candidate.Original = Original;
+			Candidate.Policy = Policy;
+		}
+		if (Spec.IsActive() && !bHasActiveInstance)
+		{
+			OutResult.BlockingSpec = Spec.Handle;
+			OutResult.Reason = EReason::UnsupportedAbility;
+			return false; // Native active/count without an endable project instance cannot be called complete.
+		}
+	}
+	OutResult.Outcome = EOutcome::Ready;
+	OutResult.Reason = EReason::None;
+	OutResult.BlockingSpec = {};
+	return true;
+}
+
+FGGYGOAvatarSwitchAbilityExitResult UGGYGOAbilitySystemComponent::CheckAvatarSwitchAbilitiesExited(
+	const FGGYGOAvatarBindingContext& Expected) const
+{
+	check(IsInGameThread());
+	FGGYGOAvatarSwitchAbilityExitResult Result;
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
+	{
+		Result.Outcome = EGGYGOAvatarSwitchAbilityExitOutcome::Busy;
+		Result.Reason = EGGYGOAvatarSwitchAbilityExitReason::NativeWriteBusy;
+		return Result;
+	}
+	TArray<FAvatarSwitchAbilityExitCandidate> Current;
+	CollectAvatarSwitchAbilityExitCandidates(Expected, true, Current, Result);
+	return Result;
+}
+
+FGGYGOAvatarSwitchAbilityExitResult UGGYGOAbilitySystemComponent::TryExitAbilitiesForAvatarSwitch(
+	const FGGYGOAvatarBindingContext& Expected, TFunction<bool()> IsOriginalCallerCurrent)
+{
+	check(IsInGameThread());
+	using EOutcome = EGGYGOAvatarSwitchAbilityExitOutcome;
+	using EReason = EGGYGOAvatarSwitchAbilityExitReason;
+	const FGGYGOAvatarBindingContext OriginalContext = Expected;
+	FGGYGOAvatarSwitchAbilityExitResult Result;
+	if (!IsOriginalCallerCurrent) { Result.Reason = EReason::MissingContextQuery; return Result; }
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
+	{
+		Result.Outcome = EOutcome::Busy;
+		Result.Reason = EReason::NativeWriteBusy;
+		return Result;
+	}
+	TArray<FAvatarSwitchAbilityExitCandidate> Candidates;
+	// Ability exit does not write ActorInfo. Its own lease excludes reentrant writes/activation
+	// while the caller continues to authenticate the original Pawn's published Ready context.
+	FScopedAvatarSwitchAbilityExit ExitScope(this, Candidates);
+	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC(this);
+	const auto RecheckCaller = [&]()
+	{
+		UGGYGOAbilitySystemComponent* LiveASC = OriginalASC.Get();
+		if (!LiveASC) { Result.Outcome = EOutcome::Stale; Result.Reason = EReason::InvalidASC; return false; }
+		if (LiveASC->CheckAvatarBindingContext(OriginalContext, Result.BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded)
+		{
+			Result.Outcome = EOutcome::Stale;
+			Result.Reason = EReason::BindingChanged;
+			return false;
+		}
+		const bool bCallerCurrent = IsOriginalCallerCurrent();
+		LiveASC = OriginalASC.Get();
+		if (!LiveASC) { Result.Outcome = EOutcome::Stale; Result.Reason = EReason::InvalidASC; return false; }
+		if (LiveASC->CheckAvatarBindingContext(OriginalContext, Result.BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded)
+		{
+			Result.Outcome = EOutcome::Stale;
+			Result.Reason = EReason::BindingChanged;
+			return false;
+		}
+		if (!bCallerCurrent) { Result.Outcome = EOutcome::Stale; Result.Reason = EReason::CallerExpired; return false; }
+		return true;
+	};
+	if (!RecheckCaller() || !CollectAvatarSwitchAbilityExitCandidates(OriginalContext, false, Candidates, Result)
+		|| !RecheckCaller()) { return Result; }
+	// All default-Cancel instances have passed admission before the first native cancel.
+	ExitScope.bCancellationReservationsActive = true;
+	for (const FAvatarSwitchAbilityExitCandidate& Candidate : Candidates)
+	{
+		if (Candidate.Policy == EGGYGOAbilityAvatarExitPolicy::ContinueInBackground) { continue; }
+		if (!RecheckCaller()) { return Result; }
+		UGGYGOGameplayAbility* Ability = Candidate.Ability.Get();
+		FGGYGOAbilityActivationHandle Current;
+		Result.BlockingSpec = Candidate.Spec;
+		Result.TerminationReason = Ability ? Ability->CheckAvatarSwitchExitPreflight(true, Current)
+			: EGGYGOAbilityTerminationReason::InvalidAbility;
+		if (Result.TerminationReason != EGGYGOAbilityTerminationReason::None || !Current.HasSameActivation(Candidate.Original)
+			|| Ability->GetAvatarExitPolicy() != Candidate.Policy)
+		{
+			Result.Outcome = EOutcome::Stale;
+			Result.Reason = EReason::ActivationChanged;
+			return Result;
+		}
+		const FGGYGOAbilityTerminationResult Termination = Ability->RequestAbilityCancel(Candidate.Original, true);
+		if (Termination.Outcome != EGGYGOAbilityTerminationOutcome::Completed
+			|| !Termination.Original.GetOriginalActivation().HasSameActivation(Candidate.Original)
+			|| Termination.Original.GetRequestKind() != EGGYGOAbilityTerminationRequestKind::Cancel)
+		{
+			Result.Outcome = EOutcome::Failed;
+			Result.Reason = EReason::TerminationNotCompleted;
+			Result.TerminationReason = Termination.Reason;
+			return Result; // Accepted/Deferred/unsupported are never switch permission.
+		}
+		if (!RecheckCaller()) { return Result; }
+	}
+	TArray<FAvatarSwitchAbilityExitCandidate> Remaining;
+	if (!CollectAvatarSwitchAbilityExitCandidates(OriginalContext, true, Remaining, Result))
+	{
+		if (Result.Outcome == EOutcome::Rejected) { Result.Outcome = EOutcome::Failed; }
+		return Result; // This is a post-cancellation failure, not side-effect-free admission rejection.
+	}
+	if (!RecheckCaller()) { return Result; }
+	Result.Outcome = EOutcome::Completed;
+	return Result;
+}
+
 FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAbilities(
 	const FGGYGOAvatarBindingContext& Expected,
 	const FGameplayTagContainer* WithTags,
@@ -4461,7 +4693,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAb
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::MissingContextQuery);
 	}
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
@@ -4558,7 +4790,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryRemoveAvatarBindingGa
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::MissingContextQuery);
 	}
-	if (IsAvatarBindingNativeWriteBusy())
+	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}

@@ -130,7 +130,10 @@ public:
 	/**
 	 * 切到指定序号的位置。仅服务器有效。
 	 *
-	 * @return 是否真的发生了切换。目标已出战、序号越界、目标已死亡或没有实体都返回 false。
+	 * 默认取消旧位置的技能，只有显式后台继续的技能保留。待取消集合不能完整退出时，
+	 * 不释放输入或转移控制；成功只在真实双向附身关系确认后提交，不清除 Slot/ASC/GE/冷却。
+	 * 取消已发生后若外调改变原请求，返回失败，不承诺恢复技能或旧 Held 输入。
+	 * @return 是否真的完成切换。同步重入、无效目标或退出/附身失败均返回 false。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SwitchToSlot(int32 SlotIndex);
@@ -221,7 +224,7 @@ private:
 	/** 当前组件必须是权威 PlayerState 的唯一队伍，且 Controller/World 对应。 */
 	APlayerController* GetRegistrationController() const;
 
-	/** 只读验证新成员的初始化、连接归属和 Slot/ASC/PawnExtension 绑定。 */
+	/** 以 Slot 验证持久连接归属及实际 ASC/Avatar/Extension Ready；Pawn Owner 不表示队伍归属。 */
 	bool HasValidSlotBinding(const AGGYGOCharacterSlot* Slot, const APlayerController* OwningController) const;
 
 	/** 外调返回后只核对原表现对象与本组件终止边界，不认证 ASC 绑定。 */
@@ -238,4 +241,6 @@ private:
 	bool bSquadTerminationStarted = false;
 	bool bConsumingCreatedSlotResources = false;
 	bool bFinalComponentDestructionRequested = false;
+	/** 仅由一次同步 Switch 栈持有，退出即归还；不是第二份出战状态或延期切换队列。 */
+	bool bSwitchRequestInProgress = false;
 };

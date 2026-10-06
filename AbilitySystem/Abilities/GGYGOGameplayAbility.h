@@ -284,6 +284,14 @@ enum class EGGYGOAbilityActivationPolicy : uint8
 	OnSpawn
 };
 
+/** Explicit ability configuration for giving up player control of its original Avatar. */
+UENUM(BlueprintType)
+enum class EGGYGOAbilityAvatarExitPolicy : uint8
+{
+	Cancel,
+	ContinueInBackground
+};
+
 UCLASS(Abstract, HideCategories = Input, Meta = (ShortTooltip = "GGYGO 项目的 GameplayAbility 基类。"))
 class GGYGO_API UGGYGOGameplayAbility : public UGameplayAbility
 {
@@ -343,6 +351,9 @@ public:
 
 	/** 激活时机策略。 */
 	EGGYGOAbilityActivationPolicy GetActivationPolicy() const { return ActivationPolicy; }
+
+	/** Continue is an explicit class default; it never renews old resource-work provenance. */
+	EGGYGOAbilityAvatarExitPolicy GetAvatarExitPolicy() const { return AvatarExitPolicy; }
 
 	/** 所属组。为空表示不参与组仲裁。 */
 	FGameplayTag GetGroupTag() const { return GroupTag; }
@@ -569,6 +580,10 @@ protected:
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Ability Activation")
 	EGGYGOAbilityActivationPolicy ActivationPolicy;
 
+	/** Default switch behavior is cancellation. Explicit Continue may be noncancelable. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Avatar Exit")
+	EGGYGOAbilityAvatarExitPolicy AvatarExitPolicy = EGGYGOAbilityAvatarExitPolicy::Cancel;
+
 	/**
 	 * 所属组，取 `AbilityGroup.*`。为空表示不参与组仲裁（等价于独立运行）。
 	 * 组规则配在独立 DataAsset 上，不在这里。
@@ -608,6 +623,13 @@ private:
 	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle);
 	enum class EControlledActivationValidationPurpose : uint8 { ResourceWork, Termination };
 	FGGYGOAbilityActivationHandle CaptureCurrentActivationForTermination() const;
+	/** Read-only admission; does not install a termination or release resources. */
+	EGGYGOAbilityTerminationReason CheckAvatarSwitchExitPreflight(bool bRequiresCancellation,
+		FGGYGOAbilityActivationHandle& OutOriginal) const;
+	/** Shared pure admission. None certifies only the live original; End/Cancel also capture resources. */
+	EGGYGOAbilityTerminationReason CheckOriginalTerminationAdmission(
+		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
+		FGGYGOAbilityMontageOwnershipCheck& OutMontageCapture) const;
 	FGGYGOAbilityActivationHandle ValidateCurrentControlledActivation(bool bRequireActive = true,
 		bool bRequireSpec = true,
 		EControlledActivationValidationPurpose Purpose = EControlledActivationValidationPurpose::ResourceWork) const;

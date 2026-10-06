@@ -62,6 +62,47 @@ struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOAbilityGroupRule;
 struct FGGYGOMontagePlayGuardResult;
 
+enum class EGGYGOAvatarSwitchAbilityExitOutcome : uint8
+{
+	Rejected = 0,
+	/** Pure query: no current cancellation is required. Not termination history. */
+	Ready,
+	/** All requested original cancellations actually completed in this invocation. */
+	Completed,
+	Busy,
+	Stale,
+	Failed
+};
+
+enum class EGGYGOAvatarSwitchAbilityExitReason : uint8
+{
+	InvalidRequest = 0,
+	None,
+	InvalidASC,
+	NotAuthority,
+	MissingContextQuery,
+	BindingChanged,
+	CallerExpired,
+	NativeWriteBusy,
+	PendingAbilityChanges,
+	UnsupportedAbility,
+	InvalidExitPolicy,
+	AbilityNotReady,
+	ActiveCancellationRequired,
+	ActivationChanged,
+	TerminationNotCompleted
+};
+
+/** Synchronous result/diagnostic only; does not retain a caller or own native ability state. */
+struct GGYGO_API FGGYGOAvatarSwitchAbilityExitResult
+{
+	EGGYGOAvatarSwitchAbilityExitOutcome Outcome = EGGYGOAvatarSwitchAbilityExitOutcome::Rejected;
+	EGGYGOAvatarSwitchAbilityExitReason Reason = EGGYGOAvatarSwitchAbilityExitReason::InvalidRequest;
+	FGameplayAbilitySpecHandle BlockingSpec;
+	EGGYGOAbilityTerminationReason TerminationReason = EGGYGOAbilityTerminationReason::None;
+	EGGYGOAvatarBindingReason BindingReason = EGGYGOAvatarBindingReason::None;
+};
+
 /**
  * Subscriber-only view of immutable original termination history.
  * As with K4, private inheritance prevents callers from reaching native Broadcast/Clear;
@@ -249,6 +290,21 @@ public:
 		const FGameplayTagContainer* WithTags,
 		const FGameplayTagContainer* WithoutTags,
 		TFunction<bool()> IsOriginalCallerCurrent);
+
+	/**
+	 * Classify and preflight every native active instance before any cancellation.
+	 * Cancel only exact originals through RequestAbilityCancel; explicit Continue is not canceled,
+	 * including noncancelable Continue. Only actual Completed results permit Completed here.
+	 * The required synchronous pure query proves the original switch request before/after callbacks.
+	 * No input release, ActorInfo commit, automatic retry, rollback or second ability executor.
+	 */
+	FGGYGOAvatarSwitchAbilityExitResult TryExitAbilitiesForAvatarSwitch(
+		const FGGYGOAvatarBindingContext& Expected, TFunction<bool()> IsOriginalCallerCurrent);
+
+	/** Pure current check: same complete Context and only supported Continue instances remain.
+	 * Ready is not proof of a previous cancellation. Recheck after each external control callback. */
+	FGGYGOAvatarSwitchAbilityExitResult CheckAvatarSwitchAbilitiesExited(
+		const FGGYGOAvatarBindingContext& Expected) const;
 
 	/**
 	 * Remove native Cues in the exact original context under one synchronous Busy window.
@@ -673,6 +729,34 @@ private:
 	uint64 AllocateAbilityActivationOriginSerial();
 
 	friend class UGGYGOGameplayAbility;
+
+	struct FAvatarSwitchAbilityExitCandidate
+	{
+		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+		FGameplayAbilitySpecHandle Spec;
+		FGGYGOAbilityActivationHandle Original;
+		EGGYGOAbilityAvatarExitPolicy Policy = EGGYGOAbilityAvatarExitPolicy::Cancel;
+	};
+	/** Stack-only candidate/write exclusion lease; published Ready reads remain valid.
+	 * GAS still owns Active/CanBeCanceled/termination. This is not an ActorInfo native write. */
+	class FScopedAvatarSwitchAbilityExit
+	{
+	public:
+		FScopedAvatarSwitchAbilityExit(UGGYGOAbilitySystemComponent* InASC,
+			const TArray<FAvatarSwitchAbilityExitCandidate>& InCandidates);
+		~FScopedAvatarSwitchAbilityExit();
+		FScopedAvatarSwitchAbilityExit(const FScopedAvatarSwitchAbilityExit&) = delete;
+		FScopedAvatarSwitchAbilityExit& operator=(const FScopedAvatarSwitchAbilityExit&) = delete;
+		bool bCancellationReservationsActive = false;
+		const TArray<FAvatarSwitchAbilityExitCandidate>& Candidates;
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	};
+	FScopedAvatarSwitchAbilityExit* AvatarSwitchAbilityExitScope = nullptr;
+	bool IsAvatarSwitchCancellationReserved(const UGGYGOGameplayAbility* Ability) const;
+	bool CollectAvatarSwitchAbilityExitCandidates(const FGGYGOAvatarBindingContext& Expected,
+		bool bRequireExited, TArray<FAvatarSwitchAbilityExitCandidate>& OutCandidates,
+		FGGYGOAvatarSwitchAbilityExitResult& OutResult) const;
 	/** Read-only targets captured before a native cleanup traversal, valid only in its stack. */
 	struct FNativeAbilityCleanupTarget
 	{

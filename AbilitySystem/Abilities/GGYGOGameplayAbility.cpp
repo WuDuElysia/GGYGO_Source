@@ -141,6 +141,53 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivationFor
 		: ValidateCurrentControlledActivation(true, true, EControlledActivationValidationPurpose::Termination);
 }
 
+EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckOriginalTerminationAdmission(
+	const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
+	FGGYGOAbilityMontageOwnershipCheck& OutMontageCapture) const
+{
+	using EReason = EGGYGOAbilityTerminationReason;
+	OutMontageCapture = {};
+	if (!Original.Proof.IsValid()) { return EReason::InvalidRequest; }
+	if (Original.Proof->Ability.Get() != this) { return EReason::WrongIssuer; }
+	if (!IsValid(this) || !IsInstantiated()) { return EReason::InvalidAbility; }
+	if (!IsActive()) { return EReason::NotActive; }
+	if (!CaptureCurrentActivationForTermination().HasSameActivation(Original)) { return EReason::ActivationChanged; }
+	UGGYGOAbilitySystemComponent* ASC = Original.Proof->ASC.Get();
+	const TSharedPtr<const FGameplayAbilityActorInfo> Info = Original.Proof->Allocation.Pin();
+	if (!IsValid(ASC)) { return EReason::InvalidASC; }
+	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Original.Proof->SpecHandle);
+	if (!Spec || Spec->PendingRemove) { return EReason::InvalidAbility; }
+	if (!Info.IsValid() || !IsEndAbilityValid(Original.Proof->SpecHandle, Info.Get())) { return EReason::NotActive; }
+	if (Kind == EGGYGOAbilityTerminationRequestKind::None) { return EReason::None; }
+	if (Kind == EGGYGOAbilityTerminationRequestKind::Cancel && !CanBeCanceled()) { return EReason::NotCancelable; }
+	if (LastOriginalTerminationSerial == MAX_uint64) { return EReason::IdentityExhausted; }
+	OutMontageCapture = ASC->CaptureMontagePlaybackOwnership(
+		const_cast<UGGYGOGameplayAbility*>(this), Original.Proof->SpecHandle, CurrentActivationInfo);
+	return OutMontageCapture.Outcome == EGGYGOAbilityMontagePlaybackOutcome::Succeeded
+		|| OutMontageCapture.Outcome == EGGYGOAbilityMontagePlaybackOutcome::NoOwnedPlayback
+		? EReason::None : EReason::MontageCaptureFailed;
+}
+
+EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckAvatarSwitchExitPreflight(
+	bool bRequiresCancellation, FGGYGOAbilityActivationHandle& OutOriginal) const
+{
+	check(IsInGameThread());
+	using EReason = EGGYGOAbilityTerminationReason;
+	OutOriginal = {};
+	if (IsControlledActivationTerminationBusy()) { return EReason::TerminationInProgress; }
+	if (AbilityActivationCall) { return EReason::ActivationCallInProgress; }
+	if (ScopeLockCount > 0) { return EReason::ScopeLocked; }
+	const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivationForTermination();
+	if (!Original.HasActivation()) { return EReason::ActivationChanged; }
+	if (!Original.Proof->bHasControlledTryBoundary) { return EReason::UnsupportedEntry; }
+	FGGYGOAbilityMontageOwnershipCheck Capture;
+	const EReason Admission = CheckOriginalTerminationAdmission(Original,
+		bRequiresCancellation ? EGGYGOAbilityTerminationRequestKind::Cancel : EGGYGOAbilityTerminationRequestKind::None, Capture);
+	if (Admission != EReason::None) { return Admission; }
+	OutOriginal = Original;
+	return EReason::None;
+}
+
 FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::ValidateCurrentControlledActivation(
 	bool bRequireActive, bool bRequireSpec, EControlledActivationValidationPurpose Purpose) const
 {
@@ -347,42 +394,27 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 		else { OutResult.Outcome = EOutcome::Busy; OutResult.Reason = EReason::TerminationInProgress; }
 		return {};
 	}
-	if (!IsValid(this) || !IsInstantiated()) { OutResult.Reason = EReason::InvalidAbility; return {}; }
-	if (!IsActive()) { OutResult.Outcome = EOutcome::Stale; OutResult.Reason = EReason::NotActive; return {}; }
-	const FGGYGOAbilityActivationHandle Current = CaptureCurrentActivationForTermination();
-	if (!Current.HasSameActivation(Original))
+	FGGYGOAbilityMontageOwnershipCheck MontageCapture;
+	const EReason Admission = CheckOriginalTerminationAdmission(Original, Kind, MontageCapture);
+	if (Admission != EReason::None && Admission != EReason::MontageCaptureFailed)
 	{
-		OutResult.Outcome = EOutcome::Stale;
-		OutResult.Reason = EReason::ActivationChanged;
+		OutResult.Reason = Admission;
+		if (Admission == EReason::ActivationChanged || (Admission == EReason::NotActive && !IsActive()))
+		{
+			OutResult.Outcome = EOutcome::Stale;
+		}
 		return {};
 	}
 	UGGYGOAbilitySystemComponent* ASC = Original.Proof->ASC.Get();
 	const TSharedPtr<const FGameplayAbilityActorInfo> ActorInfo = Original.Proof->Allocation.Pin();
-	if (!IsValid(ASC)) { OutResult.Reason = EReason::InvalidASC; return {}; }
-	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Original.Proof->SpecHandle);
-	if (!Spec || Spec->PendingRemove) { OutResult.Reason = EReason::InvalidAbility; return {}; }
-	if (!ActorInfo.IsValid() || !IsEndAbilityValid(Original.Proof->SpecHandle, ActorInfo.Get()))
-	{
-		// PreActivate's witness precedes native ActiveCount++; it is not yet endable.
-		OutResult.Reason = EReason::NotActive;
-		return {};
-	}
-	if (Kind == EGGYGOAbilityTerminationRequestKind::Cancel && !CanBeCanceled())
-	{
-		OutResult.Reason = EReason::NotCancelable;
-		return {};
-	}
-	if (LastOriginalTerminationSerial == MAX_uint64) { OutResult.Reason = EReason::IdentityExhausted; return {}; }
 	FGGYGOAbilityTerminationContext Context;
 	Context.OriginalActivation = Original;
 	Context.RequestKind = Kind;
 	Context.bReplicateEndAbility = Kind == EGGYGOAbilityTerminationRequestKind::End && bReplicate;
 	Context.bReplicateCancelAbility = Kind == EGGYGOAbilityTerminationRequestKind::Cancel && bReplicate;
 	Context.bWasCancelled = Kind == EGGYGOAbilityTerminationRequestKind::Cancel || bWasCancelled;
-	Context.OriginalMontageCapture = ASC->CaptureMontagePlaybackOwnership(this,
-		Original.Proof->SpecHandle, CurrentActivationInfo);
-	if (Context.OriginalMontageCapture.Outcome != EGGYGOAbilityMontagePlaybackOutcome::Succeeded
-		&& Context.OriginalMontageCapture.Outcome != EGGYGOAbilityMontagePlaybackOutcome::NoOwnedPlayback)
+	Context.OriginalMontageCapture = MontageCapture;
+	if (Admission == EReason::MontageCaptureFailed)
 	{
 		OutResult.Original = Context;
 		OutResult.Outcome = EOutcome::Failed;
@@ -951,6 +983,11 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 {
 	UGGYGOAbilitySystemComponent* EvaluationASC = ActorInfo
 		? Cast<UGGYGOAbilitySystemComponent>(ActorInfo->AbilitySystemComponent.Get()) : nullptr;
+	if (EvaluationASC && EvaluationASC->AvatarSwitchAbilityExitScope)
+	{
+		if (OptionalRelevantTags) { OptionalRelevantTags->AddTag(GGYGOGameplayTags::Ability_ActivateFail_ActivationGroup); }
+		return false; // A synchronous old-Avatar exit cannot acquire a new activation.
+	}
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalEvaluationASC(EvaluationASC);
 	const TWeakObjectPtr<const UGGYGOGameplayAbility> OriginalEvaluationAbility(this);
 	const bool bHadProjectEvaluationASC = EvaluationASC != nullptr;
@@ -1049,6 +1086,15 @@ bool UGGYGOGameplayAbility::CanActivateAbilityAdditional(const FGameplayAbilityS
 
 void UGGYGOGameplayAbility::SetCanBeCanceled(bool bCanBeCanceled)
 {
+	UGGYGOAbilitySystemComponent* ASC = CurrentActorInfo
+		? Cast<UGGYGOAbilitySystemComponent>(CurrentActorInfo->AbilitySystemComponent.Get()) : nullptr;
+	if (!bCanBeCanceled && ASC && ASC->IsAvatarSwitchCancellationReserved(this))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("AbilitySystem Avatar switch [%s] ASC [%s] Spec [%s] rejects a late CanBeCanceled=false write to its preflighted original cancellation."),
+			*GetPathName(), *GetPathNameSafe(ASC), *CurrentSpecHandle.ToString());
+		return;
+	}
 	// 只有 Exclusive 能力可以拒绝被取消。
 	// Coexist 能力随时可能被同组高优先级或跨组 Exclusive 顶掉，
 	// 如果它声明自己不可取消，仲裁就无法执行，组规则会失效。

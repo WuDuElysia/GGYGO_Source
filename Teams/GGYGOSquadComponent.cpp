@@ -7,6 +7,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Components/GGYGOHealthComponent.h"
+#include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
@@ -14,6 +15,7 @@
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameFramework/PlayerState.h"
+#include "Misc/ScopeExit.h"
 #include "Net/UnrealNetwork.h"
 #include "Player/GGYGOPlayerState.h"
 #include "Teams/GGYGOCharacterSlot.h"
@@ -359,9 +361,11 @@ bool UGGYGOSquadComponent::HasValidSlotBinding(const AGGYGOCharacterSlot* Slot, 
 
 	const UGGYGOAbilitySystemComponent* ASC = Slot->GetGGYGOAbilitySystemComponent();
 	const AGGYGOCharacterBase* Avatar = Cast<AGGYGOCharacterBase>(Slot->GetAvatarPawn());
+	// Slot owns the persistent squad connection. Pawn Owner is native control state:
+	// APawn::UnPossessed clears it while the same Slot/ASC/Avatar binding remains valid.
 	if (!IsValid(ASC) || ASC->IsBeingDestroyed() || ASC->GetOwnerActor() != Slot ||
 		!IsValid(Avatar) || Avatar->IsActorBeingDestroyed() || !Avatar->HasAuthority() ||
-		Avatar->GetWorld() != GetWorld() || Avatar->GetOwner() != OwningController ||
+		Avatar->GetWorld() != GetWorld() ||
 		ASC->GetAvatarActor() != Avatar ||
 		(Avatar->GetController() && Avatar->GetController() != OwningController))
 	{
@@ -461,95 +465,221 @@ bool UGGYGOSquadComponent::RegisterSlotInternal(AGGYGOCharacterSlot* Slot, APawn
 
 bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex)
 {
-	if (bSquadTerminationStarted || !IsValid(this) || IsBeingDestroyed())
+	check(IsInGameThread());
+	if (bSquadTerminationStarted || bSwitchRequestInProgress || !IsValid(this) || IsBeingDestroyed())
 	{
 		return false;
 	}
-	AActor* Owner = GetOwner();
-	if (!Owner || Owner->GetLocalRole() != ROLE_Authority)
-	{
-		return false;
-	}
-
 	if (!Slots.IsValidIndex(SlotIndex) || SlotIndex == ActiveSlotIndex)
 	{
 		return false;
 	}
 
+	APlayerController* PC = GetRegistrationController();
 	AGGYGOCharacterSlot* NewSlot = Slots[SlotIndex];
-	if (!IsValid(NewSlot) || NewSlot->IsActorBeingDestroyed() || !CanSlotBeActive(NewSlot))
+	AGGYGOCharacterSlot* OldSlot = GetActiveSlot();
+	if (!PC || !HasValidSlotBinding(NewSlot, PC) || !CanSlotBeActive(NewSlot)
+		|| (ActiveSlotIndex != INDEX_NONE && !HasValidSlotBinding(OldSlot, PC)))
 	{
 		return false;
 	}
 
-	APlayerState* OwningPlayerState = Cast<APlayerState>(Owner);
-	APlayerController* PC = OwningPlayerState ? Cast<APlayerController>(OwningPlayerState->GetOwner()) : nullptr;
-	if (!PC)
+	AGGYGOCharacterBase* NewCharacter = Cast<AGGYGOCharacterBase>(NewSlot->GetAvatarPawn());
+	AGGYGOCharacterBase* OldCharacter = OldSlot ? Cast<AGGYGOCharacterBase>(OldSlot->GetAvatarPawn()) : nullptr;
+	if (NewCharacter->GetController() || NewCharacter == OldCharacter
+		|| (OldCharacter ? PC->GetPawn() != OldCharacter || OldCharacter->GetController() != PC : PC->GetPawn() != nullptr))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("SwitchToSlot: [%s] 找不到 PlayerController，无法转移控制权。"), *GetNameSafe(Owner));
+			TEXT("[Teams] SwitchToSlot Squad=%s Controller=%s Target=%s Reason=OriginalControlMismatch; request rejected."),
+			*GetPathNameSafe(this), *GetPathNameSafe(PC), *GetPathNameSafe(NewCharacter));
 		return false;
 	}
 
-	AGGYGOCharacterSlot* OldSlot = GetActiveSlot();
+	// These values identify one synchronous request. ASC alone owns ability and input state.
+	const int32 OriginalActiveIndex = ActiveSlotIndex;
 	const TWeakObjectPtr<UGGYGOSquadComponent> OriginalSquad(this);
 	const TWeakObjectPtr<APlayerController> OriginalController(PC);
 	const TWeakObjectPtr<AGGYGOCharacterSlot> OriginalNewSlot(NewSlot);
 	const TWeakObjectPtr<AGGYGOCharacterSlot> OriginalOldSlot(OldSlot);
-	const auto CanContinueSwitch = [&]()
+	const TWeakObjectPtr<AGGYGOCharacterBase> OriginalNewCharacter(NewCharacter);
+	const TWeakObjectPtr<AGGYGOCharacterBase> OriginalOldCharacter(OldCharacter);
+	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalNewASC(NewSlot->GetGGYGOAbilitySystemComponent());
+	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalOldASC(OldSlot ? OldSlot->GetGGYGOAbilitySystemComponent() : nullptr);
+	const FGGYGOAvatarBindingContext NewContext = OriginalNewASC->GetAvatarBindingContext();
+	const FGGYGOAvatarBindingContext OldContext = OriginalOldASC.IsValid()
+		? OriginalOldASC->GetAvatarBindingContext() : FGGYGOAvatarBindingContext{};
+	const FString SquadPath = GetPathName();
+	bSwitchRequestInProgress = true;
+	ON_SCOPE_EXIT
+	{
+		if (UGGYGOSquadComponent* Squad = OriginalSquad.Get()) { Squad->bSwitchRequestInProgress = false; }
+	};
+
+	const auto IsOriginalLayoutCurrent = [&](int32 ExpectedIndex)
 	{
 		UGGYGOSquadComponent* Squad = OriginalSquad.Get();
 		return Squad && !Squad->bSquadTerminationStarted && !Squad->IsBeingDestroyed() &&
-			OriginalController.IsValid() && !OriginalController->IsActorBeingDestroyed() &&
-			OriginalNewSlot.IsValid() && !OriginalNewSlot->IsActorBeingDestroyed();
+			Squad->bSwitchRequestInProgress && Squad->ActiveSlotIndex == ExpectedIndex &&
+			OriginalController.IsValid() && Squad->GetRegistrationController() == OriginalController.Get() &&
+			Squad->GetSlot(SlotIndex) == OriginalNewSlot.Get() && OriginalNewSlot.IsValid() &&
+			(OriginalActiveIndex == INDEX_NONE || (OriginalOldSlot.IsValid() && Squad->GetSlot(OriginalActiveIndex) == OriginalOldSlot.Get()));
+	};
+	const auto IsOriginalRequestCurrent = [&](int32 ExpectedIndex)
+	{
+		UGGYGOSquadComponent* Squad = OriginalSquad.Get();
+		if (!IsOriginalLayoutCurrent(ExpectedIndex) || !OriginalNewCharacter.IsValid() || !OriginalNewASC.IsValid()
+			|| !Squad->HasValidSlotBinding(OriginalNewSlot.Get(), OriginalController.Get())
+			|| !Squad->CanSlotBeActive(OriginalNewSlot.Get())
+			|| OriginalNewSlot->GetAvatarPawn() != OriginalNewCharacter.Get()
+			|| OriginalNewSlot->GetGGYGOAbilitySystemComponent() != OriginalNewASC.Get()
+			|| !OriginalNewASC->GetAvatarBindingContext().Binding.HasSameIdentity(NewContext.Binding))
+		{
+			return false;
+		}
+		return OriginalActiveIndex == INDEX_NONE || (OriginalOldCharacter.IsValid() && OriginalOldASC.IsValid()
+			&& Squad->HasValidSlotBinding(OriginalOldSlot.Get(), OriginalController.Get())
+			&& OriginalOldSlot->GetAvatarPawn() == OriginalOldCharacter.Get()
+			&& OriginalOldSlot->GetGGYGOAbilitySystemComponent() == OriginalOldASC.Get()
+			&& OriginalOldASC->GetAvatarBindingContext().Binding.HasSameIdentity(OldContext.Binding));
+	};
+	const auto HasOriginalControl = [&]()
+	{
+		APlayerController* Controller = OriginalController.Get();
+		return Controller && (OriginalActiveIndex == INDEX_NONE ? Controller->GetPawn() == nullptr
+			: OriginalOldCharacter.IsValid() && Controller->GetPawn() == OriginalOldCharacter.Get()
+				&& OriginalOldCharacter->GetController() == Controller);
+	};
+	const auto HasNewControl = [&]()
+	{
+		return OriginalController.IsValid() && OriginalNewCharacter.IsValid()
+			&& OriginalController->GetPawn() == OriginalNewCharacter.Get()
+			&& OriginalNewCharacter->GetController() == OriginalController.Get()
+			&& (!OriginalOldCharacter.IsValid() || OriginalOldCharacter->GetController() == nullptr);
+	};
+	const auto OldAbilitiesAreReady = [&](const FGGYGOAvatarBindingContext& Expected)
+	{
+		if (!OriginalOldASC.IsValid()) { return OriginalActiveIndex == INDEX_NONE; }
+		const auto Result = OriginalOldASC->CheckAvatarSwitchAbilitiesExited(Expected);
+		if (Result.Outcome == decltype(Result.Outcome)::Ready) { return true; }
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Teams] SwitchToSlot Squad=%s OldASC=%s Spec=%s Reason=ExitReadback Outcome=%u Detail=%u; current exit permission rejected."),
+			*SquadPath, *GetPathNameSafe(OriginalOldASC.Get()), *Result.BlockingSpec.ToString(),
+			static_cast<uint8>(Result.Outcome), static_cast<uint8>(Result.Reason));
+		return false;
+	};
+	const auto IsOriginalCancellationCallerCurrent = [&]()
+	{
+		return IsOriginalRequestCurrent(OriginalActiveIndex) && HasOriginalControl()
+			&& OriginalNewCharacter->GetController() == nullptr;
+	};
+	const auto ReportStoppedRequest = [&](const TCHAR* Reason)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Teams] SwitchToSlot Squad=%s Controller=%s OldSlot=%s Target=%s Reason=%s; original request stopped without input or control restoration."),
+			*SquadPath, *GetPathNameSafe(OriginalController.Get()), *GetPathNameSafe(OriginalOldSlot.Get()),
+			*GetPathNameSafe(OriginalNewSlot.Get()), Reason);
+		return false;
 	};
 
-	// 顺序很重要：先解除旧的再附身新的。
-	//
-	// 反过来做会让 UnPossess 在新 Pawn 已被附身之后执行，
-	// 而 UnPossess 会清掉 Controller 的 Pawn 引用 —— 刚建立的附身关系被清掉。
-	if (OldSlot)
+	if (OriginalOldASC.IsValid())
 	{
-		PC->UnPossess();
-		if (!CanContinueSwitch() || !OriginalOldSlot.IsValid())
+		const auto Exit = OriginalOldASC->TryExitAbilitiesForAvatarSwitch(OldContext, IsOriginalCancellationCallerCurrent);
+		if (Exit.Outcome != decltype(Exit.Outcome)::Completed)
 		{
+			UE_LOG(LogGGYGOAbilitySystem, Warning,
+				TEXT("[Teams] SwitchToSlot Squad=%s OldSlot=%s Target=%s Reason=AbilityExit Outcome=%u Detail=%u; control/input/presentation not transferred."),
+				*SquadPath, *GetPathNameSafe(OriginalOldSlot.Get()), *GetPathNameSafe(OriginalNewSlot.Get()),
+				static_cast<uint8>(Exit.Outcome), static_cast<uint8>(Exit.Reason));
 			return false;
+		}
+	}
+	if (!IsOriginalCancellationCallerCurrent() || !OldAbilitiesAreReady(OldContext))
+	{
+		return ReportStoppedRequest(TEXT("PostAbilityExitChangedRequest"));
+	}
+
+	// One local release, then the ASC's existing unique input retirement. Never replay
+	// ReleasePlayerInput against a successor or synthesize a physical release/press.
+	if (OriginalOldCharacter.IsValid())
+	{
+		if (UGGYGOHeroComponent* Hero = UGGYGOHeroComponent::FindHeroComponent(OriginalOldCharacter.Get()))
+		{
+			Hero->ReleasePlayerInput();
+		}
+		if (!IsOriginalCancellationCallerCurrent() || !OldAbilitiesAreReady(OldContext))
+		{
+			return ReportStoppedRequest(TEXT("HeroReleaseChangedRequest"));
+		}
+		OriginalOldASC->ClearAbilityInput();
+		if (!IsOriginalCancellationCallerCurrent() || !OldAbilitiesAreReady(OldContext))
+		{
+			return ReportStoppedRequest(TEXT("InputRetirementChangedRequest"));
+		}
+	}
+
+	const auto FailControlTransfer = [&](const TCHAR* Reason)
+	{
+		// Native Possess has no request receipt. On failure, reciprocal pointers alone
+		// cannot authorize undoing a callback's later possession of the same Pawn.
+		// Keep actual control untouched; do not request an automatic return to old.
+		if (IsOriginalRequestCurrent(OriginalActiveIndex) && !OriginalController->GetPawn()
+			&& !OriginalNewCharacter->GetController())
+		{
+			OriginalSquad->DeactivateSlot(OriginalNewSlot.Get());
+		}
+		if (IsOriginalLayoutCurrent(OriginalActiveIndex) && !HasOriginalControl())
+		{
+			OriginalSquad->ActiveSlotIndex = INDEX_NONE;
+			OriginalSquad->OnActiveCharacterChanged.Broadcast(nullptr);
+		}
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Teams] SwitchToSlot Squad=%s Controller=%s Target=%s Reason=%s; switch failed, cancelled GA and retired input are not restored."),
+			*SquadPath, *GetPathNameSafe(OriginalController.Get()), *GetPathNameSafe(OriginalNewCharacter.Get()), Reason);
+		return false;
+	};
+
+	if (OriginalOldCharacter.IsValid())
+	{
+		OriginalController->UnPossess();
+		if (!IsOriginalRequestCurrent(OriginalActiveIndex) || OriginalController->GetPawn()
+			|| OriginalOldCharacter->GetController() || OriginalNewCharacter->GetController()
+			|| !OldAbilitiesAreReady(OriginalOldASC->GetAvatarBindingContext()))
+		{
+			return FailControlTransfer(TEXT("UnPossessOrRefreshFailed"));
 		}
 		OriginalSquad->DeactivateSlot(OriginalOldSlot.Get());
-		if (!CanContinueSwitch())
+		if (!IsOriginalRequestCurrent(OriginalActiveIndex) || OriginalController->GetPawn()
+			|| OriginalNewCharacter->GetController()
+			|| !OldAbilitiesAreReady(OriginalOldASC->GetAvatarBindingContext()))
 		{
-			return false;
+			return FailControlTransfer(TEXT("OldPresentationChangedRequest"));
 		}
 	}
 
-	OriginalSquad->ActiveSlotIndex = SlotIndex;
-
 	OriginalSquad->ActivateSlot(OriginalNewSlot.Get());
-	if (!CanContinueSwitch())
+	if (!IsOriginalRequestCurrent(OriginalActiveIndex) || OriginalController->GetPawn()
+		|| OriginalNewCharacter->GetController()
+		|| !OldAbilitiesAreReady(OriginalOldASC.IsValid() ? OriginalOldASC->GetAvatarBindingContext() : OldContext))
 	{
-		return false;
-	}
-
-	const TWeakObjectPtr<AGGYGOCharacterBase> OriginalNewCharacter(
-		Cast<AGGYGOCharacterBase>(OriginalNewSlot->GetAvatarPawn()));
-	if (!OriginalNewCharacter.IsValid() || OriginalNewCharacter->IsActorBeingDestroyed())
-	{
-		return false;
+		return FailControlTransfer(TEXT("NewPresentationChangedRequest"));
 	}
 	OriginalController->Possess(OriginalNewCharacter.Get());
-	if (!CanContinueSwitch() || !OriginalNewCharacter.IsValid())
+	if (!IsOriginalRequestCurrent(OriginalActiveIndex) || !HasNewControl()
+		|| !OldAbilitiesAreReady(OriginalOldASC.IsValid() ? OriginalOldASC->GetAvatarBindingContext() : OldContext))
 	{
-		return false;
+		return FailControlTransfer(TEXT("PossessReadbackFailed"));
 	}
 
+	// ActiveSlotIndex is the only committed squad state. Native Possess is void;
+	// the reciprocal relationships above, not its return, prove the control transfer.
+	OriginalSquad->ActiveSlotIndex = SlotIndex;
 	OriginalSquad->OnActiveCharacterChanged.Broadcast(OriginalNewCharacter.Get());
-
-	return CanContinueSwitch();
+	return IsOriginalRequestCurrent(SlotIndex) && HasNewControl();
 }
 
 bool UGGYGOSquadComponent::SwitchToNextSlot()
 {
-	if (bSquadTerminationStarted || !IsValid(this) || IsBeingDestroyed())
+	if (bSquadTerminationStarted || bSwitchRequestInProgress || !IsValid(this) || IsBeingDestroyed())
 	{
 		return false;
 	}
@@ -565,9 +695,11 @@ bool UGGYGOSquadComponent::SwitchToNextSlot()
 	for (int32 Offset = 1; Offset < Count; ++Offset)
 	{
 		const int32 Candidate = (ActiveSlotIndex + Offset) % Count;
-		if (SwitchToSlot(Candidate))
+		if (CanSlotBeActive(GetSlot(Candidate)))
 		{
-			return true;
+			// Skip unavailable members, but do not retry a partially-executed exit on
+			// another target after a real switch request has failed.
+			return SwitchToSlot(Candidate);
 		}
 		if (!OriginalSquad.IsValid() || OriginalSquad->bSquadTerminationStarted || OriginalSquad->IsBeingDestroyed())
 		{
@@ -580,7 +712,7 @@ bool UGGYGOSquadComponent::SwitchToNextSlot()
 
 bool UGGYGOSquadComponent::SwitchToPreviousSlot()
 {
-	if (bSquadTerminationStarted || !IsValid(this) || IsBeingDestroyed())
+	if (bSquadTerminationStarted || bSwitchRequestInProgress || !IsValid(this) || IsBeingDestroyed())
 	{
 		return false;
 	}
@@ -595,9 +727,9 @@ bool UGGYGOSquadComponent::SwitchToPreviousSlot()
 	{
 		// 加 Count 再取模，避免负数下标。
 		const int32 Candidate = ((ActiveSlotIndex - Offset) % Count + Count) % Count;
-		if (SwitchToSlot(Candidate))
+		if (CanSlotBeActive(GetSlot(Candidate)))
 		{
-			return true;
+			return SwitchToSlot(Candidate);
 		}
 		if (!OriginalSquad.IsValid() || OriginalSquad->bSquadTerminationStarted || OriginalSquad->IsBeingDestroyed())
 		{
