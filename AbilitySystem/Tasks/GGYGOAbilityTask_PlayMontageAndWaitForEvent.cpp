@@ -11,6 +11,7 @@
 #include "AbilitySystem/Tasks/GGYGORootMotionScaleLease.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
+#include "AnimNotifies/AnimNotify_PlayMontageNotify.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
@@ -35,6 +36,65 @@ struct UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbackRegistration
 
 namespace
 {
+	bool ResolveNativeMontageNotify(const UAnimMontage* Montage, FName NotifyName,
+		const FAnimNotifyEvent*& OutEvent, float& OutPositionSeconds, FString& OutDiagnostic)
+	{
+		OutEvent = nullptr;
+		OutPositionSeconds = 0.0f;
+		OutDiagnostic.Reset();
+		if (!IsInGameThread() || !IsValid(Montage) || NotifyName.IsNone())
+		{
+			OutDiagnostic = TEXT("Native Montage Notify resolution requires GameThread, a valid Montage and a nonempty name.");
+			return false;
+		}
+		const float Length = Montage->GetPlayLength();
+		if (!FMath::IsFinite(Length) || Length <= 0.0f)
+		{
+			OutDiagnostic = TEXT("Native Montage Notify resolution requires a finite positive Montage length.");
+			return false;
+		}
+		const FAnimNotifyEvent* Matched = nullptr;
+		for (const FAnimNotifyEvent& Event : Montage->Notifies)
+		{
+			const UAnimNotify_PlayMontageNotifyWindow* Window = Cast<UAnimNotify_PlayMontageNotifyWindow>(Event.NotifyStateClass.Get());
+			if (Window && FName(*Window->UAnimNotify_PlayMontageNotifyWindow::GetNotifyName_Implementation()) == NotifyName)
+			{
+				OutDiagnostic = TEXT("The configured name also identifies a Montage Notify Window; a single native point is required.");
+				return false;
+			}
+			const UAnimNotify_PlayMontageNotify* Notify = Cast<UAnimNotify_PlayMontageNotify>(Event.Notify.Get());
+			// Read the native Broadcast name without invoking a Blueprint display-name override.
+			if (!Notify || FName(*Notify->UAnimNotify_PlayMontageNotify::GetNotifyName_Implementation()) != NotifyName) { continue; }
+			if (Notify->GetClass() != UAnimNotify_PlayMontageNotify::StaticClass()
+				|| Event.NotifyStateClass || Event.GetLinkedMontage() != Montage
+				|| !Event.IsBranchingPoint() || Event.GetDuration() != 0.0f)
+			{
+				OutDiagnostic = TEXT("The configured name must identify the stock UAnimNotify_PlayMontageNotify native point, not a state or subclass.");
+				return false;
+			}
+			if (Matched)
+			{
+				OutDiagnostic = TEXT("The configured native Montage Notify point is duplicated.");
+				return false;
+			}
+			const float Position = Event.GetTriggerTime();
+			if (!FMath::IsFinite(Position) || Position < 0.0f || Position > Length)
+			{
+				OutDiagnostic = TEXT("The native Montage Notify trigger time is nonfinite or outside the Montage timeline.");
+				return false;
+			}
+			Matched = &Event;
+		}
+		if (!Matched)
+		{
+			OutDiagnostic = TEXT("The configured stock native Montage Notify point is missing.");
+			return false;
+		}
+		OutEvent = Matched; // Borrowed only by the current call; never retained across asset mutation.
+		OutPositionSeconds = Matched->GetTriggerTime();
+		return true;
+	}
+
 	bool StopOriginalMontageInstance(const FGGYGOMontagePlayGuardIdentity& Identity,
 		const FGGYGOAbilityMontagePlaybackHandle& Playback,
 		const TWeakObjectPtr<UAbilitySystemComponent>& OriginalASC,
@@ -120,7 +180,8 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 	else if (NativeCallbackRegistration.IsValid()) { Reason = TEXT("a native callback package is already registered"); }
 	else if (!Callbacks.OnCompleted.IsBound() && !Callbacks.OnBlendOut.IsBound()
 		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound()
-		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound() && !Callbacks.OnFailed.IsBound())
+		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound()
+		&& !Callbacks.NotifyReceived.IsBound() && !Callbacks.OnFailed.IsBound())
 	{
 		Reason = TEXT("the native callback package has no bound callbacks");
 	}
@@ -279,6 +340,109 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalSectionSnapshot
 	return true;
 }
 
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotify(
+	const UAnimMontage* Montage, FName NotifyName, float& OutNotifyPositionSeconds, FString& OutDiagnostic)
+{
+	const FAnimNotifyEvent* Event = nullptr;
+	return ResolveNativeMontageNotify(Montage, NotifyName, Event, OutNotifyPositionSeconds, OutDiagnostic);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ConfigureOriginalMontageNotify(FName InName, FString& OutDiagnostic)
+{
+	OutDiagnostic.Reset();
+	if (!IsInGameThread() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+		|| bCancellationRequested || bPoseFailureRequested || GetState() != EGameplayTaskState::AwaitingActivation
+		|| !ConfiguredMontageNotifyName.IsNone())
+	{
+		OutDiagnostic = TEXT("Native Montage Notify configuration is allowed once, on the original pre-Ready AwaitingActivation task.");
+		return false;
+	}
+	const FAnimNotifyEvent* Event = nullptr;
+	float Position = 0.0f;
+	if (!ResolveNativeMontageNotify(MontageToPlay, InName, Event, Position, OutDiagnostic)) { return false; }
+	ConfiguredMontageNotify = Event->Notify;
+	ConfiguredMontageNotifyName = InName;
+	ConfiguredMontageNotifyPositionSeconds = Position;
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageNotifySourceCurrent() const
+{
+	if (ConfiguredMontageNotifyName.IsNone() || !IsValid(ConfiguredMontageNotify)) { return false; }
+	const FAnimNotifyEvent* Event = nullptr;
+	float Position = 0.0f;
+	FString Diagnostic;
+	return ResolveNativeMontageNotify(MontageToPlay, ConfiguredMontageNotifyName, Event, Position, Diagnostic)
+		&& Event->Notify == ConfiguredMontageNotify && Position == ConfiguredMontageNotifyPositionSeconds;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySnapshot(
+	FGGYGOMontageNotifyFact& OutFact, float& OutPositionSeconds) const
+{
+	check(IsInGameThread());
+	OutFact = {};
+	OutPositionSeconds = 0.0f;
+	if (!CanDispatchOriginalInstanceFact(OriginalGuardIdentity) || !IsOriginalMontageNotifySourceCurrent()) { return false; }
+	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
+	if (!Instance || !FMath::IsFinite(Instance->GetPosition())) { return false; }
+	OutFact.Montage = MontageToPlay;
+	OutFact.Mesh = ActivatedMesh.Get();
+	OutFact.MontageInstanceId = Instance->GetInstanceID();
+	OutFact.NotifyName = ConfiguredMontageNotifyName;
+	OutFact.NotifyPositionSeconds = ConfiguredMontageNotifyPositionSeconds;
+	OutPositionSeconds = Instance->GetPosition();
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalMontageNotifyFact(
+	const FGGYGOMontageNotifyFact& Fact, const FGGYGOMontagePlayGuardIdentity& Original) const
+{
+	return CanDispatchOriginalInstanceFact(Original) && IsOriginalMontageNotifySourceCurrent()
+		&& GetTaskMontageInstance() && Fact.Montage == MontageToPlay && Fact.Mesh == ActivatedMesh.Get()
+		&& Fact.MontageInstanceId == Original.CreatedInstanceId && Fact.NotifyName == ConfiguredMontageNotifyName
+		&& Fact.NotifyPositionSeconds == ConfiguredMontageNotifyPositionSeconds;
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageNotifyFact(
+	const FGGYGOMontageNotifyFact& Fact, const FGGYGOMontagePlayGuardIdentity& Original)
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
+	const auto Recheck = [&]() -> UGGYGOAbilityTask_PlayMontageAndWaitForEvent*
+	{
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+		return Task && OriginalAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Task->Ability))
+			&& OriginalASC.HasSameIndexAndSerialNumber(TWeakObjectPtr<UAbilitySystemComponent>(Task->AbilitySystemComponent.Get()))
+			&& Task->CanDispatchOriginalMontageNotifyFact(Fact, Original) ? Task : nullptr;
+	};
+	if (!Recheck()) { return; }
+	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = NativeCallbackRegistration;
+	if (NativeSnapshot.IsValid()) { NativeSnapshot->Callbacks.NotifyReceived.ExecuteIfBound(Fact); }
+	NativeSnapshot.Reset(); // Capture destructors are external code too; recheck after they return.
+	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Recheck()) { Task->NotifyReceived.Broadcast(Fact); }
+	// No task access after BP; the caller may retire this task and launch a same-asset successor.
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
+	FName NotifyName, const FBranchingPointNotifyPayload& Payload)
+{
+	if (NotifyName != ConfiguredMontageNotifyName || Payload.MontageInstanceID == INDEX_NONE
+		|| Payload.MontageInstanceID != MontageInstanceId || Payload.SkelMeshComponent != ActivatedMesh.Get()
+		|| Payload.SequenceAsset != MontageToPlay || !Payload.NotifyEvent) { return; }
+	const FAnimNotifyEvent* Event = nullptr;
+	float Position = 0.0f;
+	FString Diagnostic;
+	if (!ResolveNativeMontageNotify(MontageToPlay, NotifyName, Event, Position, Diagnostic)
+		|| Event != Payload.NotifyEvent || Event->Notify != ConfiguredMontageNotify
+		|| Position != ConfiguredMontageNotifyPositionSeconds) { return; }
+	FGGYGOMontageNotifyFact Fact;
+	float CurrentPosition = 0.0f;
+	if (!TryGetOriginalMontageNotifySnapshot(Fact, CurrentPosition)) { return; }
+	const FGGYGOMontagePlayGuardIdentity Original = OriginalGuardIdentity;
+	DispatchOriginalMontageNotifyFact(Fact, Original); // Never forward the borrowed engine payload.
+}
+
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(
 	const UAnimMontage* Montage,
 	float RequestedRate,
@@ -342,6 +506,20 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	{
 		FailAndEndTask(TEXT("Montage、播放速率或 RootMotion 缩放配置无效"));
 		return;
+	}
+	if (!ConfiguredMontageNotifyName.IsNone())
+	{
+		if (!IsOriginalMontageNotifySourceCurrent())
+		{
+			FailAndEndTask(TEXT("配置的原生 Montage Notify 单点声明在 Ready 前已失效"));
+			return;
+		}
+		if (!NotifyReceived.IsBound() && !(NativeCallbackRegistration.IsValid()
+			&& NativeCallbackRegistration->Callbacks.NotifyReceived.IsBound()))
+		{
+			FailAndEndTask(TEXT("配置的原生 Montage Notify 没有 pre-Ready native 或 Blueprint 消费者"));
+			return;
+		}
 	}
 	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(AbilitySystemComponent.Get());
 	if (!ASC)
@@ -514,6 +692,16 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		if (Task && !Task->bEndingTask) { Task->FailAndEndTask(TEXT("原 Guard 实例已失效，无法安装任务委托"), &Result); }
 		return;
 	}
+	if (!Task->ConfiguredMontageNotifyName.IsNone() && !Task->IsOriginalMontageNotifySourceCurrent())
+	{
+		Task->StopPlayingMontage();
+		Task = OriginalTask.Get();
+		if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished)
+		{
+			Task->FailAndEndTask(TEXT("原生播放外调返回后配置的 Montage Notify 单点声明已改变"));
+		}
+		return;
+	}
 	// Bind the result's exact instance, never the current instance found by asset.
 	if (Instance->OnMontageSectionChanged.IsBound() && Instance->OnMontageSectionChanged.GetUObject() != Task)
 	{
@@ -526,6 +714,11 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	Instance->OnMontageEnded = Task->MontageEndedDelegate;
 	Task->MontageSectionChangedDelegate.BindUObject(Task, &ThisClass::OnMontageSectionChangedForInstance, Result.Guard.Identity);
 	Instance->OnMontageSectionChanged = Task->MontageSectionChangedDelegate;
+	if (!Task->ConfiguredMontageNotifyName.IsNone())
+	{
+		// This engine multicast has no handle: detach only the original AnimInstance/task/function pair.
+		AnimInstance->OnPlayMontageNotifyBegin.AddDynamic(Task, &ThisClass::OnOriginalMontageNotifyBegin);
+	}
 
 	if (ACharacter* Character = Task->ActivatedCharacter.Get())
 	{
@@ -610,6 +803,10 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	// Close the subscription before any cleanup. Its captures stay stack-owned until all old
 	// cleanup and Super have returned, so their destructors cannot interrupt a member-write tail.
 	TSharedPtr<FNativeCallbackRegistration> DetachedNativeCallbacks = MoveTemp(NativeCallbackRegistration);
+	if (UAnimInstance* OriginalAnimInstance = ActivatedAnimInstance.Get())
+	{
+		OriginalAnimInstance->OnPlayMontageNotifyBegin.RemoveDynamic(this, &ThisClass::OnOriginalMontageNotifyBegin);
+	}
 	ActionPoseContractTicket.Reset();
 	// Keep bTickingTask until native deactivation removes this task from TickingTasks.
 	if (AbilityEnded && bStopWhenAbilityEnds) { RequestInFlightMontageStop(); }

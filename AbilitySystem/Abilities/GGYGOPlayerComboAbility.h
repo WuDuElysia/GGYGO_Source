@@ -15,6 +15,7 @@ class UWorld;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOPlayerComboLifecycleFixture;
 struct FGGYGOMontageSectionFact;
+struct FGGYGOMontageNotifyFact;
 enum class EGGYGOActionMotionReleaseReason : uint8;
 
 UCLASS(Blueprintable)
@@ -34,6 +35,8 @@ public:
 	bool IsComboWindowOpen() const { return Window.bOpen; }
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
 	bool HasPendingComboRequest() const { return Window.PendingRequestId > 0; }
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
+	bool IsInterruptionOpen() const;
 	bool ValidateComboConfiguration(FString& OutError) const;
 #if WITH_EDITOR
 	virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
@@ -50,11 +53,10 @@ protected:
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	bool IsStepPlayable(int32 Index) const;
-	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f);
+	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f, int32 SourceRequestId = 0);
 	void ReleaseMontageTask(const FGGYGOAbilityActivationHandle& Original);
 	void OpenTraceWindow(const FGGYGOAbilityActivationHandle& Original);
 	void ReleaseTraceWindow(const FGGYGOAbilityActivationHandle& Original);
-	void TryAdvanceCombo(const FGGYGOAbilityActivationHandle& Original);
 	void RejectRequest(const FGGYGOAbilityActivationHandle& Original, int32 RequestId);
 	void SendAuthoritativeStep(const FGGYGOAbilityActivationHandle& Original, int32 RequestId, bool bAccepted);
 	void HandleWatchdog(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken);
@@ -64,7 +66,8 @@ protected:
 	bool IsMotionResourceCurrent(const TSharedPtr<FStepMotionResources>& Resource) const;
 	bool InitializeStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageSectionFact& Fact);
-	void EnterStepEnd(const TSharedPtr<FStepMotionResources>& Resource);
+	void HandleMontageNotify(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageNotifyFact& Fact);
+	void EnableStepInterruption(const TSharedPtr<FStepMotionResources>& Resource);
 	void TryCompleteStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
 	void ReleaseStepMotion(EGGYGOActionMotionReleaseReason Reason);
@@ -81,7 +84,8 @@ protected:
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	TArray<FGGYGOComboStep> ComboSteps;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (ClampMin = "0.0", ClampMax = "1.0"))
+	/** 历史缓冲配置存值；作者信号模式仅接受开门后真实新请求，不缓存或重放开门前输入。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (ClampMin = "0.0", ClampMax = "1.0", ToolTip = "历史存值；作者信号模式不缓存开门前攻击。"))
 	float InputBufferSeconds = 0.35f;
 	/** 实际原生播放与混出预算以外的完成宽限；仅用于现有 watchdog，不决定动画混合。
 	 *  原 CMC 最后区间或原 Task 完成事实缺失时，截止后明确中止原激活。 */
@@ -124,6 +128,8 @@ private:
 	FTimerHandle WatchdogHandle;
 	int32 CurrentStep = INDEX_NONE;
 	int32 LastRequestId = 0;
+	/** 本段实际起播的原输入请求序号；段号可回接，旧服务器确认按请求顺序隔离。 */
+	int32 CurrentStepRequestId = 0;
 	int32 StepSyncRevision = 0;
 	bool bChangedMeshTick = false;
 	bool bAddedMeshPrerequisite = false;

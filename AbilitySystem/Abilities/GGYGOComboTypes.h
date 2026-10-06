@@ -7,8 +7,8 @@
 
 class UAnimMontage;
 
-/** 每段一个 Main→End Montage；同一 CMC 资源执行完整自然轨迹，End 仅放开真实移动打断。
- *  时间窗口与原生混出时机在 Montage 上配置。 */
+/** 每段一个 Main→End Montage；同一 CMC 资源执行完整自然轨迹。
+ *  作者单点通知经过后持续允许真实移动或新攻击打断，段落不隐式开门。 */
 USTRUCT(BlueprintType)
 struct GGYGO_API FGGYGOComboStep
 {
@@ -26,9 +26,14 @@ struct GGYGO_API FGGYGOComboStep
 	/** 原动画厘米位移的显式倍率；Avatar 实际缩放由 CMC 仅应用一次。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion", meta = (ClampMin = "0.001"))
 	float MotionTranslationScale = 1.0f;
-	/** INDEX_NONE 表示终段；首版仅允许指向后面的段，避免意外循环。 */
+	/** 已过作者信号后一次真实新攻击的接续目标；INDEX_NONE 显式关闭攻击接续。
+	 *  可回前段，但无新请求不自动推进或循环。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
 	int32 NextStepIndex = INDEX_NONE;
+	/** Montage 内唯一原生 Montage Notify 单点的显式名称；缺失/重名/不可达明确拒绝。
+	 *  普通 Hit/Combo Window 不授予打断权限，新播放独立重新关门。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
+	FName InterruptionNotifyName = TEXT("Event.Montage.CancelPoint");
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ClampMin = "0.01"))
 	float PlayRate = 1.0f;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo", meta = (ClampMin = "0.0"))

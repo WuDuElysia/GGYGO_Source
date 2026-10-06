@@ -28,6 +28,7 @@
 
 #include "Abilities/Tasks/AbilityTask.h"
 #include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
+#include "Animation/AnimNotifies/AnimNotify.h"
 #include "Animation/Runtime/GGYGOActionPoseContract.h"
 #include "GameplayTagContainer.h"
 
@@ -85,6 +86,29 @@ struct GGYGO_API FGGYGOMontageSectionSnapshot
 
 DECLARE_DELEGATE_OneParam(FGGYGOMontageSectionFactDelegate, const FGGYGOMontageSectionFact&);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOMontageSectionFactBPDelegate, FGGYGOMontageSectionFact, SectionFact);
+
+/** An authored native point from this task's exact original playback.
+ * This fact and its authored position grant no ability, input or movement authority. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOMontageNotifyFact
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	TObjectPtr<UAnimMontage> Montage = nullptr;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	TObjectPtr<USkeletalMeshComponent> Mesh = nullptr;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	int32 MontageInstanceId = INDEX_NONE;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	FName NotifyName = NAME_None;
+	/** Native trigger time, including its offset; not a later callback-time position. */
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	float NotifyPositionSeconds = 0.0f;
+};
+
+DECLARE_DELEGATE_OneParam(FGGYGOMontageNotifyFactDelegate, const FGGYGOMontageNotifyFact&);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOMontageNotifyFactBPDelegate, FGGYGOMontageNotifyFact, NotifyFact);
 
 UENUM(BlueprintType)
 enum class EGGYGOMontageTaskFailureStage : uint8
@@ -146,6 +170,7 @@ public:
 		FGGYGOPlayMontageAndWaitForEventDelegate OnCancelled;
 		FGGYGOPlayMontageAndWaitForEventDelegate EventReceived;
 		FGGYGOMontageSectionFactDelegate SectionReceived;
+		FGGYGOMontageNotifyFactDelegate NotifyReceived;
 		FGGYGOMontageTaskFailureDelegate OnFailed;
 	};
 
@@ -164,6 +189,20 @@ public:
 	 * NAME_None and finite zero/negative rates are raw facts for the caller to interpret. */
 	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Ability|Tasks")
 	bool TryGetOriginalSectionSnapshot(FGGYGOMontageSectionSnapshot& OutSnapshot) const;
+
+	/** Optional, once-only pre-Ready subscription to one stock native Montage Notify point.
+	 * Missing, duplicate, state/subclass or invalid-time declarations fail explicitly. */
+	UFUNCTION(BlueprintCallable, Category = "Ability|Tasks")
+	bool ConfigureOriginalMontageNotify(FName InName, FString& OutDiagnostic);
+	/** Shared declaration validation for callers checking their authored configurations.
+	 * No playback, registration, Blueprint callback or business-state mutation occurs. */
+	static bool ResolveOriginalMontageNotify(const UAnimMontage* Montage, FName NotifyName,
+		float& OutNotifyPositionSeconds, FString& OutDiagnostic);
+	/** Actual position of this task's fixed-ID original instance, including natural blend-out.
+	 * Used after Ready and original caller authentication; false clears both outputs.
+	 * This read does not synthesize a Notify or decide whether a business gate is open. */
+	UFUNCTION(BlueprintCallable, BlueprintPure = false, Category = "Ability|Tasks")
+	bool TryGetOriginalMontageNotifySnapshot(FGGYGOMontageNotifyFact& OutFact, float& OutPositionSeconds) const;
 
 	virtual void Activate() override;
 	/** Required contracts only: read Animation's original lease through UE's task scheduler. */
@@ -220,6 +259,10 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOMontageSectionFactBPDelegate SectionReceived;
 
+	/** Exact original native point; may arrive during natural blend-out, never from ASC events. */
+	UPROPERTY(BlueprintAssignable)
+	FGGYGOMontageNotifyFactBPDelegate NotifyReceived;
+
 	/** Required pose failure after this original task has stopped and released its resources.
 	 * This is independent of user cancellation and may be received from a finished task. */
 	UPROPERTY(BlueprintAssignable)
@@ -238,6 +281,13 @@ private:
 	void DispatchOriginalCallback(ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData);
 	void DispatchOriginalSectionFact(const FGGYGOMontageSectionFact& Fact,
 		const FGGYGOMontagePlayGuardIdentity& Original);
+	bool IsOriginalMontageNotifySourceCurrent() const;
+	bool CanDispatchOriginalMontageNotifyFact(const FGGYGOMontageNotifyFact& Fact,
+		const FGGYGOMontagePlayGuardIdentity& Original) const;
+	void DispatchOriginalMontageNotifyFact(const FGGYGOMontageNotifyFact& Fact,
+		const FGGYGOMontagePlayGuardIdentity& Original);
+	UFUNCTION()
+	void OnOriginalMontageNotifyBegin(FName NotifyName, const FBranchingPointNotifyPayload& Payload);
 
 	/** 当前 Montage 是否仍由本任务驱动。 */
 	bool IsNotifyValid() const;
@@ -282,6 +332,13 @@ private:
 	/** 要播的 Montage。 */
 	UPROPERTY()
 	TObjectPtr<UAnimMontage> MontageToPlay;
+
+	/** Immutable declaration bound before Ready; never stores an open/closed business gate.
+	 * Retain the UObject, not an invalidatable pointer into Montage.Notifies. */
+	UPROPERTY()
+	TObjectPtr<UAnimNotify> ConfiguredMontageNotify = nullptr;
+	FName ConfiguredMontageNotifyName = NAME_None;
+	float ConfiguredMontageNotifyPositionSeconds = 0.0f;
 
 	/** 监听的事件标签。 */
 	UPROPERTY()

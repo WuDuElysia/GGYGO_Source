@@ -10,6 +10,7 @@
 #include "Animation/AnimCurveTypes.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/Skeleton.h"
+#include "AnimNotifies/AnimNotify_PlayMontageNotify.h"
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
@@ -226,8 +227,9 @@ struct FGGYGOPlayerComboLifecycleFixture
 	UGGYGOPlayerComboLifecycleTestAbility* Ability = nullptr;
 
 #if WITH_EDITOR
-	// Read-only access to the production ability. These helpers neither adopt its
-	// resources into the synthetic fixture nor change its native callbacks.
+	// Inspect the production ability without adopting its resources or changing its
+	// native callbacks. The explicit Main-point probe below swaps only a PIE instance's
+	// step configuration for an unsaved transient copy and restores it after teardown.
 	static UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetProductionMontageTask(
 		const UGGYGOPlayerComboAbility* Production)
 	{
@@ -249,6 +251,51 @@ struct FGGYGOPlayerComboLifecycleFixture
 		OutStep = Production->ComboSteps[0];
 		return true;
 	}
+	static int32 ReadProductionLastInputRequest(const UGGYGOPlayerComboAbility* Production)
+	{
+		return Production ? Production->LastRequestId : 0;
+	}
+	static bool InstallProductionMainPointProbe(UGGYGOPlayerComboAbility* Production, int32 StepIndex,
+		FGGYGOComboStep& OutOriginal, TStrongObjectPtr<UAnimMontage>& OutProbe, FString& Error)
+	{
+		if (!Production || Production->IsActive() || !Production->ComboSteps.IsValidIndex(StepIndex)) { return false; }
+		OutOriginal = Production->ComboSteps[StepIndex];
+		float OriginalPoint = 0.0f;
+		if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotify(
+			OutOriginal.Montage, OutOriginal.InterruptionNotifyName, OriginalPoint, Error)) { return false; }
+		UAnimMontage* Probe = DuplicateObject<UAnimMontage>(OutOriginal.Montage, GetTransientPackage(),
+			MakeUniqueObjectName(GetTransientPackage(), UAnimMontage::StaticClass(), TEXT("PlayerComboSignalProbe")));
+		if (!Probe) { Error = TEXT("could not duplicate the formal Montage for the finite unsaved point probe"); return false; }
+		OutProbe.Reset(Probe);
+		const int32 Main = Probe->GetSectionIndex(OutOriginal.MainSection);
+		const int32 End = Probe->GetSectionIndex(OutOriginal.EndSection);
+		if (Main == INDEX_NONE || End == INDEX_NONE) { Error = TEXT("formal probe lost its Main/End"); return false; }
+		const float MainStart = Probe->GetAnimCompositeSection(Main).GetTime();
+		const float EndStart = Probe->GetAnimCompositeSection(End).GetTime();
+		const float PointPosition = MainStart + (EndStart - MainStart) * 0.5f;
+		for (FAnimNotifyEvent& Event : Probe->Notifies)
+		{
+			const auto* Point = Cast<UAnimNotify_PlayMontageNotify>(Event.Notify.Get());
+			if (Point && FName(*Point->GetNotifyName_Implementation()) == OutOriginal.InterruptionNotifyName)
+			{
+				Event.Link(Probe, PointPosition);
+				Event.RefreshTriggerOffset(Probe->CalculateOffsetForNotify(PointPosition));
+			}
+		}
+		static_cast<UAnimSequenceBase*>(Probe)->RefreshCacheData();
+		float ResolvedPoint = 0.0f;
+		if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotify(
+			Probe, OutOriginal.InterruptionNotifyName, ResolvedPoint, Error)
+			|| ResolvedPoint <= MainStart || ResolvedPoint >= EndStart) { return false; }
+		Production->ComboSteps[StepIndex].Montage = Probe;
+		return true;
+	}
+	static void RestoreProductionMainPointProbe(UGGYGOPlayerComboAbility* Production, int32 StepIndex,
+		const FGGYGOComboStep& Original, const UAnimMontage* Probe)
+	{
+		if (Production && Production->ComboSteps.IsValidIndex(StepIndex)
+			&& Production->ComboSteps[StepIndex].Montage == Probe) { Production->ComboSteps[StepIndex] = Original; }
+	}
 	static bool ProductionResourcesReleased(const UGGYGOPlayerComboAbility* Production, UWorld* ProductionWorld)
 	{
 		return Production && ProductionWorld && !Production->StepMotionResources.IsValid()
@@ -258,7 +305,7 @@ struct FGGYGOPlayerComboLifecycleFixture
 			&& !Production->MontageCallbackRegistration.IsValid() && !Production->InputCallbackRegistration.IsValid()
 			&& !Production->TraceHitSubscription.IsValid() && !Production->bChangedMeshTick
 			&& !Production->bAddedMeshPrerequisite && Production->CurrentStepToken == 0
-			&& Production->CurrentStep == INDEX_NONE
+			&& Production->CurrentStep == INDEX_NONE && Production->CurrentStepRequestId == 0
 			&& !ProductionWorld->GetTimerManager().TimerExists(Production->WatchdogHandle);
 	}
 #endif
@@ -334,6 +381,16 @@ struct FGGYGOPlayerComboLifecycleFixture
 #if WITH_EDITOR
 		if (Montage->AddAnimCompositeSection(TEXT("Main"), 0.0f) == INDEX_NONE
 			|| Montage->AddAnimCompositeSection(TEXT("End"), 0.5f) == INDEX_NONE) { return false; }
+		UAnimNotify_PlayMontageNotify* Signal = NewObject<UAnimNotify_PlayMontageNotify>(Montage);
+		FNameProperty* SignalNameProperty = FindFProperty<FNameProperty>(Signal->GetClass(), TEXT("NotifyName"));
+		if (!SignalNameProperty) { return false; }
+		SignalNameProperty->SetPropertyValue_InContainer(Signal, FName(TEXT("Event.Montage.CancelPoint")));
+		FAnimNotifyEvent SignalEvent;
+		SignalEvent.Notify = Signal;
+		SignalEvent.NotifyName = FName(TEXT("Event.Montage.CancelPoint"));
+		SignalEvent.Link(Montage, 0.5f);
+		Montage->Notifies.Add(SignalEvent);
+		static_cast<UAnimSequenceBase*>(Montage)->RefreshCacheData();
 #else
 		return false;
 #endif
@@ -424,6 +481,9 @@ struct FGGYGOPlayerComboLifecycleFixture
 			&& !EndingMontageTask->OnBlendOut.IsBound()
 			&& !EndingMontageTask->EventReceived.IsBound()
 			&& !EndingMontageTask->SectionReceived.IsBound()
+			&& !EndingMontageTask->NotifyReceived.IsBound()
+			&& AnimInstance && !AnimInstance->OnPlayMontageNotifyBegin.Contains(
+				EndingMontageTask, FName(TEXT("OnOriginalMontageNotifyBegin")))
 			&& EndingInputTask && !EndingInputTask->IsActive()
 			&& !EndingInputTask->OnPress.IsBound()
 			&& Mesh && Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered
@@ -1115,6 +1175,9 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 		&& ActivationA.Reason == EGGYGOAbilityActivationRequestReason::None)
 		|| !CheckActiveResources(ActivationA.OriginalActivation, TEXT("A"), 0.0f)) { return false; }
 	Fixture.Ability->UsePredictingActivationModeForTest();
+	FGGYGOMontageSectionSnapshot BeforeCorrectionSnapshot;
+	if (!TestTrue(TEXT("保留纠正前同资产的精确旧实例"), Fixture.GetMontageTask()
+		&& Fixture.GetMontageTask()->TryGetOriginalSectionSnapshot(BeforeCorrectionSnapshot))) { return false; }
 	FGameplayAbilityTargetDataHandle CorrectStep = MakeComboCorrection(7, 19, 1, 0.25f);
 	TestEqual(TEXT("通过 GAS TargetDataHandle 发送精确载荷类型"), CorrectStep.Num(), 1);
 	TestEqual(TEXT("TargetDataHandle 保存精确 USTRUCT 类型"),
@@ -1141,6 +1204,30 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("较新拒绝载荷回滚到服务器段"), Fixture.Ability->GetCurrentComboStep(), 0);
 	Fixture.Ability->ReceiveAbilityCorrection(MakeComboCorrection(7, 20, 1, 0.1f, false, false, false));
 	TestEqual(TEXT("旧修订不能回滚较新服务器段"), Fixture.Ability->GetCurrentComboStep(), 0);
+	// The configured author-point target can return to a smaller step; confirmations are ordered
+	// by their original input requests, never by the numerical step index.
+	Fixture.Ability->ReceiveAbilityCorrection(MakeComboCorrection(9, 21, 1, 0.2f));
+	TestEqual(TEXT("较新确认进入前向段"), Fixture.Ability->GetCurrentComboStep(), 1);
+	Fixture.Ability->ReceiveAbilityCorrection(MakeComboCorrection(10, 22, 0, 0.1f));
+	TestEqual(TEXT("较新原请求确认可回接首段"), Fixture.Ability->GetCurrentComboStep(), 0);
+	Fixture.Ability->ReceiveAbilityCorrection(MakeComboCorrection(11, 21, 1, 0.2f));
+	TestEqual(TEXT("旧请求确认不回写已回接的首段"), Fixture.Ability->GetCurrentComboStep(), 0);
+	FAnimNotifyEvent* OriginalSignalEvent = nullptr;
+	for (FAnimNotifyEvent& Event : Fixture.Montage->Notifies)
+	{
+		if (Cast<UAnimNotify_PlayMontageNotify>(Event.Notify.Get())) { OriginalSignalEvent = &Event; break; }
+	}
+	if (!TestNotNull(TEXT("实际同资产有唯一原生作者点"), OriginalSignalEvent)) { return false; }
+	FBranchingPointNotifyPayload RetiredSignal(Fixture.Mesh, Fixture.Montage, OriginalSignalEvent,
+		BeforeCorrectionSnapshot.MontageInstanceId);
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(FName(TEXT("Event.Montage.CancelPoint")), RetiredSignal);
+	TestFalse(TEXT("同资产旧播放的原生通知不能打开新资源门"), Fixture.Ability->IsInterruptionOpen());
+	FGameplayEventData WeakSignal;
+	WeakSignal.EventTag = GGYGOGameplayTags::Event_Montage_CancelPoint;
+	WeakSignal.OptionalObject = Fixture.Montage;
+	WeakSignal.OptionalObject2 = Fixture.Mesh;
+	Fixture.ASC->HandleGameplayEvent(WeakSignal.EventTag, &WeakSignal);
+	TestFalse(TEXT("ASC普通GameplayEvent不能伪造原作者单点开门"), Fixture.Ability->IsInterruptionOpen());
 	if (!CheckActiveResources(ActivationA.OriginalActivation, TEXT("纠正后的 A"), 0.1f)) { return false; }
 	if (!TestFalse(TEXT("A 纠正阶段未取得 Owned Trace 窗口"), Fixture.GetTraceWindow().HasWindow())) { return false; }
 	if (!EndNormalActivation(ActivationA.OriginalActivation, TEXT("A"))) { return false; }
@@ -1716,13 +1803,16 @@ bool FGGYGOPlayerComboRuntimeHitBuilderFailureTest::RunTest(const FString& Param
 namespace
 {
 	enum class EComboPoseFailureProbe : uint8 { None, StartupMissingDeclaration, RuntimeInvalidated };
+	enum class EComboEndAttackProbe : uint8 { None, Restart, Natural };
 	/** A finite production PIE smoke. Automation observes; UE alone runs input, animation and movement frames. */
 	class FComboEndProductionPIECommand : public IAutomationLatentCommand
 	{
 	public:
 		FComboEndProductionPIECommand(FAutomationTestBase& InTest, bool bInHeldDuringMain,
-			EComboPoseFailureProbe InPoseProbe = EComboPoseFailureProbe::None)
-			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), PoseProbe(InPoseProbe), OuterWorld(GWorld),
+			EComboPoseFailureProbe InPoseProbe = EComboPoseFailureProbe::None, int32 InLastMovementStep = 0,
+			EComboEndAttackProbe InEndAttackProbe = EComboEndAttackProbe::None)
+			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), PoseProbe(InPoseProbe), LastMovementStep(InLastMovementStep),
+			EndAttackProbe(InEndAttackProbe), TargetStep(InEndAttackProbe == EComboEndAttackProbe::None ? 0 : 2), OuterWorld(GWorld),
 			OuterViewport(GEngine ? GEngine->GameViewport.Get() : nullptr) {}
 		virtual ~FComboEndProductionPIECommand() override
 		{
@@ -1732,6 +1822,7 @@ namespace
 				Stage = EStage::Ending;
 				ReleaseGameplayObservations();
 				CloseOwnedPIE(true);
+				ReleaseMainPointProbeAfterPIETeardown();
 			}
 			FEditorDelegates::PreBeginPIE.Remove(PreHandle);
 			FEditorDelegates::PostPIEStarted.Remove(PostHandle);
@@ -1762,6 +1853,13 @@ namespace
 			if (Stage == EStage::PoseSuccessorMain) { ObservePoseSuccessorMain(); return false; }
 			if (Stage == EStage::PoseSuccessorEnd) { ObservePoseSuccessorEnd(); return false; }
 			if (Stage == EStage::Main) { TryCaptureMain(); return false; }
+			if (Stage == EStage::AdvanceEnd) { AdvanceAtEnd(); return false; }
+			if (Stage == EStage::MainAttackPress) { PressAttackDuringTerminalMain(); return false; }
+			if (Stage == EStage::MainAttackRejected) { ObserveRejectedMainAttack(); return false; }
+			if (Stage == EStage::EndAttack) { ObserveEndAttack(); return false; }
+			if (Stage == EStage::Natural) { ObserveFullNaturalEnd(); return false; }
+			if (Stage == EStage::NaturalIdle) { ObserveNaturalIdle(); return false; }
+			if (Stage == EStage::ResetRelease) { RestartAfterMovement(); return false; }
 			if (Stage == EStage::End) { ObserveNaturalEnd(); return false; }
 			if (Stage == EStage::Cancel)
 			{
@@ -1773,7 +1871,8 @@ namespace
 		}
 
 	private:
-		enum class EStage : uint8 { Start, Player, Main, End, Cancel, Locomotion, Ending, Done, PoseWaitFailure, PoseSuccessorMain, PoseSuccessorEnd, PoseSuccessorPress };
+		enum class EStage : uint8 { Start, Player, Main, AdvanceEnd, MainAttackPress, MainAttackRejected, EndAttack, Natural, NaturalIdle,
+			End, Cancel, Locomotion, ResetRelease, Ending, Done, PoseWaitFailure, PoseSuccessorMain, PoseSuccessorEnd, PoseSuccessorPress };
 		void Fail(const FString& Reason)
 		{
 			if (bFailed) { return; }
@@ -1784,8 +1883,8 @@ namespace
 					PoseCaseName(), static_cast<uint32>(Stage), *GetPathNameSafe(World.Get()), *GetPathNameSafe(Ability.Get()), InstanceId, *Reason));
 				return;
 			}
-			Test.AddError(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Case=%s Stage=%u World=%s Pawn=%s GA=%s Instance=%d: %s"),
-				bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"), static_cast<uint32>(Stage),
+			Test.AddError(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Case=%s AttackProbe=%u TargetStep=%d ExpectedStep=%d Stage=%u World=%s Pawn=%s GA=%s Instance=%d: %s"),
+				bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"), static_cast<uint32>(EndAttackProbe), TargetStep, ExpectedStep, static_cast<uint32>(Stage),
 				*GetPathNameSafe(World.Get()), *GetPathNameSafe(Character.Get()), *GetPathNameSafe(Ability.Get()), InstanceId, *Reason));
 		}
 		int32 CountPIEWorlds() const
@@ -2075,6 +2174,17 @@ namespace
 				Fail(TEXT("native focus did not preserve the original Cold first-press/Ready chain")); return;
 			}
 			if (PoseProbe != EComboPoseFailureProbe::None && !PreparePoseProbe()) { return; }
+			if (PoseProbe == EComboPoseFailureProbe::None && (bHeldDuringMain || EndAttackProbe != EComboEndAttackProbe::None))
+			{
+				MainPointProbeIndex = bHeldDuringMain ? 0 : 2;
+				if (!FGGYGOPlayerComboLifecycleFixture::InstallProductionMainPointProbe(Combo, MainPointProbeIndex,
+					OriginalPointProbeStep, MainPointProbe, Error))
+				{
+					Fail(TEXT("finite unsaved formal Main-point configuration failed: ") + Error); return;
+				}
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.InterruptionProductionSmoke] AuthorPointInMain Step=%d Original=%s Transient=%s; original package/Sequences/windows unchanged, no save."),
+					MainPointProbeIndex, *GetPathNameSafe(OriginalPointProbeStep.Montage), *GetPathNameSafe(MainPointProbe.Get())));
+			}
 			EndHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data) { ObserveAbilityEnd(Data); });
 			CompletedHandle = ProductionASC->OnAbilityTerminationCompleted().AddLambda([this](const FGGYGOAbilityTerminationCompletedNotice& Notice)
 			{
@@ -2184,6 +2294,12 @@ namespace
 		{
 			if (EndCount != 0) { Fail(TEXT("attack ended before its original Main was observed")); return; }
 			if (!Ability->IsActive()) { return; }
+			const int32 ActualStep = Ability->GetCurrentComboStep();
+			if (ActualStep != ExpectedStep)
+			{
+				if (ReplacedTask.Get() && ActualStep == ReplacedStep) { return; }
+				Fail(TEXT("real attack input started an unexpected production step")); return;
+			}
 			FGGYGOComboStep Step;
 			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get());
 			FGGYGOMontageSectionSnapshot Snapshot;
@@ -2192,6 +2308,42 @@ namespace
 			if (Snapshot.Montage != Step.Montage || Snapshot.SectionName != Step.MainSection || !Movement->HasActiveActionMotion())
 			{
 				Fail(TEXT("normal activation did not expose original Main and CMC action resource")); return;
+			}
+			const FGGYGOAbilityActivationHandle Captured = Ability->CaptureCurrentActivation();
+			if (!Captured.HasActivation() || (OriginalActivation.HasActivation() && !Captured.HasSameActivation(OriginalActivation)))
+			{
+				Fail(TEXT("End attack replaced the original GA activation instead of its owned step")); return;
+			}
+			if (ReplacedTask.Get())
+			{
+				const FAnimMontageInstance* Previous = AnimInstance->GetMontageInstanceForID(ReplacedInstanceId);
+				// Allow native frame scheduling, never the original multi-second End duration.
+				const float ObservationBudget = FMath::Max(0.25f, 3.0f * World->GetDeltaSeconds());
+				if (Task == ReplacedTask.Get() || Snapshot.MontageInstanceId == ReplacedInstanceId
+					|| World->GetTimeSeconds() - ReplacementRequestWorldTime > ObservationBudget
+					|| ReplacedTask->GetState() != EGameplayTaskState::Finished
+					|| ReplacedTask->EventReceived.IsBound() || ReplacedTask->SectionReceived.IsBound()
+					|| ReplacedTask->NotifyReceived.IsBound()
+					|| AnimInstance->OnPlayMontageNotifyBegin.Contains(ReplacedTask.Get(), FName(TEXT("OnOriginalMontageNotifyBegin")))
+					|| ReplacedTask->OnCompleted.IsBound() || ReplacedTask->OnInterrupted.IsBound()
+					|| ReplacedTask->OnBlendOut.IsBound() || (Previous && Previous->IsActive() && !Previous->IsStopped())
+					|| !InputTask.Get() || InputTask.Get() != FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()))
+				{
+					Fail(TEXT("End attack did not retire the exact old Task/playback while retaining the original input task")); return;
+				}
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] EndAttackReplacement OldStep=%d OldInstance=%d Remaining=%.6f NewStep=%d NewInstance=%d ResponseSeconds=%.6f SameActivation=1 OldTaskFinished=1 ActionActive=1."),
+					ReplacedStep, ReplacedInstanceId, ReplacedEndRemaining, ActualStep, Snapshot.MontageInstanceId,
+					World->GetTimeSeconds() - ReplacementRequestWorldTime));
+				ReplacedTask.Reset();
+			}
+			if (bCheckingMovementReset)
+			{
+				if (ActualStep != 0 || Captured.HasSameActivation(PreviousActivation))
+				{
+					Fail(TEXT("movement interruption did not reset the next real attack to a new activation at step 01")); return;
+				}
+				Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] MovementReset: next real attack begins at step 01 with a new original activation."));
+				bCheckingMovementReset = false;
 			}
 			Montage = Snapshot.Montage.Get();
 			InstanceId = Snapshot.MontageInstanceId;
@@ -2203,17 +2355,130 @@ namespace
 			{
 				Fail(TEXT("original End range invalid")); return;
 			}
+			FGGYGOMontageNotifyFact PointSnapshot;
+			float PointReadPosition = 0.0f;
+			if (!Task->TryGetOriginalMontageNotifySnapshot(PointSnapshot, PointReadPosition)
+				|| PointSnapshot.Montage != Snapshot.Montage || PointSnapshot.MontageInstanceId != Snapshot.MontageInstanceId
+				|| PointSnapshot.NotifyName != Step.InterruptionNotifyName || PointSnapshot.Mesh != Mesh.Get()
+				|| (PointReadPosition < PointSnapshot.NotifyPositionSeconds && Ability->IsInterruptionOpen()))
+			{
+				Fail(TEXT("new original playback did not reset its author-point permission or snapshot identity")); return;
+			}
+			AuthorPointPosition = PointSnapshot.NotifyPositionSeconds;
+			NaturalEarliestEndWorldSeconds = World->GetTimeSeconds() + (EndEnd - Snapshot.PositionSeconds) / Task->GetEffectivePlayRate();
 			MontageTask.Reset(Task);
 			InputTask.Reset(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()));
-			OriginalActivation = Ability->CaptureCurrentActivation();
+			OriginalActivation = Captured;
 			if (!OriginalActivation.HasActivation() || !InputTask.IsValid()) { Fail(TEXT("original GA/input task identity unavailable")); return; }
 			SendNativeKey(AttackKey, false); bAttackDown = false;
 			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] OriginalMain Montage=%s Instance=%d Position=%.6f End=[%.6f,%.6f)."),
 				*Montage->GetPathName(), InstanceId, Snapshot.PositionSeconds, EndStart, EndEnd));
 			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated) { BeginPoseRuntimeFault(); return; }
+			if (bRestartSent)
+			{
+				bRestartCaptured = true;
+				Stage = EStage::Natural;
+				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
+				return;
+			}
+			if (bFinalResetAttack)
+			{
+				Stage = EStage::Natural;
+				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
+				return;
+			}
+			if (ActualStep < TargetStep)
+			{
+				Stage = EStage::AdvanceEnd;
+				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
+				return;
+			}
+			if (EndAttackProbe != EComboEndAttackProbe::None)
+			{
+				Stage = EndAttackProbe == EComboEndAttackProbe::Restart ? EStage::MainAttackPress : EStage::Natural;
+				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
+				return;
+			}
 			Stage = EStage::End;
 			Deadline = FPlatformTime::Seconds() + 10.0;
 			if (bHeldDuringMain) { bWDown = true; SendNativeKey(EKeys::W, true); }
+		}
+		bool ReadOriginalPlayback(FGGYGOMontageSectionSnapshot& Snapshot)
+		{
+			if (EndCount != 0 || CompletedCount != 0 || !Ability->IsActive()
+				|| !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation)
+				|| !MontageTask.Get() || !MontageTask->TryGetOriginalSectionSnapshot(Snapshot)
+				|| Snapshot.Montage != Montage.Get() || Snapshot.MontageInstanceId != InstanceId)
+			{
+				Fail(TEXT("original native playback/activation changed before the issued End input")); return false;
+			}
+			return true;
+		}
+		void SendEndAttack(const FGGYGOMontageSectionSnapshot& Snapshot, int32 NextStep)
+		{
+			FGGYGOComboStep Step;
+			if (!FGGYGOPlayerComboLifecycleFixture::ReadProductionStep(Ability.Get(), Step)
+				|| Step.NextStepIndex != NextStep || !Ability->IsInterruptionOpen()
+				|| Snapshot.PositionSeconds < AuthorPointPosition || Snapshot.PositionSeconds >= EndEnd
+				|| !Movement->HasActiveActionMotion() || PlayerInput->IsPressed(AttackKey))
+			{
+				Fail(TEXT("configured End target, remaining trajectory or real released attack edge is unavailable")); return;
+			}
+			ReplacedTask.Reset(MontageTask.Get());
+			ReplacedStep = Ability->GetCurrentComboStep();
+			ReplacedInstanceId = InstanceId;
+			ReplacedEndRemaining = EndEnd - Snapshot.PositionSeconds;
+			ReplacementRequestWorldTime = World->GetTimeSeconds();
+			ExpectedStep = NextStep;
+			Stage = EStage::Main;
+			Deadline = FPlatformTime::Seconds() + 3.0;
+			bAttackDown = true;
+			SendNativeKey(AttackKey, true);
+		}
+		void AdvanceAtEnd()
+		{
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!ReadOriginalPlayback(Snapshot) || Snapshot.SectionName != EndSection) { return; }
+			SendEndAttack(Snapshot, Ability->GetCurrentComboStep() + 1);
+		}
+		void PressAttackDuringTerminalMain()
+		{
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!ReadOriginalPlayback(Snapshot)) { return; }
+			if (Snapshot.SectionName != MainSection) { Fail(TEXT("terminal Main ended before its real rejection probe")); return; }
+			if (PlayerInput->IsPressed(AttackKey)) { return; } // The previously issued key-up must reach native input.
+			MainAttackRequest = FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get());
+			bAttackDown = true;
+			SendNativeKey(AttackKey, true);
+			Stage = EStage::MainAttackRejected;
+		}
+		void ObserveRejectedMainAttack()
+		{
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!ReadOriginalPlayback(Snapshot)) { return; }
+			if (FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get()) <= MainAttackRequest) { return; }
+			if (Ability->GetCurrentComboStep() != TargetStep || Snapshot.SectionName != MainSection
+				|| Snapshot.PositionSeconds >= AuthorPointPosition || Ability->IsInterruptionOpen()
+				|| Ability->HasPendingComboRequest() || !Movement->HasActiveActionMotion())
+			{
+				Fail(TEXT("terminal Main real attack was allowed to replace its original step")); return;
+			}
+			bMainAttackRejected = true;
+			SendNativeKey(AttackKey, false); bAttackDown = false;
+			Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] TerminalMain: a delivered new attack request was rejected; original step/instance remains."));
+			Stage = EStage::EndAttack;
+		}
+		void ObserveEndAttack()
+		{
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!ReadOriginalPlayback(Snapshot) || !Ability->IsInterruptionOpen()) { return; }
+			if (!bMainAttackRejected) { Fail(TEXT("terminal Main rejection was not observed before End restart")); return; }
+			if (Snapshot.SectionName != MainSection || Snapshot.PositionSeconds >= EndStart)
+			{
+				Fail(TEXT("author point was not able to open attack replacement inside Main")); return;
+			}
+			bRestartSent = true;
+			SendEndAttack(Snapshot, 0);
 		}
 		void ObserveNaturalEnd()
 		{
@@ -2252,11 +2517,16 @@ namespace
 			{
 				const EGGYGOMovementInputOriginQualification Qualification = OriginalOrigin->GetQualification(PlayerInput.Get());
 				LogPreflight(TEXT("NaturalEndBeforeFirstW"), Qualification, Result, Error);
-				if (Qualification != EGGYGOMovementInputOriginQualification::Cold || PlayerInput->IsPressed(EKeys::W)
-					|| (Result != EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof
-						&& Result != EGGYGOQualifiedMovementIntentQueryResult::NotHeld))
+				const bool bOriginalFirstPress = TargetStep == 0
+					&& Qualification == EGGYGOMovementInputOriginQualification::Cold
+					&& (Result == EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof
+						|| Result == EGGYGOQualifiedMovementIntentQueryResult::NotHeld);
+				const bool bOriginalReleasedRequest = TargetStep > 0
+					&& Qualification == EGGYGOMovementInputOriginQualification::Rearm
+					&& Result == EGGYGOQualifiedMovementIntentQueryResult::NotHeld;
+				if (PlayerInput->IsPressed(EKeys::W) || (!bOriginalFirstPress && !bOriginalReleasedRequest))
 				{
-					Fail(TEXT("new-press case lost original Cold first-observation state before natural End")); return;
+					Fail(TEXT("new-press case lacks its original Cold or real released/rearmed source state before End")); return;
 				}
 				bWDown = true; SendNativeKey(EKeys::W, true);
 			}
@@ -2267,6 +2537,7 @@ namespace
 			if (Data.AbilityThatEnded != Ability.Get()) { return; }
 			if (PoseProbe != EComboPoseFailureProbe::None) { ObservePoseAbilityEnd(Data); return; }
 			++EndCount; EndData = Data;
+			EndObservedWorldSeconds = World.IsValid() ? World->GetTimeSeconds() : -1.0f;
 			if (Data.AbilitySpecHandle != SpecHandle || !OriginalActivation.HasActivation())
 			{
 				Fail(TEXT("original activation/spec was unavailable at native ability end")); return;
@@ -2301,6 +2572,8 @@ namespace
 				&& !MontageTask->OnCompleted.IsBound() && !MontageTask->OnInterrupted.IsBound()
 				&& !MontageTask->OnCancelled.IsBound() && !MontageTask->OnBlendOut.IsBound()
 				&& !MontageTask->EventReceived.IsBound() && !MontageTask->SectionReceived.IsBound()
+				&& !MontageTask->NotifyReceived.IsBound() && AnimInstance.IsValid()
+				&& !AnimInstance->OnPlayMontageNotifyBegin.Contains(MontageTask.Get(), FName(TEXT("OnOriginalMontageNotifyBegin")))
 				&& !InputTask->OnPress.IsBound() && Trace.IsValid() && !Trace->IsTracing()
 				&& Mesh.IsValid() && Mesh->VisibilityBasedAnimTickOption == SavedTick
 				&& Mesh->bEnableUpdateRateOptimizations == bSavedURO && HasMeshPrerequisite() == bSavedPrerequisite
@@ -2310,7 +2583,9 @@ namespace
 		{
 			if (EndCount != 1 || CompletedCount != 1 || !EndData.bWasCancelled || !Completion.HasCompletion()
 				|| Completion.GetReason() != EGGYGOAbilityTerminationReason::None || !bEndSnapshotAvailable
-				|| EndedSection != EndSection || !FMath::IsFinite(EndPosition) || EndPosition < EndStart || EndPosition >= EndEnd
+				|| EndedSection != (bHeldDuringMain ? MainSection : EndSection)
+				|| !FMath::IsFinite(EndPosition) || EndPosition < AuthorPointPosition || EndPosition >= EndEnd
+				|| (bHeldDuringMain && EndPosition >= EndStart)
 				|| !bStoppedAtEnd || EndIntentResult != EGGYGOQualifiedMovementIntentQueryResult::Qualified
 				|| EndIntent.Provenance != EGGYGOQualifiedMovementIntentProvenance::LocalSourceHeld
 				|| EndIntent.SessionSerial == 0 || EndIntent.RequestSerial == 0 || EndIntent.ExecutionRequestSerial == 0
@@ -2345,8 +2620,94 @@ namespace
 				&& Set && (!Set->bUseCurveDrivenSpeed || Movement->IsCurveDrivingSpeed()))
 			{
 				LogLocomotionSnapshot(TEXT("CancellationAndLocomotionObserved"));
-				BeginEnding();
+				if (bHeldDuringMain) { BeginEnding(); return; }
+				PreviousActivation = OriginalActivation;
+				OriginalActivation = {};
+				EndCount = 0; CompletedCount = 0; EndData = {}; Completion = {};
+				bSawQualifiedMain = false; bSawNaturalEnd = false; bSawWalk = false;
+				bEndSnapshotAvailable = false; bStoppedAtEnd = false; bResourcesRestoredAtEnd = false;
+				MainIntent = {}; EndIntent = {}; EndIntentResult = EGGYGOQualifiedMovementIntentQueryResult::Unavailable;
+				bFinalResetAttack = TargetStep >= LastMovementStep;
+				if (!bFinalResetAttack) { ++TargetStep; }
+				ExpectedStep = 0; bCheckingMovementReset = true;
+				Stage = EStage::ResetRelease;
+				Deadline = FPlatformTime::Seconds() + 5.0;
+				SendNativeKey(EKeys::W, false); bWDown = false;
 			}
+		}
+		void RestartAfterMovement()
+		{
+			if (Ability->IsActive() || !ResourcesRestored()) { Fail(TEXT("ended attack regained resources before the next real press")); return; }
+			FGGYGOQualifiedMovementIntent Intent;
+			FString Error;
+			const auto Result = Movement->QueryQualifiedMovementIntent(Scope, Intent, Error);
+			if (PlayerInput->IsPressed(EKeys::W) || Result != EGGYGOQualifiedMovementIntentQueryResult::NotHeld) { return; }
+			if (OriginalOrigin->GetQualification(PlayerInput.Get()) != EGGYGOMovementInputOriginQualification::Rearm
+				|| PlayerInput->IsPressed(AttackKey))
+			{
+				Fail(TEXT("real move release did not preserve the original rearmed source and released attack key")); return;
+			}
+			Stage = EStage::Main;
+			Deadline = FPlatformTime::Seconds() + 3.0;
+			bAttackDown = true;
+			SendNativeKey(AttackKey, true);
+		}
+		void ObserveFullNaturalEnd()
+		{
+			if (EndCount == 0 || CompletedCount == 0)
+			{
+				FGGYGOMontageSectionSnapshot Snapshot;
+				if (EndCount == 0 && MontageTask.Get() && MontageTask->TryGetOriginalSectionSnapshot(Snapshot))
+				{
+					if (Snapshot.Montage != Montage.Get() || Snapshot.MontageInstanceId != InstanceId
+						|| Ability->GetCurrentComboStep() != ExpectedStep)
+					{
+						Fail(TEXT("without a new request the original natural step/instance changed")); return;
+					}
+					if (Snapshot.SectionName == EndSection && Snapshot.PositionSeconds >= EndStart
+						&& Snapshot.PositionSeconds < EndEnd)
+					{
+						if (!bSawNaturalEnd && !Movement->HasActiveActionMotion())
+						{
+							Fail(TEXT("natural End lost its original continuous CMC trajectory at entry")); return;
+						}
+						bSawNaturalEnd = true;
+						NaturalLastPosition = Snapshot.PositionSeconds;
+					}
+				}
+				if (EndCount > 1 || CompletedCount > 1 || (EndCount == 0 && !Ability->IsActive())
+					|| (EndCount == 0 && !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation)))
+				{
+					Fail(TEXT("natural original activation vanished or duplicated its End/Completed"));
+				}
+				return; // Task Completed may precede the exact CMC final-consumption callback.
+			}
+			if (EndCount != 1 || CompletedCount != 1 || EndData.bWasCancelled || !Completion.HasCompletion()
+				|| Completion.GetReason() != EGGYGOAbilityTerminationReason::None
+				|| Completion.GetOriginal().GetRequestKind() != EGGYGOAbilityTerminationRequestKind::End
+				|| !bSawNaturalEnd || !bResourcesRestoredAtEnd || !ResourcesRestored() || Ability->IsActive()
+				|| !FMath::IsFinite(NaturalEarliestEndWorldSeconds)
+				|| EndObservedWorldSeconds + FMath::Max(0.05f, World->GetDeltaSeconds()) < NaturalEarliestEndWorldSeconds
+				|| PlayerInput->IsPressed(AttackKey) || PlayerInput->IsPressed(EKeys::W)
+				|| (EndAttackProbe == EComboEndAttackProbe::Restart && (!bRestartCaptured || !bMainAttackRejected)))
+			{
+				Fail(TEXT("no-request natural End failed original completion/cleanup or restarted automatically")); return;
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NaturalEnd Step=%d Instance=%d EndEnd=%.6f LastObservedPosition=%.6f End=1 Completed=1 Cancelled=0 NoAutomaticRestart=1 RestartObserved=%d."),
+				ExpectedStep, InstanceId, EndEnd, NaturalLastPosition, bRestartCaptured));
+			NaturalIdleUntilWorldSeconds = World->GetTimeSeconds() + 0.25f;
+			Stage = EStage::NaturalIdle;
+			Deadline = FPlatformTime::Seconds() + 3.0;
+		}
+		void ObserveNaturalIdle()
+		{
+			if (Ability->IsActive() || EndCount != 1 || CompletedCount != 1 || !ResourcesRestored()
+				|| ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Attacking)
+				|| PlayerInput->IsPressed(AttackKey) || PlayerInput->IsPressed(EKeys::W))
+			{
+				Fail(TEXT("without a new request the naturally ended attack restarted or reacquired resources")); return;
+			}
+			if (World->GetTimeSeconds() >= NaturalIdleUntilWorldSeconds) { BeginEnding(); }
 		}
 		void LogLocomotionSnapshot(const TCHAR* Boundary)
 		{
@@ -2710,7 +3071,7 @@ namespace
 				ASC->OnAbilityTerminationCompleted().Remove(CompletedHandle);
 			}
 			EndHandle.Reset(); CompletedHandle.Reset();
-			MontageTask.Reset(); InputTask.Reset(); // Ended task observation roots never survive this finite smoke.
+			ReplacedTask.Reset(); MontageTask.Reset(); InputTask.Reset(); // Observation roots never survive this finite smoke.
 			if (!FSlateApplication::IsInitialized()) { return; }
 			FSlateApplication& Slate = FSlateApplication::Get();
 			const TSharedPtr<SWidget> CurrentFocus = Slate.GetKeyboardFocusedWidget();
@@ -2735,6 +3096,13 @@ namespace
 			}
 			if (CurrentFocus.IsValid() && CurrentFocus != ViewportWidget) { Slate.SetKeyboardFocus(CurrentFocus, EFocusCause::SetDirectly); }
 			else if (PreviousFocus.IsValid()) { Slate.SetKeyboardFocus(PreviousFocus.Pin(), EFocusCause::SetDirectly); }
+		}
+		void ReleaseMainPointProbeAfterPIETeardown()
+		{
+			if (!MainPointProbe.Get() || OwnsPIESession() || CountPIEWorlds() != 0) { return; }
+			FGGYGOPlayerComboLifecycleFixture::RestoreProductionMainPointProbe(Ability.Get(), MainPointProbeIndex,
+				OriginalPointProbeStep, MainPointProbe.Get());
+			MainPointProbe.Reset();
 		}
 		void CloseOwnedPIE(bool bSynchronous)
 		{
@@ -2777,13 +3145,15 @@ namespace
 			}
 			const bool bReleased = Test.TestTrue(TEXT("production smoke released its original PIE session/context"),
 				!OwnsPIESession() && CountPIEWorlds() == 0);
+			if (bReleased) { ReleaseMainPointProbeAfterPIETeardown(); }
 			const bool bGlobalsRestored = Test.TestTrue(TEXT("native teardown restored outer world/viewport"),
 				GWorld == OuterWorld && GEngine && GEngine->GameViewport.Get() == OuterViewport);
 			if (!bFailed && bReleased && bGlobalsRestored)
 			{
 				if (PoseProbe == EComboPoseFailureProbe::None)
 				{
-					Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] PASS: strict End cancellation, normal locomotion and original native PIE teardown observed."));
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] PASS: Case=%u LastMovementStep=%d; exact original End/step resources, real input chain and native PIE teardown observed."),
+						static_cast<uint32>(EndAttackProbe), LastMovementStep));
 				}
 				else if (bPoseBehaviorVerified)
 				{
@@ -2797,6 +3167,20 @@ namespace
 		FAutomationTestBase& Test;
 		const bool bHeldDuringMain;
 		const EComboPoseFailureProbe PoseProbe;
+		const int32 LastMovementStep;
+		const EComboEndAttackProbe EndAttackProbe;
+		int32 TargetStep = 0, ExpectedStep = 0, ReplacedStep = INDEX_NONE, ReplacedInstanceId = INDEX_NONE, MainAttackRequest = 0;
+		bool bRestartSent = false, bRestartCaptured = false, bMainAttackRejected = false;
+		bool bCheckingMovementReset = false, bFinalResetAttack = false;
+		float ReplacedEndRemaining = 0.0f, NaturalLastPosition = 0.0f;
+		float ReplacementRequestWorldTime = 0.0f, NaturalEarliestEndWorldSeconds = 0.0f;
+		float EndObservedWorldSeconds = -1.0f, NaturalIdleUntilWorldSeconds = 0.0f;
+		FGGYGOAbilityActivationHandle PreviousActivation;
+		TStrongObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> ReplacedTask;
+		float AuthorPointPosition = 0.0f;
+		int32 MainPointProbeIndex = INDEX_NONE;
+		FGGYGOComboStep OriginalPointProbeStep;
+		TStrongObjectPtr<UAnimMontage> MainPointProbe;
 		EStage Stage = EStage::Start;
 		bool bFailed = false, bSawPreBegin = false, bPIEStarted = false;
 		bool bStartupCaptured = false, bLoggedOwnerWait = false;
@@ -2880,7 +3264,17 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndProductionNewPressTest,
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGGYGOPlayerComboEndProductionNewPressTest::RunTest(const FString& Parameters)
 {
-	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false));
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 2));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndAttackProductionTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.ProductionNativeAttackAndNatural",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboEndAttackProductionTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0, EComboEndAttackProbe::Restart));
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0, EComboEndAttackProbe::Natural));
 	return true;
 }
 
