@@ -52,6 +52,7 @@ public:
 	void CheckMessagesDuringAbort(UBehaviorTreeComponent& Owner);
 	void HandleUnpossessed();
 	void HandleUninitialized();
+	void HandleInitialPawnChanged(APawn* NewPawn);
 	UFUNCTION()
 	void HandleDestroyed(AActor* Actor);
 
@@ -90,6 +91,10 @@ public:
 	int32 AvatarDestroyedCount = 0;
 	int32 ControllerDestroyedCount = 0;
 	int32 StateDestroyedCount = 0;
+	int32 InitialPossessCount = 0;
+	bool bInitialAssemblyBound = false;
+	bool bInitialBrainWithoutStartedTree = false;
+	bool bBrainStoppedWithoutInstanceAtControllerDestroy = false;
 	bool bRecording = true;
 	bool bReferencesClearedAtAbort = false;
 	bool bAssemblyBoundAtAbort = false;

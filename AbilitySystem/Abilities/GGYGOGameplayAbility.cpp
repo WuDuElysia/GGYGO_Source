@@ -134,8 +134,15 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivation() 
 		: ValidateCurrentControlledActivation();
 }
 
+FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::CaptureCurrentActivationForTermination() const
+{
+	check(IsInGameThread());
+	return IsControlledActivationTerminationBusy() ? FGGYGOAbilityActivationHandle{}
+		: ValidateCurrentControlledActivation(true, true, EControlledActivationValidationPurpose::Termination);
+}
+
 FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::ValidateCurrentControlledActivation(
-	bool bRequireActive, bool bRequireSpec) const
+	bool bRequireActive, bool bRequireSpec, EControlledActivationValidationPurpose Purpose) const
 {
 	check(IsInGameThread());
 	if (!IsValid(this) || !IsInstantiated() || (bRequireActive && !IsActive())
@@ -172,6 +179,16 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::ValidateCurrentControlledAc
 	Original.ASCAffectedAnimInstanceTag = Proof.ASCAffectedAnimInstanceTag;
 	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Actual;
 	EGGYGOAvatarBindingReason SnapshotReason;
+	if (Purpose == EControlledActivationValidationPurpose::Termination && Proof.BindingContext.HasIssuedContext())
+	{
+		// Only ASC's authenticated current commit may continue this exact Binding. The
+		// immutable activation and old resource snapshots are never rewritten or renewed.
+		return Original.Allocation.IsValid() && Original.Allocation.Get() == CurrentActorInfo
+			&& ASC->CheckOriginalAbilityBindingForTermination(Proof.BindingContext, Original)
+			? CurrentControlledActivation : FGGYGOAbilityActivationHandle{};
+	}
+	// Resource work (and the pre-existing unissued-context mode) still requires the
+	// exact original write and complete source. It cannot borrow the refreshed context.
 	const FGGYGOAvatarBindingContext Context = ASC->GetAvatarBindingContext();
 	if (!Original.Allocation.IsValid() || Original.Allocation.Get() != CurrentActorInfo
 		|| Context.Binding.Serial != Proof.BindingContext.Binding.Serial
@@ -332,7 +349,7 @@ TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord> UGGYGOGameplayAbil
 	}
 	if (!IsValid(this) || !IsInstantiated()) { OutResult.Reason = EReason::InvalidAbility; return {}; }
 	if (!IsActive()) { OutResult.Outcome = EOutcome::Stale; OutResult.Reason = EReason::NotActive; return {}; }
-	const FGGYGOAbilityActivationHandle Current = CaptureCurrentActivation();
+	const FGGYGOAbilityActivationHandle Current = CaptureCurrentActivationForTermination();
 	if (!Current.HasSameActivation(Original))
 	{
 		OutResult.Outcome = EOutcome::Stale;
@@ -579,7 +596,8 @@ EGGYGOAbilityTerminationReason UGGYGOGameplayAbility::CheckOriginalTerminationSo
 		return EReason::None;
 	}
 	if (OriginalTermination.Get() != &Record
-		|| !ValidateCurrentControlledActivation().HasSameActivation(Record.Context.GetOriginalActivation()))
+		|| !ValidateCurrentControlledActivation(true, true, EControlledActivationValidationPurpose::Termination)
+			.HasSameActivation(Record.Context.GetOriginalActivation()))
 	{
 		return EReason::ActivationChanged;
 	}
@@ -791,7 +809,8 @@ void UGGYGOGameplayAbility::ObserveOriginalNativeEnd(UGGYGOAbilitySystemComponen
 		// and ActorInfo directly, without manufacturing a fresh active identity.
 		if (Record->bHasNativeCleanupSource
 			? CheckOriginalTerminationSource(*Record) != EGGYGOAbilityTerminationReason::None
-			: !ValidateCurrentControlledActivation(false).HasSameActivation(Record->Context.GetOriginalActivation()))
+			: !ValidateCurrentControlledActivation(false, true, EControlledActivationValidationPurpose::Termination)
+				.HasSameActivation(Record->Context.GetOriginalActivation()))
 		{
 			if (Record->bHasNativeCleanupSource)
 			{
@@ -1788,7 +1807,7 @@ void UGGYGOGameplayAbility::CancelAbility(const FGameplayAbilitySpecHandle Handl
 	TSharedPtr<FOriginalTerminationRecord> Record = OriginalTermination;
 	if (!Record.IsValid())
 	{
-		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
+		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivationForTermination();
 		if (!Original.HasActivation())
 		{
 			UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -1849,7 +1868,7 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 	if (!Record.IsValid())
 	{
 		// Actual GAS teardown was handled only by its authenticated native scope above.
-		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivation();
+		const FGGYGOAbilityActivationHandle Original = CaptureCurrentActivationForTermination();
 		if (!Original.HasActivation() || Original.Proof->SpecHandle != Handle
 			|| Original.Proof->Allocation.Pin().Get() != ActorInfo
 			|| Original.Proof->ActivationKey != ActivationInfo.GetActivationPredictionKey())

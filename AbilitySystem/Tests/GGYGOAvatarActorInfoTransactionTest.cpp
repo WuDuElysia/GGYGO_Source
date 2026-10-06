@@ -6,6 +6,7 @@
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/Pawn.h"
+#include "GameFramework/PlayerController.h"
 #include "GameplayAbilitySpec.h"
 #include "AbilitySystemGlobals.h"
 #include "GameplayCueManager.h"
@@ -64,6 +65,33 @@ void UGGYGOAvatarBindingPublicationTestAbility::DisarmPawnNoticeHookForTest()
 	PawnNoticeHook.Unbind();
 }
 
+void UGGYGOAvatarBindingPublicationTestAbility::HoldControlledActivationForTest()
+{
+	bHoldControlledActivation = true;
+}
+
+void UGGYGOAvatarBindingPublicationTestAbility::ActivateAbilityBody(
+	const FGGYGOAbilityActivationHandle& Original, FGameplayAbilitySpecHandle Handle,
+	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
+	const FGameplayEventData* TriggerEventData)
+{
+	if (!bHoldControlledActivation)
+	{
+		Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
+	}
+}
+
+void UGGYGOAvatarBindingPublicationTestAbility::CleanupAbilityResourcesForTermination(
+	const FGGYGOAbilityTerminationContext& Context)
+{
+	if (bHoldControlledActivation)
+	{
+		++ControlledCleanupCalls;
+		LastCleanupActivation = Context.GetOriginalActivation();
+	}
+	Super::CleanupAbilityResourcesForTermination(Context);
+}
+
 void UGGYGOAvatarBindingPublicationTestAbility::OnPawnAvatarSet()
 {
 	++PawnNoticeCalls;
@@ -75,6 +103,13 @@ void UGGYGOAvatarBindingPublicationTestAbility::OnPawnAvatarSet()
 		PawnNoticeHook.Unbind();
 		OneShot.Execute();
 	}
+}
+
+UGGYGOAvatarBindingRefreshEndTestAbility::UGGYGOAvatarBindingRefreshEndTestAbility(
+	const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	NetExecutionPolicy = EGameplayAbilityNetExecutionPolicy::ServerOnly;
 }
 
 UGGYGOAvatarBindingCancelTestAbility::UGGYGOAvatarBindingCancelTestAbility(
@@ -1522,6 +1557,202 @@ bool FGGYGOAvatarBindingCueNativeRemovedAndBusy::RunTest(const FString& Paramete
 	bOK &= Resources.Close();
 	bOK &= TestEqual(TEXT("Idempotent cleanup cannot emit another Removed"), Notify->GetRemovedCallsForTest(), RemovedBefore + 1);
 	return bOK;
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOAvatarActorInfoOriginalEndAfterSameBindingRefresh,
+	"GGYGO.AbilitySystem.ActorInfoTransaction.OriginalEndAfterSameBindingRefresh",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOAvatarActorInfoOriginalEndAfterSameBindingRefresh::RunTest(const FString& Parameters)
+{
+	using namespace GGYGOAvatarActorInfoTransactionTests;
+	FFixture Fixture;
+	if (!Fixture.Initialize(*this)) { return false; }
+	APawn* Pawn = Fixture.World->SpawnActor<APawn>();
+	APlayerController* ControllerA = Fixture.World->SpawnActor<APlayerController>();
+	APlayerController* ControllerB = Fixture.World->SpawnActor<APlayerController>();
+	if (!TestNotNull(TEXT("Original Pawn"), Pawn)
+		|| !TestNotNull(TEXT("Original Controller"), ControllerA)
+		|| !TestNotNull(TEXT("Refresh Controller"), ControllerB)) { return false; }
+	ControllerA->Possess(Pawn);
+	if (!TestTrue(TEXT("Initial native possession"), Pawn->GetController() == ControllerA)) { return false; }
+	// GAS resolves PlayerController from the ASC Owner chain, as the persistent Slot does.
+	Fixture.Owner->SetOwner(ControllerA);
+	if (!TestTrue(TEXT("Original ASC Owner belongs to Controller A"), Fixture.Owner->GetOwner() == ControllerA)) { return false; }
+
+	FGGYGOAvatarBindingPublicationReceipt InitReceipt;
+	const FGGYGOAvatarBindingResult Init = Fixture.ASC->TryBootstrapAvatarActorInfoTransaction(
+		Fixture.Request(EGGYGOAvatarBindingKind::Init, {}, Pawn), InitReceipt);
+	if (!CheckCommit(*this, Fixture, Init, InitReceipt, {}, EGGYGOAvatarBindingNoticeKind::Initialized,
+		Fixture.Owner, Pawn)
+		|| !TestTrue(TEXT("ActorInfo captured original Controller"), Fixture.ASC->AbilityActorInfo->PlayerController.Get() == ControllerA))
+	{
+		return false;
+	}
+	const FGameplayAbilityActorInfo* OriginalAllocation = Fixture.ASC->AbilityActorInfo.Get();
+	const FGameplayAbilitySpecHandle Handle = Fixture.ASC->GiveAbility(
+		FGameplayAbilitySpec(UGGYGOAvatarBindingRefreshEndTestAbility::StaticClass(), 1));
+	FGameplayAbilitySpec* Spec = Fixture.ASC->FindAbilitySpecFromHandle(Handle);
+	TWeakObjectPtr<UGGYGOAvatarBindingPublicationTestAbility> Probe = Spec
+		? Cast<UGGYGOAvatarBindingPublicationTestAbility>(Spec->GetPrimaryInstance()) : nullptr;
+	FGGYGOAbilityActivationHandle ExpectedEnd;
+	int32 NativeEndCalls = 0;
+	int32 LastObservedCleanupCalls = 0;
+	int32 CompletedCalls = 0;
+	bool bCallbackOK = true;
+
+	// Own only this grant/subscriptions. Early exits withdraw callbacks before clearing a remaining GA.
+	struct FOwnedProbe
+	{
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		TWeakObjectPtr<UGGYGOAvatarBindingPublicationTestAbility> Ability;
+		FGameplayAbilitySpecHandle Handle;
+		FDelegateHandle NativeEnd;
+		FDelegateHandle Completed;
+		void ClearGrant()
+		{
+			const FGameplayAbilitySpecHandle OwnedHandle = Handle;
+			Handle = FGameplayAbilitySpecHandle();
+			if (ASC.IsValid() && OwnedHandle.IsValid()) { ASC->ClearAbility(OwnedHandle); }
+		}
+		~FOwnedProbe()
+		{
+			if (Ability.IsValid()) { Ability->OnGameplayAbilityEndedWithData.Remove(NativeEnd); }
+			if (ASC.IsValid())
+			{
+				ASC->OnAbilityTerminationCompleted().Remove(Completed);
+			}
+			ClearGrant();
+		}
+	} Owned{Fixture.ASC, Probe, Handle};
+	if (!TestTrue(TEXT("Original project probe granted"), Handle.IsValid() && Probe.IsValid())) { return false; }
+	Probe->HoldControlledActivationForTest();
+	if (!TestTrue(TEXT("Fixture has real native authority"),
+		Fixture.Owner->HasAuthority() && ControllerA->HasAuthority() && ControllerB->HasAuthority())
+		|| !TestTrue(TEXT("Spec/CDO and primary instance both use the server-only policy"),
+			Spec->Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::ServerOnly
+			&& Probe->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::ServerOnly)) { return false; }
+	const auto ObserveNativeEnd = [&](const FAbilityEndedData& Data)
+	{
+		++NativeEndCalls;
+		LastObservedCleanupCalls = Probe->GetControlledCleanupCallsForTest();
+		bCallbackOK &= TestTrue(TEXT("Native End keeps exact GA and Spec"),
+			Data.AbilityThatEnded.Get() == Probe.Get() && Data.AbilitySpecHandle == Handle);
+		bCallbackOK &= TestFalse(TEXT("Normal End preserves cancellation flag"), Data.bWasCancelled);
+		bCallbackOK &= TestTrue(TEXT("Cleanup precedes native End for the exact original"),
+			Probe->GetLastCleanupActivationForTest().HasSameActivation(ExpectedEnd));
+	};
+	// Native End clears this instance delegate after every broadcast, including a reused instance.
+	const auto InstallNativeEndObserver = [&]()
+	{
+		Probe->OnGameplayAbilityEndedWithData.Remove(Owned.NativeEnd);
+		Owned.NativeEnd = Probe->OnGameplayAbilityEndedWithData.AddLambda(ObserveNativeEnd);
+		return Owned.NativeEnd.IsValid();
+	};
+	InstallNativeEndObserver();
+	Owned.Completed = Fixture.ASC->OnAbilityTerminationCompleted().AddLambda(
+		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+	{
+		++CompletedCalls;
+		bCallbackOK &= TestTrue(TEXT("Completed keeps the exact original and request kind"),
+			Notice.HasCompletion() && Notice.GetOriginal().GetOriginalActivation().HasSameActivation(ExpectedEnd)
+			&& Notice.GetOriginal().GetRequestKind() == EGGYGOAbilityTerminationRequestKind::End);
+		bCallbackOK &= TestEqual(TEXT("Completed follows the native End"), NativeEndCalls, CompletedCalls);
+	});
+	if (!TestTrue(TEXT("Both original observers installed"), Owned.NativeEnd.IsValid() && Owned.Completed.IsValid())) { return false; }
+
+	const FGGYGOAbilityActivationRequestResult ActivationA = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Handle);
+	if (!TestTrue(TEXT("A is a real controlled live activation"),
+		ActivationA.bNativeAccepted && ActivationA.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& ActivationA.OriginalActivation.HasActivation() && Probe->IsActive())
+		|| !TestTrue(TEXT("A initially qualifies its original work source"),
+			Probe->CaptureCurrentActivation().HasSameActivation(ActivationA.OriginalActivation))) { return false; }
+
+	ControllerA->UnPossess();
+	ControllerB->Possess(Pawn);
+	Fixture.Owner->SetOwner(ControllerB);
+	if (!TestTrue(TEXT("Native Controller actually changed"), Pawn->GetController() == ControllerB)
+		|| !TestTrue(TEXT("Same ASC Owner now belongs to Controller B"), Fixture.Owner->GetOwner() == ControllerB)
+		|| !TestTrue(TEXT("ActorInfo is still the pre-refresh cache"),
+			Fixture.ASC->AbilityActorInfo->PlayerController.Get() == ControllerA)) { return false; }
+	FGGYGOAvatarBindingPublicationReceipt RefreshReceipt;
+	const FGGYGOAvatarBindingResult Refresh = Fixture.ASC->TryExecuteAvatarActorInfoTransaction(
+		Fixture.Request(EGGYGOAvatarBindingKind::Refresh, Init.CommittedContext), RefreshReceipt);
+	if (!CheckCommit(*this, Fixture, Refresh, RefreshReceipt, Init.CommittedContext,
+		EGGYGOAvatarBindingNoticeKind::Refreshed, Fixture.Owner, Pawn, true)
+		|| !TestTrue(TEXT("Refresh uses the original allocation and new native Controller"),
+			Fixture.ASC->AbilityActorInfo.Get() == OriginalAllocation
+			&& Fixture.ASC->AbilityActorInfo->PlayerController.Get() == ControllerB)
+		|| !TestTrue(TEXT("Refresh really replaced LastActorInfoWrite"),
+			!Refresh.CommittedContext.LastActorInfoWrite.HasSameIdentity(Init.CommittedContext.LastActorInfoWrite))
+		|| !TestTrue(TEXT("Refresh does not terminate the live GA"), Probe->IsActive())) { return false; }
+
+	EGGYGOAvatarBindingReason BindingReason;
+	if (!TestFalse(TEXT("Keeping End eligibility does not renew old GA resource work"), Probe->CaptureCurrentActivation().HasActivation())
+		|| !TestEqual(TEXT("Old full Context cannot borrow the refreshed write"),
+			Fixture.ASC->CheckAvatarBindingContext(Init.CommittedContext, BindingReason), EGGYGOAvatarBindingOutcome::Stale)
+		|| !TestEqual(TEXT("Original Binding still has an authenticated current commit"),
+			Fixture.ASC->CheckAvatarBindingIdentity(Init.CommittedContext.Binding, BindingReason), EGGYGOAvatarBindingOutcome::Succeeded))
+	{
+		return false;
+	}
+	ExpectedEnd = ActivationA.OriginalActivation;
+	const FGGYGOAbilityTerminationResult EndA = Probe->RequestAbilityEnd(ExpectedEnd, false, false);
+	if (!TestEqual(TEXT("A normal End after same-Binding Refresh completes"), EndA.Outcome, EGGYGOAbilityTerminationOutcome::Completed)
+		|| !TestEqual(TEXT("A End retains exact original Context"), EndA.Original.GetOriginalActivation().HasSameActivation(ExpectedEnd), true)
+		|| !TestFalse(TEXT("A is inactive after End"), Probe->IsActive())
+		|| !TestEqual(TEXT("A cleanup once"), Probe->GetControlledCleanupCallsForTest(), 1)
+		|| !TestEqual(TEXT("A native End once"), NativeEndCalls, 1)
+		|| !TestEqual(TEXT("A protocol completion once"), CompletedCalls, 1) || !bCallbackOK) { return false; }
+
+	if (!TestTrue(TEXT("Successor B has its own native End observer"), InstallNativeEndObserver())) { return false; }
+	const FGGYGOAbilityActivationRequestResult ActivationB = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Handle);
+	if (!TestTrue(TEXT("A real successor uses a new exact activation"),
+		ActivationB.bNativeAccepted && ActivationB.OriginalActivation.HasActivation() && Probe->IsActive()
+		&& !ActivationB.OriginalActivation.HasSameActivation(ActivationA.OriginalActivation))) { return false; }
+	const FGGYGOAbilityTerminationResult StaleA = Probe->RequestAbilityEnd(ActivationA.OriginalActivation, false, false);
+	if (!TestEqual(TEXT("A cannot end successor B"), StaleA.Outcome, EGGYGOAbilityTerminationOutcome::Stale)
+		|| !TestEqual(TEXT("A stale reason remains ActivationChanged"), StaleA.Reason, EGGYGOAbilityTerminationReason::ActivationChanged)
+		|| !TestTrue(TEXT("B keeps its own work source and stays active"),
+			Probe->IsActive() && Probe->CaptureCurrentActivation().HasSameActivation(ActivationB.OriginalActivation))
+		|| !TestEqual(TEXT("Rejected A has no cleanup"), Probe->GetControlledCleanupCallsForTest(), 1)
+		|| !TestEqual(TEXT("Rejected A has no completion"), CompletedCalls, 1)) { return false; }
+	ExpectedEnd = ActivationB.OriginalActivation;
+	if (!TestEqual(TEXT("B ends with its own original"), Probe->RequestAbilityEnd(ExpectedEnd, false, false).Outcome,
+		EGGYGOAbilityTerminationOutcome::Completed) || !bCallbackOK) { return false; }
+
+	if (!TestTrue(TEXT("C has its own native End observer"), InstallNativeEndObserver())) { return false; }
+	const FGGYGOAbilityActivationRequestResult ActivationC = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Handle);
+	if (!TestTrue(TEXT("C is live before exact same-endpoint rebind"),
+		ActivationC.bNativeAccepted && ActivationC.OriginalActivation.HasActivation() && Probe->IsActive())) { return false; }
+	FGGYGOAvatarBindingPublicationReceipt RebindReceipt;
+	const FGGYGOAvatarBindingResult Rebind = Fixture.ASC->TryExecuteAvatarActorInfoTransaction(
+		Fixture.Request(EGGYGOAvatarBindingKind::Init, Refresh.CommittedContext, Pawn), RebindReceipt);
+	if (!CheckCommit(*this, Fixture, Rebind, RebindReceipt, Refresh.CommittedContext,
+		EGGYGOAvatarBindingNoticeKind::Initialized, Fixture.Owner, Pawn)
+		|| !TestFalse(TEXT("Init issues a different Binding even at identical endpoints"),
+			Rebind.CommittedContext.Binding.HasSameIdentity(Refresh.CommittedContext.Binding))) { return false; }
+	const FGGYGOAbilityTerminationResult StaleC = Probe->RequestAbilityEnd(ActivationC.OriginalActivation, false, false);
+	const bool bRebindChecksOK = TestEqual(TEXT("A replaced Binding cannot borrow same-endpoint End"), StaleC.Outcome, EGGYGOAbilityTerminationOutcome::Stale)
+		&& TestEqual(TEXT("Replaced Binding reason is ActivationChanged"), StaleC.Reason, EGGYGOAbilityTerminationReason::ActivationChanged)
+		&& TestTrue(TEXT("Rejected End leaves the native activation untouched"), Probe->IsActive())
+		&& TestFalse(TEXT("Rebind does not renew C work permissions"), Probe->CaptureCurrentActivation().HasActivation())
+		&& TestEqual(TEXT("Only A and B ran cleanup"), Probe->GetControlledCleanupCallsForTest(), 2)
+		&& TestEqual(TEXT("Only A and B completed native End"), NativeEndCalls, 2)
+		&& TestEqual(TEXT("Only A and B published completion"), CompletedCalls, 2)
+		&& bCallbackOK;
+	if (!bRebindChecksOK) { return false; }
+
+	// Observe this grant's native removal while the fixture and captured values are still alive.
+	// Native OnRemoveAbility marks the instance as garbage after End, so read cleanup in the callback.
+	ExpectedEnd = ActivationC.OriginalActivation;
+	Owned.ClearGrant();
+	return TestNull(TEXT("Fixture removed only its own grant"), Fixture.ASC->FindAbilitySpecFromHandle(Handle))
+		&& TestEqual(TEXT("Own grant removal cleans up exact C once"), LastObservedCleanupCalls, 3)
+		&& TestEqual(TEXT("Own grant removal delivers C native End once"), NativeEndCalls, 3)
+		&& TestEqual(TEXT("Native grant removal publishes no business completion"), CompletedCalls, 2)
+		&& bCallbackOK;
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS

@@ -100,6 +100,30 @@ void UGGYGOEncounterBTProbe::HandleUninitialized()
 	Events.Add(TEXT("Detach"));
 }
 
+void UGGYGOEncounterBTProbe::HandleInitialPawnChanged(APawn* NewPawn)
+{
+	if (!bRecording || !NewPawn || NewPawn != Avatar.Get()) { return; }
+	++InitialPossessCount;
+	const AGGYGOBossState* Host = State.Get();
+	const AGGYGOBossAIController* AI = Controller.Get();
+	const AGGYGOEncounterBTTestPawn* Pawn = Avatar.Get();
+	const UGGYGOAbilitySystemComponent* HostASC = ASC.Get();
+	const UGGYGOPawnExtensionComponent* Extension = Pawn ? Pawn->GetPawnExtensionComponent() : nullptr;
+	const UGGYGOBossDefinition* Definition = Host ? Host->GetBossDefinition() : nullptr;
+	bInitialAssemblyBound = IsValid(Host) && IsValid(AI) && IsValid(Pawn) && IsValid(HostASC)
+		&& IsValid(Extension) && Definition && Definition->BehaviorTree == Tree.Get()
+		&& AI->GetBossState() == Host && AI->GetPawn() == Pawn && Pawn->GetController() == AI
+		&& Host->GetAvatarPawn() == Pawn && HostASC->GetOwnerActor() == Host
+		&& HostASC->GetAvatarActor() == Pawn && Extension->GetGGYGOAbilitySystemComponent() == HostASC;
+	// Native Possess broadcasts after OnPossess/RunBehaviorTree returns, before the
+	// production initial wrapper returns to SpawnBoss and its failure cleanup begins.
+	UBehaviorTreeComponent* BT = AI ? Cast<UBehaviorTreeComponent>(AI->GetBrainComponent()) : nullptr;
+	Brain = BT;
+	bInitialBrainWithoutStartedTree = IsValid(BT) && BT->GetOwner() == AI && BT->GetAIOwner() == AI
+		&& BT->IsRegistered() && BT->HasBeenInitialized() && !BT->GetRootTree()
+		&& !BT->TreeHasBeenStarted() && !BT->GetActiveNode();
+}
+
 void UGGYGOEncounterBTProbe::HandleDestroyed(AActor* Actor)
 {
 	if (!bRecording) { return; }
@@ -128,6 +152,9 @@ void UGGYGOEncounterBTProbe::HandleDestroyed(AActor* Actor)
 		bFinalStateObserved = IsValid(BT) && IsValid(Task);
 		bFinalStateStopped = bFinalStateObserved && IsStopped(*BT, Task);
 		bInstanceAndMemoryReleasedAtControllerDestroy = InstanceDestroyedCount == 1 && MemoryDestroyedCount == 1;
+		bBrainStoppedWithoutInstanceAtControllerDestroy = IsValid(BT)
+			&& !BT->IsRunning() && !BT->TreeHasBeenStarted() && !BT->IsAbortPending()
+			&& !BT->GetRootTree() && !BT->GetActiveNode();
 	}
 	else if (Actor == State.Get())
 	{
@@ -368,6 +395,101 @@ namespace
 		return A != INDEX_NONE && B != INDEX_NONE && A < B;
 	}
 
+	bool RunInvalidRequiredTreeScenario(FAutomationTestBase& Test)
+	{
+		FEncounterBTWorld Fixture;
+		if (!Test.TestTrue(TEXT("real initialized Game World/Context/Physics/AISystem/Manager"), Fixture.Initialize()))
+		{
+			return false;
+		}
+		FEncounterBTConfig Config(false);
+		Config.Tree->RootNode = nullptr;
+		if (!Test.TestTrue(TEXT("non-null required tree has an invalid missing root, not AssemblyOnly mode"),
+			Config.Definition->BehaviorTree == Config.Tree.Get() && !Config.Tree->RootNode)) { return false; }
+		UGGYGOEncounterBTProbe* Probe = Fixture.Probe.Get();
+		AGGYGOEncounterBTTestEncounter* Encounter = Fixture.World->SpawnActor<AGGYGOEncounterBTTestEncounter>();
+		if (!Test.TestNotNull(TEXT("Encounter"), Encounter)) { return false; }
+		Encounter->ConfigureForTest(Config.Definition.Get(), Probe);
+		Probe->Encounter = Encounter;
+		Probe->Tree = Config.Tree.Get();
+		FActorSpawnParameters ExternalParams;
+		ExternalParams.Owner = Encounter;
+		AActor* External = Fixture.World->SpawnActor<AActor>(ExternalParams);
+		if (!Test.TestNotNull(TEXT("external ownership witness"), External)) { return false; }
+		const TWeakObjectPtr<AActor> ExternalWeak(External);
+		int32 CreatedStates = 0;
+		int32 CreatedControllers = 0;
+		int32 CreatedAvatars = 0;
+		FDelegateHandle PawnWatch;
+		// Observe actual production-created identities before failure clears unpublished
+		// creation records. No test code performs the rejected assembly's cleanup.
+		const FDelegateHandle SpawnWatch = Fixture.World->AddOnActorSpawnedHandler(
+			FOnActorSpawned::FDelegate::CreateLambda([&](AActor* Actor)
+			{
+				if (Actor->GetOwner() != Encounter) { return; }
+				if (AGGYGOBossState* State = Cast<AGGYGOBossState>(Actor))
+				{
+					++CreatedStates;
+					Probe->State = State;
+					Probe->ASC = State->GetGGYGOAbilitySystemComponent();
+					State->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
+				}
+				else if (AGGYGOBossAIController* Controller = Cast<AGGYGOBossAIController>(Actor))
+				{
+					++CreatedControllers;
+					Probe->Controller = Controller;
+					Controller->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
+					PawnWatch = Controller->GetOnNewPawnNotifier().AddUObject(
+						Probe, &UGGYGOEncounterBTProbe::HandleInitialPawnChanged);
+				}
+				else if (AGGYGOEncounterBTTestPawn* Avatar = Cast<AGGYGOEncounterBTTestPawn>(Actor))
+				{
+					++CreatedAvatars;
+					Probe->Avatar = Avatar;
+					Avatar->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
+					if (UGGYGOPawnExtensionComponent* Extension = Avatar->GetPawnExtensionComponent())
+					{
+						Extension->OnAbilitySystemUninitialized_Register(FSimpleMulticastDelegate::FDelegate::CreateUObject(
+							Probe, &UGGYGOEncounterBTProbe::HandleUninitialized));
+					}
+				}
+			}));
+		// Keep real startup Errors visible. Behavior assertions and automation log failures
+		// are separate evidence; do not turn invalid required configuration into a green run.
+		const bool bSpawned = Encounter->SpawnBoss();
+		Fixture.World->RemoveOnActorSpawnedHandler(SpawnWatch);
+		if (AGGYGOBossAIController* Controller = Probe->Controller.Get())
+		{
+			Controller->GetOnNewPawnNotifier().Remove(PawnWatch);
+		}
+		// All DUT observations/assertions precede explicit or RAII fixture cleanup.
+		bool bPassed = Test.TestFalse(TEXT("production SpawnBoss rejects invalid required tree"), bSpawned);
+		bPassed &= Test.TestEqual(TEXT("production created the original State"), CreatedStates, 1);
+		bPassed &= Test.TestEqual(TEXT("production created the original Controller"), CreatedControllers, 1);
+		bPassed &= Test.TestEqual(TEXT("production created the original Avatar"), CreatedAvatars, 1);
+		bPassed &= Test.TestEqual(TEXT("original initial Possess returned through native Pawn notification"), Probe->InitialPossessCount, 1);
+		bPassed &= Test.TestTrue(TEXT("original State/ASC/Pawn/Controller assembly bound before failure cleanup"), Probe->bInitialAssemblyBound);
+		bPassed &= Test.TestTrue(TEXT("native RunBehaviorTree created initialized Brain but no root/Started instance"), Probe->bInitialBrainWithoutStartedTree);
+		bPassed &= Test.TestTrue(TEXT("failure cleanup stopped the actual native Brain before Controller destruction"),
+			Probe->bBrainStoppedWithoutInstanceAtControllerDestroy);
+		bPassed &= Test.TestTrue(TEXT("failed original assembly detached before Avatar destruction"), Probe->bDetachedBeforeAvatarDestroy);
+		bPassed &= Test.TestTrue(TEXT("failed SpawnBoss publishes no assembly"),
+			!Encounter->GetBossState() && !Encounter->GetBossController() && !Encounter->GetBossAvatar());
+		bPassed &= Test.TestTrue(TEXT("original created actors and native Brain invalid before fixture cleanup"),
+			!Probe->State.IsValid() && !Probe->Controller.IsValid() && !Probe->Avatar.IsValid() && !Probe->Brain.IsValid());
+		bPassed &= Test.TestEqual(TEXT("failed assembly UnPossess once"), Probe->UnpossessCount, 1);
+		bPassed &= Test.TestEqual(TEXT("failed assembly host uninitialization once"), Probe->DetachCount, 1);
+		bPassed &= Test.TestEqual(TEXT("failed created Avatar destroyed once"), Probe->AvatarDestroyedCount, 1);
+		bPassed &= Test.TestEqual(TEXT("failed created Controller destroyed once"), Probe->ControllerDestroyedCount, 1);
+		bPassed &= Test.TestEqual(TEXT("failed created State destroyed once"), Probe->StateDestroyedCount, 1);
+		bPassed &= Test.TestTrue(TEXT("failed required tree never created or executed a task instance"),
+			Probe->InstanceCreatedCount == 0 && Probe->ExecuteCount == 0 && Probe->TickCount == 0);
+		bPassed &= Test.TestTrue(TEXT("failure cleanup preserves the external Actor with the same Encounter Owner"), ExternalWeak.IsValid());
+		Test.AddInfo(FString::Printf(TEXT("RequiredTreeRejectsInvalidRoot behavior assertions: %s; production startup Errors remain unsuppressed."),
+			bPassed ? TEXT("PASS") : TEXT("FAIL")));
+		return bPassed;
+	}
+
 	bool RunEncounterBTScenario(FAutomationTestBase& Test, EEncounterBTScenario Scenario)
 	{
 		FEncounterBTWorld Fixture;
@@ -537,5 +659,13 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOEncounterBTLatentCleanupTest,
 bool FGGYGOEncounterBTLatentCleanupTest::RunTest(const FString& Parameters)
 {
 	return RunEncounterBTScenario(*this, EEncounterBTScenario::CleanupLatent);
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOEncounterBTInvalidRequiredTreeTest,
+	"GGYGO.BossAI.Encounter.BehaviorTree.RequiredTreeRejectsInvalidRoot",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOEncounterBTInvalidRequiredTreeTest::RunTest(const FString& Parameters)
+{
+	return RunInvalidRequiredTreeScenario(*this);
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

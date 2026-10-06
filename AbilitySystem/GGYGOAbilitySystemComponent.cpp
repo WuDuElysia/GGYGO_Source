@@ -2636,6 +2636,30 @@ bool UGGYGOAbilitySystemComponent::ValidateAvatarBindingActualSnapshotForPurpose
 	return true;
 }
 
+bool UGGYGOAbilitySystemComponent::CheckOriginalAbilityBindingForTermination(
+	const FGGYGOAvatarBindingContext& OriginalContext,
+	const FActualAvatarBindingActorInfoSnapshot& OriginalSource) const
+{
+	check(IsInGameThread());
+	EGGYGOAvatarBindingReason Reason;
+	if (!OriginalContext.HasIssuedContext()
+		|| CheckAvatarBindingIdentity(OriginalContext.Binding, Reason) != EGGYGOAvatarBindingOutcome::Succeeded)
+	{
+		return false;
+	}
+	// CheckAvatarBindingIdentity has authenticated the current committed full snapshot.
+	// Refresh may change Controller/Mesh/Anim/Movement, never the original allocation,
+	// ASC or Owner/Avatar endpoints. No current endpoint is used to manufacture a source.
+	const FActualAvatarBindingActorInfoSnapshot& Committed = AvatarBindingActorInfoSnapshot;
+	return OriginalSource.Allocation.IsValid() && Committed.Allocation.IsValid()
+		&& OriginalSource.Allocation.Get() == Committed.Allocation.Get()
+		&& OriginalSource.AbilitySystemComponent.HasSameIndexAndSerialNumber(Committed.AbilitySystemComponent)
+		&& OriginalSource.OwnerActor.HasSameIndexAndSerialNumber(Committed.OwnerActor)
+		&& OriginalSource.AvatarActor.HasSameIndexAndSerialNumber(Committed.AvatarActor)
+		&& OriginalSource.CachedOwnerActor.HasSameIndexAndSerialNumber(Committed.CachedOwnerActor)
+		&& OriginalSource.CachedAvatarActor.HasSameIndexAndSerialNumber(Committed.CachedAvatarActor);
+}
+
 bool UGGYGOAbilitySystemComponent::HasSameAvatarBindingActualSnapshot(
 	const FActualAvatarBindingActorInfoSnapshot& First,
 	const FActualAvatarBindingActorInfoSnapshot& Second) const

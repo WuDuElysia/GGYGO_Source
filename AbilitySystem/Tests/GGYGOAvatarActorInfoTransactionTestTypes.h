@@ -46,14 +46,35 @@ public:
 	void DisarmPawnNoticeHookForTest();
 	int32 GetPawnNoticeCallsForTest() const { return PawnNoticeCalls; }
 	TWeakObjectPtr<AActor> GetLastNotifiedAvatarForTest() const { return LastNotifiedAvatar; }
+	void HoldControlledActivationForTest();
+	int32 GetControlledCleanupCallsForTest() const { return ControlledCleanupCalls; }
+	const FGGYGOAbilityActivationHandle& GetLastCleanupActivationForTest() const { return LastCleanupActivation; }
 
 protected:
 	virtual void OnPawnAvatarSet() override;
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 
 private:
 	int32 PawnNoticeCalls = 0;
 	TWeakObjectPtr<AActor> LastNotifiedAvatar;
 	FGGYGOAvatarBindingPublicationPawnHook PawnNoticeHook;
+	bool bHoldControlledActivation = false;
+	int32 ControlledCleanupCalls = 0;
+	FGGYGOAbilityActivationHandle LastCleanupActivation;
+};
+
+/** Dedicated authoritative activation fixture; its own CDO and instances use the same policy. */
+UCLASS(Transient)
+class UGGYGOAvatarBindingRefreshEndTestAbility : public UGGYGOAvatarBindingPublicationTestAbility
+{
+	GENERATED_BODY()
+
+public:
+	UGGYGOAvatarBindingRefreshEndTestAbility(
+		const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 };
 
 /** Ordinary native GAS probe: real activation/cancellation, no project admission or custom callbacks. */

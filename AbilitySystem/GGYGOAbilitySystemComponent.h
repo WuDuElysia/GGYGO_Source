@@ -864,6 +864,9 @@ private:
 		const TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof>& Original,
 		EGGYGOAvatarBindingReason& OutReason);
 	void RetireFailedAvatarActorInfoInitCleanup();
+	/** Termination-only continuation of an already-issued ability Binding. Never renews work sources. */
+	bool CheckOriginalAbilityBindingForTermination(const FGGYGOAvatarBindingContext& OriginalContext,
+		const FActualAvatarBindingActorInfoSnapshot& OriginalSource) const;
 	bool HasSameAvatarBindingActualSnapshot(const FActualAvatarBindingActorInfoSnapshot& First,
 		const FActualAvatarBindingActorInfoSnapshot& Second) const;
 	void DiscardActiveAvatarBindingIdentityOperation(bool bRevokeBeforeContext);

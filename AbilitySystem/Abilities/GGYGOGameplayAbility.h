@@ -297,12 +297,14 @@ public:
 
 	// ===== Controlled activation identity and original termination =====
 
-	/** Copy history issued at the actual native activation; empty never supplies a guessed source. */
+	/** Copy the actual activation only while its original resource-work source still matches.
+	 * A committed same-Binding Refresh may retain End eligibility without renewing this source. */
 	FGGYGOAbilityActivationHandle CaptureCurrentActivation() const;
 
 	/**
 	 * End only the authenticated original activation. First parameters/resources stay fixed;
-	 * stale/invalid sources fail explicitly. Completed is later than native OnAbilityEnded.
+	 * A committed same-Binding Refresh preserves termination eligibility only, not old resource work.
+	 * Stale/invalid sources fail explicitly. Completed is later than native OnAbilityEnded.
 	 */
 	FGGYGOAbilityTerminationResult RequestAbilityEnd(const FGGYGOAbilityActivationHandle& Original,
 		bool bReplicateEndAbility, bool bWasCancelled);
@@ -604,8 +606,11 @@ private:
 		bool bHasControlledTryBoundary, EGGYGOAbilityActivationRequestReason& OutReason);
 	void RetireControlledActivation();
 	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle);
+	enum class EControlledActivationValidationPurpose : uint8 { ResourceWork, Termination };
+	FGGYGOAbilityActivationHandle CaptureCurrentActivationForTermination() const;
 	FGGYGOAbilityActivationHandle ValidateCurrentControlledActivation(bool bRequireActive = true,
-		bool bRequireSpec = true) const;
+		bool bRequireSpec = true,
+		EControlledActivationValidationPurpose Purpose = EControlledActivationValidationPurpose::ResourceWork) const;
 
 	struct FOriginalTerminationRecord;
 	/** Actual final End stack span; owns a dispatch only when this entry created the record. */
