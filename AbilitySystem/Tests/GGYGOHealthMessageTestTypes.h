@@ -18,6 +18,7 @@ public:
 
 	virtual UAbilitySystemComponent* GetAbilitySystemComponent() const override;
 	UGGYGOAbilitySystemComponent* GetProjectAbilitySystemComponent() const { return AbilitySystemComponent; }
+	void SetTestNetRole(ENetRole InRole) { SetRole(InRole); AbilitySystemComponent->CacheIsNetSimulated(); }
 
 private:
 	UPROPERTY(VisibleAnywhere)
@@ -31,6 +32,26 @@ class UGGYGOHealthMessageRepNotifyTestSet : public UGGYGOHealthSet
 	GENERATED_BODY()
 
 public:
+	virtual UWorld* GetWorld() const override;
+	void SetMessageWorldOverride(UWorld* World);
+	void ClearMessageWorldOverride();
+	void BeginTestNetReceive() { PreNetReceive(); }
+	void EndTestNetReceive() { PostNetReceive(); }
+
+	void SimulateReplicatedMaxHealth(float NewValue)
+	{
+		const FGameplayAttributeData OldValue = *GetMaxHealthAttribute().GetGameplayAttributeDataChecked(this);
+		*GetMaxHealthAttribute().GetGameplayAttributeDataChecked(this) = FGameplayAttributeData(NewValue);
+		OnRep_MaxHealth(OldValue);
+	}
+
+	void SimulateReplicatedMaxPoise(float NewValue)
+	{
+		const FGameplayAttributeData OldValue = *GetMaxPoiseAttribute().GetGameplayAttributeDataChecked(this);
+		*GetMaxPoiseAttribute().GetGameplayAttributeDataChecked(this) = FGameplayAttributeData(NewValue);
+		OnRep_MaxPoise(OldValue);
+	}
+
 	void SimulateReplicatedHealth(float NewValue)
 	{
 		FGameplayAttributeData NewAttributeValue(NewValue);
@@ -56,4 +77,8 @@ public:
 		*GetPoiseAttribute().GetGameplayAttributeDataChecked(this) = NewValue;
 		OnRep_Poise(OldValue);
 	}
+
+private:
+	bool bOverrideMessageWorld = false;
+	TWeakObjectPtr<UWorld> MessageWorldOverride;
 };

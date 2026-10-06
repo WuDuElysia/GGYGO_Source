@@ -44,7 +44,7 @@ public:
 	UGGYGOHealthSet();
 
 	// ===== 生命 =====
-	/** 当前生命值。所有写入都会 Clamp 到 [0, MaxHealth]；伤害执行通常经 Damage 元属性结算。 */
+	/** 聚合后的当前生命值限制为 [0, MaxHealth]；内部有限 Base 可越界以保留持续 GE 的结算语义。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, Health);
 	/** 生命上限。可被 GE 修改；下调时会同步压低当前 Health。 */
 	ATTRIBUTE_ACCESSORS(UGGYGOHealthSet, MaxHealth);
@@ -101,7 +101,7 @@ protected:
 	 */
 	virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
 
-	/** 基础值变更入口的 Clamp。 */
+	/** Health/Poise 允许有限 Base 越界；其它属性仍保留各自的 Base 边界。 */
 	virtual void PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const override;
 	/** 聚合值变更入口的 Clamp。与上面是两条不同入口，都必须处理才能覆盖所有修改方式。 */
 	virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
@@ -110,7 +110,11 @@ protected:
 	/** 本次 RepNotify 内迟到创建聚合器时，只记录匹配未判定帧的阶段。 */
 	virtual void OnAttributeAggregatorCreated(const FGameplayAttribute& Attribute, FAggregator* NewAggregator) const override;
 
-	/** 集中定义各属性边界。被两个 PreAttribute 入口共用。 */
+	/** 复制批处理的请求只存活于原生 Pre/PostNetReceive 生命周期。 */
+	virtual void PreNetReceive() override;
+	virtual void PostNetReceive() override;
+
+	/** 聚合后的可见属性边界。 */
 	void ClampAttribute(const FGameplayAttribute& Attribute, float& NewValue) const;
 
 private:
@@ -118,7 +122,9 @@ private:
 	struct FQueuedResult;
 	struct FExpectedAttributeChange;
 	struct FRepNotifyFrame;
+	struct FNetReceiveFrame;
 	enum class EQueuedResultType : uint8;
+	enum class EMessageDeliveryResult : uint8;
 
 	/** 只在当前同步 GE Modifier 调用栈非空；嵌套时以回调数据地址配对 Pre/Post。 */
 	TArray<TSharedPtr<FModifierFrame>> ModifierFrames;
@@ -128,8 +134,12 @@ private:
 	TArray<TSharedPtr<FExpectedAttributeChange>> ExpectedAttributeChanges;
 	/** 记录 RepNotify 的调用阶段、弱来源及最终聚合值，仅存活于该同步宏调用期间。 */
 	TArray<TSharedPtr<FRepNotifyFrame>> RepNotifyFrames;
+	/** 仅保存本次复制要求重算的属性和弱来源，不保存 Base/Current 快照。 */
+	TArray<TSharedPtr<FNetReceiveFrame>> NetReceiveFrames;
 	/** 将 PostAttributeChange 内部的联动写入一起完成后再发布同步结果。 */
 	int32 AttributeChangeDepth = 0;
+	/** Diagnostic bits only: report each missing message dependency once until routing recovers. */
+	uint8 ReportedMessageDependencyFailures = 0;
 
 	TSharedPtr<FModifierFrame> FindFrame(const FGameplayEffectModCallbackData& Data) const;
 	TSharedPtr<FModifierFrame> FindAwaitingFrame(const FGameplayAttribute& Attribute) const;
@@ -137,11 +147,17 @@ private:
 	void EndRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame);
 	bool CanClassifyRepNotifyFrame(const TSharedPtr<FRepNotifyFrame>& Frame) const;
 	TSharedPtr<FRepNotifyFrame> FindRepNotifyFrame(const FGameplayAttribute& Attribute) const;
-	void PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute);
+	TSharedPtr<FExpectedAttributeChange> PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute);
 	void PopExpectedAttributeChange();
-	TSharedPtr<FModifierFrame> ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute);
+	TSharedPtr<FExpectedAttributeChange> ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute);
+	/** 权威 Current 目标通过 ASC 换算为 Base，实际 Post 回调证明提交。 */
+	bool TrySetCurrentValue(const FGameplayAttribute& Attribute, float DesiredCurrent, const TSharedPtr<FModifierFrame>& Frame);
+	void RequestClientMaxReevaluation(const FGameplayAttribute& Attribute);
+	void ReevaluateClientMax(const FGameplayAttribute& Attribute, const TWeakObjectPtr<AActor>& Owner, const TWeakObjectPtr<UAbilitySystemComponent>& ASC);
+	bool IsCurrentAttributeSource(const FGameplayAttribute& Attribute, const AActor* Owner, const UAbilitySystemComponent* ASC) const;
 	void QueueAttributeResult(EQueuedResultType ResultType, const TSharedPtr<FModifierFrame>& Frame, float Magnitude, float OldValue, float NewValue);
 	void QueueMessageResult(const FGameplayTag& Verb, const TSharedPtr<FModifierFrame>& Frame, float Magnitude);
+	EMessageDeliveryResult PublishMessageResult(const FQueuedResult& Result);
 	void FlushPendingResults();
 	void ApplyModifierMinimumHealth(const FGameplayAttribute& Attribute, float& NewValue) const;
 	/** 当前生命值。HideFromModifiers 只影响编辑器属性列表；运行时直接 GE 仍经 Clamp 与边沿处理。 */

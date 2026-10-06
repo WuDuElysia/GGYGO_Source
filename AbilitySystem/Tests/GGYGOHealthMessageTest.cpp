@@ -5,6 +5,7 @@
 #include "Engine/World.h"
 #include "GameFramework/GameplayMessageSubsystem.h"
 #include "Messages/GGYGOVerbMessage.h"
+#include "Misc/ScopeExit.h"
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
 
@@ -18,6 +19,23 @@ AGGYGOHealthMessageTestActor::AGGYGOHealthMessageTestActor()
 UAbilitySystemComponent* AGGYGOHealthMessageTestActor::GetAbilitySystemComponent() const
 {
 	return AbilitySystemComponent;
+}
+
+UWorld* UGGYGOHealthMessageRepNotifyTestSet::GetWorld() const
+{
+	return bOverrideMessageWorld ? MessageWorldOverride.Get() : Super::GetWorld();
+}
+
+void UGGYGOHealthMessageRepNotifyTestSet::SetMessageWorldOverride(UWorld* World)
+{
+	bOverrideMessageWorld = true;
+	MessageWorldOverride = World;
+}
+
+void UGGYGOHealthMessageRepNotifyTestSet::ClearMessageWorldOverride()
+{
+	bOverrideMessageWorld = false;
+	MessageWorldOverride.Reset();
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -1506,6 +1524,424 @@ bool FGGYGOHealthMessageRepNotifySetterTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Restoration reopened death edge latch"), DeathCount, 2);
 	Target.HealthSet->SimulateReplicatedHealth(0.0f);
 	TestEqual(TEXT("Duplicate zero does not repeat edge"), DeathCount, 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOHealthMessageDeliveryLifecycleTest,
+	"GGYGO.AbilitySystem.HealthMessage.DeliveryLifecycle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOHealthMessageDeliveryLifecycleTest::RunTest(const FString& Parameters)
+{
+	FGGYGOHealthMessageTestFixture Fixture;
+	if (!TestTrue(TEXT("Initialize real GI, world and router"), Fixture.Initialize())) { return false; }
+	const FGGYGOHealthMessageCombatant Source = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant Target = Fixture.CreateCombatant();
+	if (!TestNotNull(TEXT("Source ASC"), Source.ASC) || !TestNotNull(TEXT("Target ASC"), Target.ASC)
+		|| !TestNotNull(TEXT("Target HealthSet"), Target.HealthSet)) { return false; }
+	Target.HealthSet->InitHealth(100.0f);
+	Target.HealthSet->InitPoise(10.0f);
+	TestFalse(TEXT("Fixture actor has not begun play"), Target.Actor->HasActorBegunPlay());
+
+	int32 HealthChangedCount = 0;
+	int32 DamageMessageCount = 0;
+	int32 PoiseChangedCount = 0;
+	int32 PoiseBrokenCount = 0;
+	int32 BreakMessageCount = 0;
+	Fixture.TrackAttributeDelegate(Target.HealthSet->OnHealthChanged,
+		Target.HealthSet->OnHealthChanged.AddLambda([&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float)
+		{
+			++HealthChangedCount;
+			TestEqual(TEXT("Health delegate sees consumed damage meta"), Target.HealthSet->GetDamage(), 0.0f);
+		}));
+	Fixture.TrackAttributeDelegate(Target.HealthSet->OnPoiseChanged,
+		Target.HealthSet->OnPoiseChanged.AddLambda([&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float)
+		{
+			++PoiseChangedCount;
+		}));
+	Fixture.TrackAttributeDelegate(Target.HealthSet->OnPoiseBroken,
+		Target.HealthSet->OnPoiseBroken.AddLambda([&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float)
+		{
+			++PoiseBrokenCount;
+		}));
+	const auto ListenDamage = [&]()
+	{
+		Fixture.Listen(GGYGOGameplayTags::Message_Damage, [&](FGameplayTag, const FGGYGOVerbMessage& Message)
+		{
+			++DamageMessageCount;
+			TestTrue(TEXT("Damage message retains target"), Message.Target == Target.Actor);
+			TestEqual(TEXT("Delivered damage has consumed meta"), Target.HealthSet->GetDamage(), 0.0f);
+		});
+	};
+	ListenDamage();
+	Fixture.ApplyDamage(Source, Target, 5.0f, Source.Actor);
+	TestEqual(TEXT("PreBegin damage settles"), Target.HealthSet->GetHealth(), 95.0f);
+	TestEqual(TEXT("PreBegin delivers with ready dependencies"), DamageMessageCount, 1);
+	Fixture.MessageHandles.Last().Unregister();
+	Fixture.ApplyDamage(Source, Target, 2.0f, Source.Actor);
+	TestEqual(TEXT("No-listener damage still settles"), Target.HealthSet->GetHealth(), 93.0f);
+	TestEqual(TEXT("Removed listener receives nothing"), DamageMessageCount, 1);
+	ListenDamage();
+	Fixture.Listen(GGYGOGameplayTags::Message_PoiseBreak, [&](FGameplayTag, const FGGYGOVerbMessage&)
+	{
+		++BreakMessageCount;
+	});
+
+	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] DeliveryFailed Reason=MissingWorld"), EAutomationExpectedErrorFlags::Contains, 2);
+	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] DeliveryFailed Reason=MissingGameInstance"), EAutomationExpectedErrorFlags::Contains, 1);
+	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] DeliveryFailed Reason=MissingRouter"), EAutomationExpectedErrorFlags::Contains, 2);
+	const auto CheckFailedDamage = [&](float Damage, float ExpectedHealth)
+	{
+		const int32 MessagesBefore = DamageMessageCount;
+		const int32 ChangesBefore = HealthChangedCount;
+		Fixture.ApplyDamage(Source, Target, Damage, Source.Actor);
+		TestEqual(TEXT("Delivery failure retains completed settlement"), Target.HealthSet->GetHealth(), ExpectedHealth);
+		TestEqual(TEXT("Delivery failure retains attribute delegate"), HealthChangedCount, ChangesBefore + 1);
+		TestEqual(TEXT("Delivery failure consumes meta"), Target.HealthSet->GetDamage(), 0.0f);
+		TestEqual(TEXT("Unavailable route does not report delivery"), DamageMessageCount, MessagesBefore);
+	};
+	Target.HealthSet->SetMessageWorldOverride(nullptr);
+	CheckFailedDamage(3.0f, 90.0f);
+	CheckFailedDamage(4.0f, 86.0f);
+	Target.HealthSet->ClearMessageWorldOverride();
+	Fixture.ApplyDamage(Source, Target, 1.0f, Source.Actor);
+	TestEqual(TEXT("Recovery delivers only the new result, without replay"), DamageMessageCount, 2);
+	Target.HealthSet->SetMessageWorldOverride(nullptr);
+	CheckFailedDamage(1.0f, 84.0f);
+
+	// Only HealthSet's message context is overridden; the real ASC keeps its initialized GI world.
+	UWorld* DependencyWorld = UWorld::CreateWorld(EWorldType::Game, false,
+		FName(TEXT("GGYGOHealthMessageDependencyWorld")));
+	if (!TestNotNull(TEXT("Isolated dependency world"), DependencyWorld))
+	{
+		Target.HealthSet->ClearMessageWorldOverride();
+		return false;
+	}
+	UGameInstance* MissingRouterGameInstance = nullptr;
+	ON_SCOPE_EXIT
+	{
+		Target.HealthSet->ClearMessageWorldOverride();
+		DependencyWorld->SetGameInstance(nullptr);
+		DependencyWorld->DestroyWorld(false);
+		if (UPackage* Package = DependencyWorld->GetPackage()) { Package->SetDirtyFlag(false); }
+		if (MissingRouterGameInstance)
+		{
+			if (MissingRouterGameInstance->IsRooted()) { MissingRouterGameInstance->RemoveFromRoot(); }
+			MissingRouterGameInstance->MarkAsGarbage();
+		}
+	};
+	Target.HealthSet->SetMessageWorldOverride(DependencyWorld);
+	TestNull(TEXT("Dependency world has no GI"), DependencyWorld->GetGameInstance());
+	CheckFailedDamage(2.0f, 82.0f);
+	CheckFailedDamage(2.0f, 80.0f);
+	MissingRouterGameInstance = NewObject<UGameInstance>(Fixture.Engine);
+	if (!TestNotNull(TEXT("GI with intentionally uninitialized subsystems"), MissingRouterGameInstance)) { return false; }
+	MissingRouterGameInstance->AddToRoot();
+	DependencyWorld->SetGameInstance(MissingRouterGameInstance);
+	TestNull(TEXT("Missing router is a real subsystem lookup"),
+		UGameInstance::GetSubsystem<UGameplayMessageSubsystem>(MissingRouterGameInstance));
+	CheckFailedDamage(2.0f, 78.0f);
+	CheckFailedDamage(2.0f, 76.0f);
+	Target.HealthSet->ClearMessageWorldOverride();
+	Fixture.ApplyDamage(Source, Target, 1.0f, Source.Actor);
+	TestEqual(TEXT("Recovered router does not replay discarded messages"), DamageMessageCount, 3);
+	Target.HealthSet->SetMessageWorldOverride(DependencyWorld);
+	CheckFailedDamage(1.0f, 74.0f);
+	TestEqual(TEXT("All damage attribute notifications survive"), HealthChangedCount, 12);
+
+	{
+		const bool bWasTearingDown = Fixture.World->bIsTearingDown;
+		Fixture.World->bIsTearingDown = true;
+		ON_SCOPE_EXIT { Fixture.World->bIsTearingDown = bWasTearingDown; Target.HealthSet->ClearMessageWorldOverride(); };
+		Target.HealthSet->SetMessageWorldOverride(nullptr);
+		Fixture.ApplyPoiseDamage(Source, Target, 10.0f, Source.Actor);
+		TestEqual(TEXT("Teardown retains poise settlement"), Target.HealthSet->GetPoise(), 0.0f);
+		TestEqual(TEXT("Teardown retains changed delegate"), PoiseChangedCount, 1);
+		TestEqual(TEXT("Teardown retains broken delegate"), PoiseBrokenCount, 1);
+		TestEqual(TEXT("Teardown consumes poise meta"), Target.HealthSet->GetPoiseDamage(), 0.0f);
+		TestEqual(TEXT("Owner world teardown retires even a missing message world"), BreakMessageCount, 0);
+	}
+
+	const FGGYGOHealthMessageCombatant DestroyTarget = Fixture.CreateCombatant();
+	if (!TestNotNull(TEXT("Destruction target HealthSet"), DestroyTarget.HealthSet)) { return false; }
+	DestroyTarget.HealthSet->InitPoise(10.0f);
+	bool bDestroyedDuringChanged = false;
+	int32 DestroyedBrokenCount = 0;
+	Fixture.TrackAttributeDelegate(DestroyTarget.HealthSet->OnPoiseChanged,
+		DestroyTarget.HealthSet->OnPoiseChanged.AddLambda([&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float)
+		{
+			bDestroyedDuringChanged = Fixture.World->DestroyActor(DestroyTarget.Actor);
+		}));
+	Fixture.TrackAttributeDelegate(DestroyTarget.HealthSet->OnPoiseBroken,
+		DestroyTarget.HealthSet->OnPoiseBroken.AddLambda([&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float)
+		{
+			++DestroyedBrokenCount;
+		}));
+	Fixture.ApplyPoiseDamage(Source, DestroyTarget, 10.0f, Source.Actor);
+	TestTrue(TEXT("Real actor destruction occurs before the queued message"), bDestroyedDuringChanged);
+	TestTrue(TEXT("Owner exposes real destruction evidence"), DestroyTarget.Actor->IsActorBeingDestroyed());
+	TestEqual(TEXT("Destruction preserves committed poise"), DestroyTarget.HealthSet->GetPoise(), 0.0f);
+	TestEqual(TEXT("Destruction preserves edge delegate"), DestroyedBrokenCount, 1);
+	TestEqual(TEXT("Destruction consumes poise meta"), DestroyTarget.HealthSet->GetPoiseDamage(), 0.0f);
+	TestEqual(TEXT("Destruction retires its remaining message"), BreakMessageCount, 0);
+	Fixture.ApplyDirectPoise(Source, Target, EGameplayModOp::Additive, 10.0f, Source.Actor);
+	Fixture.ApplyPoiseDamage(Source, Target, 10.0f, Source.Actor);
+	TestEqual(TEXT("Only the new live break is delivered after retirement"), BreakMessageCount, 1);
+	TestEqual(TEXT("Live restoration reopens the original edge"), PoiseBrokenCount, 2);
+	return true;
+}
+
+namespace
+{
+	FActiveGameplayEffectHandle ApplyPersistentNumericModifiers(FGGYGOHealthMessageTestFixture& Fixture,
+		const FGGYGOHealthMessageCombatant& Target, const TArray<FGGYGOHealthMessageTestModifier>& Modifiers)
+	{
+		UGameplayEffect* Effect = Fixture.CreateEffect(Modifiers, EGameplayEffectDurationType::Infinite);
+		if (!Effect) { return FActiveGameplayEffectHandle(); }
+		FGameplayEffectContextHandle Context = Target.ASC->MakeEffectContext();
+		Context.AddInstigator(Target.Actor, Target.Actor);
+		return Target.ASC->ApplyGameplayEffectSpecToSelf(FGameplayEffectSpec(Effect, Context, 1.0f));
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOHealthMessageCurrentValueSettlementTest,
+	"GGYGO.AbilitySystem.HealthMessage.CurrentValueSettlement",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOHealthMessageCurrentValueSettlementTest::RunTest(const FString& Parameters)
+{
+	FGGYGOHealthMessageTestFixture Fixture;
+	if (!TestTrue(TEXT("Numeric fixture initializes"), Fixture.Initialize())) { return false; }
+	const FGGYGOHealthMessageCombatant Target = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant Offset = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant AboveMax = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant Reentry = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant Rejected = Fixture.CreateCombatant();
+	const FGGYGOHealthMessageCombatant PostRejected = Fixture.CreateCombatant();
+	if (!Target.HealthSet || !Offset.HealthSet || !AboveMax.HealthSet || !Reentry.HealthSet || !Rejected.HealthSet || !PostRejected.HealthSet)
+	{
+		AddError(TEXT("Numeric combatants were not created"));
+		return false;
+	}
+	TArray<FGGYGOVerbMessage> Messages;
+	Fixture.Listen(GGYGOGameplayTags::Message_Damage, [&Messages](FGameplayTag, const FGGYGOVerbMessage& Message)
+	{
+		Messages.Add(Message);
+	});
+	Target.HealthSet->SetMaxHealth(500.0f);
+	Target.HealthSet->SetMaxPoise(500.0f);
+	const FActiveGameplayEffectHandle Multiply = ApplyPersistentNumericModifiers(Fixture, Target,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::MultiplyAdditive, 2.0f },
+		 { UGGYGOHealthSet::GetPoiseAttribute(), EGameplayModOp::MultiplyAdditive, 2.0f }});
+	TestTrue(TEXT("Persistent multiplier is active"), Multiply.IsValid());
+	TestEqual(TEXT("Base100 times2 exposes Current200"), Target.HealthSet->GetHealth(), 200.0f);
+	Fixture.ApplyDamage(Target, Target, 10.0f, Target.Actor);
+	TestEqual(TEXT("Damage10 consumes Current10 once"), Target.HealthSet->GetHealth(), 190.0f);
+	TestEqual(TEXT("Damage10 leaves Base95"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 95.0f);
+	Target.ASC->RemoveActiveGameplayEffect(Multiply);
+	TestEqual(TEXT("Removing times2 after Damage10 reveals Current95"), Target.HealthSet->GetHealth(), 95.0f);
+	const FActiveGameplayEffectHandle CapMultiply = ApplyPersistentNumericModifiers(Fixture, Target,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::MultiplyAdditive, 2.0f },
+		 { UGGYGOHealthSet::GetPoiseAttribute(), EGameplayModOp::MultiplyAdditive, 2.0f }});
+	TestTrue(TEXT("Cap fixture multiplier is active"), CapMultiply.IsValid());
+	Fixture.ApplyHealing(Target, Target, 10.0f, Target.Actor);
+	TestEqual(TEXT("Healing10 restores Current200"), Target.HealthSet->GetHealth(), 200.0f);
+	Fixture.ApplyPoiseDamage(Target, Target, 10.0f, Target.Actor);
+	TestEqual(TEXT("PoiseDamage10 consumes Current10 once"), Target.HealthSet->GetPoise(), 190.0f);
+	TestEqual(TEXT("PoiseDamage10 leaves Base95"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetPoiseAttribute()), 95.0f);
+	Target.HealthSet->SetMaxHealth(150.0f);
+	Target.HealthSet->SetMaxPoise(150.0f);
+	TestEqual(TEXT("MaxHealth reduction commits Current150"), Target.HealthSet->GetHealth(), 150.0f);
+	TestEqual(TEXT("MaxPoise reduction commits Current150"), Target.HealthSet->GetPoise(), 150.0f);
+	TestEqual(TEXT("Health cap inversion leaves Base75"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 75.0f);
+	TestEqual(TEXT("Poise cap inversion leaves Base75"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetPoiseAttribute()), 75.0f);
+	TestTrue(TEXT("Settlement retains the actual GE"), Target.ASC->GetActiveGameplayEffect(CapMultiply) != nullptr);
+	Target.ASC->RemoveActiveGameplayEffect(CapMultiply);
+	TestEqual(TEXT("Removing multiplier reveals settled Health75"), Target.HealthSet->GetHealth(), 75.0f);
+	TestEqual(TEXT("Removing multiplier reveals settled Poise75"), Target.HealthSet->GetPoise(), 75.0f);
+	TestEqual(TEXT("Cap and removal add no damage messages"), Messages.Num(), 1);
+	if (Messages.Num() == 1) { TestEqual(TEXT("Damage message retains raw10"), Messages[0].Magnitude, 10.0f); }
+
+	Offset.HealthSet->SetMaxHealth(500.0f);
+	int32 DeathEdges = 0;
+	Fixture.TrackAttributeDelegate(Offset.HealthSet->OnOutOfHealth, Offset.HealthSet->OnOutOfHealth.AddLambda(
+		[&DeathEdges](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float) { ++DeathEdges; }));
+	const FActiveGameplayEffectHandle Add = ApplyPersistentNumericModifiers(Fixture, Offset,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Additive, 200.0f }});
+	TestTrue(TEXT("Persistent additive effect is active"), Add.IsValid());
+	Fixture.ApplyDamage(Offset, Offset, 110.0f, Offset.Actor);
+	TestEqual(TEXT("Base100 plus200 minus110 is Current190"), Offset.HealthSet->GetHealth(), 190.0f);
+	TestEqual(TEXT("Additive settlement permits finite Base minus10"), Offset.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), -10.0f);
+	Offset.ASC->RemoveActiveGameplayEffect(Add);
+	TestEqual(TEXT("Buff removal clamps negative Base to Current0"), Offset.HealthSet->GetHealth(), 0.0f);
+	TestEqual(TEXT("Buff removal uses the existing death edge"), DeathEdges, 1);
+	TestEqual(TEXT("Buff removal does not invent damage"), Messages.Num(), 2);
+
+	const FActiveGameplayEffectHandle Half = ApplyPersistentNumericModifiers(Fixture, AboveMax,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::MultiplyAdditive, 0.5f }});
+	TestTrue(TEXT("Half multiplier is active"), Half.IsValid());
+	Fixture.ApplyHealing(AboveMax, AboveMax, 80.0f, AboveMax.Actor);
+	TestEqual(TEXT("Healing clamps visible Current to100"), AboveMax.HealthSet->GetHealth(), 100.0f);
+	TestEqual(TEXT("Finite Base200 may exceed Max100"), AboveMax.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 200.0f);
+	AboveMax.ASC->RemoveActiveGameplayEffect(Half);
+	TestEqual(TEXT("Removal keeps visible Current within Max"), AboveMax.HealthSet->GetHealth(), 100.0f);
+
+	Reentry.HealthSet->SetMaxHealth(500.0f);
+	const FActiveGameplayEffectHandle ReentryMultiply = ApplyPersistentNumericModifiers(Fixture, Reentry,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::MultiplyAdditive, 2.0f }});
+	bool bSwapped = false;
+	bool bHealed = false;
+	Fixture.TrackNativeDelegate(Reentry.ASC, UGGYGOHealthSet::GetDamageAttribute(),
+		Reentry.ASC->GetGameplayAttributeValueChangeDelegate(UGGYGOHealthSet::GetDamageAttribute()).AddLambda(
+		[&](const FOnAttributeChangeData& Data)
+		{
+			if (!bSwapped && Data.OldValue > 0.0f && Data.NewValue == 0.0f)
+			{
+				bSwapped = true;
+				Reentry.ASC->RemoveActiveGameplayEffect(ReentryMultiply);
+				ApplyPersistentNumericModifiers(Fixture, Reentry,
+					{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Additive, 200.0f }});
+			}
+		}));
+	Fixture.TrackNativeDelegate(Reentry.ASC, UGGYGOHealthSet::GetHealthAttribute(),
+		Reentry.ASC->GetGameplayAttributeValueChangeDelegate(UGGYGOHealthSet::GetHealthAttribute()).AddLambda(
+		[&](const FOnAttributeChangeData& Data)
+		{
+			if (!bHealed && Data.NewValue == 290.0f)
+			{
+				bHealed = true;
+				Fixture.ApplyHealing(Reentry, Reentry, 10.0f, Reentry.Actor);
+			}
+		}));
+	TArray<float> ReentryResults;
+	Fixture.TrackAttributeDelegate(Reentry.HealthSet->OnHealthChanged, Reentry.HealthSet->OnHealthChanged.AddLambda(
+		[&](AActor*, AActor*, const FGameplayEffectSpec*, float, float, float NewValue) { ReentryResults.Add(NewValue); }));
+	Fixture.ApplyDamage(Reentry, Reentry, 10.0f, Reentry.Actor);
+	TestTrue(TEXT("Meta-clear callback changed actual aggregation"), bSwapped);
+	TestTrue(TEXT("Native callback reentered after original Current290 write"), bHealed);
+	TestEqual(TEXT("Post recalculates and nested healing leaves Current300"), Reentry.HealthSet->GetHealth(), 300.0f);
+	TestEqual(TEXT("Reentry uses new additive aggregation Base100"), Reentry.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 100.0f);
+	TestTrue(TEXT("Original290 remains a recorded fact after later300"), ReentryResults.Contains(290.0f) && ReentryResults.Last() == 300.0f);
+	TestEqual(TEXT("Original damage still publishes once after later write"), Messages.Num(), 3);
+	TestEqual(TEXT("Reentry consumes Damage meta"), Reentry.HealthSet->GetDamage(), 0.0f);
+	TestEqual(TEXT("Reentry consumes Healing meta"), Reentry.HealthSet->GetHealing(), 0.0f);
+
+	const FActiveGameplayEffectHandle Override = ApplyPersistentNumericModifiers(Fixture, Rejected,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Override, 50.0f }});
+	TestTrue(TEXT("Noninvertible effect remains real and active"), Override.IsValid());
+	const FGGYGOAttributeBaseCalculationResult RejectCalculation = Rejected.ASC->TryCalculateNumericAttributeBaseForCurrentValue(
+		Rejected.HealthSet, UGGYGOHealthSet::GetHealthAttribute(), 50.0f, 40.0f);
+	TestTrue(TEXT("Override has an explicit rejection"), RejectCalculation.Outcome == EGGYGOAttributeBaseCalculationOutcome::Rejected
+		&& RejectCalculation.Reason == EGGYGOAttributeBaseCalculationReason::NonInvertibleChannel);
+	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] MetaRejected"), EAutomationExpectedErrorFlags::Contains, 1);
+	Fixture.ApplyDamage(Rejected, Rejected, 10.0f, Rejected.Actor);
+	TestEqual(TEXT("Rejected meta never enters storage"), Rejected.HealthSet->GetDamage(), 0.0f);
+	TestEqual(TEXT("Rejected inverse never changes Current"), Rejected.HealthSet->GetHealth(), 50.0f);
+	TestEqual(TEXT("Rejected inverse never changes Base"), Rejected.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 100.0f);
+	TestEqual(TEXT("Rejected damage publishes no success message"), Messages.Num(), 3);
+	bool bMadeNoninvertible = false;
+	Fixture.TrackNativeDelegate(PostRejected.ASC, UGGYGOHealthSet::GetDamageAttribute(),
+		PostRejected.ASC->GetGameplayAttributeValueChangeDelegate(UGGYGOHealthSet::GetDamageAttribute()).AddLambda(
+		[&](const FOnAttributeChangeData& Data)
+		{
+			if (!bMadeNoninvertible && Data.OldValue > 0.0f && Data.NewValue == 0.0f)
+			{
+				bMadeNoninvertible = true;
+				ApplyPersistentNumericModifiers(Fixture, PostRejected,
+					{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Override, 50.0f }});
+			}
+		}));
+	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] CurrentWriteRejected"), EAutomationExpectedErrorFlags::Contains, 1);
+	Fixture.ApplyDamage(PostRejected, PostRejected, 10.0f, PostRejected.Actor);
+	TestTrue(TEXT("Meta-clear callback can invalidate a previously usable inverse"), bMadeNoninvertible);
+	TestEqual(TEXT("Post rejection still retires its consumed meta"), PostRejected.HealthSet->GetDamage(), 0.0f);
+	TestEqual(TEXT("Post rejection preserves callback's real Current50"), PostRejected.HealthSet->GetHealth(), 50.0f);
+	TestEqual(TEXT("Post rejection removes only its unconfirmed damage candidate"), Messages.Num(), 3);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOHealthMessageClientMaxNetReceiveTest,
+	"GGYGO.AbilitySystem.HealthMessage.ClientMaxNetReceive",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOHealthMessageClientMaxNetReceiveTest::RunTest(const FString& Parameters)
+{
+	FGGYGOHealthMessageTestFixture Fixture;
+	if (!TestTrue(TEXT("NetReceive fixture initializes"), Fixture.Initialize())) { return false; }
+	const FGGYGOHealthMessageCombatant Target = Fixture.CreateCombatant();
+	if (!TestNotNull(TEXT("Client HealthSet exists"), Target.HealthSet)) { return false; }
+	Target.HealthSet->SetMaxHealth(500.0f);
+	Target.HealthSet->SetMaxPoise(500.0f);
+	const FActiveGameplayEffectHandle Persistent = ApplyPersistentNumericModifiers(Fixture, Target,
+		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Additive, 200.0f },
+		 { UGGYGOHealthSet::GetPoiseAttribute(), EGameplayModOp::Additive, 200.0f },
+		 { UGGYGOHealthSet::GetMaxHealthAttribute(), EGameplayModOp::Additive, 0.0f }});
+	TestTrue(TEXT("Client projection retains an actual persistent GE"), Persistent.IsValid());
+	Target.Actor->SetTestNetRole(ROLE_SimulatedProxy);
+	TestFalse(TEXT("Native ASC authority cache reflects simulated role"), Target.ASC->IsOwnerActorAuthoritative());
+	int32 DamageMessages = 0;
+	int32 BreakMessages = 0;
+	int32 HealthChanges = 0;
+	int32 PoiseChanges = 0;
+	Fixture.Listen(GGYGOGameplayTags::Message_Damage, [&](FGameplayTag, const FGGYGOVerbMessage&) { ++DamageMessages; });
+	Fixture.Listen(GGYGOGameplayTags::Message_PoiseBreak, [&](FGameplayTag, const FGGYGOVerbMessage&) { ++BreakMessages; });
+	Fixture.TrackAttributeDelegate(Target.HealthSet->OnHealthChanged, Target.HealthSet->OnHealthChanged.AddLambda(
+		[&](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float, float OldValue, float NewValue)
+		{
+			++HealthChanges;
+			TestTrue(TEXT("Client cap has no fabricated GE source"), !Instigator && !Causer && !Spec);
+			TestEqual(TEXT("Client cap old Health is the real300"), OldValue, 300.0f);
+			TestEqual(TEXT("Client cap new Health is150"), NewValue, 150.0f);
+		}));
+	Fixture.TrackAttributeDelegate(Target.HealthSet->OnPoiseChanged, Target.HealthSet->OnPoiseChanged.AddLambda(
+		[&](AActor*, AActor*, const FGameplayEffectSpec*, float, float OldValue, float NewValue)
+		{
+			++PoiseChanges;
+			if (PoiseChanges == 1)
+			{
+				TestEqual(TEXT("Client cap old Poise is the real300"), OldValue, 300.0f);
+				TestEqual(TEXT("Client cap new Poise is150"), NewValue, 150.0f);
+			}
+		}));
+	Target.HealthSet->BeginTestNetReceive();
+	Target.HealthSet->SimulateReplicatedMaxHealth(150.0f);
+	Target.HealthSet->SimulateReplicatedMaxPoise(150.0f);
+	TestEqual(TEXT("Health dependency waits for native batch end"), Target.HealthSet->GetHealth(), 300.0f);
+	TestEqual(TEXT("Poise dependency waits for native batch end"), Target.HealthSet->GetPoise(), 300.0f);
+	TestEqual(TEXT("No deferred Health project result publishes early"), HealthChanges, 0);
+	TestEqual(TEXT("No deferred Poise project result publishes early"), PoiseChanges, 0);
+	Target.HealthSet->EndTestNetReceive();
+	TestEqual(TEXT("NetReceive end reevaluates Health within Max"), Target.HealthSet->GetHealth(), 150.0f);
+	TestEqual(TEXT("NetReceive end reevaluates Poise within Max"), Target.HealthSet->GetPoise(), 150.0f);
+	TestEqual(TEXT("Client Health retains real Base100"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetHealthAttribute()), 100.0f);
+	TestEqual(TEXT("Client Poise retains real Base100"), Target.ASC->GetNumericAttributeBase(UGGYGOHealthSet::GetPoiseAttribute()), 100.0f);
+	TestTrue(TEXT("Client projection leaves GE active"), Target.ASC->GetActiveGameplayEffect(Persistent) != nullptr);
+	TestEqual(TEXT("Client Health publishes only the final real change"), HealthChanges, 1);
+	TestEqual(TEXT("Client Poise publishes only the final real change"), PoiseChanges, 1);
+	TestEqual(TEXT("Client dependency invents no damage message"), DamageMessages, 0);
+	TestEqual(TEXT("Client dependency invents no poise message"), BreakMessages, 0);
+	bool bNestedDirectWrite = false;
+	Fixture.TrackNativeDelegate(Target.ASC, UGGYGOHealthSet::GetPoiseAttribute(),
+		Target.ASC->GetGameplayAttributeValueChangeDelegate(UGGYGOHealthSet::GetPoiseAttribute()).AddLambda(
+		[&](const FOnAttributeChangeData& Data)
+		{
+			if (!bNestedDirectWrite && Data.NewValue == 100.0f)
+			{
+				bNestedDirectWrite = true;
+				Target.HealthSet->SetPoise(-200.0f);
+			}
+		}));
+	// Also cover the unbatched native OnRep path and a real nested write after its marker.
+	Target.HealthSet->SimulateReplicatedMaxPoise(100.0f);
+	TestTrue(TEXT("Client cap native callback may make a distinct direct write"), bNestedDirectWrite);
+	TestEqual(TEXT("Distinct nested direct write commits Poise0"), Target.HealthSet->GetPoise(), 0.0f);
+	TestEqual(TEXT("Only the real nested write publishes PoiseBreak"), BreakMessages, 1);
+	TestEqual(TEXT("Cap and real nested write both preserve their changes"), PoiseChanges, 3);
+	Target.HealthSet->BeginTestNetReceive();
+	Target.HealthSet->EndTestNetReceive();
+	TestEqual(TEXT("A later empty receive cannot replay Health request"), HealthChanges, 1);
+	TestEqual(TEXT("A later empty receive cannot replay Poise request"), PoiseChanges, 3);
+	Target.Actor->SetTestNetRole(ROLE_Authority);
 	return true;
 }
 

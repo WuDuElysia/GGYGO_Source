@@ -50,6 +50,7 @@
 class AActor;
 class APlayerController;
 class UAnimInstance;
+class UAttributeSet;
 class UMovementComponent;
 class USkeletalMeshComponent;
 class UGameplayAbility;
@@ -61,6 +62,43 @@ struct FFrame;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOAbilityGroupRule;
 struct FGGYGOMontagePlayGuardResult;
+
+enum class EGGYGOAttributeBaseCalculationOutcome : uint8
+{
+	Rejected = 0,
+	Ready,
+	Stale
+};
+
+enum class EGGYGOAttributeBaseCalculationReason : uint8
+{
+	InvalidRequest = 0,
+	None,
+	WrongThread,
+	InvalidASC,
+	NotAuthority,
+	InvalidAttribute,
+	UnsupportedAttribute,
+	MissingAttributeSet,
+	SourceChanged,
+	CaptureFailed,
+	NonFiniteInput,
+	NonFiniteSource,
+	NonFiniteModifier,
+	InvalidDivisor,
+	NonInvertibleChannel,
+	NonFiniteResult,
+	ForwardMismatch,
+	AggregationChanged
+};
+
+/** Stack-call calculation only. CalculatedBase is finite and usable only for Ready/None. */
+struct GGYGO_API FGGYGOAttributeBaseCalculationResult
+{
+	EGGYGOAttributeBaseCalculationOutcome Outcome = EGGYGOAttributeBaseCalculationOutcome::Rejected;
+	EGGYGOAttributeBaseCalculationReason Reason = EGGYGOAttributeBaseCalculationReason::InvalidRequest;
+	float CalculatedBase = 0.0f;
+};
 
 enum class EGGYGOAvatarSwitchAbilityExitOutcome : uint8
 {
@@ -223,6 +261,19 @@ public:
 	UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	/** Actual GAS destruction supplies a synchronous native cleanup source. */
 	virtual void DestroyActiveState() override;
+
+	/**
+	 * Game-thread, authority-only calculation for registered FGameplayAttributeData attributes.
+	 * Uses native capture/qualification, channel inversion and forward evaluation; no attribute write
+	 * or gameplay clamp. May create GAS's lazy aggregator and invoke its native qualification hook.
+	 * ExpectedAttributeSet must remain the actual original host, and ExpectedCurrent must still match.
+	 * Ready is a finite candidate for immediate native Base writing, not settlement/history evidence;
+	 * the caller owns clamp policy and confirmation of its real PostAttributeChange. Do not retain it
+	 * across callbacks or async work. Neither capture nor aggregation data escapes this call.
+	 */
+	FGGYGOAttributeBaseCalculationResult TryCalculateNumericAttributeBaseForCurrentValue(
+		const UAttributeSet* ExpectedAttributeSet, const FGameplayAttribute& Attribute,
+		float ExpectedCurrent, float DesiredCurrent);
 
 	/**
 	 * Identity-only APIs; game thread only. No native binding or write-window execution.

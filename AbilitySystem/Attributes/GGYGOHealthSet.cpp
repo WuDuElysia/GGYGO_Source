@@ -5,16 +5,22 @@
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "GameFramework/GameplayMessageSubsystem.h"
+#include "GameplayEffectAggregator.h"
 #include "GameplayEffectExtension.h"
 #include "Messages/GGYGOVerbMessage.h"
 #include "Misc/ScopeExit.h"
 #include "Net/UnrealNetwork.h"
 #include "System/GGYGOGameplayTags.h"
 
+#include <limits>
+
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOHealthSet)
+
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOHealthMessage, Log, All);
 
 enum class UGGYGOHealthSet::EQueuedResultType : uint8
 {
@@ -25,6 +31,13 @@ enum class UGGYGOHealthSet::EQueuedResultType : uint8
 	PoiseBroken,
 	DamageMessage,
 	PoiseBreakMessage
+};
+
+enum class UGGYGOHealthSet::EMessageDeliveryResult : uint8
+{
+	Delivered,
+	Retired,
+	DependencyFailure
 };
 
 struct UGGYGOHealthSet::FModifierFrame
@@ -49,6 +62,18 @@ struct UGGYGOHealthSet::FExpectedAttributeChange
 	TSharedPtr<FModifierFrame> Frame;
 	FGameplayAttribute Attribute;
 	bool bConsumed = false;
+	bool bClientMaxReevaluation = false;
+	bool bObservedWrite = false;
+	bool bRejectedInput = false;
+	float ObservedCurrent = 0.0f;
+};
+
+struct UGGYGOHealthSet::FNetReceiveFrame
+{
+	TWeakObjectPtr<AActor> Owner;
+	TWeakObjectPtr<UAbilitySystemComponent> ASC;
+	bool bReevaluateHealth = false;
+	bool bReevaluatePoise = false;
 };
 
 struct UGGYGOHealthSet::FRepNotifyFrame
@@ -206,12 +231,14 @@ void UGGYGOHealthSet::OnAttributeAggregatorCreated(const FGameplayAttribute& Att
 	}
 }
 
-void UGGYGOHealthSet::PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute)
+TSharedPtr<UGGYGOHealthSet::FExpectedAttributeChange> UGGYGOHealthSet::PushExpectedAttributeChange(
+	const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute)
 {
 	TSharedPtr<FExpectedAttributeChange> Expected = MakeShared<FExpectedAttributeChange>();
 	Expected->Frame = Frame;
 	Expected->Attribute = Attribute;
-	ExpectedAttributeChanges.Add(MoveTemp(Expected));
+	ExpectedAttributeChanges.Add(Expected);
+	return Expected;
 }
 
 void UGGYGOHealthSet::PopExpectedAttributeChange()
@@ -222,7 +249,7 @@ void UGGYGOHealthSet::PopExpectedAttributeChange()
 	}
 }
 
-TSharedPtr<UGGYGOHealthSet::FModifierFrame> UGGYGOHealthSet::ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute)
+TSharedPtr<UGGYGOHealthSet::FExpectedAttributeChange> UGGYGOHealthSet::ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute)
 {
 	if (ExpectedAttributeChanges.IsEmpty())
 	{
@@ -241,7 +268,177 @@ TSharedPtr<UGGYGOHealthSet::FModifierFrame> UGGYGOHealthSet::ConsumeExpectedAttr
 	}
 
 	Expected->bConsumed = true;
-	return Expected->Frame;
+	return Expected;
+}
+
+bool UGGYGOHealthSet::IsCurrentAttributeSource(const FGameplayAttribute& Attribute,
+	const AActor* Owner, const UAbilitySystemComponent* ASC) const
+{
+	const auto IdentityIsCurrent = [this, &Attribute, Owner, ASC]()
+	{
+		return IsValid(this) && !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& IsValid(Owner) && !Owner->IsActorBeingDestroyed() && GetOuter() == Owner
+			&& IsValid(ASC) && !ASC->IsBeingDestroyed() && !ASC->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& ASC->GetAttributeSet(Attribute.GetAttributeSetClass()) == this;
+	};
+	if (!IdentityIsCurrent())
+	{
+		return false;
+	}
+	// An owner's GAS interface can run project code. Revalidate after querying it.
+	return GetOwningAbilitySystemComponent() == ASC && IdentityIsCurrent();
+}
+
+bool UGGYGOHealthSet::TrySetCurrentValue(const FGameplayAttribute& Attribute, float DesiredCurrent,
+	const TSharedPtr<FModifierFrame>& Frame)
+{
+	AActor* Owner = Cast<AActor>(GetOuter());
+	UGGYGOAbilitySystemComponent* ASC = IsValid(Owner) ? Cast<UGGYGOAbilitySystemComponent>(GetOwningAbilitySystemComponent()) : nullptr;
+	if (!IsCurrentAttributeSource(Attribute, Owner, ASC)
+		|| FScopedAggregatorOnDirtyBatch::GlobalBatchCount != 0)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] CurrentWriteRejected Reason=InvalidSourceOrOpenBatch Set=%s ASC=%s Attribute=%s Effect=%s"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(),
+			*GetPathNameSafe(Frame.IsValid() && Frame->EffectSpec.IsValid() ? Frame->EffectSpec->Def.Get() : nullptr));
+		return false;
+	}
+
+	const float ExpectedCurrent = ASC->GetNumericAttribute(Attribute);
+	const FGGYGOAttributeBaseCalculationResult Calculation = ASC->TryCalculateNumericAttributeBaseForCurrentValue(
+		this, Attribute, ExpectedCurrent, DesiredCurrent);
+	if (Calculation.Outcome != EGGYGOAttributeBaseCalculationOutcome::Ready
+		|| Calculation.Reason != EGGYGOAttributeBaseCalculationReason::None)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] CurrentWriteRejected Outcome=%d Reason=%d Set=%s ASC=%s Attribute=%s Effect=%s Current=%g Desired=%g"),
+			static_cast<int32>(Calculation.Outcome), static_cast<int32>(Calculation.Reason),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(),
+			*GetPathNameSafe(Frame.IsValid() && Frame->EffectSpec.IsValid() ? Frame->EffectSpec->Def.Get() : nullptr),
+			ExpectedCurrent, DesiredCurrent);
+		return false;
+	}
+
+	const TSharedPtr<FExpectedAttributeChange> Expected = PushExpectedAttributeChange(Frame, Attribute);
+	ASC->SetNumericAttributeBase(Attribute, Calculation.CalculatedBase);
+	PopExpectedAttributeChange();
+	// Native delegates can already have made later writes. Only this marker's Post fact counts.
+	const double NativeFloatTolerance = FMath::Max(static_cast<double>(UE_KINDA_SMALL_NUMBER),
+		4.0 * std::numeric_limits<float>::epsilon() * FMath::Max(1.0, FMath::Abs(static_cast<double>(DesiredCurrent))));
+	if (!Expected->bObservedWrite || Expected->bRejectedInput || !FMath::IsFinite(Expected->ObservedCurrent)
+		|| FMath::Abs(static_cast<double>(Expected->ObservedCurrent) - DesiredCurrent) > NativeFloatTolerance)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] CurrentWriteUnconfirmed Set=%s ASC=%s Attribute=%s Effect=%s Observed=%d Current=%g Desired=%g"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(),
+			*GetPathNameSafe(Frame.IsValid() && Frame->EffectSpec.IsValid() ? Frame->EffectSpec->Def.Get() : nullptr),
+			Expected->bObservedWrite, Expected->ObservedCurrent, DesiredCurrent);
+		return false;
+	}
+	return true;
+}
+
+void UGGYGOHealthSet::PreNetReceive()
+{
+	const TSharedPtr<FNetReceiveFrame> Frame = MakeShared<FNetReceiveFrame>();
+	Frame->Owner = Cast<AActor>(GetOuter());
+	if (Frame->Owner.IsValid())
+	{
+		Frame->ASC = GetOwningAbilitySystemComponent();
+	}
+	NetReceiveFrames.Add(Frame);
+	Super::PreNetReceive();
+}
+
+void UGGYGOHealthSet::PostNetReceive()
+{
+	const TSharedPtr<FNetReceiveFrame> Frame = NetReceiveFrames.IsEmpty() ? nullptr : NetReceiveFrames.Last();
+	// This drains native dirty work. Requests raised by that work still belong to this receive.
+	Super::PostNetReceive();
+	if (!Frame.IsValid())
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error, TEXT("[Messages][HealthSet] NetReceiveSourceMissing Set=%s"), *GetPathNameSafe(this));
+		return;
+	}
+	NetReceiveFrames.RemoveSingle(Frame);
+	// Retire the request before invoking GAS, so nested callbacks cannot replay it.
+	if (Frame->bReevaluateHealth)
+	{
+		ReevaluateClientMax(GetHealthAttribute(), Frame->Owner, Frame->ASC);
+	}
+	if (Frame->bReevaluatePoise)
+	{
+		ReevaluateClientMax(GetPoiseAttribute(), Frame->Owner, Frame->ASC);
+	}
+}
+
+void UGGYGOHealthSet::RequestClientMaxReevaluation(const FGameplayAttribute& Attribute)
+{
+	AActor* Owner = Cast<AActor>(GetOuter());
+	UAbilitySystemComponent* ASC = IsValid(Owner) ? GetOwningAbilitySystemComponent() : nullptr;
+	if (!NetReceiveFrames.IsEmpty())
+	{
+		const TSharedPtr<FNetReceiveFrame>& Frame = NetReceiveFrames.Last();
+		if (Frame->Owner.Get() == Owner && Frame->ASC.Get() == ASC && IsCurrentAttributeSource(Attribute, Owner, ASC))
+		{
+			Frame->bReevaluateHealth |= Attribute == GetHealthAttribute();
+			Frame->bReevaluatePoise |= Attribute == GetPoiseAttribute();
+			return;
+		}
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] ClientMaxRequestRejected Reason=SourceChanged Set=%s ASC=%s Attribute=%s"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName());
+		return;
+	}
+	ReevaluateClientMax(Attribute, Owner, ASC);
+}
+
+void UGGYGOHealthSet::ReevaluateClientMax(const FGameplayAttribute& Attribute,
+	const TWeakObjectPtr<AActor>& Owner, const TWeakObjectPtr<UAbilitySystemComponent>& SourceASC)
+{
+	UAbilitySystemComponent* ASC = SourceASC.Get();
+	if (!IsCurrentAttributeSource(Attribute, Owner.Get(), ASC))
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] ClientMaxRequestRetired Reason=SourceChanged Set=%s ASC=%s Attribute=%s"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName());
+		return;
+	}
+	if (ASC->IsOwnerActorAuthoritative() || Owner->HasAuthority() || FScopedAggregatorOnDirtyBatch::GlobalBatchCount != 0)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] ClientMaxRequestRejected Reason=AuthorityOrOpenBatch Set=%s ASC=%s Attribute=%s"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName());
+		return;
+	}
+	const float Current = ASC->GetNumericAttribute(Attribute);
+	const float Base = ASC->GetNumericAttributeBase(Attribute);
+	const float Maximum = Attribute == GetHealthAttribute() ? GetMaxHealth() : GetMaxPoise();
+	if (!FMath::IsFinite(Current) || !FMath::IsFinite(Base) || !FMath::IsFinite(Maximum) || Maximum < 1.0f)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] ClientMaxRequestRejected Reason=InvalidNumericSource Set=%s ASC=%s Attribute=%s"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName());
+		return;
+	}
+	if (Current <= Maximum)
+	{
+		return;
+	}
+	const TSharedPtr<FExpectedAttributeChange> Expected = PushExpectedAttributeChange(nullptr, Attribute);
+	Expected->bClientMaxReevaluation = true;
+	// This explicitly selected client mode asks native GAS to reevaluate the same real Base.
+	// It does not reverse the replicated Current or write a cached projected value.
+	ASC->SetNumericAttributeBase(Attribute, Base);
+	PopExpectedAttributeChange();
+	if (!Expected->bObservedWrite || Expected->bRejectedInput || !FMath::IsFinite(Expected->ObservedCurrent)
+		|| Expected->ObservedCurrent < 0.0f || Expected->ObservedCurrent > Maximum)
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] ClientMaxWriteUnconfirmed Set=%s ASC=%s Attribute=%s Observed=%d Current=%g Max=%g"),
+			*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(),
+			Expected->bObservedWrite, Expected->ObservedCurrent, Maximum);
+	}
 }
 
 void UGGYGOHealthSet::QueueAttributeResult(EQueuedResultType ResultType, const TSharedPtr<FModifierFrame>& Frame,
@@ -262,6 +459,87 @@ void UGGYGOHealthSet::QueueMessageResult(const FGameplayTag& Verb, const TShared
 	const EQueuedResultType ResultType = Verb == GGYGOGameplayTags::Message_Damage
 		? EQueuedResultType::DamageMessage : EQueuedResultType::PoiseBreakMessage;
 	QueueAttributeResult(ResultType, Frame, Magnitude, 0.0f, 0.0f);
+}
+
+UGGYGOHealthSet::EMessageDeliveryResult UGGYGOHealthSet::PublishMessageResult(const FQueuedResult& Result)
+{
+	const FModifierFrame* Frame = Result.Frame.Get();
+	const FGameplayTag Verb = Result.Type == EQueuedResultType::DamageMessage
+		? GGYGOGameplayTags::Message_Damage : GGYGOGameplayTags::Message_PoiseBreak;
+	AActor* Owner = Cast<AActor>(GetOuter());
+	UWorld* World = nullptr;
+	UGameInstance* GameInstance = nullptr;
+	const auto FailDelivery = [&](uint8 ReasonBit, const TCHAR* Reason)
+	{
+		if ((ReportedMessageDependencyFailures & ReasonBit) == 0)
+		{
+			ReportedMessageDependencyFailures |= ReasonBit;
+			const UGameplayEffect* Effect = Frame && Frame->EffectSpec.IsValid() ? Frame->EffectSpec->Def.Get() : nullptr;
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] DeliveryFailed Reason=%s Set=%s Owner=%s World=%s GameInstance=%s Verb=%s Effect=%s"),
+				Reason, *GetPathNameSafe(this), *GetPathNameSafe(Owner), *GetPathNameSafe(World),
+				*GetPathNameSafe(GameInstance), *Verb.ToString(), *GetPathNameSafe(Effect));
+		}
+		return EMessageDeliveryResult::DependencyFailure;
+	};
+
+	// Null context and PreBeginPlay are not destruction evidence. Check real lifecycle facts first,
+	// including the owner's world before a derived GetWorld() can report missing context.
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| (GetOuter() && GetOuter()->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		|| (Owner && Owner->IsActorBeingDestroyed()))
+	{
+		return EMessageDeliveryResult::Retired;
+	}
+	if (!IsValid(Owner))
+	{
+		return FailDelivery(1 << 0, TEXT("InvalidOwner"));
+	}
+	const UWorld* OwnerWorld = Owner->GetWorld();
+	if (OwnerWorld && (OwnerWorld->bIsTearingDown || OwnerWorld->IsBeingCleanedUp() || OwnerWorld->IsCleanedUp()
+		|| OwnerWorld->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)))
+	{
+		return EMessageDeliveryResult::Retired;
+	}
+
+	World = GetWorld();
+	if (World && (World->bIsTearingDown || World->IsBeingCleanedUp() || World->IsCleanedUp()
+		|| World->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)))
+	{
+		return EMessageDeliveryResult::Retired;
+	}
+	if (!IsValid(World))
+	{
+		return FailDelivery(1 << 1, TEXT("MissingWorld"));
+	}
+	GameInstance = World->GetGameInstance();
+	if (GameInstance && GameInstance->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return EMessageDeliveryResult::Retired;
+	}
+	if (!IsValid(GameInstance))
+	{
+		return FailDelivery(1 << 2, TEXT("MissingGameInstance"));
+	}
+	UGameplayMessageSubsystem* Router = UGameInstance::GetSubsystem<UGameplayMessageSubsystem>(GameInstance);
+	if (!IsValid(Router))
+	{
+		return FailDelivery(1 << 3, TEXT("MissingRouter"));
+	}
+
+	ReportedMessageDependencyFailures = 0;
+	FGGYGOVerbMessage Message;
+	Message.Verb = Verb;
+	Message.Instigator = Frame ? Frame->EffectCauser.Get() : nullptr;
+	Message.Target = Result.Target.Get();
+	if (Frame)
+	{
+		Message.InstigatorTags = Frame->SourceTags;
+		Message.TargetTags = Frame->TargetTags;
+	}
+	Message.Magnitude = Result.Magnitude;
+	Router->BroadcastMessage(Message.Verb, Message);
+	return EMessageDeliveryResult::Delivered;
 }
 
 void UGGYGOHealthSet::FlushPendingResults()
@@ -291,21 +569,8 @@ void UGGYGOHealthSet::FlushPendingResults()
 		{
 		case EQueuedResultType::DamageMessage:
 		case EQueuedResultType::PoiseBreakMessage:
-			if (UWorld* World = GetWorld(); World && UGameplayMessageSubsystem::HasInstance(this))
-			{
-				FGGYGOVerbMessage Message;
-				Message.Verb = Result->Type == EQueuedResultType::DamageMessage
-					? GGYGOGameplayTags::Message_Damage : GGYGOGameplayTags::Message_PoiseBreak;
-				Message.Instigator = EffectCauser;
-				Message.Target = Result->Target.Get();
-				if (Frame)
-				{
-					Message.InstigatorTags = Frame->SourceTags;
-					Message.TargetTags = Frame->TargetTags;
-				}
-				Message.Magnitude = Result->Magnitude;
-				UGameplayMessageSubsystem::Get(World).BroadcastMessage(Message.Verb, Message);
-			}
+			// Delivery failure/retirement does not undo settlement or skip attribute delegates.
+			PublishMessageResult(*Result);
 			break;
 		case EQueuedResultType::HealthChanged:
 			OnHealthChanged.Broadcast(OriginalInstigator, EffectCauser, EffectSpec, Result->Magnitude, Result->OldValue, Result->NewValue);
@@ -335,7 +600,15 @@ void UGGYGOHealthSet::ApplyModifierMinimumHealth(const FGameplayAttribute& Attri
 		return;
 	}
 
-	const TSharedPtr<FModifierFrame> Frame = FindAwaitingFrame(Attribute);
+	TSharedPtr<FModifierFrame> Frame = FindAwaitingFrame(Attribute);
+	if (!Frame.IsValid() && !ExpectedAttributeChanges.IsEmpty())
+	{
+		const TSharedPtr<FExpectedAttributeChange>& Expected = ExpectedAttributeChanges.Last();
+		if (Expected.IsValid() && !Expected->bConsumed && Expected->Attribute == Attribute)
+		{
+			Frame = Expected->Frame;
+		}
+	}
 	if (Frame.IsValid())
 	{
 		NewValue = FMath::Clamp(NewValue, Frame->MinimumHealth, GetMaxHealth());
@@ -395,6 +668,13 @@ void UGGYGOHealthSet::OnRep_MaxHealth(const FGameplayAttributeData& OldValue)
 			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxHealth, OldValue);
 		}
 	}
+	// Without an aggregator the native macro only broadcasts, so no PostAttributeChange
+	// requests this dependency. Always inspect the final source after the macro too.
+	if (CanClassifyRepNotifyFrame(RepFrame) && !RepFrame->OwningASC->IsOwnerActorAuthoritative()
+		&& GetHealth() > GetMaxHealth())
+	{
+		RequestClientMaxReevaluation(GetHealthAttribute());
+	}
 	const float EffectiveMaxHealth = RepFrame->bEffectiveValueCaptured ? RepFrame->EffectiveNewValue : IncomingValue;
 
 	OnMaxHealthChanged.Broadcast(nullptr, nullptr, nullptr, EffectiveMaxHealth - OldValue.GetCurrentValue(), OldValue.GetCurrentValue(), EffectiveMaxHealth);
@@ -435,6 +715,11 @@ void UGGYGOHealthSet::OnRep_MaxPoise(const FGameplayAttributeData& OldValue)
 			GAMEPLAYATTRIBUTE_REPNOTIFY(UGGYGOHealthSet, MaxPoise, OldValue);
 		}
 	}
+	if (CanClassifyRepNotifyFrame(RepFrame) && !RepFrame->OwningASC->IsOwnerActorAuthoritative()
+		&& GetPoise() > GetMaxPoise())
+	{
+		RequestClientMaxReevaluation(GetPoiseAttribute());
+	}
 }
 
 bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data)
@@ -446,6 +731,20 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 
 	const FGameplayAttribute Attribute = Data.EvaluatedData.Attribute;
 	const bool bIsDamageFromSelfDestruct = Data.EffectSpec.GetDynamicAssetTags().HasTagExact(GGYGOGameplayTags::Gameplay_Damage_SelfDestruct);
+	if (Attribute == GetHealthAttribute() || Attribute == GetPoiseAttribute()
+		|| Attribute == GetMaxHealthAttribute() || Attribute == GetMaxPoiseAttribute())
+	{
+		const float ProspectiveBase = FAggregator::StaticExecModOnBaseValue(
+			Data.Target.GetNumericAttributeBase(Attribute), Data.EvaluatedData.ModifierOp, Data.EvaluatedData.Magnitude);
+		if (!FMath::IsFinite(Data.EvaluatedData.Magnitude) || !FMath::IsFinite(ProspectiveBase)
+			|| (Data.EvaluatedData.ModifierOp == EGameplayModOp::DivideAdditive && FMath::IsNearlyZero(Data.EvaluatedData.Magnitude)))
+		{
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] DirectResourceRejected Reason=InvalidNumericInput Set=%s ASC=%s Attribute=%s Effect=%s"),
+				*GetPathNameSafe(this), *GetPathNameSafe(&Data.Target), *Attribute.GetName(), *GetPathNameSafe(Data.EffectSpec.Def.Get()));
+			return false;
+		}
+	}
 
 	// 只拦截正向伤害。负值不当作"伤害"处理，避免用负伤害绕过免疫来治疗。
 	if (Attribute == GetDamageAttribute() && Data.EvaluatedData.Magnitude > 0.0f)
@@ -504,6 +803,53 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 	}
 #endif
 
+	if (Attribute == GetDamageAttribute() || Attribute == GetHealingAttribute() || Attribute == GetPoiseDamageAttribute())
+	{
+		UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(&Data.Target);
+		const FGameplayAttribute Resource = Attribute == GetPoiseDamageAttribute() ? GetPoiseAttribute() : GetHealthAttribute();
+		if (!ASC || !FMath::IsFinite(Data.EvaluatedData.Magnitude)
+			|| !FMath::IsFinite(Data.Target.GetNumericAttribute(Attribute))
+			|| FScopedAggregatorOnDirtyBatch::GlobalBatchCount != 0)
+		{
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] MetaRejected Reason=InvalidInputOrOpenBatch Set=%s ASC=%s Attribute=%s Effect=%s"),
+				*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(), *GetPathNameSafe(Data.EffectSpec.Def.Get()));
+			return false;
+		}
+		const float Current = ASC->GetNumericAttribute(Resource);
+		if (Data.EvaluatedData.ModifierOp == EGameplayModOp::DivideAdditive && FMath::IsNearlyZero(Data.EvaluatedData.Magnitude))
+		{
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] MetaRejected Reason=InvalidDivisor Set=%s ASC=%s Attribute=%s Effect=%s"),
+				*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(), *GetPathNameSafe(Data.EffectSpec.Def.Get()));
+			return false;
+		}
+		const float ProspectiveMeta = FAggregator::StaticExecModOnBaseValue(
+			ASC->GetNumericAttributeBase(Attribute), Data.EvaluatedData.ModifierOp, Data.EvaluatedData.Magnitude);
+		const double ProspectiveContribution = static_cast<double>(ProspectiveMeta) - ASC->GetNumericAttribute(Attribute);
+		if (!FMath::IsFinite(ProspectiveMeta) || !FMath::IsFinite(ProspectiveContribution)
+			|| FMath::Abs(ProspectiveContribution) > MAX_flt)
+		{
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] MetaRejected Reason=NonFiniteMetaResult Set=%s ASC=%s Attribute=%s Effect=%s"),
+				*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(), *GetPathNameSafe(Data.EffectSpec.Def.Get()));
+			return false;
+		}
+		// Validate support before accepting the meta write. This candidate is never saved or committed.
+		const FGGYGOAttributeBaseCalculationResult Preflight = ASC->TryCalculateNumericAttributeBaseForCurrentValue(
+			this, Resource, Current, Current);
+		if (Preflight.Outcome != EGGYGOAttributeBaseCalculationOutcome::Ready
+			|| Preflight.Reason != EGGYGOAttributeBaseCalculationReason::None)
+		{
+			UE_LOG(LogGGYGOHealthMessage, Error,
+				TEXT("[Messages][HealthSet] MetaRejected Outcome=%d Reason=%d Set=%s ASC=%s Attribute=%s Resource=%s Effect=%s"),
+				static_cast<int32>(Preflight.Outcome), static_cast<int32>(Preflight.Reason),
+				*GetPathNameSafe(this), *GetPathNameSafe(ASC), *Attribute.GetName(), *Resource.GetName(),
+				*GetPathNameSafe(Data.EffectSpec.Def.Get()));
+			return false;
+		}
+	}
+
 	ModifierFrames.Add(MoveTemp(Frame));
 
 	return true;
@@ -538,9 +884,16 @@ void UGGYGOHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallback
 			SetDamage(GetDamage() - Contribution);
 			PopExpectedAttributeChange();
 
-			PushExpectedAttributeChange(Frame, GetHealthAttribute());
-			SetHealth(FMath::Clamp(GetHealth() - Contribution, Frame->MinimumHealth, GetMaxHealth()));
-			PopExpectedAttributeChange();
+			const float DesiredCurrent = static_cast<float>(FMath::Clamp(static_cast<double>(GetHealth()) - Contribution,
+				static_cast<double>(Frame->MinimumHealth), static_cast<double>(GetMaxHealth())));
+			if (!TrySetCurrentValue(GetHealthAttribute(), DesiredCurrent, Frame))
+			{
+				// Preserve original queue order, but never publish a rejected frame as settled damage.
+				PendingResults.RemoveAll([&Frame](const TSharedPtr<FQueuedResult>& Result)
+				{
+					return Result.IsValid() && Result->Frame == Frame && Result->Type == EQueuedResultType::DamageMessage;
+				});
+			}
 		}
 	}
 	else if (Attribute == GetHealingAttribute())
@@ -553,9 +906,9 @@ void UGGYGOHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallback
 			SetHealing(GetHealing() - Contribution);
 			PopExpectedAttributeChange();
 
-			PushExpectedAttributeChange(Frame, GetHealthAttribute());
-			SetHealth(FMath::Clamp(GetHealth() + Contribution, Frame->MinimumHealth, GetMaxHealth()));
-			PopExpectedAttributeChange();
+			const float DesiredCurrent = static_cast<float>(FMath::Clamp(static_cast<double>(GetHealth()) + Contribution,
+				static_cast<double>(Frame->MinimumHealth), static_cast<double>(GetMaxHealth())));
+			TrySetCurrentValue(GetHealthAttribute(), DesiredCurrent, Frame);
 		}
 	}
 	else if (Attribute == GetPoiseDamageAttribute())
@@ -568,9 +921,9 @@ void UGGYGOHealthSet::PostGameplayEffectExecute(const FGameplayEffectModCallback
 			SetPoiseDamage(GetPoiseDamage() - Contribution);
 			PopExpectedAttributeChange();
 
-			PushExpectedAttributeChange(Frame, GetPoiseAttribute());
-			SetPoise(FMath::Clamp(GetPoise() - Contribution, 0.0f, GetMaxPoise()));
-			PopExpectedAttributeChange();
+			const float DesiredCurrent = static_cast<float>(FMath::Clamp(static_cast<double>(GetPoise()) - Contribution,
+				0.0, static_cast<double>(GetMaxPoise())));
+			TrySetCurrentValue(GetPoiseAttribute(), DesiredCurrent, Frame);
 		}
 	}
 
@@ -589,8 +942,26 @@ void UGGYGOHealthSet::PreAttributeBaseChange(const FGameplayAttribute& Attribute
 {
 	Super::PreAttributeBaseChange(Attribute, NewValue);
 
-	ClampAttribute(Attribute, NewValue);
-	ApplyModifierMinimumHealth(Attribute, NewValue);
+	// Health/Poise Base is internal aggregation input, not the visible resource boundary.
+	// A finite negative Base may be required by an active additive effect.
+	if (!FMath::IsFinite(NewValue))
+	{
+		// Native setters have a void Pre hook. Decline the invalid Base, retain its prior value,
+		// and report failure explicitly; never choose a replacement gameplay value.
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] BaseWriteRejected Reason=NonFiniteInput Set=%s Attribute=%s Requested=%g"),
+			*GetPathNameSafe(this), *Attribute.GetName(), NewValue);
+		NewValue = Attribute.GetGameplayAttributeDataChecked(this)->GetBaseValue();
+		if (!ExpectedAttributeChanges.IsEmpty())
+		{
+			const TSharedPtr<FExpectedAttributeChange>& Expected = ExpectedAttributeChanges.Last();
+			if (Expected.IsValid() && !Expected->bConsumed && Expected->Attribute == Attribute) { Expected->bRejectedInput = true; }
+		}
+	}
+	if (Attribute != GetHealthAttribute() && Attribute != GetPoiseAttribute())
+	{
+		ClampAttribute(Attribute, NewValue);
+	}
 
 	// Ordinary ASC base writes pass through this hook. RepNotify's internal rewind and
 	// aggregator recompute write the numeric value directly and do not.
@@ -604,6 +975,18 @@ void UGGYGOHealthSet::PreAttributeChange(const FGameplayAttribute& Attribute, fl
 {
 	Super::PreAttributeChange(Attribute, NewValue);
 
+	if (!FMath::IsFinite(NewValue))
+	{
+		UE_LOG(LogGGYGOHealthMessage, Error,
+			TEXT("[Messages][HealthSet] CurrentWriteRejected Reason=NonFiniteAggregate Set=%s Attribute=%s Requested=%g"),
+			*GetPathNameSafe(this), *Attribute.GetName(), NewValue);
+		NewValue = Attribute.GetGameplayAttributeDataChecked(this)->GetCurrentValue();
+		if (!ExpectedAttributeChanges.IsEmpty())
+		{
+			const TSharedPtr<FExpectedAttributeChange>& Expected = ExpectedAttributeChanges.Last();
+			if (Expected.IsValid() && !Expected->bConsumed && Expected->Attribute == Attribute) { Expected->bRejectedInput = true; }
+		}
+	}
 	ClampAttribute(Attribute, NewValue);
 	ApplyModifierMinimumHealth(Attribute, NewValue);
 }
@@ -623,6 +1006,7 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 
 	// 新嵌套 GE 的初始写入优先配对；其后才消费 HealthSet setter 的一次性标记。
 	TSharedPtr<FModifierFrame> Frame = FindAwaitingFrame(Attribute);
+	TSharedPtr<FExpectedAttributeChange> Expected;
 	if (Frame.IsValid())
 	{
 		Frame->bAwaitingInitialWrite = false;
@@ -633,10 +1017,16 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 	}
 	else
 	{
-		Frame = ConsumeExpectedAttributeChange(Attribute);
+		Expected = ConsumeExpectedAttributeChange(Attribute);
+		if (Expected.IsValid())
+		{
+			Frame = Expected->Frame;
+			Expected->bObservedWrite = true;
+			Expected->ObservedCurrent = NewValue;
+		}
 	}
 
-	TSharedPtr<FRepNotifyFrame> RepFrame = Frame.IsValid() || bExplicitBaseWrite ? nullptr : ActiveRepFrame;
+	TSharedPtr<FRepNotifyFrame> RepFrame = Frame.IsValid() || Expected.IsValid() || bExplicitBaseWrite ? nullptr : ActiveRepFrame;
 	if (RepFrame.IsValid() && RepFrame->Stage == FRepNotifyFrame::EStage::Undetermined)
 	{
 		// GAMEPLAYATTRIBUTE_REPNOTIFY with an Aggregator first rewinds to OldEvaluatedValue.
@@ -661,9 +1051,8 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 	const bool bSuppressProjectResults = bRepNotifyEffectiveWrite;
 	const float EventMagnitude = Frame.IsValid() ? Frame->OriginalMagnitude : (NewValue - OldValue);
 
-	// 上限下调时必须同步压低当前值，否则会出现 Health 大于 MaxHealth。
-	// 走 ASC 的 ApplyModToAttribute 而不是直接 SetHealth，是为了让这次修改仍然经过
-	// 完整的属性变更生命周期与通知。
+	// Authority commits a Current target through the inverse calculation. Client replication
+	// retains its real Base and reevaluates it after the native receive batch has drained.
 	if (Attribute == GetMaxHealthAttribute())
 	{
 		if (GetHealth() > NewValue)
@@ -671,9 +1060,14 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 			UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
 			check(GGYGOASC);
 
-			PushExpectedAttributeChange(Frame, GetHealthAttribute());
-			GGYGOASC->ApplyModToAttribute(GetHealthAttribute(), EGameplayModOp::Override, NewValue);
-			PopExpectedAttributeChange();
+			if (GGYGOASC->IsOwnerActorAuthoritative())
+			{
+				TrySetCurrentValue(GetHealthAttribute(), NewValue, Frame);
+			}
+			else
+			{
+				RequestClientMaxReevaluation(GetHealthAttribute());
+			}
 		}
 
 		if (OldValue != NewValue && !bSuppressProjectResults)
@@ -688,9 +1082,14 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 			UGGYGOAbilitySystemComponent* GGYGOASC = GetGGYGOAbilitySystemComponent();
 			check(GGYGOASC);
 
-			PushExpectedAttributeChange(Frame, GetPoiseAttribute());
-			GGYGOASC->ApplyModToAttribute(GetPoiseAttribute(), EGameplayModOp::Override, NewValue);
-			PopExpectedAttributeChange();
+			if (GGYGOASC->IsOwnerActorAuthoritative())
+			{
+				TrySetCurrentValue(GetPoiseAttribute(), NewValue, Frame);
+			}
+			else
+			{
+				RequestClientMaxReevaluation(GetPoiseAttribute());
+			}
 		}
 	}
 
@@ -751,7 +1150,10 @@ void UGGYGOHealthSet::PostAttributeChange(const FGameplayAttribute& Attribute, f
 		if (bNotifyPoiseBroken && !bSuppressProjectResults)
 		{
 			QueueAttributeResult(EQueuedResultType::PoiseBroken, Frame, BreakMagnitude, OldValue, NewValue);
-			QueueMessageResult(GGYGOGameplayTags::Message_PoiseBreak, Frame, BreakMagnitude);
+			if (!Expected.IsValid() || !Expected->bClientMaxReevaluation)
+			{
+				QueueMessageResult(GGYGOGameplayTags::Message_PoiseBreak, Frame, BreakMagnitude);
+			}
 		}
 	}
 

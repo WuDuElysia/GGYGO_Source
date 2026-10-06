@@ -6,6 +6,8 @@
 #include "Animation/AnimInstance.h"
 #include "GameFramework/MovementComponent.h"
 #include "GameFramework/PlayerController.h"
+#include "GameplayEffect.h"
+#include "GameplayEffectAggregator.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOAbilityTagRelationshipMapping.h"
@@ -18,12 +20,134 @@
 #include "System/GGYGOGameplayTags.h"
 #include "Templates/UnrealTemplate.h"
 
+#include <limits>
+
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilitySystemComponent)
 
 UE_DEFINE_GAMEPLAY_TAG(TAG_GGYGO_Gameplay_AbilityInputBlocked, "Gameplay.AbilityInputBlocked");
 
 namespace
 {
+	// Native snapshots omit EvaluationMetaData. Preserve the original capture's already evaluated
+	// qualification bits; these comparisons never dereference the copied GE tag-requirement pointers.
+	bool HasSameAttributeAggregation(const FAggregator& First, const FAggregator& Second)
+	{
+		if (First.GetBaseValue() != Second.GetBaseValue()) { return false; }
+		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> FirstMods;
+		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> SecondMods;
+		First.GetAllAggregatorMods(FirstMods);
+		Second.GetAllAggregatorMods(SecondMods);
+		if (FirstMods.Num() != SecondMods.Num()) { return false; }
+		for (const auto& Entry : FirstMods)
+		{
+			const TArray<FAggregatorMod>* const* Other = SecondMods.Find(Entry.Key);
+			if (!Other) { return false; }
+			for (int32 Op = 0; Op < EGameplayModOp::Max; ++Op)
+			{
+				const TArray<FAggregatorMod>& A = Entry.Value[Op];
+				const TArray<FAggregatorMod>& B = (*Other)[Op];
+				if (A.Num() != B.Num()) { return false; }
+				for (int32 Index = 0; Index < A.Num(); ++Index)
+				{
+					const FAggregatorMod& Left = A[Index];
+					const FAggregatorMod& Right = B[Index];
+					if (Left.Qualifies() != Right.Qualifies() || Left.IsPredicted != Right.IsPredicted
+						|| Left.ActiveHandle != Right.ActiveHandle || Left.SourceTagReqs != Right.SourceTagReqs
+						|| Left.TargetTagReqs != Right.TargetTagReqs
+						|| FMemory::Memcmp(&Left.EvaluatedMagnitude, &Right.EvaluatedMagnitude, sizeof(float)) != 0
+						|| FMemory::Memcmp(&Left.StackCount, &Right.StackCount, sizeof(float)) != 0)
+					{
+						return false;
+					}
+				}
+			}
+		}
+		return true;
+	}
+
+	EGGYGOAttributeBaseCalculationReason PrepareNativeAttributeCalculationChannels(
+		const FAggregator& QualifiedSnapshot, const FAggregatorEvaluateParameters& Parameters,
+		FAggregatorModChannelContainer& OutChannels, TArray<EGameplayModEvaluationChannel>& OutOrder)
+	{
+		using EReason = EGGYGOAttributeBaseCalculationReason;
+		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> Mods;
+		QualifiedSnapshot.GetAllAggregatorMods(Mods);
+		Mods.GetKeys(OutOrder);
+		OutOrder.Sort([](EGameplayModEvaluationChannel A, EGameplayModEvaluationChannel B)
+		{
+			return static_cast<uint8>(A) < static_cast<uint8>(B);
+		});
+		for (EGameplayModEvaluationChannel Channel : OutOrder)
+		{
+			const TArray<FAggregatorMod>* Arrays = Mods.FindChecked(Channel);
+			FAggregatorModChannel& NativeChannel = OutChannels.FindOrAddModChannel(Channel);
+			FAggregatorModChannel CompoundOnly;
+			FAggregatorModChannel GainOnly;
+			for (int32 Op = 0; Op < EGameplayModOp::Max; ++Op)
+			{
+				for (const FAggregatorMod& Mod : Arrays[Op])
+				{
+					if (!Mod.Qualifies()) { continue; }
+					if (!FMath::IsFinite(Mod.EvaluatedMagnitude)) { return EReason::NonFiniteModifier; }
+					if (Op == EGameplayModOp::Override) { return EReason::NonInvertibleChannel; }
+					// A stack-only projection into UE's own evaluator, not a second aggregation formula.
+					// Qualification is already frozen; no GE pointers/dependents or new qualification policy.
+					const EGameplayModOp::Type NativeOp = static_cast<EGameplayModOp::Type>(Op);
+					NativeChannel.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
+						FActiveGameplayEffectHandle());
+					if (NativeOp == EGameplayModOp::MultiplyAdditive || NativeOp == EGameplayModOp::DivideAdditive
+						|| NativeOp == EGameplayModOp::MultiplyCompound)
+					{
+						GainOnly.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
+							FActiveGameplayEffectHandle());
+					}
+					if (NativeOp == EGameplayModOp::MultiplyCompound)
+					{
+						CompoundOnly.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
+							FActiveGameplayEffectHandle());
+					}
+				}
+			}
+			FAggregatorModInfo Info;
+			Info.Channel = Channel;
+			const auto SetQualified = [](const FAggregatorModInfo& ModInfo)
+			{
+				ModInfo.Mod->SetExplicitQualifies(true);
+			};
+			NativeChannel.ForEachMod(Info, SetQualified);
+			CompoundOnly.ForEachMod(Info, SetQualified);
+			GainOnly.ForEachMod(Info, SetQualified);
+
+			// Native ReverseEvaluate silently substitutes 1 for a zero divisor. Reject before calling it.
+			const float Division = FAggregatorModChannel::SumMods(Arrays[EGameplayModOp::DivideAdditive],
+				GameplayEffectUtilities::GetModifierBiasByModifierOp(EGameplayModOp::DivideAdditive), Parameters);
+			if (!FMath::IsFinite(Division) || FMath::IsNearlyZero(Division)) { return EReason::InvalidDivisor; }
+			const float Multiplier = FAggregatorModChannel::SumMods(Arrays[EGameplayModOp::MultiplyAdditive],
+				GameplayEffectUtilities::GetModifierBiasByModifierOp(EGameplayModOp::MultiplyAdditive), Parameters);
+			if (!FMath::IsFinite(Multiplier)) { return EReason::NonFiniteResult; }
+			if (Multiplier <= UE_SMALL_NUMBER) { return EReason::NonInvertibleChannel; }
+			// The native compound product helper is private. Evaluate a native compound-only channel,
+			// including its real float underflow/overflow, without copying its multiplication algorithm.
+			const float Compound = CompoundOnly.EvaluateWithBase(1.0f, Parameters);
+			if (!FMath::IsFinite(Compound)) { return EReason::NonFiniteResult; }
+			if (Compound == 0.0f) { return EReason::NonInvertibleChannel; }
+			const float Gain = GainOnly.EvaluateWithBase(1.0f, Parameters);
+			if (!FMath::IsFinite(Gain)) { return EReason::NonFiniteResult; }
+			if (Gain == 0.0f) { return EReason::NonInvertibleChannel; }
+		}
+		return EReason::None;
+	}
+
+	bool IsAttributeForwardValueConfirmed(float Actual, float Desired)
+	{
+		// Only float arithmetic roundoff is admitted; no gameplay clamp or success-value substitution.
+		const double Scale = FMath::Max(1.0, FMath::Abs(static_cast<double>(Desired)));
+		const double Tolerance = FMath::Max(static_cast<double>(UE_KINDA_SMALL_NUMBER),
+			4.0 * std::numeric_limits<float>::epsilon() * Scale);
+		return FMath::IsFinite(Actual)
+			&& FMath::Abs(static_cast<double>(Actual) - static_cast<double>(Desired)) <= Tolerance;
+	}
+
 	bool IsCommittedAvatarBindingCleanupKind(EGGYGOAvatarBindingKind Kind)
 	{
 		return Kind == EGGYGOAvatarBindingKind::Clear
@@ -95,6 +219,170 @@ UGGYGOAbilitySystemComponent::UGGYGOAbilitySystemComponent(const FObjectInitiali
 	InputHeldSpecHandles.Reset();
 
 	ActiveAbilitiesByGroup.Reset();
+}
+
+FGGYGOAttributeBaseCalculationResult UGGYGOAbilitySystemComponent::TryCalculateNumericAttributeBaseForCurrentValue(
+	const UAttributeSet* ExpectedAttributeSet, const FGameplayAttribute& Attribute,
+	float ExpectedCurrent, float DesiredCurrent)
+{
+	using EOutcome = EGGYGOAttributeBaseCalculationOutcome;
+	using EReason = EGGYGOAttributeBaseCalculationReason;
+	const auto Fail = [](EOutcome Outcome, EReason Reason)
+	{
+		FGGYGOAttributeBaseCalculationResult Result;
+		Result.Outcome = Outcome;
+		Result.Reason = Reason;
+		return Result;
+	};
+	if (!IsInGameThread()) { return Fail(EOutcome::Rejected, EReason::WrongThread); }
+	if (!IsValid(this) || IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	{
+		return Fail(EOutcome::Rejected, EReason::InvalidASC);
+	}
+	AActor* ComponentOwner = GetOwner();
+	if (!IsValid(ComponentOwner) || ComponentOwner->IsActorBeingDestroyed())
+	{
+		return Fail(EOutcome::Rejected, EReason::InvalidASC);
+	}
+	if (!IsOwnerActorAuthoritative() || !ComponentOwner->HasAuthority())
+	{
+		return Fail(EOutcome::Rejected, EReason::NotAuthority);
+	}
+	if (!Attribute.IsValid() || Attribute.IsSystemAttribute())
+	{
+		return Fail(EOutcome::Rejected, EReason::InvalidAttribute);
+	}
+	// Struct attributes have distinct native Base/Current storage. Legacy float projection is not
+	// a supported business mode and must not enter native ReverseEvaluate's float fallback.
+	if (!FGameplayAttribute::IsGameplayAttributeDataProperty(Attribute.GetUProperty()))
+	{
+		return Fail(EOutcome::Rejected, EReason::UnsupportedAttribute);
+	}
+	if (!FMath::IsFinite(ExpectedCurrent) || !FMath::IsFinite(DesiredCurrent))
+	{
+		return Fail(EOutcome::Rejected, EReason::NonFiniteInput);
+	}
+	if (!IsValid(ExpectedAttributeSet) || ExpectedAttributeSet->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| GetAttributeSubobject(Attribute.GetAttributeSetClass()) != ExpectedAttributeSet)
+	{
+		return Fail(EOutcome::Rejected, EReason::MissingAttributeSet);
+	}
+	AActor* SetOwner = Cast<AActor>(ExpectedAttributeSet->GetOuter());
+	if (!IsValid(SetOwner) || SetOwner->IsActorBeingDestroyed()
+		|| ExpectedAttributeSet->GetOwningAbilitySystemComponent() != this)
+	{
+		return Fail(EOutcome::Rejected, EReason::MissingAttributeSet);
+	}
+	const TWeakObjectPtr<const UAttributeSet> OriginalSet(ExpectedAttributeSet);
+	const TWeakObjectPtr<AActor> OriginalComponentOwner(ComponentOwner);
+	const TWeakObjectPtr<AActor> OriginalSetOwner(SetOwner);
+	// The owning-ASC query above can invoke the owner's interface. Do not read native default/missing
+	// attribute values if that call retired or replaced the original host.
+	if (!OriginalSet.IsValid() || !OriginalComponentOwner.IsValid() || !OriginalSetOwner.IsValid()
+		|| GetAttributeSubobject(Attribute.GetAttributeSetClass()) != OriginalSet.Get()
+		|| GetOwner() != OriginalComponentOwner.Get())
+	{
+		return Fail(EOutcome::Stale, EReason::SourceChanged);
+	}
+	const float OriginalBase = GetNumericAttributeBase(Attribute);
+	if (!FMath::IsFinite(OriginalBase) || !FMath::IsFinite(GetNumericAttribute(Attribute)))
+	{
+		return Fail(EOutcome::Rejected, EReason::NonFiniteSource);
+	}
+	const auto SourceIdentityIsCurrent = [this, &Attribute, &OriginalSet, &OriginalComponentOwner,
+		&OriginalSetOwner]()
+	{
+		const UAttributeSet* Set = OriginalSet.Get();
+		const AActor* Owner = OriginalComponentOwner.Get();
+		const AActor* AttributeOwner = OriginalSetOwner.Get();
+		return IsValid(this) && !IsBeingDestroyed() && !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& IsValid(Set) && !Set->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& IsValid(Owner) && !Owner->IsActorBeingDestroyed() && Owner->HasAuthority()
+			&& IsValid(AttributeOwner) && !AttributeOwner->IsActorBeingDestroyed()
+			&& GetOwner() == Owner && Set->GetOuter() == AttributeOwner && IsOwnerActorAuthoritative()
+			&& GetAttributeSubobject(Attribute.GetAttributeSetClass()) == Set;
+	};
+	const auto SourceIsCurrent = [this, &Attribute, &OriginalSet, &SourceIdentityIsCurrent,
+		OriginalBase, ExpectedCurrent]()
+	{
+		if (!SourceIdentityIsCurrent()) { return false; }
+		// The generated attribute setter resolves ASC through this very owner interface. Recheck it
+		// too, and repeat the pure identity check after any code invoked by the owner's query.
+		if (OriginalSet.Get()->GetOwningAbilitySystemComponent() != this || !SourceIdentityIsCurrent()) { return false; }
+		return GetNumericAttributeBase(Attribute) == OriginalBase && GetNumericAttribute(Attribute) == ExpectedCurrent;
+	};
+	if (!SourceIsCurrent()) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+
+	const FGameplayEffectAttributeCaptureDefinition Definition(Attribute,
+		EGameplayEffectAttributeCaptureSource::Target, false);
+	FGameplayEffectAttributeCaptureSpec Capture(Definition);
+	CaptureAttributeForGameplayEffect(Capture);
+	if (!SourceIsCurrent()) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+	if (!Capture.HasValidCapture()) { return Fail(EOutcome::Rejected, EReason::CaptureFailed); }
+	// Matches authority OnAttributeAggregatorDirty: null execution tags, no predicted modifiers.
+	const FAggregatorEvaluateParameters Parameters;
+	TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> LiveMods;
+	const bool bGathered = Capture.AttemptGatherAttributeMods(Parameters, LiveMods);
+	if (!SourceIsCurrent()) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+	FAggregator Snapshot;
+	if (!bGathered || !Capture.AttemptGetAttributeAggregatorSnapshot(Snapshot))
+	{
+		return Fail(EOutcome::Rejected, EReason::CaptureFailed);
+	}
+	if (Snapshot.GetBaseValue() != OriginalBase) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+	FAggregatorModChannelContainer Channels;
+	TArray<EGameplayModEvaluationChannel> Order;
+	const EReason Preparation = PrepareNativeAttributeCalculationChannels(Snapshot, Parameters, Channels, Order);
+	if (Preparation != EReason::None) { return Fail(EOutcome::Rejected, Preparation); }
+	if (!FMath::IsFinite(Channels.EvaluateWithBase(OriginalBase, Parameters)))
+	{
+		return Fail(EOutcome::Rejected, EReason::NonFiniteResult);
+	}
+	float CalculatedBase = DesiredCurrent;
+	for (int32 Index = Order.Num() - 1; Index >= 0; --Index)
+	{
+		float PreviousChannelValue = 0.0f;
+		if (!Channels.FindOrAddModChannel(Order[Index]).ReverseEvaluate(CalculatedBase, Parameters, PreviousChannelValue))
+		{
+			return Fail(EOutcome::Rejected, EReason::NonInvertibleChannel);
+		}
+		if (!FMath::IsFinite(PreviousChannelValue)) { return Fail(EOutcome::Rejected, EReason::NonFiniteResult); }
+		CalculatedBase = PreviousChannelValue;
+	}
+	if (!IsAttributeForwardValueConfirmed(Channels.EvaluateWithBase(CalculatedBase, Parameters), DesiredCurrent))
+	{
+		return Fail(EOutcome::Rejected, EReason::ForwardMismatch);
+	}
+
+	// Recapture the actual current aggregator, not merely the retained original ref: removing/readding
+	// an attribute set can retire a ref without invalidating its native capture. Native evaluation may
+	// call custom qualification code, so recheck both registration and frozen aggregation afterwards.
+	FGameplayEffectAttributeCaptureSpec CurrentCapture(Definition);
+	CaptureAttributeForGameplayEffect(CurrentCapture);
+	if (!SourceIsCurrent()) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+	float NativeForwardValue = 0.0f;
+	const bool bEvaluated = CurrentCapture.AttemptCalculateAttributeMagnitudeWithBase(
+		Parameters, CalculatedBase, NativeForwardValue);
+	if (!SourceIsCurrent()) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
+	FAggregator CurrentSnapshot;
+	if (!bEvaluated || !CurrentCapture.AttemptGetAttributeAggregatorSnapshot(CurrentSnapshot))
+	{
+		return Fail(EOutcome::Rejected, EReason::CaptureFailed);
+	}
+	if (!HasSameAttributeAggregation(Snapshot, CurrentSnapshot))
+	{
+		return Fail(EOutcome::Stale, EReason::AggregationChanged);
+	}
+	if (!FMath::IsFinite(NativeForwardValue)) { return Fail(EOutcome::Rejected, EReason::NonFiniteResult); }
+	if (!IsAttributeForwardValueConfirmed(NativeForwardValue, DesiredCurrent))
+	{
+		return Fail(EOutcome::Rejected, EReason::ForwardMismatch);
+	}
+	FGGYGOAttributeBaseCalculationResult Result;
+	Result.Outcome = EOutcome::Ready;
+	Result.Reason = EReason::None;
+	Result.CalculatedBase = CalculatedBase;
+	return Result;
 }
 
 UGGYGOAbilitySystemComponent::FScopedNativeAbilityCleanup::FScopedNativeAbilityCleanup(
