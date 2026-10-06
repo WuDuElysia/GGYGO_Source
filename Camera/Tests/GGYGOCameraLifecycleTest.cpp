@@ -1,5 +1,9 @@
 #include "Camera/Tests/GGYGOCameraLifecycleTestTypes.h"
 
+#include "Camera/CameraPhotography.h"
+#include "Camera/GGYGOCameraMode_ThirdPerson.h"
+#include "Camera/GGYGOPlayerCameraManager.h"
+
 #include "Components/BoxComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/EngineBaseTypes.h"
@@ -7,6 +11,7 @@
 #include "Engine/HitResult.h"
 #include "Engine/NetworkDelegates.h"
 #include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/ScopeExit.h"
@@ -347,6 +352,147 @@ namespace
 			GameInstance.Reset();
 		}
 	};
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCameraPhotographyPublicationAdmissionTest,
+	"GGYGO.Camera.PhotographyPublicationAdmission",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOCameraPhotographyPublicationAdmissionTest::RunTest(const FString& Parameters)
+{
+	if (!TestNotNull(TEXT("GEngine"), GEngine)) { return false; }
+	FGGYGOCameraLifecycleTestWorld TestWorld(GEngine);
+	UWorld* World = TestWorld.World;
+	if (!TestNotNull(TEXT("existing camera test World"), World)) { return false; }
+	AddInfo(FString::Printf(
+		TEXT("Photography supported=%d; this leaf checks the direct virtual entry and native cache contract, not paused LevelTick dispatch or photography-provider movement."),
+		FCameraPhotographyManager::IsSupported(World) ? 1 : 0));
+
+	FActorSpawnParameters SpawnParams;
+	SpawnParams.ObjectFlags |= RF_Transient;
+	APlayerController* Controller = World->SpawnActor<APlayerController>(SpawnParams);
+	AGGYGOCameraLifecycleTestPawn* Pawn = World->SpawnActor<AGGYGOCameraLifecycleTestPawn>(SpawnParams);
+	SpawnParams.Owner = Controller;
+	AGGYGOPlayerCameraManager* Manager = World->SpawnActor<AGGYGOPlayerCameraManager>(SpawnParams);
+	if (!TestNotNull(TEXT("native Controller"), Controller)
+		|| !TestNotNull(TEXT("existing camera Pawn type"), Pawn)
+		|| !TestNotNull(TEXT("project camera Manager"), Manager)) { return false; }
+	Manager->InitializeFor(Controller);
+	APlayerCameraManager* NativeEntry = Manager;
+	const bool bOriginalFullTickWhenPaused = Controller->ShouldPerformFullTickWhenPaused();
+	if (!TestTrue(TEXT("native initialization waits for provider activation"),
+		Manager->GetCameraPublicationState() == EGGYGOCameraPublicationState::NotActivated)
+		|| !TestFalse(TEXT("initial camera seed is not confirmed"), Manager->HasConfirmedNativeCameraView())) { return false; }
+
+	const auto CheckCache = [this, Manager](const FString& Context,
+		const FMinimalViewInfo& Current, const FMinimalViewInfo& Previous, float CurrentTime, float PreviousTime)
+	{
+		TestTrue(Context + TEXT(" preserves current native POV"),
+			FMinimalViewInfo::StaticStruct()->CompareScriptStruct(&Manager->GetCameraCacheView(), &Current, 0));
+		TestTrue(Context + TEXT(" preserves previous native POV"),
+			FMinimalViewInfo::StaticStruct()->CompareScriptStruct(&Manager->GetLastFrameCameraCacheView(), &Previous, 0));
+		TestEqual(Context + TEXT(" preserves current cache timestamp"), Manager->GetCameraCacheTime(), CurrentTime, 0.0f);
+		TestEqual(Context + TEXT(" preserves previous cache timestamp"), Manager->GetLastFrameCameraCacheTime(), PreviousTime, 0.0f);
+	};
+	const auto AdvanceClock = [this, World, Manager]()
+	{
+		// Real World time advancement, not private cache/time/state injection.
+		World->Tick(LEVELTICK_TimeOnly, 0.25f);
+		const float GameTime = static_cast<float>(World->GetTimeSeconds());
+		return TestTrue(TEXT("native Fill has a different game time to write; unchanged timestamps cannot pass vacuously"),
+			FMath::IsFinite(GameTime) && GameTime > Manager->GetCameraCacheTime());
+	};
+	const FString ExternalWriteDiagnostic = FString::Printf(
+		TEXT("Module=[Camera] Manager=[%s] Field=[NativeCache] Reason=[external-cache-seed-is-not-a-confirmed-native-update]; write rejected."),
+		*Manager->GetPathName());
+
+	const FMinimalViewInfo Seed = Manager->GetCameraCacheView();
+	const FMinimalViewInfo PreviousSeed = Manager->GetLastFrameCameraCacheView();
+	const float SeedTime = Manager->GetCameraCacheTime();
+	const float PreviousSeedTime = Manager->GetLastFrameCameraCacheTime();
+	if (!AdvanceClock()) { return false; }
+	NativeEntry->UpdateCameraPhotographyOnly();
+	CheckCache(TEXT("NotActivated photography entry"), Seed, PreviousSeed, SeedTime, PreviousSeedTime);
+	TestFalse(TEXT("photography entry does not confirm the initialization seed"), Manager->HasConfirmedNativeCameraView());
+
+	// Qualified native control bypasses the new override, reproducing the old entry.
+	// Even without a supported backend, native Fill must actually change the timestamp.
+	AddExpectedMessagePlain(ExternalWriteDiagnostic, ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
+	Manager->APlayerCameraManager::UpdateCameraPhotographyOnly();
+	if (!TestEqual(TEXT("old native entry actually advances current cache timestamp"),
+		Manager->GetCameraCacheTime(), static_cast<float>(World->GetTimeSeconds()), 0.0f)
+		|| !TestTrue(TEXT("old native entry changed the original timestamp"),
+			Manager->GetCameraCacheTime() != SeedTime)) { return false; }
+
+	UGGYGOCameraLifecycleTestComponent* Camera = Pawn->GetCameraForTest();
+	if (!TestNotNull(TEXT("existing registered GG camera"), Camera)
+		|| !TestTrue(TEXT("fixture camera is registered before activation"), Camera->IsRegistered())
+		|| !TestTrue(TEXT("fixture Pawn enables native camera component selection"), Pawn->bFindCameraComponentWhenViewTarget)
+		|| !TestTrue(TEXT("fixture Manager uses native component selection"), Manager->CameraStyle == NAME_Default)
+		|| !TestFalse(TEXT("synthetic fixture does not replace a Hero arbiter"), Camera->DetermineCameraModeDelegate.IsBound())) { return false; }
+	// This minimal Game World registers components without initializing actors.
+	// Native OnRegister therefore defers auto-activation; use the public lifecycle.
+	Camera->Activate();
+	TInlineComponentArray<UCameraComponent*> FixtureCameras;
+	Pawn->GetComponents(FixtureCameras);
+	if (!TestTrue(TEXT("exact fixture camera is the native target's only selectable active camera"),
+		FixtureCameras.Num() == 1 && FixtureCameras[0] == Camera && Camera->IsActive())) { return false; }
+	// Native, asset-free configured mode; no CDO changes or new test type.
+	Camera->DetermineCameraModeDelegate.BindLambda([]() { return UGGYGOCameraMode_ThirdPerson::StaticClass(); });
+	const FGGYGOCameraEvaluationResult Activated = Manager->ActivateCameraEvaluation(Pawn, Camera);
+	if (!TestTrue(TEXT("public activation evaluates the GG source successfully"), Activated.IsSuccess())
+		|| !TestTrue(TEXT("valid native update establishes a confirmed cache"), Manager->HasConfirmedNativeCameraView())
+		|| !TestTrue(TEXT("valid activation enters Running"),
+			Manager->GetCameraPublicationState() == EGGYGOCameraPublicationState::Running)) { return false; }
+
+	const FMinimalViewInfo RunningView = Manager->GetCameraCacheView();
+	const FMinimalViewInfo PreviousRunningView = Manager->GetLastFrameCameraCacheView();
+	const float RunningTime = Manager->GetCameraCacheTime();
+	if (!AdvanceClock()) { return false; }
+	AddExpectedMessagePlain(ExternalWriteDiagnostic, ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
+	NativeEntry->UpdateCameraPhotographyOnly();
+	TestEqual(TEXT("Running still delegates to native photography-only Fill"),
+		Manager->GetCameraCacheTime(), static_cast<float>(World->GetTimeSeconds()), 0.0f);
+	TestEqual(TEXT("Running retains native previous timestamp ordering"), Manager->GetLastFrameCameraCacheTime(), RunningTime, 0.0f);
+	TestTrue(TEXT("Running preserves the existing out-of-scope POV publication behavior"),
+		FMinimalViewInfo::StaticStruct()->CompareScriptStruct(&Manager->GetCameraCacheView(), &RunningView, 0)
+		&& FMinimalViewInfo::StaticStruct()->CompareScriptStruct(&Manager->GetLastFrameCameraCacheView(), &PreviousRunningView, 0));
+	TestTrue(TEXT("Running photography entry keeps admission and confirmation"),
+		Manager->GetCameraPublicationState() == EGGYGOCameraPublicationState::Running && Manager->HasConfirmedNativeCameraView());
+
+	FViewTargetTransitionParams InvalidTransition;
+	InvalidTransition.BlendTime = -1.0f;
+	const FGGYGOCameraEvaluationResult ExpectedFailure = FGGYGOCameraEvaluationResult::Failure(
+		nullptr, TEXT("ViewTargetTransition"), TEXT("non-finite-or-negative-transition-input"));
+	const FString StopDiagnostic = FString::Printf(
+		TEXT("Module=[Camera] Manager=[%s] Controller=[%s] World=[%s] Target=[%s] Component=[%s] Mode=[%s] ModeClass=[%s] Field=[%s] Reason=[%s] ConfirmedNativeView=[1]; explicit original Restart required."),
+		*Manager->GetPathName(), *Controller->GetPathName(), *World->GetPathName(), *Pawn->GetPathName(), *Camera->GetPathName(),
+		*ExpectedFailure.ModePath, *ExpectedFailure.ModeClassPath, *ExpectedFailure.Field.ToString(), *ExpectedFailure.Reason);
+	AddExpectedMessagePlain(StopDiagnostic, ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1);
+	Manager->SetViewTarget(Pawn, InvalidTransition);
+	if (!TestTrue(TEXT("invalid public transition stops the original admitted source"),
+		Manager->GetCameraPublicationState() == EGGYGOCameraPublicationState::Stopped)
+		|| !TestTrue(TEXT("Stopped retains its confirmed native view"), Manager->HasConfirmedNativeCameraView())
+		|| !TestTrue(TEXT("original failure remains explicit"),
+			Manager->GetCameraPublicationResult().Field == ExpectedFailure.Field
+			&& Manager->GetCameraPublicationResult().Reason == ExpectedFailure.Reason)) { return false; }
+
+	const FMinimalViewInfo StoppedView = Manager->GetCameraCacheView();
+	const FMinimalViewInfo PreviousStoppedView = Manager->GetLastFrameCameraCacheView();
+	const float StoppedTime = Manager->GetCameraCacheTime();
+	const float PreviousStoppedTime = Manager->GetLastFrameCameraCacheTime();
+	if (!AdvanceClock()) { return false; }
+	NativeEntry->UpdateCameraPhotographyOnly();
+	CheckCache(TEXT("Stopped photography entry"), StoppedView, PreviousStoppedView, StoppedTime, PreviousStoppedTime);
+	TestTrue(TEXT("photography entry cannot recover Stopped or consume its original failure"),
+		Manager->GetCameraPublicationState() == EGGYGOCameraPublicationState::Stopped
+		&& Manager->GetCameraPublicationResult().Field == ExpectedFailure.Field
+		&& Manager->GetCameraPublicationResult().Reason == ExpectedFailure.Reason
+		&& Manager->HasConfirmedNativeCameraView());
+	TestEqual(TEXT("photography admission does not change the Controller paused full-tick policy"),
+		Controller->ShouldPerformFullTickWhenPaused(), bOriginalFullTickWhenPaused);
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCameraOffsetOwnershipTest,

@@ -49,6 +49,8 @@ public:
 
 	virtual void InitializeFor(APlayerController* PC) override;
 	virtual void UpdateCamera(float DeltaTime) override;
+	/** Pause-only native entry obeys the same admission state as UpdateCamera. */
+	virtual void UpdateCameraPhotographyOnly() override;
 	virtual void SetViewTarget(AActor* NewViewTarget,
 		FViewTargetTransitionParams TransitionParams = FViewTargetTransitionParams()) override;
 	virtual void ApplyCameraModifiers(float DeltaTime, FMinimalViewInfo& InOutPOV) override;

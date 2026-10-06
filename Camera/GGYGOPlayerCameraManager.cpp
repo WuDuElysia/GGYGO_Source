@@ -350,6 +350,14 @@ void AGGYGOPlayerCameraManager::UpdateCamera(float DeltaTime)
 	Super::UpdateCamera(DeltaTime);
 }
 
+void AGGYGOPlayerCameraManager::UpdateCameraPhotographyOnly()
+{
+	// LevelTick dispatches this virtual entry while paused without UpdateCamera.
+	// Reject before native Fill can write timestamps after our POV setters return.
+	if (PublicationState != EGGYGOCameraPublicationState::Running) { return; }
+	Super::UpdateCameraPhotographyOnly();
+}
+
 void AGGYGOPlayerCameraManager::SetViewTarget(AActor* NewViewTarget, FViewTargetTransitionParams TransitionParams)
 {
 	if (ActiveNativeUpdate)
