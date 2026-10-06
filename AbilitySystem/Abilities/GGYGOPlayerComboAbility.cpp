@@ -842,6 +842,65 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		{
 			if (ThisClass* Self = WeakThis.Get()) { Self->HandleMontageSection(WeakMotion.Pin(), Fact); }
 		});
+	Callbacks.OnFailed = FGGYGOMontageTaskFailureDelegate::CreateLambda(
+		[WeakThis, WeakTask, WeakMotion, Original, ThisStepToken](const FGGYGOMontageTaskFailureFact& Fact)
+		{
+			ThisClass* Self = WeakThis.Get();
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const OriginalTask = WeakTask.Get(true);
+			const TSharedPtr<FStepMotionResources> OriginalResource = WeakMotion.Pin();
+			// Native EndTask marks this historical sender Garbage. Admit its exact remaining object,
+			// never a destroyed sender, and authenticate the GA's own original resources without live-task helpers.
+			if (!Self || !OriginalTask || OriginalTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+				|| !OriginalResource.IsValid() || !Self->IsActivationCurrent(Original)
+				|| ThisStepToken == 0 || Self->CurrentStepToken != ThisStepToken
+				|| Self->MontageTask.Get() != OriginalTask || Self->StepMotionResources != OriginalResource
+				|| OriginalResource->Section == FStepMotionResources::ESection::Retired
+				|| Self->CurrentStep != OriginalResource->StepIndex || OriginalResource->StepToken != ThisStepToken
+				|| !OriginalResource->Activation.HasSameActivation(Original) || OriginalResource->Task.Get(true) != OriginalTask) { return; }
+			const bool bStartup = Fact.Stage == EGGYGOMontageTaskFailureStage::Startup;
+			const bool bPlayback = Fact.Stage == EGGYGOMontageTaskFailureStage::Playback;
+			const bool bOriginalInstance = bStartup
+				? Fact.MontageInstanceId == INDEX_NONE && OriginalResource->MontageInstanceId == INDEX_NONE
+				: bPlayback && OriginalResource->MontageInstanceId != INDEX_NONE
+					&& Fact.MontageInstanceId == OriginalResource->MontageInstanceId;
+			const FString OriginalLogContext = FString::Printf(
+				TEXT("Ability='%s' Step=%d StepToken=%llu Task='%s' Montage='%s' Slot='%s' SourceValid=%d ExpectedMontage='%s' ExpectedSlot='%s' Stage=%u Instance=%d ExpectedInstance=%d Diagnostic='%s'"),
+				*OriginalResource->AbilityPath, OriginalResource->StepIndex, static_cast<unsigned long long>(ThisStepToken),
+				*GetPathNameSafe(OriginalTask), *GetPathNameSafe(Fact.Montage.Get()), *Fact.SlotName.ToString(),
+				OriginalResource->Source.IsValid(),
+				*GetPathNameSafe(OriginalResource->Source.IsValid() ? OriginalResource->Source->Montage.Get() : nullptr),
+				*(OriginalResource->Source.IsValid() ? OriginalResource->Source->SlotName.ToString() : FString(TEXT("Unavailable"))),
+				static_cast<uint32>(Fact.Stage), Fact.MontageInstanceId, OriginalResource->MontageInstanceId, *Fact.Diagnostic);
+			if (!OriginalResource->Source.IsValid() || Fact.Montage != OriginalResource->Source->Montage.Get()
+				|| Fact.SlotName != OriginalResource->Source->SlotName || !bOriginalInstance)
+			{
+				UE_LOG(LogGGYGOAbilitySystem, Error,
+					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RejectedFact %s; required failure did not identify this original resource"),
+					*OriginalLogContext);
+				return;
+			}
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RequiredDependencyFailed %s"), *OriginalLogContext);
+			// Required dependency failure ends this original even when user cancellation is disabled.
+			const FGGYGOAbilityTerminationResult Result = Self->RequestAbilityEnd(Original, true, true);
+			switch (Result.Outcome)
+			{
+			case EGGYGOAbilityTerminationOutcome::Completed:
+			case EGGYGOAbilityTerminationOutcome::Accepted:
+			case EGGYGOAbilityTerminationOutcome::Deferred:
+			case EGGYGOAbilityTerminationOutcome::AlreadyPending:
+				UE_LOG(LogGGYGOAbilitySystem, Display,
+					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d Reason=%d"),
+					*OriginalLogContext, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
+				break;
+			default:
+				UE_LOG(LogGGYGOAbilitySystem, Error,
+					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d Reason=%d; original End request was not accepted"),
+					*OriginalLogContext, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
+				break;
+			}
+			// Only copied diagnostic context and the returned result are accessed after the external End request.
+		});
 	const FDelegateHandle Registration = StartedMontageTask->RegisterNativeCallbacks(MoveTemp(Callbacks));
 	if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get()))
 	{

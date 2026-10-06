@@ -3,11 +3,225 @@
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 
 #include "Animation/AnimMontage.h"
+#include "Animation/AnimClassInterface.h"
+#include "Animation/AnimInstanceProxy.h"
+#include "Animation/Nodes/GGYGOAnimNode_ActionPoseSlot.h"
+#include "Components/SkeletalMeshComponent.h"
+#include "Engine/SkeletalMesh.h"
 #include "GameFramework/Actor.h"
 #include "Templates/UnrealTemplate.h"
+#include "UObject/UnrealType.h"
 
 using EGuardOutcome = EGGYGOMontagePlayGuardOutcome;
 using ENativeStage = EGGYGOMontagePlayGuardNativeStage;
+
+namespace GGYGOActionPoseProviderPrivate
+{
+	struct FNodeView
+	{
+		FName PropertyKey;
+		const FGGYGOAnimNode_ActionPoseSlot* Node = nullptr;
+	};
+
+	TArray<FNodeView> FindNodes(const UGGYGOMontageGuardAnimInstance* Instance)
+	{
+		TArray<FNodeView> Result;
+		const IAnimClassInterface* AnimClass = IAnimClassInterface::GetFromClass(Instance->GetClass());
+		if (AnimClass)
+		{
+			for (const FStructProperty* Property : AnimClass->GetAnimNodeProperties())
+			{
+				if (Property && Property->Struct && Property->Struct->IsChildOf(FGGYGOAnimNode_ActionPoseSlot::StaticStruct()))
+				{
+					FNodeView& View = Result.AddDefaulted_GetRef();
+					View.PropertyKey = Property->GetFName();
+					View.Node = Property->ContainerPtrToValuePtr<FGGYGOAnimNode_ActionPoseSlot>(Instance);
+				}
+			}
+		}
+		return Result;
+	}
+
+	FString Diagnose(const UObject* Instance, const UAnimMontage* Montage, FName Slot, const FString& Reason)
+	{
+		return FString::Printf(TEXT("[Animation.ActionPoseContract] AnimInstance=%s Montage=%s Slot=%s Reason=%s"),
+			*GetPathNameSafe(Instance), *GetPathNameSafe(Montage), *Slot.ToString(), *Reason);
+	}
+}
+
+EGGYGOActionPoseContractAcquireResult UGGYGOMontageGuardAnimInstance::AcquireActionPoseContract(
+	UAnimMontage* OriginalMontage, FGGYGOActionPoseContractTicket& OutTicket, FString& OutDiagnostic) const
+{
+	check(IsInGameThread());
+	using EResult = EGGYGOActionPoseContractAcquireResult;
+	using namespace GGYGOActionPoseProviderPrivate;
+	OutTicket.Reset();
+	OutDiagnostic.Reset();
+	auto Reject = [&](EResult Result, const FString& Reason)
+	{
+		OutDiagnostic = Diagnose(this, OriginalMontage, RequiredPoseCorrectionSlot, Reason);
+		return Result;
+	};
+	if (!IsValid(OriginalMontage))
+	{
+		return Reject(EResult::Rejected, TEXT("Original montage is invalid."));
+	}
+	const FName OriginalRequiredSlot = RequiredPoseCorrectionSlot;
+	const TArray<FNodeView> DeclaredNodes = FindNodes(this);
+	bool bMontageUsesCorrectionProducer = false;
+	for (const FNodeView& View : DeclaredNodes)
+	{
+		bMontageUsesCorrectionProducer |= OriginalMontage->IsValidSlot(View.Node->SlotName);
+	}
+	if (OriginalRequiredSlot.IsNone() || !OriginalMontage->IsValidSlot(OriginalRequiredSlot))
+	{
+		if (bMontageUsesCorrectionProducer)
+		{
+			return Reject(EResult::Rejected, TEXT("Montage uses a correction producer without the matching required role slot declaration."));
+		}
+		// Explicit ordinary native slot mode allocates no ticket and needs no polling.
+		return EResult::ExplicitNotRequired;
+	}
+	const uint64 OriginalLifecycle = LifecycleGeneration;
+	const TWeakObjectPtr<UGGYGOMontageGuardAnimInstance> OriginalSelf(const_cast<UGGYGOMontageGuardAnimInstance*>(this));
+	const TWeakObjectPtr<UAnimMontage> OriginalAsset(OriginalMontage);
+	const TWeakObjectPtr<USkeletalMeshComponent> OriginalMesh(GetSkelMeshComponent());
+	const TWeakObjectPtr<USkeletalMesh> OriginalModel(OriginalMesh.IsValid() ? OriginalMesh->GetSkeletalMeshAsset() : nullptr);
+	auto IsOriginalContextCurrent = [&]()
+	{
+		return OriginalSelf.Get() == this && OriginalAsset.IsValid() && OriginalMesh.IsValid() && OriginalModel.IsValid()
+			&& bLifecycleReady && !bIdentityExhausted && OriginalLifecycle != 0 && LifecycleGeneration == OriginalLifecycle
+			&& LifecycleOwner.Get() == GetOwningActor() && (!bHadLifecycleOwner || LifecycleOwner.IsValid())
+			&& RequiredPoseCorrectionSlot == OriginalRequiredSlot && GetSkelMeshComponent() == OriginalMesh.Get()
+			&& OriginalMesh->GetAnimInstance() == this && OriginalMesh->GetSkeletalMeshAsset() == OriginalModel.Get();
+	};
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Unavailable, TEXT("Original provider lifecycle, owner, primary mesh or mesh model is unavailable."));
+	}
+	// This is the engine's wait for this original component's parallel evaluation,
+	// not an evaluation request, new proxy, callback registry or source clock.
+	const FAnimInstanceProxy& Proxy = GetProxyOnGameThread<FAnimInstanceProxy>();
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Unavailable, TEXT("Original provider context changed during its native evaluation barrier."));
+	}
+	const TArray<FNodeView> CurrentNodes = FindNodes(this);
+	const FNodeView* Producer = nullptr;
+	for (const FNodeView& View : CurrentNodes)
+	{
+		if (View.Node->SlotName == OriginalRequiredSlot)
+		{
+			if (Producer)
+			{
+				return Reject(EResult::Rejected, TEXT("More than one correction producer declares the required slot."));
+			}
+			Producer = &View;
+		}
+		else if (OriginalMontage->IsValidSlot(View.Node->SlotName))
+		{
+			return Reject(EResult::Rejected, TEXT("Montage also uses an undeclared second correction slot."));
+		}
+	}
+	if (!Producer)
+	{
+		return Reject(EResult::Rejected, TEXT("Required role slot has no compiled correction producer in the original AnimInstance."));
+	}
+	FString Diagnostic;
+	if (Proxy.GetRequiredBones().GetSkeletalMeshAsset() != OriginalModel.Get()
+		|| !Producer->Node->CheckCapability(Proxy.GetRequiredBones(), Diagnostic))
+	{
+		return Reject(EResult::Unavailable, Diagnostic.IsEmpty() ? TEXT("Native RequiredBones belongs to a different mesh model.") : Diagnostic);
+	}
+	if (!Producer->Node->ValidateMontageCapability(OriginalMontage, Diagnostic))
+	{
+		return Reject(EResult::Rejected, Diagnostic);
+	}
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Unavailable, TEXT("Original provider context changed before ticket publication."));
+	}
+	OutTicket.OriginalProvider = OriginalSelf;
+	OutTicket.OriginalMeshComponent = OriginalMesh;
+	OutTicket.OriginalMeshAsset = OriginalModel;
+	OutTicket.OriginalMontage = OriginalAsset;
+	OutTicket.NodePropertyKey = Producer->PropertyKey;
+	OutTicket.SlotName = OriginalRequiredSlot;
+	OutTicket.GuardLifecycleGeneration = OriginalLifecycle;
+	OutTicket.ContractConfigEpoch = Producer->Node->GetContractConfigEpoch();
+	OutTicket.FailureSerialAtAcquire = Producer->Node->GetFailureSerial();
+	return EResult::RequiredReady;
+}
+
+EGGYGOActionPoseContractPollResult UGGYGOMontageGuardAnimInstance::PollActionPoseContract(
+	const FGGYGOActionPoseContractTicket& OriginalTicket, FString& OutDiagnostic) const
+{
+	check(IsInGameThread());
+	using EResult = EGGYGOActionPoseContractPollResult;
+	using namespace GGYGOActionPoseProviderPrivate;
+	OutDiagnostic.Reset();
+	auto Reject = [&](EResult Result, const FString& Reason)
+	{
+		OutDiagnostic = Diagnose(this, OriginalTicket.OriginalMontage.Get(), OriginalTicket.SlotName, Reason);
+		return Result;
+	};
+	auto IsOriginalContextCurrent = [&]()
+	{
+		return OriginalTicket.IsValid() && OriginalTicket.OriginalProvider.Get() == this
+			&& bLifecycleReady && !bIdentityExhausted && LifecycleGeneration == OriginalTicket.GuardLifecycleGeneration
+			&& LifecycleOwner.Get() == GetOwningActor() && (!bHadLifecycleOwner || LifecycleOwner.IsValid())
+			&& RequiredPoseCorrectionSlot == OriginalTicket.SlotName
+			&& GetSkelMeshComponent() == OriginalTicket.OriginalMeshComponent.Get()
+			&& OriginalTicket.OriginalMeshComponent->GetAnimInstance() == this
+			&& OriginalTicket.OriginalMeshComponent->GetSkeletalMeshAsset() == OriginalTicket.OriginalMeshAsset.Get();
+	};
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Invalidated, TEXT("Original contract provider, owner, mesh, role declaration or lifecycle was replaced."));
+	}
+	const FAnimInstanceProxy& Proxy = GetProxyOnGameThread<FAnimInstanceProxy>();
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Invalidated, TEXT("Original contract context changed during its native evaluation barrier."));
+	}
+	const TArray<FNodeView> Nodes = FindNodes(this);
+	const FNodeView* Producer = nullptr;
+	for (const FNodeView& View : Nodes)
+	{
+		if (View.Node->SlotName == OriginalTicket.SlotName)
+		{
+			if (Producer || View.PropertyKey != OriginalTicket.NodePropertyKey)
+			{
+				return Reject(EResult::Invalidated, TEXT("Original correction producer was replaced or its required slot is ambiguous."));
+			}
+			Producer = &View;
+		}
+	}
+	if (!Producer || Producer->Node->GetContractConfigEpoch() != OriginalTicket.ContractConfigEpoch
+		|| !Producer->Node->IsConfigurationCurrent(Proxy.GetRequiredBones()))
+	{
+		return Reject(EResult::Invalidated, TEXT("Original node configuration or current mesh reference contract changed; ticket is not refreshed."));
+	}
+	if (Producer->Node->GetFailureSerial() > OriginalTicket.FailureSerialAtAcquire)
+	{
+		return Reject(EResult::Failed, Producer->Node->GetLastFailureDiagnostic());
+	}
+	FString Diagnostic;
+	if (Proxy.GetRequiredBones().GetSkeletalMeshAsset() != OriginalTicket.OriginalMeshAsset.Get()
+		|| !Producer->Node->CheckCapability(Proxy.GetRequiredBones(), Diagnostic))
+	{
+		return Reject(EResult::Failed, Diagnostic.IsEmpty() ? TEXT("Native RequiredBones no longer belongs to the original model.") : Diagnostic);
+	}
+	if (!Producer->Node->ValidateMontageCapability(OriginalTicket.OriginalMontage.Get(), Diagnostic))
+	{
+		return Reject(EResult::Failed, Diagnostic);
+	}
+	if (!IsOriginalContextCurrent())
+	{
+		return Reject(EResult::Invalidated, TEXT("Original contract context changed during polling."));
+	}
+	return EResult::Valid;
+}
 
 struct FGGYGOMontagePlayGuardScope::FState
 {
@@ -138,6 +352,53 @@ void UGGYGOMontageGuardAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 	check(IsInGameThread());
 	RefreshLifecycleOwner();
 	Super::NativeUpdateAnimation(DeltaSeconds);
+
+	// UAnimInstance has already advanced and published its native montage data
+	// before this GT hook. Validate participating inputs here; the worker may not
+	// read MontageInstances or the proxy's protected montage evaluation array.
+	const IAnimClassInterface* AnimClass = IAnimClassInterface::GetFromClass(GetClass());
+	if (!AnimClass) { return; }
+	const FAnimInstanceProxy& Proxy = GetProxyOnGameThread<FAnimInstanceProxy>();
+	USkeletalMeshComponent* Mesh = GetSkelMeshComponent();
+	const bool bProviderCurrent = bLifecycleReady && !bIdentityExhausted
+		&& LifecycleOwner.Get() == GetOwningActor() && (!bHadLifecycleOwner || LifecycleOwner.IsValid())
+		&& Mesh && Mesh->GetAnimInstance() == this && Mesh->GetSkeletalMeshAsset();
+	for (const FStructProperty* Property : AnimClass->GetAnimNodeProperties())
+	{
+		if (!Property || !Property->Struct || !Property->Struct->IsChildOf(FGGYGOAnimNode_ActionPoseSlot::StaticStruct())) { continue; }
+		FGGYGOAnimNode_ActionPoseSlot* Node = Property->ContainerPtrToValuePtr<FGGYGOAnimNode_ActionPoseSlot>(this);
+		bool bInputsValid = bProviderCurrent;
+		FString Diagnostic;
+		if (!bInputsValid)
+		{
+			Diagnostic = TEXT("Original GT montage capability provider lifecycle, owner or primary mesh is unavailable.");
+		}
+		for (const FAnimMontageInstance* Instance : MontageInstances)
+		{
+			if (!bInputsValid) { break; }
+			if (!Instance)
+			{
+				bInputsValid = false;
+				Diagnostic = TEXT("Original native montage input is null on the game-thread capability update.");
+				break;
+			}
+			// Same eligibility as native UpdateMontageEvaluationData. The scalar
+			// read selects participation only; no weight/ID/position is retained or
+			// used here to evaluate, blend, play or stop anything.
+			const UAnimMontage* Montage = Instance->Montage;
+			if (!Montage || Instance->GetWeight() <= ZERO_ANIMWEIGHT_THRESH || !Montage->IsValidSlot(Node->SlotName)) { continue; }
+			if (Instance->GetActiveBlendProfile())
+			{
+				bInputsValid = false;
+				Diagnostic = FString::Printf(TEXT("Montage=%s native per-bone blend profile is outside the action pose contract."), *GetPathNameSafe(Montage));
+			}
+			else
+			{
+				bInputsValid = Node->ValidateMontageCapability(Montage, Diagnostic);
+			}
+		}
+		Node->PublishNativeMontageCapability(this, Proxy.GetUpdateCounter(), bInputsValid, Diagnostic);
+	}
 }
 
 bool UGGYGOMontageGuardAnimInstance::IsMontagePlayGuardIdentityCurrent(

@@ -4,6 +4,7 @@
 
 #include "CoreMinimal.h"
 #include "Animation/AnimInstance.h"
+#include "Animation/Runtime/GGYGOActionPoseContract.h"
 #include "Animation/Runtime/GGYGOMontagePlayGuard.h"
 
 #include "GGYGOMontageGuardAnimInstance.generated.h"
@@ -22,6 +23,18 @@ public:
 	virtual void NativeInitializeAnimation() override;
 	virtual void NativeUninitializeAnimation() override;
 	virtual void NativeUpdateAnimation(float DeltaSeconds) override;
+
+	/** None explicitly selects ordinary native slots; a correction producer must be declared. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Animation|Action Pose")
+	FName RequiredPoseCorrectionSlot = NAME_None;
+
+	/** GT only, waits for the original native parallel evaluation before reading its node. */
+	EGGYGOActionPoseContractAcquireResult AcquireActionPoseContract(UAnimMontage* OriginalMontage,
+		FGGYGOActionPoseContractTicket& OutTicket, FString& OutDiagnostic) const;
+
+	/** GT only. Does not refresh the original ticket, play, stop or evaluate a pose. */
+	EGGYGOActionPoseContractPollResult PollActionPoseContract(
+		const FGGYGOActionPoseContractTicket& OriginalTicket, FString& OutDiagnostic) const;
 
 	/**
 	 * Read-only game-thread query of the original instance, lifecycle, issued call ID and owner.

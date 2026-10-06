@@ -21,6 +21,7 @@
 #include "Engine/NetConnection.h"
 #include "Engine/NetDriver.h"
 #include "Net/UnrealNetwork.h"
+#include "Misc/ScopeExit.h"
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Class.h"
 
@@ -570,8 +571,15 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 		// 引擎自己的 `CanCombineWith` 只挡 anim montage 的 root motion，
 		// 不挡 root motion source；而刹停期间两帧的 `Acceleration` 都是零，
 		// 恰好落在引擎"允许合并"的分支里。所以必须自己挡。
-		if (MoveComp->HasCurveRootMotionSource())
+		if (MoveComp->HasCurveRootMotionSource()
+			|| (MoveComp->HasNativePassiveGroundVelocity()
+				&& MoveComp->ProjectToGravityFloor(MoveComp->Velocity).SizeSquared() > KINDA_SMALL_NUMBER
+				&& (MoveComp->ShouldRejectMovementInputGroundLocomotion()
+					|| MoveComp->ShouldRejectUnownedCurveGroundLocomotion()
+					|| MoveComp->ShouldRejectUnconfiguredGroundLocomotion())))
 		{
+			// Passive braking also keeps its native starting result; a combined rewind must
+			// not substitute an earlier velocity under a later result's provenance.
 			bForceNoCombine = true;
 		}
 	}
@@ -991,6 +999,29 @@ bool UGGYGOCharacterMovementComponent::EnsureMovementOwnerSyncLifetime()
 	return false;
 }
 
+void UGGYGOCharacterMovementComponent::StopMovementImmediately()
+{
+	NativeMovementVelocityResult.Reset();
+	NativeVelocityBeforeRootMotion.Reset();
+	bNativeVelocityIntervalCanRetain = false;
+	Super::StopMovementImmediately();
+}
+
+void UGGYGOCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewUpdatedComponent)
+{
+	USceneComponent* OriginalComponent = UpdatedComponent;
+	Super::SetUpdatedComponent(NewUpdatedComponent);
+	if (UpdatedComponent != OriginalComponent)
+	{
+		NativeMovementVelocityResult.Reset();
+		NativeVelocityBeforeRootMotion.Reset();
+		bNativeVelocityIntervalOpen = false;
+		bNativeVelocityIntervalCanRetain = false;
+		NativeVelocityIntervalCharacter.Reset();
+		NativeVelocityIntervalComponent.Reset();
+	}
+}
+
 void UGGYGOCharacterMovementComponent::BeginPlay()
 {
 	Super::BeginPlay();
@@ -1004,6 +1035,12 @@ void UGGYGOCharacterMovementComponent::BeginPlay()
 void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	bMovementOwnerSyncClosed = true;
+	NativeMovementVelocityResult.Reset();
+	NativeVelocityBeforeRootMotion.Reset();
+	NativeVelocityIntervalCharacter.Reset();
+	NativeVelocityIntervalComponent.Reset();
+	bNativeVelocityIntervalOpen = false;
+	bNativeVelocityIntervalCanRetain = false;
 	ActiveMovementOwnerSyncNativeMove = nullptr;
 	// Terminal frames already own retired scopes; cancel their remaining callbacks.
 	// Current Ready subscriptions remain for the EndPlay invalidation below.
@@ -2254,7 +2291,7 @@ void UGGYGOCharacterMovementComponent::CancelMovementInputLocomotion()
 	CancelOwned(CurrentRootMotion.PendingAddRootMotionSources);
 	RetireLocomotionCurveRootMotion();
 	CurveMotion.Reset();
-	if (IsMovingOnGround() && !HasIndependentGroundRootMotion())
+	if (IsMovingOnGround() && !HasIndependentGroundRootMotion() && !HasNativePassiveGroundVelocity())
 	{
 		Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
 	}
@@ -2400,29 +2437,88 @@ bool UGGYGOCharacterMovementComponent::RejectLocomotionEvaluation(uint64 Expecte
 	else if (LocomotionRequestSerial == 0)
 	{
 		CancelMovementInputLocomotion();
-		EnforceGroundLocomotionAdmission();
+		EnforceGroundLocomotionAdmission(TEXT("RejectLocomotionEvaluation"));
 	}
 	return false;
 }
 
-void UGGYGOCharacterMovementComponent::EnforceMovementInputLocomotionAdmission()
+bool UGGYGOCharacterMovementComponent::HasNativePassiveGroundVelocity() const
+{
+	if (!IsValid(CharacterOwner) || !IsValid(UpdatedComponent) || Velocity.ContainsNaN()) return false;
+	if (bNativeVelocityIntervalOpen && bNativeVelocityIntervalCanRetain && bMovementInProgress
+		&& NativeVelocityIntervalCharacter.Get() == CharacterOwner
+		&& NativeVelocityIntervalComponent.Get() == UpdatedComponent)
+	{
+		// Collision, floor projection and native braking may change velocity inside this one interval.
+		return true;
+	}
+	if (!NativeMovementVelocityResult.IsSet()) return false;
+	const FNativeMovementVelocityResult& Result = NativeMovementVelocityResult.GetValue();
+	return Result.Character.IsValid() && Result.Character.Get() == CharacterOwner
+		&& Result.Component.IsValid() && Result.Component.Get() == UpdatedComponent
+		&& !Result.Velocity.ContainsNaN()
+		&& ProjectToGravityFloor(Velocity).Equals(ProjectToGravityFloor(Result.Velocity), KINDA_SMALL_NUMBER);
+}
+
+void UGGYGOCharacterMovementComponent::BeginNativeMovementVelocityInterval()
+{
+	// An interval cannot carry a previous interval's in-progress permission across an owner change.
+	NativeVelocityBeforeRootMotion.Reset();
+	bNativeVelocityIntervalOpen = false;
+	bNativeVelocityIntervalCanRetain = HasNativePassiveGroundVelocity();
+	NativeVelocityIntervalCharacter = CharacterOwner;
+	NativeVelocityIntervalComponent = UpdatedComponent.Get();
+	bNativeVelocityIntervalOpen = IsValid(CharacterOwner) && IsValid(UpdatedComponent);
+}
+
+void UGGYGOCharacterMovementComponent::MarkNativeMovementVelocityResult()
+{
+	if (bNativeVelocityIntervalOpen && NativeVelocityIntervalCharacter.IsValid()
+		&& NativeVelocityIntervalCharacter.Get() == CharacterOwner
+		&& NativeVelocityIntervalComponent.IsValid() && NativeVelocityIntervalComponent.Get() == UpdatedComponent)
+	{
+		bNativeVelocityIntervalCanRetain = true;
+	}
+}
+
+void UGGYGOCharacterMovementComponent::StoreNativeMovementVelocityResult()
+{
+	NativeMovementVelocityResult.Reset();
+	if (!IsValid(CharacterOwner) || !IsValid(UpdatedComponent) || Velocity.ContainsNaN()) return;
+	FNativeMovementVelocityResult Result;
+	Result.Character = CharacterOwner;
+	Result.Component = UpdatedComponent.Get();
+	Result.Velocity = Velocity;
+	NativeMovementVelocityResult = MoveTemp(Result);
+}
+
+void UGGYGOCharacterMovementComponent::EnforceMovementInputLocomotionAdmission(const TCHAR* Entry)
 {
 	if (!ShouldRejectMovementInputGroundLocomotion()) return;
-	const bool bHasRequest = ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
-		|| (bHasRequestedVelocity && ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER)
-		|| ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER;
+	const bool bNativeMomentum = HasNativePassiveGroundVelocity();
+	const FRootMotionSource* UnsupportedSource = GetUnsupportedGroundRootMotionSource();
+	const bool bHasRequest = Acceleration.ContainsNaN() || ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
+		|| (bHasRequestedVelocity && (RequestedVelocity.ContainsNaN()
+			|| ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER))
+		|| (!bNativeMomentum && (Velocity.ContainsNaN() || ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER))
+		|| UnsupportedSource;
 	if (bHasRequest && !bMovementInputAdmissionDiagnosticReported)
 	{
 		bMovementInputAdmissionDiagnosticReported = true;
 		UE_LOG(LogGGYGOMovement, Error,
-			TEXT("Movement source admission rejected: Consumer='%s', Producer='%s', Binding=%llu, Session=%llu, ExecutionRequest=%llu, MovementSet='%s', SourceReason='%s', Reason='no live admitted source request; reset, zero acceleration and neutral cannot rearm it'."),
+			TEXT("Movement source admission rejected: Consumer='%s', Producer='%s', Binding=%llu, Session=%llu, ExecutionRequest=%llu, MovementSet='%s', SourceReason='%s', Entry='%s', Mode=%d, Acceleration='%s', HasRequestedVelocity=%d, RequestedVelocity='%s', Velocity='%s', NativeMomentum=%d, LastRetiredAction=%d, UnsupportedSource='%s', SourceType='%s', Reason='no live admitted source request; reset, zero acceleration and neutral cannot rearm it'."),
 			*GetPathName(), *GetPathNameSafe(MovementInputBinding.SourceSession.Producer.Get()),
 			static_cast<unsigned long long>(MovementInputBindingSerial),
 			static_cast<unsigned long long>(MovementInputBinding.SourceSession.SessionSerial),
 			static_cast<unsigned long long>(LocomotionRequestSerial), *GetPathNameSafe(MovementSet.Get()),
-			*LastMovementInputFact.Reason.ToString());
+			*LastMovementInputFact.Reason.ToString(), Entry, static_cast<int32>(MovementMode),
+			*Acceleration.ToString(), bHasRequestedVelocity ? 1 : 0, *RequestedVelocity.ToString(),
+			*Velocity.ToString(), bNativeMomentum ? 1 : 0, LastRetiredMontageActionHandle,
+			UnsupportedSource ? *UnsupportedSource->InstanceName.ToString() : TEXT("None"),
+			*GetNameSafe(UnsupportedSource ? UnsupportedSource->GetScriptStruct() : nullptr));
 	}
-	Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
+	if (!bNativeMomentum)
+		Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
 }
 
 bool UGGYGOCharacterMovementComponent::IsMontageActionMovementModeSupported() const
@@ -2779,6 +2875,9 @@ bool UGGYGOCharacterMovementComponent::CancelMontageActionMotionForMovement(
 			== EGGYGOQualifiedMovementIntentQueryResult::Qualified && AfterReleaseIntent == OriginalIntent)
 	{
 		Self->Velocity.X = 0.0; Self->Velocity.Y = 0.0;
+		Self->NativeMovementVelocityResult.Reset();
+		Self->NativeVelocityBeforeRootMotion.Reset();
+		Self->bNativeVelocityIntervalCanRetain = false;
 		// Airborne cancellation retains actual vertical momentum; native Falling resumes gravity.
 		// Never restore the entry mode or manufacture a landing to admit this original input.
 		Self->CurveMotion.Reset();
@@ -2879,6 +2978,9 @@ void UGGYGOCharacterMovementComponent::EndActionMotion(int32 Handle)
 	ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
 	ActiveActionMotionHandle = INDEX_NONE;
 	Velocity.X = Velocity.Y = 0.;
+	NativeMovementVelocityResult.Reset();
+	NativeVelocityBeforeRootMotion.Reset();
+	bNativeVelocityIntervalCanRetain = false;
 	CurveMotion.Reset();
 	WalkHoldTimer = 0.f;
 	bPreviousHasMoveInput = false;
@@ -3310,22 +3412,25 @@ bool UGGYGOCharacterMovementComponent::ShouldRejectUnconfiguredGroundLocomotion(
 	return IsMovingOnGround() && !HasAcceptedMovementSet() && !HasIndependentGroundRootMotion();
 }
 
-void UGGYGOCharacterMovementComponent::EnforceGroundLocomotionAdmission()
+void UGGYGOCharacterMovementComponent::EnforceGroundLocomotionAdmission(const TCHAR* Entry)
 {
-	EnforceMovementInputLocomotionAdmission();
+	EnforceMovementInputLocomotionAdmission(Entry);
 	if (ShouldRejectUnownedCurveGroundLocomotion())
 	{
 		const auto HasOwnedSource = [](const TArray<TSharedPtr<FRootMotionSource>>& Sources)
 		{
 			return Sources.ContainsByPredicate([](const TSharedPtr<FRootMotionSource>& Source)
 			{
-				return Source.IsValid() && IsOwnedLocomotionCurveSource(*Source);
+				return Source.IsValid() && IsOwnedLocomotionCurveSource(*Source)
+					&& !Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
 			});
 		};
-		const bool bHasRequest = ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
-			|| (bHasRequestedVelocity && ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER)
-			|| ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER
-			|| LocomotionMotionType != EGGYGOLocomotionMotionType::None
+		const bool bHasRequest = Acceleration.ContainsNaN() || ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
+			|| (bHasRequestedVelocity && (RequestedVelocity.ContainsNaN()
+				|| ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER))
+			|| (!HasNativePassiveGroundVelocity()
+				&& (Velocity.ContainsNaN() || ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER))
+			|| CurveMotion.bHasCurveSource || GetUnsupportedGroundRootMotionSource()
 			|| HasOwnedSource(CurrentRootMotion.RootMotionSources)
 			|| HasOwnedSource(CurrentRootMotion.PendingAddRootMotionSources);
 		if (bHasRequest && !bGroundAdmissionDiagnosticReported && !bMovementInputAdmissionDiagnosticReported)
@@ -3345,9 +3450,11 @@ void UGGYGOCharacterMovementComponent::EnforceGroundLocomotionAdmission()
 
 	const FRootMotionSource* UnsupportedSource = GetUnsupportedGroundRootMotionSource();
 	const bool bHasGroundRequest = UnsupportedSource
-		|| ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
-		|| (bHasRequestedVelocity && ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER)
-		|| ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER;
+		|| Acceleration.ContainsNaN() || ProjectToGravityFloor(Acceleration).SizeSquared() > KINDA_SMALL_NUMBER
+		|| (bHasRequestedVelocity && (RequestedVelocity.ContainsNaN()
+			|| ProjectToGravityFloor(RequestedVelocity).SizeSquared() > KINDA_SMALL_NUMBER))
+		|| (!HasNativePassiveGroundVelocity()
+			&& (Velocity.ContainsNaN() || ProjectToGravityFloor(Velocity).SizeSquared() > KINDA_SMALL_NUMBER));
 	if (bHasGroundRequest && MovementInputBindingSerial != 0
 		&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::Admitted
 			|| LocomotionRequestAdmission == ELocomotionRequestAdmission::Released))
@@ -3366,7 +3473,8 @@ void UGGYGOCharacterMovementComponent::EnforceGroundLocomotionAdmission()
 	}
 
 	// Preserve the gravity-axis component and all native mode/base/correction handling.
-	Velocity -= ProjectToGravityFloor(Velocity);
+	if (!HasNativePassiveGroundVelocity())
+		Velocity = Velocity.ContainsNaN() ? FVector::ZeroVector : Velocity - ProjectToGravityFloor(Velocity);
 }
 
 void UGGYGOCharacterMovementComponent::CalcVelocity(float DeltaTime, float Friction, bool bFluid, float BrakingDeceleration)
@@ -3375,10 +3483,27 @@ void UGGYGOCharacterMovementComponent::CalcVelocity(float DeltaTime, float Frict
 	if (ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
 		|| ShouldRejectUnownedCurveGroundLocomotion())
 	{
-		EnforceGroundLocomotionAdmission();
+		EnforceGroundLocomotionAdmission(TEXT("CalcVelocity"));
+		if (!HasNativePassiveGroundVelocity()) return;
+		// Only native braking consumes an admitted physical result. Keep the original request
+		// values for diagnosis/source processing, but none can accelerate this rejected interval.
+		const FVector OriginalAcceleration = Acceleration;
+		const bool bOriginalRequestedVelocity = bHasRequestedVelocity;
+		const bool bOriginalForceMaxAccel = bForceMaxAccel;
+		const bool bOriginalRVOAvoidance = bUseRVOAvoidance;
+		Acceleration = FVector::ZeroVector;
+		bHasRequestedVelocity = false;
+		bForceMaxAccel = false;
+		bUseRVOAvoidance = false;
+		Super::CalcVelocity(DeltaTime, Friction, bFluid, BrakingDeceleration);
+		Acceleration = OriginalAcceleration;
+		bHasRequestedVelocity = bOriginalRequestedVelocity;
+		bForceMaxAccel = bOriginalForceMaxAccel;
+		bUseRVOAvoidance = bOriginalRVOAvoidance;
 		return;
 	}
 	Super::CalcVelocity(DeltaTime, Friction, bFluid, BrakingDeceleration);
+	if (!GetUnsupportedGroundRootMotionSource()) MarkNativeMovementVelocityResult();
 }
 
 void UGGYGOCharacterMovementComponent::ApplyRootMotionToVelocity(float DeltaTime)
@@ -3388,17 +3513,77 @@ void UGGYGOCharacterMovementComponent::ApplyRootMotionToVelocity(float DeltaTime
 	{
 		// Reject at entry, including a removed Brake/TurnBack source's final application.
 		// Native RMS application must not switch to Falling before this frame is rejected.
-		EnforceGroundLocomotionAdmission();
+		EnforceGroundLocomotionAdmission(TEXT("ApplyRootMotionToVelocity.Entry"));
+		if (HasNativePassiveGroundVelocity() && CurrentRootMotion.HasOverrideVelocity())
+		{
+			// Native Walking/NavWalking skips CalcVelocity for any prepared Override, even
+			// one rejected here. Run its otherwise skipped braking once; never apply that RMS.
+			CalcVelocity(DeltaTime, GroundFriction, false, GetMaxBrakingDeceleration());
+		}
 		return;
 	}
+	const bool bSupportedNativeSource = HasAnimRootMotion() || !GetUnsupportedGroundRootMotionSource();
 	Super::ApplyRootMotionToVelocity(DeltaTime);
+	if (bSupportedNativeSource) MarkNativeMovementVelocityResult();
+	else bNativeVelocityIntervalCanRetain = false; // An unknown RMS cannot certify a passive result.
 	for (const auto& Base : CurrentRootMotion.RootMotionSources)
 	{
 		if (Base.IsValid() && Base->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()
 			&& Base->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared))
 			static_cast<FRootMotionSource_GGYGOActionCurve*>(Base.Get())->bPreparedContributionConsumed = true;
 	}
-	EnforceGroundLocomotionAdmission();
+	EnforceGroundLocomotionAdmission(TEXT("ApplyRootMotionToVelocity.Result"));
+}
+
+void UGGYGOCharacterMovementComponent::UpdateVelocityBeforeMovement(float DeltaSeconds)
+{
+	// PerformMovement applies Override directly before this hook, without calling our
+	// ApplyRootMotionToVelocity. Consume only this move's post-Before/pre-Prepare snapshot.
+	const TOptional<FVector> BeforeRootMotion = NativeVelocityBeforeRootMotion;
+	NativeVelocityBeforeRootMotion.Reset();
+	Super::UpdateVelocityBeforeMovement(DeltaSeconds);
+	if (!CurrentRootMotion.HasOverrideVelocity()
+		|| !(ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
+			|| ShouldRejectUnownedCurveGroundLocomotion())) return;
+
+	// This hook precedes StartNewPhysics, which alone raises bMovementInProgress.
+	// Before's same-owner/component snapshot identifies this pre-physics interval.
+	const bool bSameNativeInterval = bNativeVelocityIntervalOpen
+		&& NativeVelocityIntervalCharacter.IsValid() && NativeVelocityIntervalCharacter.Get() == CharacterOwner
+		&& NativeVelocityIntervalComponent.IsValid() && NativeVelocityIntervalComponent.Get() == UpdatedComponent;
+	if (bSameNativeInterval && BeforeRootMotion.IsSet() && !BeforeRootMotion->ContainsNaN())
+	{
+		// Deny the rejected Override's whole contribution, including Z. Only already-proven
+		// momentum can retain the snapshot's ground velocity; no previous frame is restored.
+		Velocity = bNativeVelocityIntervalCanRetain ? BeforeRootMotion.GetValue()
+			: BeforeRootMotion.GetValue() - ProjectToGravityFloor(BeforeRootMotion.GetValue());
+	}
+	else
+	{
+		// No current interval can certify this native override. Fail closed and diagnose below.
+		bNativeVelocityIntervalCanRetain = false;
+		NativeMovementVelocityResult.Reset();
+		Velocity = FVector::ZeroVector;
+	}
+	EnforceGroundLocomotionAdmission(TEXT("UpdateVelocityBeforeMovement"));
+}
+
+void UGGYGOCharacterMovementComponent::UpdateCharacterStateAfterMovement(float DeltaSeconds)
+{
+	Super::UpdateCharacterStateAfterMovement(DeltaSeconds);
+	if (bNativeVelocityIntervalOpen && NativeVelocityIntervalCharacter.IsValid()
+		&& NativeVelocityIntervalCharacter.Get() == CharacterOwner
+		&& NativeVelocityIntervalComponent.IsValid() && NativeVelocityIntervalComponent.Get() == UpdatedComponent
+		&& (bNativeVelocityIntervalCanRetain || CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy))
+	{
+		StoreNativeMovementVelocityResult();
+	}
+	else NativeMovementVelocityResult.Reset();
+	NativeVelocityBeforeRootMotion.Reset();
+	bNativeVelocityIntervalOpen = false;
+	bNativeVelocityIntervalCanRetain = false;
+	NativeVelocityIntervalCharacter.Reset();
+	NativeVelocityIntervalComponent.Reset();
 }
 
 bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const
@@ -3439,6 +3624,21 @@ void UGGYGOCharacterMovementComponent::RequestRunOnNextMove()
 
 void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float DeltaSeconds)
 {
+	BeginNativeMovementVelocityInterval();
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> VelocityIntervalSelf(this);
+	ON_SCOPE_EXIT
+	{
+		UGGYGOCharacterMovementComponent* Self = VelocityIntervalSelf.Get();
+		if (Self && !Self->IsBeingDestroyed() && Self->bNativeVelocityIntervalOpen
+			&& Self->NativeVelocityIntervalCharacter.IsValid()
+			&& Self->NativeVelocityIntervalCharacter.Get() == Self->CharacterOwner
+			&& Self->NativeVelocityIntervalComponent.IsValid()
+			&& Self->NativeVelocityIntervalComponent.Get() == Self->UpdatedComponent
+			&& !Self->Velocity.ContainsNaN())
+		{
+			Self->NativeVelocityBeforeRootMotion = Self->Velocity;
+		}
+	};
 	if (CharacterOwner && CharacterOwner->bClientUpdating
 		&& (ReplayLocomotionCurveInput.IsValid() || bLocomotionCurveReplayRejected))
 	{
@@ -3537,7 +3737,7 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float 
 			&& CharacterOwner->IsPlayingNetworkedRootMotionMontage();
 		if (!bWillExtractNetworkedMontage)
 		{
-			EnforceGroundLocomotionAdmission();
+			EnforceGroundLocomotionAdmission(TEXT("UpdateCharacterStateBeforeMovement"));
 		}
 		Super::UpdateCharacterStateBeforeMovement(DeltaSeconds);
 		return;
@@ -4443,7 +4643,7 @@ bool UGGYGOCharacterMovementComponent::TryUpdateLocomotion(
 {
 	if (IsMovementInputRequestBlocked() || ShouldRejectUnownedCurveGroundLocomotion())
 	{
-		EnforceGroundLocomotionAdmission();
+		EnforceGroundLocomotionAdmission(TEXT("TryUpdateLocomotion"));
 		return false;
 	}
 	const uint64 ExpectedRequestSerial = LocomotionRequestSerial;
@@ -4646,7 +4846,7 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 	if (ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
 		|| ShouldRejectUnownedCurveGroundLocomotion())
 	{
-		EnforceGroundLocomotionAdmission();
+		EnforceGroundLocomotionAdmission(TEXT("PhysicsRotation"));
 		return;
 	}
 	// 转身的曲线接管段（Turning / Braking）朝向由 `RootMotion_Yaw` 曲线驱动。
@@ -5125,8 +5325,30 @@ void UGGYGOCharacterMovementComponent::MoveAutonomous(
 		&& !HasIndependentGroundRootMotion() && !CharacterOwner->IsPlayingNetworkedRootMotionMontage()
 		&& (LocomotionRequestSerial != 0 || bOriginalReplay))
 	{
-		// An inapplicable original interval cannot cancel/replace a later request's native sources.
-		return;
+		// An inapplicable original request cannot simulate over a current successor. A trusted
+		// native interval may still brake its current physical baseline when no motor is live.
+		const bool bNoLiveLocomotion = LocomotionRequestAdmission != ELocomotionRequestAdmission::Admitted
+			&& LocomotionRequestAdmission != ELocomotionRequestAdmission::Released
+			&& !LocomotionCurveOrigin.IsValid() && !PendingLocomotionCurveInput.IsValid();
+		bool bCurrentNativeInterval = Frame && Frame->bEnteredNativeSimulation
+			&& IsMovementOwnerSyncReceiptCurrent(Frame->Receipt);
+		if (bOriginalReplay)
+		{
+			const FMovementInputReplayCapture& Capture = MovementInputReplayCapture.GetValue();
+			const bool bSameOwnerScope = Capture.OwnerScope.GetScopeSerial() == 0
+				? CharacterOwner->HasAuthority()
+				: IsMovementOwnerSyncContextCurrent(MovementOwnerSyncContext)
+					&& Capture.OwnerScope == MovementOwnerSyncContext->Scope;
+			bCurrentNativeInterval = bSameOwnerScope && Capture.Request.Binding == MovementInputBinding
+				&& Capture.Request.Request == MovementInputRequest
+				&& Capture.Request.ExecutionRequestSerial == LocomotionRequestSerial;
+		}
+		// Keep the old rejection of new jump/crouch/custom commands. Pure braking can use
+		// native simulation only when the supplied flags already match the current stance.
+		const uint8 CurrentPhysicsFlags = static_cast<uint8>((bForceWalkRequested ? GGYGOMovementConstants::ForceWalkFlag : 0)
+			| (bWantsToCrouch ? FSavedMove_Character::FLAG_WantsToCrouch : 0));
+		if (!bNoLiveLocomotion || !bCurrentNativeInterval || !HasNativePassiveGroundVelocity()
+			|| CharacterOwner->bPressedJump || CompressedFlags != CurrentPhysicsFlags) return;
 	}
 	const bool bOriginalReleased = (Frame && Frame->bSourceExecutionApplicable
 		&& Frame->OriginalSourceCheckpoint.RequestReleasedEventSerial != 0)
@@ -5217,8 +5439,27 @@ void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacter
 		bHasPendingAuthoritativeLocomotionState = true;
 	}
 
+	const TWeakObjectPtr<ACharacter> CorrectionCharacter(CharacterOwner);
+	const TWeakObjectPtr<USceneComponent> CorrectionComponent(UpdatedComponent.Get());
 	Super::ClientHandleMoveResponse(MoveResponse);
 	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (bNativeClient && MoveResponse.IsCorrection() && Self && Self->IsMovementOwnerSyncContextCurrent(Context)
+		&& CorrectionCharacter.IsValid() && Self->CharacterOwner == CorrectionCharacter.Get()
+		&& CorrectionComponent.IsValid() && Self->UpdatedComponent == CorrectionComponent.Get())
+	{
+		const FNetworkPredictionData_Client_Character* ClientData = Self->GetPredictionData_Client_Character();
+		if (ClientData && ClientData->bUpdatePosition && ClientData->LastAckedMove.IsValid()
+			&& ClientData->LastAckedMove->TimeStamp == MoveResponse.ClientAdjustment.TimeStamp
+			&& Self->Velocity.Equals(Self->GetLastUpdateVelocity(), KINDA_SMALL_NUMBER))
+		{
+			// Observe the actually accepted native correction, never its proposed payload or ACK.
+			// Replays then continue this authoritative physical baseline, not a future local result.
+			Self->StoreNativeMovementVelocityResult();
+			Self->NativeVelocityBeforeRootMotion.Reset();
+			Self->bNativeVelocityIntervalOpen = false;
+			Self->bNativeVelocityIntervalCanRetain = false;
+		}
+	}
 	if (bNativeClient && Self && Self->IsMovementOwnerSyncContextCurrent(Context)
 		&& Context->Notice.State == EGGYGOMovementOwnerSyncState::Waiting)
 	{

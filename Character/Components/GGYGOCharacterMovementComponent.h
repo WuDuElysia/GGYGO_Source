@@ -454,6 +454,8 @@ public:
 	//~UCharacterMovementComponent interface
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
+	virtual void StopMovementImmediately() override;
+	virtual void SetUpdatedComponent(USceneComponent* NewUpdatedComponent) override;
 
 	/** 保留 CMC 自身 Tick，只做 ActionMotion 资源回收；Locomotion 在 move 模拟入口推进。 */
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
@@ -464,14 +466,20 @@ public:
 	/** 地面最低模拟速度不得抬高本模块解算出的上限，包括合法的零速度。 */
 	virtual float GetMinAnalogSpeed() const override;
 
-	/** 未准入的普通地面移动不消费输入/RequestedMove，也不保留旧平面速度。 */
+	/** 未准入的地面请求不消费输入/RequestedMove；原生物理结果仅继续原生制动。 */
 	virtual void CalcVelocity(float DeltaTime, float Friction, bool bFluid, float BrakingDeceleration) override;
 
 	/** native RMS 最后应用帧也须经过地面准入；独立动作/实际动画 RootMotion 保持原生执行。 */
 	virtual void ApplyRootMotionToVelocity(float DeltaTime) override;
 
+	/** PerformMovement 的直接 Override 已应用；在胶囊移动前拒绝未准入的贡献。 */
+	virtual void UpdateVelocityBeforeMovement(float DeltaSeconds) override;
+
 	/** 每次 move（含回放）前解算步态。 */
 	virtual void UpdateCharacterStateBeforeMovement(float DeltaSeconds) override;
+
+	/** 在原生物理结束处保存同一胶囊的实际速度结果，不发布输入准入或动作请求。 */
+	virtual void UpdateCharacterStateAfterMovement(float DeltaSeconds) override;
 
 	/** 从压缩标志位取回 ForceWalk 输入请求；步态与动作段由服务端按自身配置重算。 */
 	virtual void UpdateFromCompressedFlags(uint8 Flags) override;
@@ -821,7 +829,7 @@ private:
 	/** No source request is invented for an unmigrated local curve execution. */
 	bool ShouldRejectUnownedCurveGroundLocomotion() const;
 	bool ShouldRejectMovementInputGroundLocomotion() const;
-	void EnforceMovementInputLocomotionAdmission();
+	void EnforceMovementInputLocomotionAdmission(const TCHAR* Entry);
 	void RevokeMovementInputRequest();
 	void CancelMovementInputLocomotion();
 	/** Only the current execution request may fail; failure is cleared only by a new RequestStarted. */
@@ -931,6 +939,31 @@ private:
 	FString LocomotionRequestFailureReason;
 	bool bMovementInputAdmissionDiagnosticReported = false;
 
+	/**
+	 * Derived native physics result, never a request, speed source or executor. Captured after
+	 * admitted CMC/action/native mode physics, before external movement-update delegates, or
+	 * an actually accepted native correction. Only the same character/component and unchanged
+	 * incoming ground velocity may continue it. Before/After bound the interval; an explicit
+	 * stop, component/owner change or EndPlay invalidates it. This completed-result cache
+	 * never restores velocity; the pre-root-motion snapshot below belongs only to the current interval.
+	 */
+	struct FNativeMovementVelocityResult
+	{
+		TWeakObjectPtr<ACharacter> Character;
+		TWeakObjectPtr<USceneComponent> Component;
+		FVector Velocity = FVector::ZeroVector;
+	};
+	TOptional<FNativeMovementVelocityResult> NativeMovementVelocityResult;
+	TWeakObjectPtr<ACharacter> NativeVelocityIntervalCharacter;
+	TWeakObjectPtr<USceneComponent> NativeVelocityIntervalComponent;
+	TOptional<FVector> NativeVelocityBeforeRootMotion;
+	bool bNativeVelocityIntervalOpen = false;
+	bool bNativeVelocityIntervalCanRetain = false;
+	bool HasNativePassiveGroundVelocity() const;
+	void BeginNativeMovementVelocityInterval();
+	void MarkNativeMovementVelocityResult();
+	void StoreNativeMovementVelocityResult();
+
 	/** 只从已接受配置指针派生，不代表原动画源本帧求值成功。 */
 	bool HasAcceptedMovementSet() const;
 
@@ -946,8 +979,8 @@ private:
 	/** 只判断缺少配置的普通地面执行，不合并曲线求值失败状态。 */
 	bool ShouldRejectUnconfiguredGroundLocomotion() const;
 
-	/** 拒绝时清平面速度；首次真实请求输出一次诊断，无请求的未绑定暂态不日志。 */
-	void EnforceGroundLocomotionAdmission();
+	/** 拒绝请求/无来源执行结果；原生动量单独收束，不成为输入准入。 */
+	void EnforceGroundLocomotionAdmission(const TCHAR* Entry);
 
 	/**
 	 * 仅诊断去重，不参与准入。初始 false，每次 Set 请求复位；C14 非空拒绝或

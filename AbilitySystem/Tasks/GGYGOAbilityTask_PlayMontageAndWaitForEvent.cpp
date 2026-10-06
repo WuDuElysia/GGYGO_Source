@@ -14,6 +14,7 @@
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
+#include "Misc/ScopeExit.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilityTask_PlayMontageAndWaitForEvent)
 
@@ -111,7 +112,7 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 {
 	check(IsInGameThread());
 	const TCHAR* Reason = nullptr;
-	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bCancellationRequested
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bCancellationRequested || bPoseFailureRequested
 		|| GetState() != EGameplayTaskState::AwaitingActivation)
 	{
 		Reason = TEXT("Task is not in its original pre-Ready AwaitingActivation state");
@@ -119,7 +120,7 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 	else if (NativeCallbackRegistration.IsValid()) { Reason = TEXT("a native callback package is already registered"); }
 	else if (!Callbacks.OnCompleted.IsBound() && !Callbacks.OnBlendOut.IsBound()
 		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound()
-		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound())
+		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound() && !Callbacks.OnFailed.IsBound())
 	{
 		Reason = TEXT("the native callback package has no bound callbacks");
 	}
@@ -137,7 +138,7 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 	// Delegate construction may execute capture code. Recheck before installing this exact package.
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
 	if (!Task || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || Task->bEndingTask
-		|| Task->bCancellationRequested || Task->GetState() != EGameplayTaskState::AwaitingActivation
+		|| Task->bCancellationRequested || Task->bPoseFailureRequested || Task->GetState() != EGameplayTaskState::AwaitingActivation
 		|| Task->NativeCallbackRegistration.IsValid())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -163,7 +164,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::UnregisterNativeCallbacks(FDe
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalCallback(
 	ENativeCallback Kind, const FGGYGOMontagePlayGuardIdentity& Original) const
 {
-	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bPoseFailureRequested
 		|| GetState() == EGameplayTaskState::Finished || !ShouldBroadcastAbilityTaskDelegates()) { return false; }
 	if (Kind == ENativeCallback::Cancelled)
 	{
@@ -179,7 +180,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalCallback(
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalInstanceFact(
 	const FGGYGOMontagePlayGuardIdentity& Original) const
 {
-	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bPoseFailureRequested
 		|| GetState() == EGameplayTaskState::Finished || !ShouldBroadcastAbilityTaskDelegates()
 		|| !MatchesOriginalMontageCallback(Original)) { return false; }
 	const UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
@@ -330,7 +331,7 @@ UGGYGOAbilityTask_PlayMontageAndWaitForEvent* UGGYGOAbilityTask_PlayMontageAndWa
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 {
-	if (bEndingTask || bCancellationRequested || GetState() == EGameplayTaskState::Finished) { return; }
+	if (bEndingTask || bCancellationRequested || bPoseFailureRequested || GetState() == EGameplayTaskState::Finished) { return; }
 	if (InFlightMontagePlayCleanup.IsValid() || OriginalGuardIdentity.CallId != 0)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("MontageTask [%s] 拒绝重复 Activate：原播放任务不可复用。"), *GetNameSafe(this));
@@ -372,6 +373,67 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(ASC);
 	const TWeakObjectPtr<UAnimMontage> OriginalMontage(MontageToPlay);
+	// A rejected Acquire resets its ticket. Preserve the actual unambiguous original slot
+	// before querying, so startup failure still identifies the caller's original resource.
+	const FName OriginalSlot = MontageToPlay->SlotAnimTracks.Num() == 1
+		? MontageToPlay->SlotAnimTracks[0].SlotName : NAME_None;
+	if (UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(AnimInstance))
+	{
+		FGGYGOActionPoseContractTicket AcquiredTicket;
+		FString Diagnostic;
+		const EGGYGOActionPoseContractAcquireResult Acquired = Guard->AcquireActionPoseContract(
+			OriginalMontage.Get(), AcquiredTicket, Diagnostic);
+		// Acquire waits at the native parallel barrier. Any completion callback may have
+		// ended this task/GA or changed ActorInfo; never install a ticket through that tail.
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+		if (!Task || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || Task->bEndingTask
+			|| Task->bCancellationRequested || Task->bPoseFailureRequested
+			|| Task->GetState() == EGameplayTaskState::Finished) { return; }
+		if (!OriginalAbility.IsValid() || !OriginalAbility->IsActive() || Task->Ability != OriginalAbility.Get())
+		{
+			Task->EndTask();
+			return;
+		}
+		if (!Task->IsActivatedActorInfoCurrent())
+		{
+			Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Startup, OriginalSlot,
+				TEXT("Original Task/Ability/ASC/ActorInfo/Owner/Avatar/Mesh/Anim context changed during pose contract Acquire."));
+			return;
+		}
+		if (Acquired == EGGYGOActionPoseContractAcquireResult::Rejected
+			|| Acquired == EGGYGOActionPoseContractAcquireResult::Unavailable)
+		{
+			Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Startup, OriginalSlot,
+				FString::Printf(TEXT("Pose contract Acquire result=%d; %s"), int32(Acquired), *Diagnostic));
+			return;
+		}
+		if (Acquired == EGGYGOActionPoseContractAcquireResult::RequiredReady)
+		{
+			if (OriginalSlot.IsNone() || !AcquiredTicket.IsValid() || AcquiredTicket.GetSlotName() != OriginalSlot)
+			{
+				Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Startup, OriginalSlot,
+					TEXT("RequiredReady did not issue a valid original ticket for this Montage's unique actual slot."));
+				return;
+			}
+			if (!Task->OnFailed.IsBound() && !(Task->NativeCallbackRegistration.IsValid()
+				&& Task->NativeCallbackRegistration->Callbacks.OnFailed.IsBound()))
+			{
+				Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Startup, OriginalSlot,
+					TEXT("Required pose contract has no pre-Ready native or Blueprint OnFailed consumer; playback was not started."));
+				return;
+			}
+			Task->ActionPoseContractTicket = MoveTemp(AcquiredTicket);
+			// PerformActivation registers ticking tasks after Activate returns. Required
+			// playback failures are therefore polled after the GA fixes its Ready result ID.
+			Task->bTickingTask = true;
+		}
+		else if (Acquired != EGGYGOActionPoseContractAcquireResult::ExplicitNotRequired)
+		{
+			Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Startup, OriginalSlot,
+				FString::Printf(TEXT("Unknown pose contract Acquire result=%d; %s"), int32(Acquired), *Diagnostic));
+			return;
+		}
+	}
 	const FGameplayAbilityActivationInfo OriginalActivationInfo = Ability->GetCurrentActivationInfo();
 	const bool bStopOnOwnerEnd = bStopWhenAbilityEnds;
 	const TSharedRef<FInFlightMontagePlayCleanup> Cleanup = MakeShared<FInFlightMontagePlayCleanup>();
@@ -389,7 +451,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		{
 			const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
 			// Pure Task liveness only. The ASC owns native activation/playback authentication.
-			return Task && !Task->bEndingTask && !Task->bCancellationRequested
+			return Task && !Task->bEndingTask && !Task->bCancellationRequested && !Task->bPoseFailureRequested
 				&& Task->GetState() != EGameplayTaskState::Finished
 				&& Task->Ability == OriginalAbility.Get() && OriginalAbility.IsValid()
 				&& Task->AbilitySystemComponent.Get() == OriginalASC.Get()
@@ -397,7 +459,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		});
 
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
-	const bool bTaskOpen = Task && !Task->bEndingTask && !Task->bCancellationRequested
+	const bool bTaskOpen = Task && !Task->bEndingTask && !Task->bCancellationRequested && !Task->bPoseFailureRequested
 		&& Task->GetState() != EGameplayTaskState::Finished;
 	const bool bOriginalAbilityActive = OriginalAbility.IsValid() && OriginalAbility->IsActive();
 	const bool bTaskCurrent = bTaskOpen && bOriginalAbilityActive
@@ -478,9 +540,57 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	Task->SetWaitingOnAvatar(); // May notify the ability; no member writes follow.
 }
 
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TickTask(float /*DeltaTime*/)
+{
+	check(IsInGameThread());
+	// This task performs no time accumulation, animation/position evaluation or movement.
+	// bTickingTask is enabled only by RequiredReady and retained through native deactivation.
+	if (!bTickingTask || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+		|| bCancellationRequested || bPoseFailureRequested || GetState() != EGameplayTaskState::Active) { return; }
+	const FName OriginalSlot = ActionPoseContractTicket.GetSlotName();
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const TWeakObjectPtr<UGameplayAbility> OriginalAbility = ActivatedAbility;
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC = ActivatedASC;
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
+	const FGGYGOActionPoseContractTicket OriginalTicket = ActionPoseContractTicket;
+	UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
+	if (!Guard || !IsActivatedActorInfoCurrent() || !Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuard))
+	{
+		FailActionPoseContract(EGGYGOMontageTaskFailureStage::Playback, OriginalSlot,
+			TEXT("Original pose provider, Task/Ability/ASC/ActorInfo context or playback Guard lifecycle is no longer current."));
+		return;
+	}
+	FString Diagnostic;
+	// Poll must see even an invalidated ticket; IsValid becoming false cannot skip failure.
+	const EGGYGOActionPoseContractPollResult Polled = Guard->PollActionPoseContract(OriginalTicket, Diagnostic);
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
+	if (!Task || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || Task->bEndingTask
+		|| Task->bCancellationRequested || Task->bPoseFailureRequested
+		|| Task->GetState() != EGameplayTaskState::Active) { return; }
+	if (!OriginalAbility.IsValid() || !OriginalAbility->IsActive() || Task->Ability != OriginalAbility.Get()
+		|| Task->AbilitySystemComponent.Get() != OriginalASC.Get())
+	{
+		Task->EndTask();
+		return;
+	}
+	Guard = Cast<UGGYGOMontageGuardAnimInstance>(Task->ActivatedAnimInstance.Get());
+	if (!Guard || !Task->IsActivatedActorInfoCurrent() || !Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuard))
+	{
+		Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Playback, OriginalSlot,
+			FString::Printf(TEXT("Original context changed during pose contract Poll (result=%d); %s"), int32(Polled), *Diagnostic));
+		return;
+	}
+	if (Polled != EGGYGOActionPoseContractPollResult::Valid)
+	{
+		Task->FailActionPoseContract(EGGYGOMontageTaskFailureStage::Playback, OriginalSlot,
+			FString::Printf(TEXT("Pose contract Poll result=%d; %s"), int32(Polled), *Diagnostic));
+	}
+	// No task access after failure callbacks. Never acquire a replacement ticket here.
+}
+
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ExternalCancel()
 {
-	if (bEndingTask || bCancellationRequested) { return; }
+	if (bEndingTask || bCancellationRequested || bPoseFailureRequested) { return; }
 	bCancellationRequested = true;
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	RequestInFlightMontageStop();
@@ -500,6 +610,8 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	// Close the subscription before any cleanup. Its captures stay stack-owned until all old
 	// cleanup and Super have returned, so their destructors cannot interrupt a member-write tail.
 	TSharedPtr<FNativeCallbackRegistration> DetachedNativeCallbacks = MoveTemp(NativeCallbackRegistration);
+	ActionPoseContractTicket.Reset();
+	// Keep bTickingTask until native deactivation removes this task from TickingTasks.
 	if (AbilityEnded && bStopWhenAbilityEnds) { RequestInFlightMontageStop(); }
 	InFlightMontagePlayCleanup.Reset(); // The original native call's stack still holds its obligation.
 	if (UGameplayAbility* OriginalAbility = ActivatedAbility.Get())
@@ -526,7 +638,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsNotifyValid() const
 {
 	const UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(ActivatedASC.Get());
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
-	return !bEndingTask && !bCancellationRequested && !bBlendingOut && IsActivatedActorInfoCurrent()
+	return !bEndingTask && !bCancellationRequested && !bPoseFailureRequested && !bBlendingOut && IsActivatedActorInfoCurrent()
 		&& ASC && OriginalPlayback.HasPlayback() && Instance && Instance->IsActive() && Instance->IsPlaying()
 		&& ASC->CheckMontagePlaybackOwnership(OriginalPlayback).Outcome == EGGYGOAbilityMontagePlaybackOutcome::Succeeded;
 }
@@ -555,7 +667,8 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::MatchesOriginalMontageCallbac
 	const FGGYGOMontagePlayGuardIdentity& Original) const
 {
 	// The engine queues a copy of the exact instance delegate. The instance may already be gone.
-	return !bEndingTask && !bCancellationRequested && Original.CallId != 0 && Original.CreatedInstanceId != INDEX_NONE
+	return !bEndingTask && !bCancellationRequested && !bPoseFailureRequested
+		&& Original.CallId != 0 && Original.CreatedInstanceId != INDEX_NONE
 		&& Original.CallId == OriginalGuardIdentity.CallId
 		&& Original.LifecycleGeneration == OriginalGuardIdentity.LifecycleGeneration
 		&& Original.CreatedInstanceId == MontageInstanceId
@@ -610,6 +723,107 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailAndEndTask(
 	}
 }
 
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailActionPoseContract(
+	EGGYGOMontageTaskFailureStage Stage, FName SlotName, const FString& Diagnostic)
+{
+	check(IsInGameThread());
+	if (HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask || bCancellationRequested
+		|| bPoseFailureRequested || GetState() == EGameplayTaskState::Finished) { return; }
+
+	FGGYGOMontageTaskFailureFact Fact;
+	Fact.Montage = MontageToPlay;
+	Fact.MontageInstanceId = Stage == EGGYGOMontageTaskFailureStage::Playback ? MontageInstanceId : INDEX_NONE;
+	Fact.SlotName = SlotName;
+	Fact.Stage = Stage;
+	Fact.Diagnostic = Diagnostic;
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
+	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
+	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
+	const FGameplayAbilitySpecHandle OriginalSpecHandle = Ability ? Ability->GetCurrentAbilitySpecHandle() : FGameplayAbilitySpecHandle();
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
+	const FGGYGOAbilityMontagePlaybackHandle OriginalHandle = OriginalPlayback;
+	const TWeakObjectPtr<UAbilitySystemComponent> PlaybackASC = ActivatedASC;
+	const TWeakObjectPtr<UAnimMontage> OriginalMontage(MontageToPlay);
+	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = MoveTemp(NativeCallbackRegistration);
+	FGGYGOMontageTaskFailureBPDelegate BlueprintSnapshot = OnFailed;
+	OnFailed.Clear();
+	bPoseFailureRequested = true;
+	UE_LOG(LogGGYGOAbilitySystem, Error,
+		TEXT("[AbilitySystem.MontageTask.Pose] Task='%s' Ability='%s' ASC='%s' Avatar='%s' Mesh='%s' Anim='%s' Montage='%s' Slot='%s' Stage=%d Generation=%llu Call=%llu Instance=%d; %s"),
+		*GetPathName(), *GetPathNameSafe(OriginalAbility.Get()), *GetPathNameSafe(OriginalASC.Get()),
+		*GetPathNameSafe(ActivatedAvatarActor.Get()), *GetPathNameSafe(ActivatedMesh.Get()),
+		*GetPathNameSafe(ActivatedAnimInstance.Get()), *GetPathNameSafe(Fact.Montage.Get()),
+		*Fact.SlotName.ToString(), int32(Stage), OriginalGuard.LifecycleGeneration,
+		OriginalGuard.CallId, Fact.MontageInstanceId, *Fact.Diagnostic);
+
+	// Observe only this cleanup/delivery stack. IsActive alone cannot distinguish End ->
+	// reactivate of the same GA UObject; this does not issue a second activation identity.
+	const TSharedRef<bool> OriginalAbilityEnded = MakeShared<bool>(false);
+	FDelegateHandle EndedHandle;
+	if (UGameplayAbility* Owner = OriginalAbility.Get())
+	{
+		EndedHandle = Owner->OnGameplayAbilityEndedWithData.AddLambda(
+			[OriginalAbility, OriginalSpecHandle, OriginalAbilityEnded](const FAbilityEndedData& Data)
+			{
+				if (Data.AbilityThatEnded.Get() == OriginalAbility.Get() && Data.AbilitySpecHandle == OriginalSpecHandle)
+				{
+					*OriginalAbilityEnded = true;
+				}
+			});
+	}
+	ON_SCOPE_EXIT
+	{
+		if (UGameplayAbility* Owner = OriginalAbility.Get())
+		{
+			Owner->OnGameplayAbilityEndedWithData.Remove(EndedHandle);
+		}
+	};
+
+	RequestInFlightMontageStop();
+	ReleaseRootMotionScaleLease();
+	if (Stage == EGGYGOMontageTaskFailureStage::Playback)
+	{
+		StopOriginalMontageInstance(OriginalGuard, OriginalHandle, PlaybackASC, OriginalMontage, OriginalTask);
+	}
+	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get())
+	{
+		if (!Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->EndTask(); }
+	}
+
+	const auto Recheck = [&]() -> UGGYGOAbilityTask_PlayMontageAndWaitForEvent*
+	{
+		// Native OnDestroy clears Ability and marks the Task as garbage. This synchronous
+		// historical envelope reads the surviving original object, never a live successor.
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get(true);
+		return Task && !Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) && Task->bPoseFailureRequested
+			&& !*OriginalAbilityEnded && OriginalAbility.IsValid() && OriginalAbility->IsActive()
+			&& OriginalAbility.HasSameIndexAndSerialNumber(Task->ActivatedAbility)
+			&& OriginalASC.IsValid() && OriginalASC.HasSameIndexAndSerialNumber(Task->ActivatedASC)
+			? Task : nullptr;
+	};
+	// Historical failure is delivered after EndTask. Its original GA receiver authenticates
+	// activation/step/resource; requiring a live montage or an Active Task would swallow it.
+	if (Recheck() && NativeSnapshot.IsValid()) { NativeSnapshot->Callbacks.OnFailed.ExecuteIfBound(Fact); }
+	NativeSnapshot.Reset(); // Capture destruction may end/reactivate the GA too.
+	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Recheck())
+	{
+		const TSharedPtr<FGameplayAbilityActorInfo> OriginalInfo = Task->ActivatedActorInfo.Pin();
+		const FGameplayAbilityActorInfo* CurrentInfo = OriginalASC->AbilityActorInfo.Get();
+		if (OriginalInfo.IsValid() && CurrentInfo == OriginalInfo.Get()
+			&& OriginalAbility->GetCurrentActorInfo() == CurrentInfo
+			&& Task->ActivatedOwnerActor.IsValid() && Task->ActivatedAvatarActor.IsValid()
+			&& Task->ActivatedMesh.IsValid() && Task->ActivatedAnimInstance.IsValid()
+			&& CurrentInfo->AbilitySystemComponent.Get() == OriginalASC.Get()
+			&& CurrentInfo->OwnerActor == Task->ActivatedOwnerActor && CurrentInfo->AvatarActor == Task->ActivatedAvatarActor
+			&& CurrentInfo->SkeletalMeshComponent == Task->ActivatedMesh
+			&& CurrentInfo->GetAnimInstance() == Task->ActivatedAnimInstance.Get())
+		{
+			BlueprintSnapshot.Broadcast(Fact);
+		}
+	}
+	// No task or old resource access after BP; scope exit only removes our exact temporary observer.
+}
+
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ReleaseRootMotionScaleLease()
 {
 	const uint64 OriginalToken = RootMotionScaleLeaseToken;
@@ -626,7 +840,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::StopPlayingMontage()
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnAbilityCancelled()
 {
-	if (bEndingTask || bCancellationRequested) { return; }
+	if (bEndingTask || bCancellationRequested || bPoseFailureRequested) { return; }
 	bCancellationRequested = true;
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	RequestInFlightMontageStop();
@@ -649,7 +863,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOutForInstan
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut(UAnimMontage* Montage, bool bInterrupted)
 {
-	if (bEndingTask || bCancellationRequested || bBlendingOut || Montage != MontageToPlay) { return; }
+	if (bEndingTask || bCancellationRequested || bPoseFailureRequested || bBlendingOut || Montage != MontageToPlay) { return; }
 	bBlendingOut = true;
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	const FGGYGOAbilityMontagePlaybackHandle Playback = OriginalPlayback;
@@ -699,7 +913,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageSectionChangedForIns
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* Montage, bool bInterrupted)
 {
-	if (bEndingTask || bCancellationRequested || Montage != MontageToPlay) { return; }
+	if (bEndingTask || bCancellationRequested || bPoseFailureRequested || Montage != MontageToPlay) { return; }
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	ReleaseRootMotionScaleLease();
 	// Dispatch authenticates the original Ended fact, not current ASC ownership or an active instance.

@@ -13,6 +13,8 @@ public class GGYGO : ModuleRules
 			"Core",
 			"CoreUObject",
 			"Engine",
+			// Action pose slot derives from the native slot; its public struct exposes this dependency.
+			"AnimGraphRuntime",
 			"InputCore",
 			"EnhancedInput",
 			"GameplayAbilities",

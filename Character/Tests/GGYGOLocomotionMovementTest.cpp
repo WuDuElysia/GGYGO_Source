@@ -4,6 +4,7 @@
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
+#include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
@@ -1050,6 +1051,91 @@ bool FGGYGOLocomotionFailedRequestRecoveryTest::RunTest(const FString& Parameter
 	if (!Consume(MakeFact(EKind::RequestStarted, 3, 8, EMode::Invalid, EProof::ReleasedThenPhysicalPress),
 		EResult::Recorded, TEXT("Qualified healthy source request3 starts"))) return false;
 	if (!EvaluateHealthy(TEXT("Only qualified request3 restores real healthy sample and speed"))) return false;
+
+	// Continue the same recovered request through real native physics. Positive momentum is
+	// produced by CMC, not injected as an expected result or turned into another input request.
+	AActor* FloorOwner = World->SpawnActor<AActor>();
+	if (!TestNotNull(TEXT("Native momentum blocking-floor owner"), FloorOwner)) return false;
+	UBoxComponent* Floor = NewObject<UBoxComponent>(FloorOwner);
+	FloorOwner->SetRootComponent(Floor);
+	Floor->SetBoxExtent(FVector(1000.0, 1000.0, 20.0));
+	Floor->SetCollisionProfileName(TEXT("BlockAll"));
+	Floor->RegisterComponent();
+	const FVector FloorOrigin(10000.0, 0.0, 0.0);
+	Floor->SetWorldLocation(FloorOrigin - FVector(0.0, 0.0, 20.0));
+	Character->SetActorLocation(FloorOrigin + FVector(0.0, 0.0,
+		Character->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() + 2.15));
+	Move->SetMovementMode(MOVE_Falling);
+	Move->SetMovementMode(MOVE_Walking);
+	Move->bRunPhysicsWithNoController = true; // This public-consumer fixture has no PlayerController.
+	Move->StopMovementImmediately();
+	const FVector NativeStart = Character->GetActorLocation();
+	Move->MoveAutonomous(0.0f, 0.05f, 0, FVector(2048.0, 0.0, 0.0));
+	const FVector NativeVelocity = Move->Velocity;
+	if (!TestTrue(TEXT("Admitted request3 produces native grounded velocity and capsule movement"),
+		Move->IsMovingOnGround() && NativeVelocity.X > 32.0 && FMath::Abs(NativeVelocity.Y) < 0.001
+			&& Character->GetActorLocation().X - NativeStart.X > 1.0)) return false;
+
+	FGGYGOMovementInputFact Unresolved = MakeFact(EKind::SourceUnresolved, 3, 9, EMode::Invalid, EProof::Invalid);
+	Unresolved.Reason = FName(TEXT("NativeMomentumSourceRetired"));
+	FString UnresolvedError;
+	if (!TestTrue(TEXT("Original request3 source retires explicitly"),
+		Move->ConsumeMovementInputFact(BindingCleanup.Binding, Unresolved, UnresolvedError) == EResult::Recorded
+			&& UnresolvedError.Contains(Unresolved.Reason.ToString()))) return false;
+	if (!TestTrue(TEXT("Source retirement does not hard-stop its admitted native physical result"),
+		Move->Velocity.Equals(NativeVelocity, 0.0001))) return false;
+	const FVector CoastStart = Character->GetActorLocation();
+	Move->MoveAutonomous(0.0f, 0.005f, 0, FVector::ZeroVector);
+	const FVector CoastVelocity = Move->Velocity;
+	if (!TestTrue(TEXT("No request retains finite native braking and real capsule displacement"),
+		Move->IsMovingOnGround() && CoastVelocity.X > 0.0 && CoastVelocity.X < NativeVelocity.X
+			&& FMath::Abs(CoastVelocity.Y) < 0.001 && Character->GetActorLocation().X > CoastStart.X
+			&& !Move->HasMoveInput() && !Move->GetCurveMotion().bHasCurveSource && Move->GetMaxSpeed() == 0.0f)) return false;
+
+	// An unowned Override must neither drive nor suppress the otherwise skipped native braking.
+	// It belongs to this fixture; production rejection must leave its resource for its owner.
+	const auto UnownedSource = MakeShared<FRootMotionSource_ConstantForce>();
+	UnownedSource->InstanceName = FName(TEXT("UnownedGroundAdmissionProbe"));
+	UnownedSource->Priority = 200;
+	UnownedSource->Duration = 1.0f;
+	UnownedSource->AccumulateMode = ERootMotionAccumulateMode::Override;
+	UnownedSource->Force = FVector(0.0, 512.0, 0.0);
+	const uint16 UnownedSourceId = Move->ApplyRootMotionSource(UnownedSource);
+	if (!TestTrue(TEXT("Native fixture installs its explicit unowned source"),
+		UnownedSourceId != static_cast<uint16>(ERootMotionSourceID::Invalid))) return false;
+	Move->RequestDirectMove(FVector(0.0, 128.0, 0.0), false);
+	const FVector RejectedStart = Character->GetActorLocation();
+	// This genuine rejection retains its production Error, in addition to the two old FAILED errors.
+	Move->MoveAutonomous(0.0f, 0.002f, 0, FVector(0.0, 2048.0, 0.0));
+	const FVector RejectedVelocity = Move->Velocity;
+	if (!TestTrue(TEXT("Unadmitted acceleration, RequestedVelocity and RMS cannot drive retained momentum"),
+		RejectedVelocity.X > 0.0 && RejectedVelocity.X < CoastVelocity.X
+			&& FMath::Abs(RejectedVelocity.Y) < 0.001 && Character->GetActorLocation().X > RejectedStart.X
+			&& FMath::Abs(Character->GetActorLocation().Y - RejectedStart.Y) < 0.001
+			&& !Move->HasMoveInput() && !Move->GetCurveMotion().bHasCurveSource && Move->GetMaxSpeed() == 0.0f))
+	{
+		AddInfo(FString::Printf(TEXT("GGYGO_NATIVE_MOMENTUM_REJECTION_FAILED CoastVelocity='%s' RejectedVelocity='%s' CapsuleDelta='%s' Mode=%d HasInput=%d HasCurveSource=%d MaxSpeed=%f Override=%d"),
+			*CoastVelocity.ToString(), *RejectedVelocity.ToString(), *(Character->GetActorLocation() - RejectedStart).ToString(),
+			static_cast<int32>(Move->MovementMode), Move->HasMoveInput() ? 1 : 0,
+			Move->GetCurveMotion().bHasCurveSource ? 1 : 0, Move->GetMaxSpeed(), Move->CurrentRootMotion.HasOverrideVelocity() ? 1 : 0));
+		return false;
+	}
+	const TSharedPtr<FRootMotionSource> RetainedUnownedSource = Move->GetRootMotionSourceByID(UnownedSourceId);
+	if (!TestTrue(TEXT("Admission rejection does not remove another source owner's resource"),
+		RetainedUnownedSource.IsValid() && RetainedUnownedSource->InstanceName == UnownedSource->InstanceName)) return false;
+	Move->RemoveRootMotionSourceByID(UnownedSourceId);
+
+	// A stopped result cannot license even the same numeric velocity later written externally.
+	Move->StopMovementImmediately();
+	Move->Velocity = RejectedVelocity; // Deliberate unowned result for the negative boundary only.
+	const FVector UnownedVelocityStart = Character->GetActorLocation();
+	Move->MoveAutonomous(0.0f, 0.002f, 0, FVector::ZeroVector);
+	if (!TestTrue(TEXT("An external write cannot borrow the stopped native result's provenance"),
+		Move->Velocity.SizeSquared2D() <= KINDA_SMALL_NUMBER
+			&& FVector::DistSquared2D(Character->GetActorLocation(), UnownedVelocityStart) <= KINDA_SMALL_NUMBER
+			&& !Move->HasMoveInput() && !Move->GetCurveMotion().bHasCurveSource && Move->GetMaxSpeed() == 0.0f)) return false;
+	AddInfo(FString::Printf(TEXT("GGYGO_NATIVE_MOMENTUM_BOUNDARY_COMPLETE Native='%s' Coast='%s' Rejected='%s' InputRequest=3 SourceRetired=1 NativeBraking=1 UnadmittedDriveRejected=1 UnownedRMSRetained=1 StoppedOriginRejected=1"),
+		*NativeVelocity.ToString(), *CoastVelocity.ToString(), *RejectedVelocity.ToString()));
 
 	const FString ConsumerPath = Move->GetPathName();
 	const FString OwnerPath = Character->GetPathName();

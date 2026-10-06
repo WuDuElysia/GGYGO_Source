@@ -12,21 +12,23 @@
  *
  * 合成一个 Task 后，Montage 一结束事件监听就一起结束，不会有跨动画的串音。
  *
- * ## 四种结束路径的区别
+ * ## 结束路径的区别
  * | 委托 | 触发时机 | 能力通常该做什么 |
  * |---|---|---|
  * | `OnCompleted`   | 原实例播到自然结尾 | 调用方验证原能力生命周期后正常收尾 |
  * | `OnBlendOut`    | 开始混出（还没播完） | 提前允许下一个动作衔接 |
  * | `OnInterrupted` | 被别的 Montage 顶掉 | 中断收尾，不结算未完成的判定 |
  * | `OnCancelled`   | 能力自身被取消 | 同上，且要清理已施加的状态 |
+ * | `OnFailed`      | 必需姿态依赖失败，原 Task 已清理 | 核原激活与资源后按必需故障结束能力 |
  *
- * 分开而不是合成一个"结束了"回调，是因为动作游戏里这四种情况的后续处理不同：
+ * 分开而不是合成一个"结束了"回调，是因为这些情况的后续处理不同：
  * 自然结束要结算收招硬直，被打断则不该结算。
  */
 #pragma once
 
 #include "Abilities/Tasks/AbilityTask.h"
 #include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
+#include "Animation/Runtime/GGYGOActionPoseContract.h"
 #include "GameplayTagContainer.h"
 
 #include "GGYGOAbilityTask_PlayMontageAndWaitForEvent.generated.h"
@@ -84,6 +86,38 @@ struct GGYGO_API FGGYGOMontageSectionSnapshot
 DECLARE_DELEGATE_OneParam(FGGYGOMontageSectionFactDelegate, const FGGYGOMontageSectionFact&);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOMontageSectionFactBPDelegate, FGGYGOMontageSectionFact, SectionFact);
 
+UENUM(BlueprintType)
+enum class EGGYGOMontageTaskFailureStage : uint8
+{
+	Startup,
+	Playback
+};
+
+/** Required pose dependency failure from this task's original resource, after its cleanup.
+ * A consumer must authenticate its original ability activation/step/task before ending it.
+ * Native EndTask cleared Task.Ability and marked this sender Garbage. A historical receiver
+ * can use its captured weak task's Get(true), rejecting RF destruction, without live-task checks. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOMontageTaskFailureFact
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	TObjectPtr<UAnimMontage> Montage = nullptr;
+	/** Startup has no issued playback and reports INDEX_NONE. */
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	int32 MontageInstanceId = INDEX_NONE;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	FName SlotName = NAME_None;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	EGGYGOMontageTaskFailureStage Stage = EGGYGOMontageTaskFailureStage::Startup;
+	UPROPERTY(BlueprintReadOnly, Category = "Ability|Tasks")
+	FString Diagnostic;
+};
+
+DECLARE_DELEGATE_OneParam(FGGYGOMontageTaskFailureDelegate, const FGGYGOMontageTaskFailureFact&);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOMontageTaskFailureBPDelegate, FGGYGOMontageTaskFailureFact, FailureFact);
+
 /**
  * Montage 任务的回调。
  *
@@ -112,6 +146,7 @@ public:
 		FGGYGOPlayMontageAndWaitForEventDelegate OnCancelled;
 		FGGYGOPlayMontageAndWaitForEventDelegate EventReceived;
 		FGGYGOMontageSectionFactDelegate SectionReceived;
+		FGGYGOMontageTaskFailureDelegate OnFailed;
 	};
 
 	/** One nonempty registration, only in native AwaitingActivation before ReadyForActivation.
@@ -131,6 +166,8 @@ public:
 	bool TryGetOriginalSectionSnapshot(FGGYGOMontageSectionSnapshot& OutSnapshot) const;
 
 	virtual void Activate() override;
+	/** Required contracts only: read Animation's original lease through UE's task scheduler. */
+	virtual void TickTask(float DeltaTime) override;
 	virtual void ExternalCancel() override;
 	virtual FString GetDebugString() const override;
 	virtual void OnDestroy(bool AbilityEnded) override;
@@ -183,6 +220,11 @@ public:
 	UPROPERTY(BlueprintAssignable)
 	FGGYGOMontageSectionFactBPDelegate SectionReceived;
 
+	/** Required pose failure after this original task has stopped and released its resources.
+	 * This is independent of user cancellation and may be received from a finished task. */
+	UPROPERTY(BlueprintAssignable)
+	FGGYGOMontageTaskFailureBPDelegate OnFailed;
+
 private:
 	friend class FGGYGOMontageTaskLifecycleTest;
 	struct FInFlightMontagePlayCleanup;
@@ -211,6 +253,8 @@ private:
 	void RequestInFlightMontageStop();
 	/** 可定位失败后只取消并结束本 Task；外调返回时重检原 Task。 */
 	void FailAndEndTask(const TCHAR* Reason, const FGGYGOAbilityMontagePlaybackResult* Result = nullptr);
+	/** Pose failures stop this original resource even when owner-end playback is configured off. */
+	void FailActionPoseContract(EGGYGOMontageTaskFailureStage Stage, FName SlotName, const FString& Diagnostic);
 	/** 释放本任务持有的 root motion scale token。 */
 	void ReleaseRootMotionScaleLease();
 
@@ -284,8 +328,12 @@ private:
 	bool bBlendingOut = false;
 	/** 本 Task 的取消通知只执行一次，阻止 native/BP 回调重入重复释放/广播。 */
 	bool bCancellationRequested = false;
+	/** Terminal delivery guard only; Animation owns the pose contract and its failure state. */
+	bool bPoseFailureRequested = false;
 	/** Subscription resource only; no GA activation identity, playback state or execution authority. */
 	TSharedPtr<FNativeCallbackRegistration> NativeCallbackRegistration;
+	/** Animation owns validation/failure state; this opaque lease never upgrades to new context. */
+	FGGYGOActionPoseContractTicket ActionPoseContractTicket;
 	FGGYGOAbilityMontagePlaybackHandle OriginalPlayback;
 	FGGYGOMontagePlayGuardIdentity OriginalGuardIdentity;
 	/** 与调用栈共持停止义务，Task 被结束/销毁也不丢失；完整播放返回后释放。 */

@@ -184,6 +184,7 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 #include "TimerManager.h"
 #include "UObject/UnrealType.h"
 #if WITH_EDITOR
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Editor.h"
@@ -240,6 +241,12 @@ struct FGGYGOPlayerComboLifecycleFixture
 	{
 		if (!Production || !Production->ComboSteps.IsValidIndex(Production->CurrentStep)) { return false; }
 		OutStep = Production->ComboSteps[Production->CurrentStep];
+		return true;
+	}
+	static bool ReadProductionFirstStep(const UGGYGOPlayerComboAbility* Production, FGGYGOComboStep& OutStep)
+	{
+		if (!Production || !Production->ComboSteps.IsValidIndex(0)) { return false; }
+		OutStep = Production->ComboSteps[0];
 		return true;
 	}
 	static bool ProductionResourcesReleased(const UGGYGOPlayerComboAbility* Production, UWorld* ProductionWorld)
@@ -1687,12 +1694,14 @@ bool FGGYGOPlayerComboRuntimeHitBuilderFailureTest::RunTest(const FString& Param
 #if WITH_EDITOR
 namespace
 {
+	enum class EComboPoseFailureProbe : uint8 { None, StartupMissingDeclaration, RuntimeInvalidated };
 	/** A finite production PIE smoke. Automation observes; UE alone runs input, animation and movement frames. */
 	class FComboEndProductionPIECommand : public IAutomationLatentCommand
 	{
 	public:
-		FComboEndProductionPIECommand(FAutomationTestBase& InTest, bool bInHeldDuringMain)
-			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), OuterWorld(GWorld),
+		FComboEndProductionPIECommand(FAutomationTestBase& InTest, bool bInHeldDuringMain,
+			EComboPoseFailureProbe InPoseProbe = EComboPoseFailureProbe::None)
+			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), PoseProbe(InPoseProbe), OuterWorld(GWorld),
 			OuterViewport(GEngine ? GEngine->GameViewport.Get() : nullptr) {}
 		virtual ~FComboEndProductionPIECommand() override
 		{
@@ -1727,6 +1736,10 @@ namespace
 				return false;
 			}
 			if (!IsProductionChainCurrent()) { Fail(TEXT("original world/player/pawn/input/ASC/mesh/scope or viewport focus changed")); return false; }
+			if (Stage == EStage::PoseWaitFailure) { VerifyPoseFailure(); return false; }
+			if (Stage == EStage::PoseSuccessorPress) { StartPoseSuccessor(); return false; }
+			if (Stage == EStage::PoseSuccessorMain) { ObservePoseSuccessorMain(); return false; }
+			if (Stage == EStage::PoseSuccessorEnd) { ObservePoseSuccessorEnd(); return false; }
 			if (Stage == EStage::Main) { TryCaptureMain(); return false; }
 			if (Stage == EStage::End) { ObserveNaturalEnd(); return false; }
 			if (Stage == EStage::Cancel)
@@ -1739,11 +1752,17 @@ namespace
 		}
 
 	private:
-		enum class EStage : uint8 { Start, Player, Main, End, Cancel, Locomotion, Ending, Done };
+		enum class EStage : uint8 { Start, Player, Main, End, Cancel, Locomotion, Ending, Done, PoseWaitFailure, PoseSuccessorMain, PoseSuccessorEnd, PoseSuccessorPress };
 		void Fail(const FString& Reason)
 		{
 			if (bFailed) { return; }
 			bFailed = true;
+			if (PoseProbe != EComboPoseFailureProbe::None)
+			{
+				Test.AddError(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s Stage=%u World=%s GA=%s Instance=%d: %s"),
+					PoseCaseName(), static_cast<uint32>(Stage), *GetPathNameSafe(World.Get()), *GetPathNameSafe(Ability.Get()), InstanceId, *Reason));
+				return;
+			}
 			Test.AddError(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] Case=%s Stage=%u World=%s Pawn=%s GA=%s Instance=%d: %s"),
 				bHeldDuringMain ? TEXT("HeldDuringMain") : TEXT("NewPressDuringEnd"), static_cast<uint32>(Stage),
 				*GetPathNameSafe(World.Get()), *GetPathNameSafe(Character.Get()), *GetPathNameSafe(Ability.Get()), InstanceId, *Reason));
@@ -2034,6 +2053,7 @@ namespace
 			{
 				Fail(TEXT("native focus did not preserve the original Cold first-press/Ready chain")); return;
 			}
+			if (PoseProbe != EComboPoseFailureProbe::None && !PreparePoseProbe()) { return; }
 			EndHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data) { ObserveAbilityEnd(Data); });
 			CompletedHandle = ProductionASC->OnAbilityTerminationCompleted().AddLambda([this](const FGGYGOAbilityTerminationCompletedNotice& Notice)
 			{
@@ -2041,11 +2061,17 @@ namespace
 				{
 					++CompletedCount; Completion = Notice;
 				}
+				else if (PoseProbe != EComboPoseFailureProbe::None && PoseSuccessorActivation.HasActivation()
+					&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(PoseSuccessorActivation))
+				{
+					++PoseSuccessorCompletedCount; PoseSuccessorCompletion = Notice;
+				}
 			});
 			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeSlateRoute Map=%s GameMode=%s PC=%s Pawn=%s GA=%s Source=%s Origin=%s InputConfig=%s AttackKey=%s Scope=%llu. Automated native events; no HID/network/Cook claim."),
 				*EditorMap, *GetPathNameSafe(World->GetAuthGameMode()), *PC->GetPathName(), *Pawn->GetPathName(), *Combo->GetPathName(),
 				*Source->GetPathName(), *Origin->GetPathName(), *Config->GetPathName(), *AttackKey.ToString(), static_cast<unsigned long long>(Scope.GetScopeSerial())));
 			Stage = EStage::Main;
+			if (PoseProbe == EComboPoseFailureProbe::StartupMissingDeclaration) { Stage = EStage::PoseWaitFailure; }
 			Deadline = FPlatformTime::Seconds() + 10.0;
 			bAttackDown = true;
 			SendNativeKey(AttackKey, true);
@@ -2163,6 +2189,7 @@ namespace
 			SendNativeKey(AttackKey, false); bAttackDown = false;
 			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] OriginalMain Montage=%s Instance=%d Position=%.6f End=[%.6f,%.6f)."),
 				*Montage->GetPathName(), InstanceId, Snapshot.PositionSeconds, EndStart, EndEnd));
+			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated) { BeginPoseRuntimeFault(); return; }
 			Stage = EStage::End;
 			Deadline = FPlatformTime::Seconds() + 10.0;
 			if (bHeldDuringMain) { bWDown = true; SendNativeKey(EKeys::W, true); }
@@ -2213,6 +2240,7 @@ namespace
 		void ObserveAbilityEnd(const FAbilityEndedData& Data)
 		{
 			if (Data.AbilityThatEnded != Ability.Get()) { return; }
+			if (PoseProbe != EComboPoseFailureProbe::None) { ObservePoseAbilityEnd(Data); return; }
 			++EndCount; EndData = Data;
 			if (Data.AbilitySpecHandle != SpecHandle || !OriginalActivation.HasActivation())
 			{
@@ -2322,8 +2350,294 @@ namespace
 				OriginalMovement->IsCurveDrivingSpeed(), *Policy, OriginalASC->GetTagCount(GGYGOGameplayTags::State_WalkLoop),
 				OriginalASC->GetTagCount(GGYGOGameplayTags::State_RunStart), OriginalASC->GetTagCount(GGYGOGameplayTags::State_RunLoop)));
 		}
+		const TCHAR* PoseCaseName() const
+		{
+			return PoseProbe == EComboPoseFailureProbe::StartupMissingDeclaration
+				? TEXT("StartupMissingDeclaration") : TEXT("RuntimeInvalidatedUncancelable");
+		}
+		bool PreparePoseProbe()
+		{
+			FGGYGOComboStep Step;
+			UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(AnimInstance.Get());
+			if (!Guard || !FGGYGOPlayerComboLifecycleFixture::ReadProductionFirstStep(Ability.Get(), Step)
+				|| !Step.Montage || Step.Montage->SlotAnimTracks.Num() != 1
+				|| Guard->RequiredPoseCorrectionSlot.IsNone() || Guard->RequiredPoseCorrectionSlot != Step.MotionSlotName
+				|| Step.Montage->SlotAnimTracks[0].SlotName != Step.MotionSlotName)
+			{
+				Fail(TEXT("requires the actual migrated production ABP and its declared unique original correction slot")); return false;
+			}
+			FString Diagnostic;
+			const EGGYGOActionPoseContractAcquireResult Acquired = Guard->AcquireActionPoseContract(Step.Montage, PoseOriginalTicket, Diagnostic);
+			if (!IsProductionChainCurrent() || AnimInstance.Get() != Guard
+				|| Acquired != EGGYGOActionPoseContractAcquireResult::RequiredReady || !PoseOriginalTicket.IsValid()
+				|| PoseOriginalTicket.GetSlotName() != Step.MotionSlotName)
+			{
+				Fail(FString::Printf(TEXT("actual baseline RequiredReady is unavailable (result=%u): %s"), static_cast<uint32>(Acquired), *Diagnostic)); return false;
+			}
+			PoseGuard = Guard;
+			PoseMeshAsset = Mesh->GetSkeletalMeshAsset();
+			SavedPoseSlot = Guard->RequiredPoseCorrectionSlot;
+			Montage = Step.Montage;
+			MainSection = Step.MainSection; EndSection = Step.EndSection;
+			FAutomationTestExecutionInfo Info;
+			Test.GetExecutionInfo(Info);
+			PoseDiagnosticStart = Info.GetEntries().Num();
+			PoseActivatedHandle = ASC->AbilityActivatedCallbacks.AddLambda([this](UGameplayAbility* Activated)
+			{
+				if (Activated != Ability.Get()) { return; }
+				const FGGYGOAbilityActivationHandle Captured = Ability->CaptureCurrentActivation();
+				if (!Captured.HasActivation()) { Fail(TEXT("native activated callback did not expose its issued original identity")); return; }
+				if (!OriginalActivation.HasActivation()) { OriginalActivation = Captured; }
+				else if (Stage == EStage::PoseSuccessorMain && !Captured.HasSameActivation(OriginalActivation)) { PoseSuccessorActivation = Captured; }
+				else { Fail(TEXT("unexpected activation replaced the pose probe's original or successor")); }
+			});
+			if (!PoseActivatedHandle.IsValid()) { Fail(TEXT("native activation observation installation failed")); return false; }
+			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated)
+			{
+				PosePolicyProperty = FindFProperty<FEnumProperty>(UGGYGOGameplayAbility::StaticClass(), TEXT("SelfPolicy"));
+				if (!PosePolicyProperty || PosePolicyProperty->GetEnum() != StaticEnum<EGGYGOAbilitySelfPolicy>())
+				{
+					Fail(TEXT("existing reflected SelfPolicy enum is unavailable; cannot establish the legal uncancelable mode")); return false;
+				}
+				SavedPoseSelfPolicy = Ability->GetSelfPolicy();
+				bSavedPoseCanCancel = Ability->CanBeCanceled();
+				bPosePolicyModified = true;
+				PosePolicyProperty->GetUnderlyingProperty()->SetIntPropertyValue(PosePolicyProperty->ContainerPtrToValuePtr<void>(Ability.Get()),
+					static_cast<int64>(EGGYGOAbilitySelfPolicy::Exclusive));
+				if (Ability->GetSelfPolicy() != EGGYGOAbilitySelfPolicy::Exclusive)
+				{
+					Fail(TEXT("test instance did not accept its existing Exclusive configuration")); return false;
+				}
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s BaselineRequiredReady=1 Anim=%s Mesh=%s Montage=%s Slot=%s; actual compiled production provider, no fabricated ticket or asset changes."),
+				PoseCaseName(), *Guard->GetPathName(), *Mesh->GetPathName(), *Step.Montage->GetPathName(), *SavedPoseSlot.ToString()));
+			if (PoseProbe == EComboPoseFailureProbe::StartupMissingDeclaration)
+			{
+				bPoseSlotModified = true;
+				Guard->RequiredPoseCorrectionSlot = NAME_None; // GT-only role declaration; the actual producer stays intact.
+				FGGYGOActionPoseContractTicket RejectedTicket;
+				const EGGYGOActionPoseContractAcquireResult Rejected = Guard->AcquireActionPoseContract(Step.Montage, RejectedTicket, Diagnostic);
+				if (!IsProductionChainCurrent() || Rejected != EGGYGOActionPoseContractAcquireResult::Rejected || RejectedTicket.IsValid())
+				{
+					Fail(TEXT("missing role declaration did not reject the real compiled producer before playback: ") + Diagnostic); return false;
+				}
+			}
+			return true;
+		}
+		void BeginPoseRuntimeFault()
+		{
+			PoseOriginalTaskPath = GetPathNameSafe(MontageTask.Get());
+			FailedPoseTask.Reset(MontageTask.Get());
+			static_cast<UGameplayAbility*>(Ability.Get())->SetCanBeCanceled(false);
+			bPoseUncancelableBeforeFault = !Ability->CanBeCanceled();
+			const FGGYGOAbilityTerminationResult Cancel = Ability->RequestAbilityCancel(OriginalActivation, true);
+			if (!bPoseUncancelableBeforeFault || Cancel.Outcome != EGGYGOAbilityTerminationOutcome::Rejected
+				|| Cancel.Reason != EGGYGOAbilityTerminationReason::NotCancelable || !Ability->IsActive()
+				|| !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation) || !Movement->HasActiveActionMotion()
+				|| !IsProductionChainCurrent() || PoseGuard.Get() != AnimInstance.Get())
+			{
+				Fail(TEXT("legal Exclusive original did not reject user cancellation while retaining its exact Main resources")); return;
+			}
+			Stage = EStage::PoseWaitFailure;
+			Deadline = FPlatformTime::Seconds() + 10.0;
+			bPoseSlotModified = true;
+			PoseGuard->RequiredPoseCorrectionSlot = NAME_None;
+			FString Diagnostic;
+			const EGGYGOActionPoseContractPollResult Polled = PoseGuard->PollActionPoseContract(PoseOriginalTicket, Diagnostic);
+			if (Polled != EGGYGOActionPoseContractPollResult::Invalidated)
+			{
+				Fail(TEXT("original real ticket did not invalidate after its own role declaration changed: ") + Diagnostic); return;
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s UserCancelRejected=1 OriginalInstance=%d TicketInvalidated=1; waiting for original UE Task Tick, no manual Tick or failure injection."), PoseCaseName(), InstanceId));
+		}
+		bool PoseResourcesRestored() const
+		{
+			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated)
+			{
+				return ResourcesRestored() && !MontageTask->OnFailed.IsBound();
+			}
+			return FGGYGOPlayerComboLifecycleFixture::ProductionResourcesReleased(Ability.Get(), World.Get())
+				&& Movement.IsValid() && !Movement->HasActiveActionMotion() && !Movement->IsMovementBlockedByTag()
+				&& Trace.IsValid() && !Trace->IsTracing() && Mesh.IsValid()
+				&& Mesh->VisibilityBasedAnimTickOption == SavedTick && Mesh->bEnableUpdateRateOptimizations == bSavedURO
+				&& HasMeshPrerequisite() == bSavedPrerequisite && Character.IsValid()
+				&& Character->GetAnimRootMotionTranslationScale() == SavedRootScale;
+		}
+		void ObservePoseAbilityEnd(const FAbilityEndedData& Data)
+		{
+			if (Data.AbilitySpecHandle != SpecHandle) { Fail(TEXT("pose native End changed the original Spec")); return; }
+			if (Stage == EStage::PoseSuccessorMain || Stage == EStage::PoseSuccessorEnd)
+			{
+				++PoseSuccessorEndCount;
+				bPoseSuccessorCancelled = Data.bWasCancelled;
+				bPoseSuccessorResourcesAtEnd = ResourcesRestored();
+				return;
+			}
+			++EndCount; EndData = Data;
+			bResourcesRestoredAtEnd = PoseResourcesRestored();
+			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated)
+			{
+				FAnimMontageInstance* Instance = AnimInstance->GetMontageInstanceForID(InstanceId);
+				bEndSnapshotAvailable = Instance && Instance->Montage == Montage.Get();
+				if (bEndSnapshotAvailable)
+				{
+					EndPosition = Instance->GetPosition(); EndedSection = Instance->GetCurrentSection();
+					bStoppedAtEnd = Instance->IsStopped() || !Instance->IsActive();
+				}
+			}
+			else
+			{
+				FAnimMontageInstance* Active = AnimInstance->GetActiveMontageInstance();
+				bPoseStartupNoPlayback = (!Active || Active->Montage != Montage.Get()) && ASC->GetCurrentMontage() != Montage.Get();
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s NativeEnd Cancelled=%d Instance=%d Snapshot=%d Stopped=%d Position=%.6f StartupNoPlayback=%d ResourcesRestored=%d."),
+				PoseCaseName(), Data.bWasCancelled, InstanceId, bEndSnapshotAvailable, bStoppedAtEnd, EndPosition, bPoseStartupNoPlayback, bResourcesRestoredAtEnd));
+		}
+		bool HasPoseFailureDiagnostics() const
+		{
+			FAutomationTestExecutionInfo Info;
+			Test.GetExecutionInfo(Info); // Read the unfiltered events; never remove/expect/suppress a production Error.
+			const FString Owner = FString::Printf(TEXT("Ability='%s'"), *GetPathNameSafe(Ability.Get()));
+			const FString Asset = FString::Printf(TEXT("Montage='%s'"), *GetPathNameSafe(Montage.Get()));
+			const FString Slot = FString::Printf(TEXT("Slot='%s'"), *SavedPoseSlot.ToString());
+			const FString StageText = FString::Printf(TEXT(" Stage=%d "), PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated ? 1 : 0);
+			const FString InstanceSpace = FString::Printf(TEXT(" Instance=%d "), InstanceId);
+			const FString InstanceSemi = FString::Printf(TEXT(" Instance=%d;"), InstanceId);
+			int32 TaskFacts = 0, GAFacts = 0, EndResults = 0;
+			for (int32 Index = PoseDiagnosticStart; Index < Info.GetEntries().Num(); ++Index)
+			{
+				const FString& Message = Info.GetEntries()[Index].Event.Message;
+				if (!Message.Contains(Owner) || !Message.Contains(Asset) || !Message.Contains(Slot)
+					|| !Message.Contains(StageText) || (!Message.Contains(InstanceSpace) && !Message.Contains(InstanceSemi))) { continue; }
+				if (!PoseOriginalTaskPath.IsEmpty() && !Message.Contains(FString::Printf(TEXT("Task='%s'"), *PoseOriginalTaskPath))) { continue; }
+				if (Message.Contains(TEXT("[AbilitySystem.MontageTask.Pose]"))
+					&& (PoseProbe != EComboPoseFailureProbe::StartupMissingDeclaration || Message.Contains(TEXT("Call=0 ")))) { ++TaskFacts; }
+				if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RequiredDependencyFailed"))) { ++GAFacts; }
+				if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult"))
+					&& (Message.Contains(TEXT(" Outcome=1 ")) || Message.Contains(TEXT(" Outcome=2 "))
+						|| Message.Contains(TEXT(" Outcome=3 ")) || Message.Contains(TEXT(" Outcome=4 ")))) { ++EndResults; }
+			}
+			return TaskFacts == 1 && GAFacts == 1 && EndResults == 1;
+		}
+		void RestorePoseProbeConfiguration()
+		{
+			if (bPoseSlotModified)
+			{
+				if (!PoseGuard.IsValid() || PoseGuard.Get() != AnimInstance.Get() || !Mesh.IsValid()
+					|| Mesh->GetAnimInstance() != PoseGuard.Get() || Mesh->GetSkeletalMeshAsset() != PoseMeshAsset.Get())
+				{
+					Fail(TEXT("original provider/model changed; cannot restore the probe declaration onto another instance"));
+				}
+				else { PoseGuard->RequiredPoseCorrectionSlot = SavedPoseSlot; }
+				bPoseSlotModified = false;
+			}
+			if (bPosePolicyModified)
+			{
+				if (!Ability.IsValid() || !PosePolicyProperty) { Fail(TEXT("original test instance policy cannot be restored")); }
+				else if (Ability->IsActive() && !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation))
+				{
+					Fail(TEXT("another activation owns the same GA instance; cannot restore old probe policy onto it"));
+				}
+				else
+				{
+					static_cast<UGameplayAbility*>(Ability.Get())->SetCanBeCanceled(bSavedPoseCanCancel);
+					PosePolicyProperty->GetUnderlyingProperty()->SetIntPropertyValue(PosePolicyProperty->ContainerPtrToValuePtr<void>(Ability.Get()),
+						static_cast<int64>(SavedPoseSelfPolicy));
+					if (Ability->GetSelfPolicy() != SavedPoseSelfPolicy || Ability->CanBeCanceled() != bSavedPoseCanCancel)
+					{
+						Fail(TEXT("original policy/cancellation permission restore did not match its saved values"));
+					}
+				}
+				bPosePolicyModified = false;
+			}
+		}
+		void VerifyPoseFailure()
+		{
+			if (EndCount == 0 || CompletedCount == 0) { return; }
+			const bool bRuntime = PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated;
+			if (EndCount != 1 || CompletedCount != 1 || !OriginalActivation.HasActivation() || !EndData.bWasCancelled
+				|| !Completion.HasCompletion() || Completion.GetReason() != EGGYGOAbilityTerminationReason::None
+				|| Completion.GetOriginal().GetRequestKind() != EGGYGOAbilityTerminationRequestKind::End
+				|| Ability->IsActive() || !bResourcesRestoredAtEnd || !PoseResourcesRestored() || !HasPoseFailureDiagnostics()
+				|| (bRuntime ? (!bPoseUncancelableBeforeFault || !bEndSnapshotAvailable || !bStoppedAtEnd
+					|| EndedSection != MainSection || !FMath::IsFinite(EndPosition) || EndPosition < 0.0f || EndPosition >= EndStart)
+					: (!bPoseStartupNoPlayback || InstanceId != INDEX_NONE)))
+			{
+				Fail(TEXT("exact typed pose failure/mandatory original End/Completed/cleanup proof failed; production diagnostics remain visible")); return;
+			}
+			RestorePoseProbeConfiguration();
+			if (bFailed || !IsProductionChainCurrent()) { return; }
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s OriginalFailureAssertions=PASS; source diagnostics retained, starting a genuine subsequent Attack."), PoseCaseName()));
+			if (bAttackDown) { SendNativeKey(AttackKey, false); bAttackDown = false; }
+			Stage = EStage::PoseSuccessorPress;
+			Deadline = FPlatformTime::Seconds() + 10.0;
+		}
+		void StartPoseSuccessor()
+		{
+			// A real UE frame commits our own key-up before a separate real key-down.
+			if (Ability->IsActive() || PlayerInput->IsPressed(AttackKey) || !PoseResourcesRestored())
+			{
+				Fail(TEXT("own original release/cleanup was not committed before successor native input")); return;
+			}
+			Stage = EStage::PoseSuccessorMain;
+			bAttackDown = true; SendNativeKey(AttackKey, true);
+		}
+		void ObservePoseSuccessorMain()
+		{
+			if (PoseSuccessorEndCount != 0) { Fail(TEXT("successor ended before its genuine Main observation")); return; }
+			if (!Ability->IsActive()) { return; }
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get());
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!Task || !Task->TryGetOriginalSectionSnapshot(Snapshot)) { return; }
+			FAnimMontageInstance* OldInstance = InstanceId != INDEX_NONE ? AnimInstance->GetMontageInstanceForID(InstanceId) : nullptr;
+			if (!PoseSuccessorActivation.HasActivation() || PoseSuccessorActivation.HasSameActivation(OriginalActivation)
+				|| !Ability->CaptureCurrentActivation().HasSameActivation(PoseSuccessorActivation)
+				|| Snapshot.Montage != Montage.Get() || Snapshot.SectionName != MainSection || Snapshot.MontageInstanceId == INDEX_NONE
+				|| Snapshot.MontageInstanceId == InstanceId || Task == FailedPoseTask.Get() || !Movement->HasActiveActionMotion()
+				|| (OldInstance && !OldInstance->IsStopped() && OldInstance->IsActive())
+				|| !HasPoseFailureDiagnostics() || (FailedPoseTask.Get() && FailedPoseTask->GetState() != EGameplayTaskState::Finished))
+			{
+				Fail(TEXT("old failure affected successor identity/Main/CMC resources or replayed its failure envelope")); return;
+			}
+			MontageTask.Reset(Task);
+			InputTask.Reset(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()));
+			if (!InputTask.Get()) { Fail(TEXT("successor original input Task is unavailable")); return; }
+			SendNativeKey(AttackKey, false); bAttackDown = false;
+			Stage = EStage::PoseSuccessorEnd;
+			Deadline = FPlatformTime::Seconds() + 10.0;
+		}
+		void ObservePoseSuccessorEnd()
+		{
+			if (PoseSuccessorEndCount == 0 || PoseSuccessorCompletedCount == 0)
+			{
+				if (PoseSuccessorEndCount > 1 || PoseSuccessorCompletedCount > 1
+					|| (PoseSuccessorEndCount == 0 && PoseSuccessorCompletedCount == 0
+						&& (!Ability->IsActive() || !Ability->CaptureCurrentActivation().HasSameActivation(PoseSuccessorActivation))))
+				{
+					Fail(TEXT("successor activation vanished before its natural End/Completed"));
+				}
+				// Native End may precede controlled Completed; retain the existing bounded deadline.
+				return;
+			}
+			if (PoseSuccessorEndCount != 1 || PoseSuccessorCompletedCount != 1 || bPoseSuccessorCancelled
+				|| !PoseSuccessorCompletion.HasCompletion() || PoseSuccessorCompletion.GetReason() != EGGYGOAbilityTerminationReason::None
+				|| PoseSuccessorCompletion.GetOriginal().GetRequestKind() != EGGYGOAbilityTerminationRequestKind::End
+				|| !bPoseSuccessorResourcesAtEnd || !ResourcesRestored() || Ability->IsActive() || !HasPoseFailureDiagnostics()
+				|| (FailedPoseTask.Get() && FailedPoseTask->GetState() != EGameplayTaskState::Finished))
+			{
+				Fail(TEXT("successor did not naturally complete with exact resource cleanup independent of the old failure")); return;
+			}
+			bPoseBehaviorVerified = true;
+			BeginEnding();
+		}
 		void ReleaseGameplayObservations()
 		{
+			if (PoseProbe != EComboPoseFailureProbe::None)
+			{
+				RestorePoseProbeConfiguration();
+				if (ASC.IsValid()) { ASC->AbilityActivatedCallbacks.Remove(PoseActivatedHandle); }
+				PoseActivatedHandle.Reset();
+			}
 			if (OwnerSyncObserver.GetObserverSerial() != 0)
 			{
 				FString Error;
@@ -2411,7 +2725,14 @@ namespace
 				GWorld == OuterWorld && GEngine && GEngine->GameViewport.Get() == OuterViewport);
 			if (!bFailed && bReleased && bGlobalsRestored)
 			{
-				Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] PASS: strict End cancellation, normal locomotion and original native PIE teardown observed."));
+				if (PoseProbe == EComboPoseFailureProbe::None)
+				{
+					Test.AddInfo(TEXT("[Combat.PlayerCombo.EndProductionSmoke] PASS: strict End cancellation, normal locomotion and original native PIE teardown observed."));
+				}
+				else if (bPoseBehaviorVerified)
+				{
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s BehaviorAssertions=PASS including original cleanup, natural successor and owned PIE teardown. Production Error events remain unfiltered; this does not override the Automation result."), PoseCaseName()));
+				}
 			}
 			Stage = EStage::Done;
 			return true;
@@ -2419,6 +2740,7 @@ namespace
 
 		FAutomationTestBase& Test;
 		const bool bHeldDuringMain;
+		const EComboPoseFailureProbe PoseProbe;
 		EStage Stage = EStage::Start;
 		bool bFailed = false, bSawPreBegin = false, bPIEStarted = false;
 		bool bStartupCaptured = false, bLoggedOwnerWait = false;
@@ -2442,6 +2764,21 @@ namespace
 		EGGYGOQualifiedMovementIntentQueryResult EndIntentResult = EGGYGOQualifiedMovementIntentQueryResult::Unavailable;
 		FAbilityEndedData EndData;
 		FGGYGOAbilityTerminationCompletedNotice Completion;
+		FGGYGOAbilityActivationHandle PoseSuccessorActivation;
+		FGGYGOAbilityTerminationCompletedNotice PoseSuccessorCompletion;
+		FGGYGOActionPoseContractTicket PoseOriginalTicket;
+		TWeakObjectPtr<UGGYGOMontageGuardAnimInstance> PoseGuard;
+		TWeakObjectPtr<USkeletalMesh> PoseMeshAsset;
+		TStrongObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> FailedPoseTask;
+		FEnumProperty* PosePolicyProperty = nullptr;
+		FName SavedPoseSlot;
+		FString PoseOriginalTaskPath;
+		EGGYGOAbilitySelfPolicy SavedPoseSelfPolicy = EGGYGOAbilitySelfPolicy::Coexist;
+		bool bSavedPoseCanCancel = true, bPoseSlotModified = false, bPosePolicyModified = false;
+		bool bPoseUncancelableBeforeFault = false, bPoseStartupNoPlayback = false, bPoseBehaviorVerified = false;
+		bool bPoseSuccessorCancelled = false, bPoseSuccessorResourcesAtEnd = false;
+		int32 PoseDiagnosticStart = 0, PoseSuccessorEndCount = 0, PoseSuccessorCompletedCount = 0;
+		FDelegateHandle PoseActivatedHandle;
 		FDelegateHandle PreHandle, PostHandle, EndHandle, CompletedHandle;
 		TWeakObjectPtr<UEditorEngine> Editor;
 		TWeakObjectPtr<ULevelEditorPlaySettings> RequestSettings;
@@ -2487,6 +2824,24 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndProductionNewPressTest,
 bool FGGYGOPlayerComboEndProductionNewPressTest::RunTest(const FString& Parameters)
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboPoseStartupMissingTest,
+	"GGYGO.AbilitySystem.PlayerCombo.PoseFailure.ProductionNativeStartupMissing",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboPoseStartupMissingTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::StartupMissingDeclaration));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboPoseRuntimeInvalidatedTest,
+	"GGYGO.AbilitySystem.PlayerCombo.PoseFailure.ProductionNativeRuntimeInvalidatedUncancelable",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboPoseRuntimeInvalidatedTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::RuntimeInvalidated));
 	return true;
 }
 #endif // WITH_EDITOR
