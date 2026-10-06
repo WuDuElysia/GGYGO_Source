@@ -3,6 +3,7 @@
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/Components/GGYGOHealthComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Components/SceneComponent.h"
 #include "GameFramework/Pawn.h"
 
@@ -17,11 +18,10 @@ public:
 	AGGYGOCombatantDeathProjectionTestPawn(
 		const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-	/** Register the production HealthSet contract, then initialize Owner/Avatar ActorInfo. */
-	void InitializeAbilitySystemForTest(AActor* AvatarActor);
-
 	UGGYGOAbilitySystemComponent* GetASCForTest() const { return AbilitySystemComponent; }
+	UGGYGOHealthSet* GetHealthSetForTest() const { return HealthSet; }
 	UGGYGOHealthComponent* GetHealthForTest() const { return HealthComponent; }
+	UGGYGOPawnExtensionComponent* GetExtensionForTest() const { return PawnExtension; }
 
 private:
 	UPROPERTY(VisibleAnywhere)
@@ -35,6 +35,9 @@ private:
 
 	UPROPERTY(VisibleAnywhere)
 	TObjectPtr<UGGYGOHealthComponent> HealthComponent;
+
+	UPROPERTY(VisibleAnywhere)
+	TObjectPtr<UGGYGOPawnExtensionComponent> PawnExtension;
 };
 
 UCLASS(Transient)
