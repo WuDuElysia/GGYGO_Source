@@ -7,7 +7,8 @@
 
 class UAnimMontage;
 
-/** 每段一个 Main→End Montage；时间窗口只在 Montage 上配置。 */
+/** 每段一个 Main→End Montage；同一 CMC 资源执行完整自然轨迹，End 仅放开真实移动打断。
+ *  时间窗口与原生混出时机在 Montage 上配置。 */
 USTRUCT(BlueprintType)
 struct GGYGO_API FGGYGOComboStep
 {
@@ -19,7 +20,7 @@ struct GGYGO_API FGGYGOComboStep
 	FName MainSection = TEXT("Main");
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
 	FName EndSection = TEXT("End");
-	/** 原 Montage 动作曲线所在 Slot；必须显式配置，不选择第一个或默认 Slot。 */
+	/** 原 Montage 的 Main→End 动作曲线所在 Slot；必须显式配置，不选择第一个或默认 Slot。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion")
 	FName MotionSlotName = NAME_None;
 	/** 原动画厘米位移的显式倍率；Avatar 实际缩放由 CMC 仅应用一次。 */

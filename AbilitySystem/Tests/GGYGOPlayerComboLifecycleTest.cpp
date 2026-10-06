@@ -509,12 +509,24 @@ struct FGGYGOPlayerComboLifecycleFixture
 			&& bWorldCleared && bMontageCallbackCleared && bInputCallbackCleared && bHitSubscriptionCleared
 			&& bMeshRestoreFlagCleared && bPrerequisiteFlagCleared && Ability->CurrentStepToken == 0;
 	}
+	void SetCompletionGraceForTest(float Seconds) const { Ability->MontageCompletionGraceSeconds = Seconds; }
+	float GetExpectedCompletionTailBudget() const
+	{
+		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const Task = GetMontageTask();
+		FGGYGOMontageSectionSnapshot Snapshot;
+		if (!Task || !Task->TryGetOriginalSectionSnapshot(Snapshot) || !AnimInstance || !Montage || !Ability) { return -1.0f; }
+		const FAnimMontageInstance* const Playback = AnimInstance->GetMontageInstanceForID(Snapshot.MontageInstanceId);
+		return Playback && Playback->Montage == Montage
+			? Montage->GetDefaultBlendOutTime() * Playback->DefaultBlendTimeMultiplier + Ability->MontageCompletionGraceSeconds
+			: -1.0f;
+	}
 	float GetExpectedWatchdogRemainingFromCurrentTask() const
 	{
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const Task = GetMontageTask();
 		const float EffectiveRate = Task ? Task->GetEffectivePlayRate() : 0.0f;
-		return Montage && FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f
-			? Montage->GetPlayLength() / EffectiveRate + 2.0f
+		const float TailBudget = GetExpectedCompletionTailBudget();
+		return Montage && FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f && FMath::IsFinite(TailBudget) && TailBudget >= 0.0f
+			? Montage->GetPlayLength() / EffectiveRate + TailBudget
 			: -1.0f;
 	}
 	float GetExpectedWatchdogRemainingFromStartPosition(float StartPosition) const
@@ -523,8 +535,9 @@ struct FGGYGOPlayerComboLifecycleFixture
 		if (!Montage || !Task || !FMath::IsFinite(StartPosition)
 			|| StartPosition < 0.0f || StartPosition > Montage->GetPlayLength()) { return -1.0f; }
 		const float EffectiveRate = Task->GetEffectivePlayRate();
-		return FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f
-			? FMath::Max(0.0f, Montage->GetPlayLength() - StartPosition) / EffectiveRate + 2.0f
+		const float TailBudget = GetExpectedCompletionTailBudget();
+		return FMath::IsFinite(EffectiveRate) && EffectiveRate > 0.0f && FMath::IsFinite(TailBudget) && TailBudget >= 0.0f
+			? FMath::Max(0.0f, Montage->GetPlayLength() - StartPosition) / EffectiveRate + TailBudget
 			: -1.0f;
 	}
 };
@@ -867,7 +880,7 @@ bool FGGYGOPlayerComboActivationReentryTest::RunTest(const FString& Parameters)
 			|| !TestTrue(TEXT("旧 Montage Task 存在有限有效速率"),
 				FMath::IsFinite(OldEffectivePlayRate) && OldEffectivePlayRate > 0.0f)) { return false; }
 		const float NewExpectedWatchdog = Fixture.GetExpectedWatchdogRemainingFromCurrentTask();
-		const float OldRateWatchdog = Fixture.Montage->GetPlayLength() / OldEffectivePlayRate + 2.0f;
+		const float OldRateWatchdog = Fixture.Montage->GetPlayLength() / OldEffectivePlayRate + Fixture.GetExpectedCompletionTailBudget();
 		TestTrue(TEXT("重激活新段使用更快的有效播放速率"), NewMontageTask->GetEffectivePlayRate() > OldEffectivePlayRate);
 		TestTrue(TEXT("新激活 watchdog 保留其 Task 有效速率快照"),
 			FMath::IsNearlyEqual(Fixture.GetWatchdogRemaining(), NewExpectedWatchdog, 0.02f));
@@ -971,6 +984,11 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	FGGYGOPlayerComboLifecycleFixture Fixture;
 	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
 	const bool bHadMeshPrerequisiteBeforeActivation = Fixture.HasMeshPrerequisite();
+	// Explicit transient long-mix case: its native mix may outlast the completion grace.
+	// Production trigger/frame policy remains configured in its own Montage assets.
+	Fixture.Montage->BlendOutTriggerTime = 0.0f;
+	Fixture.Montage->BlendOut.SetBlendTime(3.0f);
+	Fixture.SetCompletionGraceForTest(0.1f);
 	const auto CheckActiveResources = [&](const FGGYGOAbilityActivationHandle& OriginalActivation,
 		const TCHAR* Label, float ExpectedStartPosition)
 	{
@@ -1002,6 +1020,9 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 			&& WatchdogRemaining > 0.0f && TestWorld.World->GetTimerManager().IsTimerActive(Fixture.GetWatchdogHandle())
 			&& FMath::IsNearlyEqual(WatchdogRemaining,
 				Fixture.GetExpectedWatchdogRemainingFromStartPosition(ExpectedStartPosition), 0.02f));
+		bPassed &= Check(TEXT("可配原生混出超过宽限时，watchdog仍覆盖完整混出与宽限"),
+			WatchdogRemaining > Fixture.Montage->GetDefaultBlendOutTime()
+			&& Fixture.GetExpectedCompletionTailBudget() > Fixture.Montage->GetDefaultBlendOutTime());
 		return bPassed;
 	};
 	const auto EndNormalActivation = [&](const FGGYGOAbilityActivationHandle& OriginalActivation, const TCHAR* Label)
@@ -2223,6 +2244,10 @@ namespace
 				Fail(TEXT("natural End has no remaining original timeline for new input")); return;
 			}
 			bSawNaturalEnd = true;
+			if (!Movement->HasActiveActionMotion())
+			{
+				Fail(TEXT("original CMC action resource was released at End entry before real movement input")); return;
+			}
 			if (!bHeldDuringMain)
 			{
 				const EGGYGOMovementInputOriginQualification Qualification = OriginalOrigin->GetQualification(PlayerInput.Get());
@@ -2602,6 +2627,14 @@ namespace
 			MontageTask.Reset(Task);
 			InputTask.Reset(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()));
 			if (!InputTask.Get()) { Fail(TEXT("successor original input Task is unavailable")); return; }
+			PoseSuccessorInstanceId = Snapshot.MontageInstanceId;
+			const int32 EndIndex = Montage->GetSectionIndex(EndSection);
+			if (EndIndex == INDEX_NONE) { Fail(TEXT("successor configured End is unavailable")); return; }
+			Montage->GetSectionStartAndEndTime(EndIndex, EndStart, EndEnd);
+			if (!FMath::IsFinite(EndStart) || !FMath::IsFinite(EndEnd) || EndEnd <= EndStart)
+			{
+				Fail(TEXT("successor original End range is invalid")); return;
+			}
 			SendNativeKey(AttackKey, false); bAttackDown = false;
 			Stage = EStage::PoseSuccessorEnd;
 			Deadline = FPlatformTime::Seconds() + 10.0;
@@ -2610,6 +2643,29 @@ namespace
 		{
 			if (PoseSuccessorEndCount == 0 || PoseSuccessorCompletedCount == 0)
 			{
+				FGGYGOMontageSectionSnapshot Snapshot;
+				if (PoseSuccessorEndCount == 0 && MontageTask.Get()
+					&& MontageTask->TryGetOriginalSectionSnapshot(Snapshot))
+				{
+					if (Snapshot.Montage != Montage.Get() || Snapshot.MontageInstanceId != PoseSuccessorInstanceId)
+					{
+						Fail(TEXT("successor natural End observation changed its original playback identity")); return;
+					}
+					if (Snapshot.SectionName == EndSection && Snapshot.PositionSeconds >= EndStart
+						&& Snapshot.PositionSeconds < EndEnd - KINDA_SMALL_NUMBER)
+					{
+						if (!bPoseSuccessorSawContinuousEnd)
+						{
+							if (!Movement->HasActiveActionMotion())
+							{
+								Fail(TEXT("successor lost the original CMC trajectory at natural End entry")); return;
+							}
+							Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] NaturalEndContinuous Montage=%s Instance=%d Position=%.6f EndEnd=%.6f ActionActive=1."),
+								*GetPathNameSafe(Montage.Get()), PoseSuccessorInstanceId, Snapshot.PositionSeconds, EndEnd));
+						}
+						bPoseSuccessorSawContinuousEnd = true;
+					}
+				}
 				if (PoseSuccessorEndCount > 1 || PoseSuccessorCompletedCount > 1
 					|| (PoseSuccessorEndCount == 0 && PoseSuccessorCompletedCount == 0
 						&& (!Ability->IsActive() || !Ability->CaptureCurrentActivation().HasSameActivation(PoseSuccessorActivation))))
@@ -2622,7 +2678,7 @@ namespace
 			if (PoseSuccessorEndCount != 1 || PoseSuccessorCompletedCount != 1 || bPoseSuccessorCancelled
 				|| !PoseSuccessorCompletion.HasCompletion() || PoseSuccessorCompletion.GetReason() != EGGYGOAbilityTerminationReason::None
 				|| PoseSuccessorCompletion.GetOriginal().GetRequestKind() != EGGYGOAbilityTerminationRequestKind::End
-				|| !bPoseSuccessorResourcesAtEnd || !ResourcesRestored() || Ability->IsActive() || !HasPoseFailureDiagnostics()
+				|| !bPoseSuccessorSawContinuousEnd || !bPoseSuccessorResourcesAtEnd || !ResourcesRestored() || Ability->IsActive() || !HasPoseFailureDiagnostics()
 				|| (FailedPoseTask.Get() && FailedPoseTask->GetState() != EGameplayTaskState::Finished))
 			{
 				Fail(TEXT("successor did not naturally complete with exact resource cleanup independent of the old failure")); return;
@@ -2776,8 +2832,9 @@ namespace
 		EGGYGOAbilitySelfPolicy SavedPoseSelfPolicy = EGGYGOAbilitySelfPolicy::Coexist;
 		bool bSavedPoseCanCancel = true, bPoseSlotModified = false, bPosePolicyModified = false;
 		bool bPoseUncancelableBeforeFault = false, bPoseStartupNoPlayback = false, bPoseBehaviorVerified = false;
-		bool bPoseSuccessorCancelled = false, bPoseSuccessorResourcesAtEnd = false;
+		bool bPoseSuccessorCancelled = false, bPoseSuccessorResourcesAtEnd = false, bPoseSuccessorSawContinuousEnd = false;
 		int32 PoseDiagnosticStart = 0, PoseSuccessorEndCount = 0, PoseSuccessorCompletedCount = 0;
+		int32 PoseSuccessorInstanceId = INDEX_NONE;
 		FDelegateHandle PoseActivatedHandle;
 		FDelegateHandle PreHandle, PostHandle, EndHandle, CompletedHandle;
 		TWeakObjectPtr<UEditorEngine> Editor;

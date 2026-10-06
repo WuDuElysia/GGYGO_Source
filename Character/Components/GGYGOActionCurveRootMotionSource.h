@@ -36,6 +36,8 @@ struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 	bool bNativeImported = false;
 	/** Derived native application evidence, copied with the original SavedMove source. */
 	bool bPreparedContributionConsumed = false;
+	/** Derived from successful original final-range evaluation; native application still has to consume it. */
+	bool bPreparedNaturalEnd = false;
 
 	virtual FRootMotionSource* Clone() const override;
 	virtual bool Matches(const FRootMotionSource* Other) const override;

@@ -158,6 +158,7 @@ DECLARE_DELEGATE_FourParams(FGGYGOQualifiedMovementIntentDelegate,
 	const FGGYGOQualifiedMovementIntent&, const FString&);
 
 DECLARE_DELEGATE_TwoParams(FGGYGOActionMotionFailureDelegate, int32, const FString&);
+DECLARE_DELEGATE_OneParam(FGGYGOActionMotionCompletionDelegate, int32);
 
 /** Immutable original action identity; native RMS owns time and per-move release state. */
 struct FGGYGOActionMotionResource
@@ -547,16 +548,23 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement|Action Motion")
 	void EndActionMotion(int32 Handle);
 
-	/** Original Montage XYZ trajectory; native Walking/NavWalking/Falling own collision and landing. */
+	/** Original complete Montage range, including an End start; native physics owns collision and landing. */
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, int32& OutHandle, FString& OutError);
+	/** Completed accepts the original Task's natural completion and drains the finite native tail.
+	 *  Acceptance is not motion completion; observe the consumed final interval separately. */
 	bool ReleaseMontageActionMotion(int32 OriginalHandle, EGGYGOActionMotionReleaseReason Reason, FString& OutError);
 	bool CancelMontageActionMotionForMovement(int32 OriginalHandle,
 		const FGGYGOQualifiedMovementIntent& OriginalIntent, FString& OutError);
 	/** Sole original GA failure recipient; release removes it before external cleanup. */
 	bool ObserveMontageActionMotionFailure(int32 OriginalHandle,
 		FGGYGOActionMotionFailureDelegate Callback, FString& OutError);
+	/** Sole original recipient, called after native physics consumes the final interval; exact late replay is allowed. */
+	bool ObserveMontageActionMotionCompletion(int32 OriginalHandle,
+		FGGYGOActionMotionCompletionDelegate Callback, FString& OutError);
+	/** Authenticated original Task non-interrupted BlendOut fact; permits only its configured finite tail. */
+	bool NotifyMontageActionNaturalBlendOut(int32 OriginalHandle, int32 OriginalMontageInstanceId, FString& OutError);
 	EGGYGOQualifiedMovementIntentQueryResult QueryQualifiedMovementIntent(
 		const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
 		FGGYGOQualifiedMovementIntent& OutIntent, FString& OutError) const;
@@ -1070,10 +1078,12 @@ protected:
 	void CleanupFinishedActionMotion();
 
 	friend struct FRootMotionSource_GGYGOActionCurve;
-	bool ValidateMontageActionRuntime(const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const;
+	bool ValidateMontageActionRuntime(const FRootMotionSource_GGYGOActionCurve& Source,
+		float SimulationTime, FString& OutError) const;
 	bool IsMontageActionMovementModeSupported() const;
 	void FailMontageActionMotion(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource, const FString& Error);
 	void NeutralizeMontageActionSource(const TSharedPtr<const FGGYGOActionMotionResource>& OriginalResource);
+	void PublishMontageActionMotionCompletion();
 	void ResumeLocomotionAfterAction();
 	void PublishQualifiedMovementIntent();
 	void RetireQualifiedMovementIntent(const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FName Reason);
@@ -1083,11 +1093,17 @@ protected:
 	uint64 QualifiedMovementIntentPublicationSerial = 0;
 	int32 QualifiedMovementIntentReplayDepth = 0;
 	TSharedPtr<const FGGYGOActionMotionResource> ActiveMontageActionResource;
-	/** At most the last completed resource, retained for its GA's End cancellation; no historical lookup. */
+	/** At most the original draining/completed resource; retained until its GA retires or a successor starts. */
 	TSharedPtr<const FGGYGOActionMotionResource> CompletedMontageActionResource;
+	/** Derived only from this resource's consumed final native contribution; no second action clock. */
+	bool bCompletedMontageActionNativeContributionConsumed = false;
 	float ActionSkippedMovementTickTime = 0.0f;
 	FGGYGOActionMotionFailureDelegate ActionMotionFailureCallback;
 	TSharedPtr<const FGGYGOActionMotionResource> ActionMotionFailureResource;
+	FGGYGOActionMotionCompletionDelegate ActionMotionCompletionCallback;
+	TSharedPtr<const FGGYGOActionMotionResource> ActionMotionCompletionResource;
+	bool bMontageActionCompletionObserverInstalled = false;
+	TSharedPtr<const FGGYGOActionMotionResource> MontageActionNaturalBlendOutResource;
 	int32 MontageActionFailurePreparationDepth = 0;
 	/** Exact last terminal token for idempotent release, without retaining a historical resource. */
 	int32 LastRetiredMontageActionHandle = INDEX_NONE;

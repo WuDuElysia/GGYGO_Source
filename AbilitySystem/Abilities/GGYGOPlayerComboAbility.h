@@ -65,11 +65,12 @@ protected:
 	bool InitializeStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageSectionFact& Fact);
 	void EnterStepEnd(const TSharedPtr<FStepMotionResources>& Resource);
+	void TryCompleteStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
 	void ReleaseStepMotion(EGGYGOActionMotionReleaseReason Reason);
 	void HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId);
 	void HandleMontageEvent(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
-	void HandleMontageCompleted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMontageCompleted(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
 	void HandleMontageBlendOut(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
 	void HandleMeleeHit(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
@@ -82,6 +83,10 @@ protected:
 	TArray<FGGYGOComboStep> ComboSteps;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (ClampMin = "0.0", ClampMax = "1.0"))
 	float InputBufferSeconds = 0.35f;
+	/** 实际原生播放与混出预算以外的完成宽限；仅用于现有 watchdog，不决定动画混合。
+	 *  原 CMC 最后区间或原 Task 完成事实缺失时，截止后明确中止原激活。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (ClampMin = "0.0"))
+	float MontageCompletionGraceSeconds = 2.0f;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	TSubclassOf<UGameplayEffect> DamageEffect;
 	/** 仅DamageEffect为空时选择共享预载GE；默认false为明确无GE、仍播放命中Cue的模式。

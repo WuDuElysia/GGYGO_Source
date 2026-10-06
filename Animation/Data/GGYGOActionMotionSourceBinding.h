@@ -11,6 +11,7 @@ struct FGGYGOActionMotionSourceSegment
 	TStrongObjectPtr<UAnimSequence> Sequence;
 	int32 SegmentIndex = INDEX_NONE;
 	float StartPos = 0.0f;
+	/** Exact original GetEndPos identity; terminal clock quantization is resolved only during coverage/mapping. */
 	float MontageEndSeconds = 0.0f;
 	float AnimStartTime = 0.0f;
 	float AnimEndTime = 0.0f;
@@ -34,8 +35,23 @@ struct FGGYGOActionMotionSourceSegment
 	}
 };
 
+/** One original section's immutable absolute montage coordinates, not a playback phase. */
+struct FGGYGOActionMotionSourceSection
+{
+	FName SectionName;
+	int32 SectionIndex = INDEX_NONE;
+	float MontageStartSeconds = 0.0f;
+	float MontageEndSeconds = 0.0f;
+
+	bool HasSameConfiguration(const FGGYGOActionMotionSourceSection& Other) const
+	{
+		return SectionName == Other.SectionName && SectionIndex == Other.SectionIndex
+			&& MontageStartSeconds == Other.MontageStartSeconds && MontageEndSeconds == Other.MontageEndSeconds;
+	}
+};
+
 /**
- * One explicitly selected section of one original single-slot montage.
+ * One explicitly selected continuous section range of one original single-slot montage.
  * Animation resolves asset routing only. GAS owns playback permission, GA owns its resources,
  * and Movement owns the action clock, curve evaluation, replay and capsule execution.
  * Assets are retained only while the caller/current RMS/bounded saved moves retain this binding.
@@ -45,6 +61,7 @@ struct FGGYGOActionMotionSourceBinding
 {
 	TStrongObjectPtr<UAnimMontage> Montage;
 	FName SlotName;
+	/** The first selected section; this does not restrict playback to that section. */
 	FName SectionName;
 	int32 TrackIndex = INDEX_NONE;
 	int32 SectionIndex = INDEX_NONE;
@@ -56,8 +73,16 @@ struct FGGYGOActionMotionSourceBinding
 	/** Asset rate only. The caller's effective montage rate already includes this exactly once. */
 	float MontageRateScale = 0.0f;
 	bool bMontageHasRootMotion = false;
-	/** Only segments covering the requested section, in original track order. */
+	/** Every selected section, including both endpoints, in original montage order. Never empty. */
+	TArray<FGGYGOActionMotionSourceSection> Sections;
+	/** Only segments covering the requested range, in original track order. */
 	TArray<FGGYGOActionMotionSourceSegment> Segments;
+
+	const FGGYGOActionMotionSourceSection* FindSection(FName Name) const
+	{
+		return Sections.FindByPredicate([Name](const FGGYGOActionMotionSourceSection& Section)
+			{ return Section.SectionName == Name; });
+	}
 
 	bool HasSameConfiguration(const FGGYGOActionMotionSourceBinding& Other) const
 	{
@@ -67,9 +92,14 @@ struct FGGYGOActionMotionSourceBinding
 			|| SectionCount != Other.SectionCount || MontageStartSeconds != Other.MontageStartSeconds
 			|| MontageEndSeconds != Other.MontageEndSeconds || MontageLength != Other.MontageLength
 			|| MontageRateScale != Other.MontageRateScale
-			|| bMontageHasRootMotion != Other.bMontageHasRootMotion || Segments.Num() != Other.Segments.Num())
+			|| bMontageHasRootMotion != Other.bMontageHasRootMotion
+			|| Sections.Num() != Other.Sections.Num() || Segments.Num() != Other.Segments.Num())
 		{
 			return false;
+		}
+		for (int32 Index = 0; Index < Sections.Num(); ++Index)
+		{
+			if (!Sections[Index].HasSameConfiguration(Other.Sections[Index])) { return false; }
 		}
 		for (int32 Index = 0; Index < Segments.Num(); ++Index)
 		{
@@ -105,12 +135,23 @@ namespace GGYGOActionMotionSource
 	GGYGO_API bool BuildSourceBinding(UAnimMontage* Montage, FName SlotName, FName SectionName,
 		FGGYGOActionMotionSourceBindingPtr& OutBinding, FString& OutError);
 
+	/**
+	 * Explicit ordered inclusive section range. Retains each original section and source segment.
+	 * Does not infer runtime section links, read curves or grant playback/phase permissions.
+	 * Missing/ambiguous/reversed sections or incomplete source coverage reject the entire range.
+	 */
+	GGYGO_API bool BuildSourceBindingRange(UAnimMontage* Montage, FName SlotName,
+		FName StartSectionName, FName FinalSectionName,
+		FGGYGOActionMotionSourceBindingPtr& OutBinding, FString& OutError);
+
 	/** Exact source configuration validation; never replaces a stale binding with a new one. */
 	GGYGO_API bool ValidateSourceBinding(const FGGYGOActionMotionSourceBinding& Binding, FString& OutError);
 
 	/**
-	 * Map ordered absolute montage coordinates within this section into original source pieces.
+	 * Map ordered absolute montage coordinates within this range into original source pieces.
 	 * Segment and loop boundaries are split; the zero-length interval is valid after validation.
+	 * The final track endpoint may share the native montage endpoint only for a verified frame
+	 * round trip within two float ULPs. It maps to the original trim end; internal seams remain exact.
 	 * Does not apply task/global/Montage.RateScale, advance time, read curves or execute movement.
 	 * Caller must provide a fixed effective montage rate and retire/restart on playback changes.
 	 * A request requiring more than 4096 source pieces is rejected, not partially returned.

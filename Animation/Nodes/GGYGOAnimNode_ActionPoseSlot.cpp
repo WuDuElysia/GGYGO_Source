@@ -37,7 +37,7 @@ void FGGYGOAnimNode_ActionPoseSlot::ClearEvaluationScratch()
 {
 	bInEvaluation = false;
 	bSourceResidualReady = false;
-	SourceResidualZ = 0.;
+	SourceResidual = FVector::ZeroVector;
 	EvaluationFailure.Reset();
 }
 
@@ -155,9 +155,9 @@ bool FGGYGOAnimNode_ActionPoseSlot::BuildReferenceCache(const FBoneContainer& Bo
 		}
 		return false;
 	}
-	OutCache.ReferenceResidualZ = OutCache.BodyParent.TransformVector(OutCache.BodyLocal.GetTranslation()).Z
-		- OutCache.TrajectoryParent.TransformVector(OutCache.TrajectoryLocal.GetTranslation()).Z;
-	if (!FMath::IsFinite(OutCache.ReferenceResidualZ))
+	OutCache.ReferenceResidual = OutCache.BodyParent.TransformVector(OutCache.BodyLocal.GetTranslation())
+		- OutCache.TrajectoryParent.TransformVector(OutCache.TrajectoryLocal.GetTranslation());
+	if (OutCache.ReferenceResidual.ContainsNaN())
 	{
 		OutDiagnostic = TEXT("Current mesh reference body/trajectory residual is nonfinite.");
 		return false;
@@ -387,10 +387,10 @@ bool FGGYGOAnimNode_ActionPoseSlot::ValidateAncestors(const FCompactPose& Pose,
 	return true;
 }
 
-double FGGYGOAnimNode_ActionPoseSlot::ReadResidualZ(const FCompactPose& Pose) const
+FVector FGGYGOAnimNode_ActionPoseSlot::ReadResidualTranslation(const FCompactPose& Pose) const
 {
-	return Reference.BodyParent.TransformVector(Pose[Reference.Body].GetTranslation()).Z
-		- Reference.TrajectoryParent.TransformVector(Pose[Reference.Trajectory].GetTranslation()).Z;
+	return Reference.BodyParent.TransformVector(Pose[Reference.Body].GetTranslation())
+		- Reference.TrajectoryParent.TransformVector(Pose[Reference.Trajectory].GetTranslation());
 }
 
 bool FGGYGOAnimNode_ActionPoseSlot::GetBodyParentTransform(const FCompactPose& Pose, FTransform& OutParent) const
@@ -426,8 +426,8 @@ void FGGYGOAnimNode_ActionPoseSlot::PostEvaluateSourcePose(FPoseContext& SourceC
 	{
 		return;
 	}
-	SourceResidualZ = ReadResidualZ(SourceContext.Pose);
-	bSourceResidualReady = FMath::IsFinite(SourceResidualZ);
+	SourceResidual = ReadResidualTranslation(SourceContext.Pose);
+	bSourceResidualReady = !SourceResidual.ContainsNaN();
 	if (!bSourceResidualReady)
 	{
 		EvaluationFailure = TEXT("The participating native Source body/trajectory residual is nonfinite.");
@@ -534,8 +534,10 @@ void FGGYGOAnimNode_ActionPoseSlot::Evaluate_AnyThread(FPoseContext& Output)
 			FailEvaluation(Diagnostic.IsEmpty() ? TEXT("The participating native Source residual was not produced in this Evaluate call.") : Diagnostic);
 			return;
 		}
-		TargetTranslation.Z += ReadResidualZ(Output.Pose) - SourceCoefficient * SourceResidualZ
-			- ActionCoefficient * Reference.ReferenceResidualZ;
+		// Remove only the action trajectory and reference alignment contribution.
+		// The authored body offset survives on every axis through native Slot mixing.
+		TargetTranslation += ReadResidualTranslation(Output.Pose) - SourceCoefficient * SourceResidual
+			- ActionCoefficient * Reference.ReferenceResidual;
 	}
 	FTransform BodyParent;
 	if (TargetTranslation.ContainsNaN() || !GetBodyParentTransform(Output.Pose, BodyParent))

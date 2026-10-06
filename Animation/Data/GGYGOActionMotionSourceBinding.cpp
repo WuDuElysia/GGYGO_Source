@@ -1,8 +1,77 @@
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
 
+#if WITH_EDITOR
+#include "Animation/AnimData/IAnimationDataModel.h"
+#include "UObject/Package.h"
+#endif
+
 namespace GGYGOActionMotionSourcePrivate
 {
 	constexpr int32 MaxMappedIntervals = 4096;
+
+	/**
+	 * A final track endpoint and the native montage clock can differ after float arithmetic and
+	 * frame-to-seconds rounding. Both frame domains must identify the same terminal coordinate;
+	 * this is not permission to cover a gap, round an internal seam or replace an invalid rate.
+	 */
+	bool ResolveMappedSegmentEnd(UAnimMontage* Montage, int32 SegmentIndex, int32 SegmentCount,
+		float RangeEnd, float OriginalEnd, float& OutEnd, FString& OutReason)
+	{
+		OutEnd = OriginalEnd;
+		OutReason.Reset();
+		const float MontageEnd = Montage->GetPlayLength();
+		if (SegmentIndex != SegmentCount - 1 || RangeEnd != MontageEnd || OriginalEnd == MontageEnd)
+		{ return true; }
+		// Bound the two float rounding stages (native endpoint, frame-to-seconds), not elapsed seconds.
+		if (!FMath::IsNearlyEqualByULP(OriginalEnd, MontageEnd, 2))
+		{
+			OutReason = FString::Printf(TEXT("native terminal endpoint %.9g differs from montage clock %.9g beyond two float ULPs"),
+				OriginalEnd, MontageEnd);
+			return false;
+		}
+		const auto CheckFrameDomain = [&](const FFrameRate& Rate, const TCHAR* Domain)
+		{
+			if (Rate.Numerator <= 0 || Rate.Denominator <= 0)
+			{
+				OutReason = FString::Printf(TEXT("%s frame rate %d/%d is invalid for native terminal quantization"),
+					Domain, Rate.Numerator, Rate.Denominator);
+				return false;
+			}
+			const double FrameCoordinate = static_cast<double>(OriginalEnd) * Rate.AsDecimal();
+			if (!FMath::IsFinite(FrameCoordinate)
+				|| FrameCoordinate < 0.0 || FrameCoordinate > static_cast<double>(MAX_int32) - 0.5)
+			{
+				OutReason = FString::Printf(TEXT("%s frame rate %d/%d cannot represent native terminal endpoint %.9g"),
+					Domain, Rate.Numerator, Rate.Denominator, OriginalEnd);
+				return false;
+			}
+			const float RoundedEnd = static_cast<float>(Rate.AsSeconds(Rate.AsFrameTime(OriginalEnd).RoundToFrame()));
+			if (RoundedEnd != MontageEnd)
+			{
+				OutReason = FString::Printf(TEXT("%s frame rate %d/%d rounds native endpoint %.9g to %.9g, not montage clock %.9g"),
+					Domain, Rate.Numerator, Rate.Denominator, OriginalEnd, RoundedEnd, MontageEnd);
+				return false;
+			}
+			return true;
+		};
+		// This is explicit saved montage metadata. GetSamplingFrameRate's default-rate branch is not used.
+		if (!CheckFrameDomain(Montage->GetCommonTargetFrameRate(), TEXT("CommonTarget"))) { return false; }
+#if WITH_EDITOR
+		if (!Montage->GetOutermost()->HasAnyPackageFlags(PKG_Cooked))
+		{
+			const IAnimationDataModel* Model = Montage->GetDataModelInterface().GetInterface();
+			if (!Model)
+			{
+				OutReason = TEXT("uncooked montage has no original data model to verify native terminal frame quantization");
+				return false;
+			}
+			// SetCompositeLength uses the model rate; it need not equal the source sampling rate.
+			if (!CheckFrameDomain(Model->GetFrameRate(), TEXT("DataModel"))) { return false; }
+		}
+#endif
+		OutEnd = MontageEnd;
+		return true;
+	}
 
 	bool Fail(UAnimMontage* Montage, FName Slot, FName Section, const TCHAR* Field,
 		const FString& Reason, FString& OutError)
@@ -13,16 +82,19 @@ namespace GGYGOActionMotionSourcePrivate
 	}
 
 	/** Resolve metadata in build mode, or compare in validation mode without rebuilding a binding. */
-	bool Resolve(UAnimMontage* Montage, FName Slot, FName Section,
+	bool Resolve(UAnimMontage* Montage, FName Slot, FName Section, FName FinalSection,
 		FGGYGOActionMotionSourceBinding* Building, const FGGYGOActionMotionSourceBinding* Expected,
 		FString& OutError)
 	{
 		const auto Reject = [&](const TCHAR* Field, const FString& Reason)
-		{ return Fail(Montage, Slot, Section, Field, Reason, OutError); };
+		{
+			return Fail(Montage, Slot, Section, Field,
+				FString::Printf(TEXT("FinalSection='%s': %s"), *FinalSection.ToString(), *Reason), OutError);
+		};
 		if (!IsInGameThread()) { return Reject(TEXT("Thread"), TEXT("source asset queries require the game thread")); }
 		if (!IsValid(Montage)) { return Reject(TEXT("Montage"), TEXT("original asset is missing or invalid")); }
-		if (Slot.IsNone() || Section.IsNone())
-		{ return Reject(TEXT("Route"), TEXT("both slot and section must be explicitly configured")); }
+		if (Slot.IsNone() || Section.IsNone() || FinalSection.IsNone())
+		{ return Reject(TEXT("Route"), TEXT("slot and both section endpoints must be explicitly configured")); }
 		if (!FMath::IsFinite(Montage->RateScale) || Montage->RateScale <= 0.0f)
 		{ return Reject(TEXT("RateScale"), TEXT("asset rate must be finite and positive")); }
 		if (Montage->TimeStretchCurve.IsValid())
@@ -34,6 +106,7 @@ namespace GGYGOActionMotionSourcePrivate
 		{ return Reject(TEXT("PlayLength"), TEXT("montage must have a finite positive length")); }
 
 		int32 SectionIndex = INDEX_NONE;
+		int32 FinalSectionIndex = INDEX_NONE;
 		float PreviousSectionTime = -1.0f;
 		for (int32 Index = 0; Index < Montage->CompositeSections.Num(); ++Index)
 		{
@@ -48,13 +121,37 @@ namespace GGYGOActionMotionSourcePrivate
 				{ return Reject(TEXT("SectionName"), TEXT("requested section name is ambiguous")); }
 				SectionIndex = Index;
 			}
+			if (Current.SectionName == FinalSection)
+			{
+				if (FinalSectionIndex != INDEX_NONE)
+				{ return Reject(TEXT("SectionName"), TEXT("requested final section name is ambiguous")); }
+				FinalSectionIndex = Index;
+			}
 		}
-		if (SectionIndex == INDEX_NONE) { return Reject(TEXT("SectionName"), TEXT("requested section does not exist")); }
-		float SectionStart = 0.0f, SectionEnd = 0.0f;
-		Montage->GetSectionStartAndEndTime(SectionIndex, SectionStart, SectionEnd);
-		if (!FMath::IsFinite(SectionStart) || !FMath::IsFinite(SectionEnd)
-			|| SectionStart < 0.0f || SectionEnd <= SectionStart || SectionEnd > MontageLength)
-		{ return Reject(TEXT("SectionRange"), TEXT("requested section has an invalid actual range")); }
+		if (SectionIndex == INDEX_NONE || FinalSectionIndex == INDEX_NONE)
+		{ return Reject(TEXT("SectionName"), TEXT("a requested section endpoint does not exist")); }
+		if (FinalSectionIndex < SectionIndex)
+		{ return Reject(TEXT("SectionRange"), TEXT("final section precedes the requested start section")); }
+		TArray<FGGYGOActionMotionSourceSection> Sections;
+		for (int32 Index = SectionIndex; Index <= FinalSectionIndex; ++Index)
+		{
+			const FName Name = Montage->CompositeSections[Index].SectionName;
+			if (Name.IsNone() || Sections.ContainsByPredicate([Name](const FGGYGOActionMotionSourceSection& Entry)
+				{ return Entry.SectionName == Name; }))
+			{ return Reject(TEXT("SectionName"), TEXT("selected sections must have explicit unique names")); }
+			FGGYGOActionMotionSourceSection Current;
+			Current.SectionName = Name;
+			Current.SectionIndex = Index;
+			Montage->GetSectionStartAndEndTime(Index, Current.MontageStartSeconds, Current.MontageEndSeconds);
+			if (!FMath::IsFinite(Current.MontageStartSeconds) || !FMath::IsFinite(Current.MontageEndSeconds)
+				|| Current.MontageStartSeconds < 0.0f || Current.MontageEndSeconds <= Current.MontageStartSeconds
+				|| Current.MontageEndSeconds > MontageLength
+				|| (!Sections.IsEmpty() && Current.MontageStartSeconds != Sections.Last().MontageEndSeconds))
+			{ return Reject(TEXT("SectionRange"), TEXT("selected sections require finite continuous actual ranges")); }
+			Sections.Add(Current);
+		}
+		const float SectionStart = Sections[0].MontageStartSeconds;
+		const float SectionEnd = Sections.Last().MontageEndSeconds;
 		const FAnimTrack& Track = Montage->SlotAnimTracks[0].AnimTrack;
 		const bool bHasRootMotion = Montage->HasRootMotion();
 		if (Expected && (Expected->TrackIndex != 0 || Expected->SectionIndex != SectionIndex
@@ -62,8 +159,16 @@ namespace GGYGOActionMotionSourcePrivate
 			|| Expected->SectionCount != Montage->CompositeSections.Num()
 			|| Expected->MontageStartSeconds != SectionStart || Expected->MontageEndSeconds != SectionEnd
 			|| Expected->MontageLength != MontageLength || Expected->MontageRateScale != Montage->RateScale
-			|| Expected->bMontageHasRootMotion != bHasRootMotion))
+			|| Expected->bMontageHasRootMotion != bHasRootMotion || Expected->Sections.Num() != Sections.Num()))
 		{ return Reject(TEXT("Configuration"), TEXT("original montage routing, range, rate or root-motion configuration changed")); }
+		if (Expected)
+		{
+			for (int32 Index = 0; Index < Sections.Num(); ++Index)
+			{
+				if (!Expected->Sections[Index].HasSameConfiguration(Sections[Index]))
+				{ return Reject(TEXT("Configuration"), TEXT("original selected section identity or coordinates changed")); }
+			}
+		}
 		if (Building)
 		{
 			Building->Montage = TStrongObjectPtr<UAnimMontage>(Montage);
@@ -78,6 +183,7 @@ namespace GGYGOActionMotionSourcePrivate
 			Building->MontageLength = MontageLength;
 			Building->MontageRateScale = Montage->RateScale;
 			Building->bMontageHasRootMotion = bHasRootMotion;
+			Building->Sections = MoveTemp(Sections);
 		}
 
 		float CoveredUntil = SectionStart;
@@ -118,9 +224,16 @@ namespace GGYGOActionMotionSourcePrivate
 				|| !FMath::IsFinite(LastLoopStart) || LastLoopStart >= SegmentEnd)
 			{ return RejectSegment(TEXT("native segment coordinates cannot represent a positive duration for every source loop")); }
 			PreviousSegmentEnd = SegmentEnd;
-			if (SegmentEnd <= SectionStart || Original.StartPos >= SectionEnd) { continue; }
+			float MappedSegmentEnd = SegmentEnd;
+			FString BoundaryError;
+			if (!ResolveMappedSegmentEnd(Montage, Index, Track.AnimSegments.Num(), SectionEnd,
+				SegmentEnd, MappedSegmentEnd, BoundaryError))
+			{ return RejectSegment(BoundaryError); }
+			if (LastLoopStart >= MappedSegmentEnd)
+			{ return RejectSegment(TEXT("native terminal quantization cannot represent a positive final source loop")); }
+			if (MappedSegmentEnd <= SectionStart || Original.StartPos >= SectionEnd) { continue; }
 			const float CoveredStart = FMath::Max(Original.StartPos, SectionStart);
-			const float CoveredEnd = FMath::Min(SegmentEnd, SectionEnd);
+			const float CoveredEnd = FMath::Min(MappedSegmentEnd, SectionEnd);
 			if (CoveredStart != CoveredUntil)
 			{ return RejectSegment(TEXT("requested section contains a source gap or overlap")); }
 			CoveredUntil = CoveredEnd;
@@ -167,11 +280,19 @@ namespace GGYGOActionMotionSourcePrivate
 bool GGYGOActionMotionSource::BuildSourceBinding(UAnimMontage* Montage, FName SlotName,
 	FName SectionName, FGGYGOActionMotionSourceBindingPtr& OutBinding, FString& OutError)
 {
+	return BuildSourceBindingRange(Montage, SlotName, SectionName, SectionName, OutBinding, OutError);
+}
+
+bool GGYGOActionMotionSource::BuildSourceBindingRange(UAnimMontage* Montage, FName SlotName,
+	FName StartSectionName, FName FinalSectionName,
+	FGGYGOActionMotionSourceBindingPtr& OutBinding, FString& OutError)
+{
 	OutBinding.Reset();
 	OutError.Reset();
 	const TSharedRef<FGGYGOActionMotionSourceBinding, ESPMode::ThreadSafe> Candidate =
 		MakeShared<FGGYGOActionMotionSourceBinding, ESPMode::ThreadSafe>();
-	if (!GGYGOActionMotionSourcePrivate::Resolve(Montage, SlotName, SectionName, &Candidate.Get(), nullptr, OutError))
+	if (!GGYGOActionMotionSourcePrivate::Resolve(Montage, SlotName, StartSectionName, FinalSectionName,
+		&Candidate.Get(), nullptr, OutError))
 	{ return false; }
 	OutBinding = Candidate;
 	return true;
@@ -180,8 +301,13 @@ bool GGYGOActionMotionSource::BuildSourceBinding(UAnimMontage* Montage, FName Sl
 bool GGYGOActionMotionSource::ValidateSourceBinding(const FGGYGOActionMotionSourceBinding& Binding, FString& OutError)
 {
 	OutError.Reset();
+	if (Binding.Sections.IsEmpty())
+	{
+		return GGYGOActionMotionSourcePrivate::Fail(Binding.Montage.Get(), Binding.SlotName, Binding.SectionName,
+			TEXT("Sections"), TEXT("original selected section range is missing"), OutError);
+	}
 	return GGYGOActionMotionSourcePrivate::Resolve(Binding.Montage.Get(), Binding.SlotName,
-		Binding.SectionName, nullptr, &Binding, OutError);
+		Binding.SectionName, Binding.Sections.Last().SectionName, nullptr, &Binding, OutError);
 }
 
 bool GGYGOActionMotionSource::MapMontageInterval(const FGGYGOActionMotionSourceBinding& Binding,
@@ -201,15 +327,20 @@ bool GGYGOActionMotionSource::MapMontageInterval(const FGGYGOActionMotionSourceB
 	if (!FMath::IsFinite(MontageStartSeconds) || !FMath::IsFinite(MontageEndSeconds)
 		|| MontageStartSeconds < Binding.MontageStartSeconds || MontageEndSeconds < MontageStartSeconds
 		|| MontageEndSeconds > Binding.MontageEndSeconds)
-	{ return Reject(TEXT("requires finite ordered absolute coordinates inside the original section; jumps/reverse ranges are not contiguous intervals")); }
+	{ return Reject(TEXT("requires finite ordered absolute coordinates inside the original section range; jumps/reverse ranges are not contiguous intervals")); }
 	if (MontageStartSeconds == MontageEndSeconds) { return true; }
 
 	double CoveredUntil = MontageStartSeconds;
 	for (int32 BindingIndex = 0; BindingIndex < Binding.Segments.Num(); ++BindingIndex)
 	{
 		const FGGYGOActionMotionSourceSegment& Segment = Binding.Segments[BindingIndex];
+		float MappedSegmentEnd = Segment.MontageEndSeconds;
+		FString BoundaryError;
+		if (!ResolveMappedSegmentEnd(Binding.Montage.Get(), Segment.SegmentIndex, Binding.TrackSegmentCount,
+			Binding.MontageEndSeconds, Segment.MontageEndSeconds, MappedSegmentEnd, BoundaryError))
+		{ return Reject(BoundaryError); }
 		const double Start = FMath::Max(static_cast<double>(MontageStartSeconds), static_cast<double>(Segment.StartPos));
-		const double End = FMath::Min(static_cast<double>(MontageEndSeconds), static_cast<double>(Segment.MontageEndSeconds));
+		const double End = FMath::Min(static_cast<double>(MontageEndSeconds), static_cast<double>(MappedSegmentEnd));
 		if (Start >= End) { continue; }
 		if (Start != CoveredUntil) { return Reject(TEXT("original source pieces do not cover the requested interval")); }
 		// The source span is the engine's float subtraction; retain its rate product exactly once.
@@ -231,7 +362,7 @@ bool GGYGOActionMotionSource::MapMontageInterval(const FGGYGOActionMotionSourceB
 			{ return Reject(TEXT("source interval exceeds its loop range or the 4096-piece mapping limit")); }
 			const double LoopStart = Segment.StartPos + static_cast<double>(LoopIndex) * LoopDuration;
 			const double LoopEnd = LoopIndex == Segment.LoopingCount - 1
-				? Segment.MontageEndSeconds : Segment.StartPos + static_cast<double>(LoopIndex + 1) * LoopDuration;
+				? MappedSegmentEnd : Segment.StartPos + static_cast<double>(LoopIndex + 1) * LoopDuration;
 			const double PieceEnd = FMath::Min(End, LoopEnd);
 			if (!FMath::IsFinite(LoopStart) || !FMath::IsFinite(LoopEnd) || Cursor < LoopStart || PieceEnd <= Cursor)
 			{ return Reject(TEXT("original loop boundaries cannot represent a forward contiguous source interval")); }

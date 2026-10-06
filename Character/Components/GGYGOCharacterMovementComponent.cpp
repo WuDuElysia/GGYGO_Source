@@ -1070,8 +1070,13 @@ void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPla
 	NeutralizeMontageActionSource(CompletedMontageActionResource);
 	ActiveMontageActionResource.Reset();
 	CompletedMontageActionResource.Reset();
+	bCompletedMontageActionNativeContributionConsumed = false;
 	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
 	ActionMotionFailureResource.Reset();
+	const auto RetiredActionCompletionCallback = MoveTemp(ActionMotionCompletionCallback);
+	ActionMotionCompletionResource.Reset();
+	bMontageActionCompletionObserverInstalled = false;
+	MontageActionNaturalBlendOutResource.Reset();
 	ActiveActionMotionHandle = INDEX_NONE;
 	ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
 	ActionSkippedMovementTickTime = 0.0f;
@@ -2571,8 +2576,12 @@ bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 	USkeletalMeshComponent* Mesh = CharacterOwner->GetMesh();
 	UAnimInstance* Anim = Mesh ? Mesh->GetAnimInstance() : nullptr;
 	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(OriginalMontageInstanceId) : nullptr;
+	const FGGYGOActionMotionSourceSection* InitialSection = Instance
+		? OriginalSource->FindSection(Instance->GetCurrentSection()) : nullptr;
 	if (!IsValid(Mesh) || !IsValid(Anim) || !Instance || Instance->Montage != OriginalSource->Montage.Get()
-		|| !Instance->IsActive() || !Instance->IsPlaying() || Instance->GetCurrentSection() != OriginalSource->SectionName
+		|| !Instance->IsActive() || !Instance->IsPlaying() || !InitialSection
+		|| MontagePositionSeconds < InitialSection->MontageStartSeconds
+		|| MontagePositionSeconds >= InitialSection->MontageEndSeconds
 		|| !FMath::IsNearlyEqual(Instance->GetPosition(), MontagePositionSeconds, UE_KINDA_SMALL_NUMBER)
 		|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() <= 0.0f
 		|| !FMath::IsNearlyEqual(Instance->GetPlayRate() * OriginalSource->MontageRateScale,
@@ -2612,8 +2621,13 @@ bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 	if (CompletedMontageActionResource.IsValid()) LastRetiredMontageActionHandle = CompletedMontageActionResource->Handle;
 	NeutralizeMontageActionSource(CompletedMontageActionResource);
 	CompletedMontageActionResource.Reset();
+	bCompletedMontageActionNativeContributionConsumed = false;
 	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
 	ActionMotionFailureResource.Reset();
+	const auto RetiredActionCompletionCallback = MoveTemp(ActionMotionCompletionCallback);
+	ActionMotionCompletionResource.Reset();
+	bMontageActionCompletionObserverInstalled = false;
+	MontageActionNaturalBlendOutResource.Reset();
 	const uint16 Id = ApplyRootMotionSource(Source);
 	if (Id == static_cast<uint16>(ERootMotionSourceID::Invalid))
 		return Reject(TEXT("native ApplyRootMotionSource rejected the original source"));
@@ -2635,7 +2649,7 @@ bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 }
 
 bool UGGYGOCharacterMovementComponent::ValidateMontageActionRuntime(
-	const FRootMotionSource_GGYGOActionCurve& Source, FString& OutError) const
+	const FRootMotionSource_GGYGOActionCurve& Source, float SimulationTime, FString& OutError) const
 {
 	OutError.Reset();
 	if (!IsValid(CharacterOwner) || !IsMontageActionMovementModeSupported() || !Source.OriginalBinding.IsValid()
@@ -2674,15 +2688,27 @@ bool UGGYGOCharacterMovementComponent::ValidateMontageActionRuntime(
 		OutError = TEXT("original Mesh/AnimInstance membership was retired or replaced");
 		return false;
 	}
-	// Completed was verified against the original instance before release. Its finite native
-	// tail survives that instance's normal retirement without looking up a newer instance.
+	// The original Task's authenticated Completed request allows only this finite native tail.
+	// It is not the consumed-final-interval fact, and never looks up a successor instance.
 	if (Source.bCompletionRequested && CompletedMontageActionResource == Resource) return true;
 	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(Resource->MontageInstanceId) : nullptr;
+	const FGGYGOActionMotionSourceSection* CurrentSection = Instance
+		? Source.OriginalBinding->FindSection(Instance->GetCurrentSection()) : nullptr;
+	// Only the original Task's non-interrupted native BlendOut fact permits stopped playback.
+	// UE still advances during that configured blend window, then holds End - KINDA_SMALL_NUMBER/2.
+	// A stopped hold can consume only the final native interval; a pause/foreign Stop has no grant.
+	const bool bNaturalBlendOut = Instance && CurrentSection && Instance->IsStopped()
+		&& MontageActionNaturalBlendOutResource == Resource && Source.OriginalBinding->Sections.Num() > 0
+		&& CurrentSection == &Source.OriginalBinding->Sections.Last()
+		&& FMath::IsFinite(Instance->GetPosition())
+		&& (Instance->IsPlaying()
+			|| (FMath::IsNearlyEqual(Instance->GetPosition(), Source.OriginalBinding->MontageEndSeconds, UE_KINDA_SMALL_NUMBER)
+				&& Source.GetTime() + SimulationTime >= Source.Duration));
 	if (!Instance || Instance->Montage != Source.OriginalBinding->Montage.Get()
-		|| !FMath::IsFinite(Instance->GetPosition())
-		|| (Instance->GetPosition() < Source.OriginalBinding->MontageEndSeconds
-			&& (!Instance->IsActive() || !Instance->IsPlaying()
-				|| Instance->GetCurrentSection() != Source.OriginalBinding->SectionName))
+		|| !FMath::IsFinite(Instance->GetPosition()) || !CurrentSection
+		|| Instance->GetPosition() < CurrentSection->MontageStartSeconds
+		|| Instance->GetPosition() > CurrentSection->MontageEndSeconds
+		|| ((!Instance->IsActive() || !Instance->IsPlaying()) && !bNaturalBlendOut)
 		|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() != Resource->InstancePlayRate
 		|| (!Source.bCompletionRequested && ActiveMontageActionResource != Resource))
 	{
@@ -2690,6 +2716,103 @@ bool UGGYGOCharacterMovementComponent::ValidateMontageActionRuntime(
 		return false;
 	}
 	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::NotifyMontageActionNaturalBlendOut(
+	int32 OriginalHandle, int32 OriginalMontageInstanceId, FString& OutError)
+{
+	OutError.Reset();
+	const auto Resource = ActiveMontageActionResource.IsValid() && ActiveMontageActionResource->Handle == OriginalHandle
+		? ActiveMontageActionResource : (CompletedMontageActionResource.IsValid()
+			&& CompletedMontageActionResource->Handle == OriginalHandle ? CompletedMontageActionResource : nullptr);
+	if (!IsInGameThread() || IsBeingDestroyed() || !Resource.IsValid()
+		|| Resource->Owner.Get() != this || Resource->Character.Get() != CharacterOwner
+		|| Resource->MontageInstanceId != OriginalMontageInstanceId || !Resource->Source.IsValid()
+		|| Resource->Source->Sections.Num() == 0)
+	{
+		OutError = TEXT("[Movement.ActionMotion] natural BlendOut fact requires the original live handle and Montage instance identity");
+		return false;
+	}
+	if (MontageActionNaturalBlendOutResource == Resource) return true;
+	// A late original blend fact grants no execution after the genuine final native contribution.
+	if (CompletedMontageActionResource == Resource && bCompletedMontageActionNativeContributionConsumed) return true;
+	UAnimInstance* Anim = Resource->AnimInstance.Get();
+	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(OriginalMontageInstanceId) : nullptr;
+	const UAnimMontage* Montage = Resource->Source->Montage.Get();
+	const auto& FinalSection = Resource->Source->Sections.Last();
+	const float Rate = Instance ? Instance->GetPlayRate() * Resource->Source->MontageRateScale : 0.0f;
+	const float Trigger = Montage && Instance ? (Montage->BlendOutTriggerTime >= 0.0f
+		? Montage->BlendOutTriggerTime : Montage->GetDefaultBlendOutTime() * Instance->DefaultBlendTimeMultiplier) : 0.0f;
+	if (!Instance || Instance->Montage != Montage || !Instance->IsStopped() || !Instance->bEnableAutoBlendOut
+		|| Instance->GetCurrentSection() != FinalSection.SectionName || Instance->GetNextSection() != NAME_None
+		|| !FMath::IsFinite(Instance->GetPosition()) || Instance->GetPosition() < FinalSection.MontageStartSeconds
+		|| Instance->GetPosition() > FinalSection.MontageEndSeconds || !FMath::IsFinite(Rate) || Rate <= 0.0f
+		|| !FMath::IsFinite(Trigger) || Trigger < 0.0f
+		|| (FinalSection.MontageEndSeconds - Instance->GetPosition()) / Rate > FMath::Max(Trigger, UE_KINDA_SMALL_NUMBER))
+	{
+		OutError = TEXT("[Movement.ActionMotion] original non-interrupted BlendOut is outside its configured final-section auto-blend window");
+		return false;
+	}
+	// The original native Task callback authenticates non-interruption; no private engine state is read.
+	MontageActionNaturalBlendOutResource = Resource;
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::ObserveMontageActionMotionCompletion(
+	int32 OriginalHandle, FGGYGOActionMotionCompletionDelegate Callback, FString& OutError)
+{
+	OutError.Reset();
+	const auto Resource = ActiveMontageActionResource.IsValid() && ActiveMontageActionResource->Handle == OriginalHandle
+		? ActiveMontageActionResource : (CompletedMontageActionResource.IsValid()
+			&& CompletedMontageActionResource->Handle == OriginalHandle ? CompletedMontageActionResource : nullptr);
+	if (!IsInGameThread() || IsBeingDestroyed() || !Resource.IsValid() || !Callback.IsBound()
+		|| Resource->Owner.Get() != this || Resource->Character.Get() != CharacterOwner
+		|| bMontageActionCompletionObserverInstalled || ActionMotionCompletionCallback.IsBound() || ActionMotionCompletionResource.IsValid())
+	{
+		OutError = TEXT("[Movement.ActionMotion] completion observer requires the original resource and its sole callback");
+		return false;
+	}
+	bMontageActionCompletionObserverInstalled = true;
+	if (CompletedMontageActionResource == Resource && bCompletedMontageActionNativeContributionConsumed)
+	{
+		Callback.Execute(OriginalHandle);
+		return true;
+	}
+	ActionMotionCompletionResource = Resource;
+	ActionMotionCompletionCallback = MoveTemp(Callback);
+	return true;
+}
+
+void UGGYGOCharacterMovementComponent::PublishMontageActionMotionCompletion()
+{
+	if (!CharacterOwner || CharacterOwner->bClientUpdating || PreparingLocomotionCurveReplayGroup) return;
+	for (const auto& Base : CurrentRootMotion.RootMotionSources)
+	{
+		if (!Base.IsValid() || Base->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()) continue;
+		const auto& Source = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*Base);
+		const auto Resource = Source.OriginalResource;
+		if (Source.SourceMode != EGGYGOActionCurveSourceMode::OriginalMontage || Source.bExplicitlyCancelled
+			|| !Source.bPreparedNaturalEnd || !Source.bPreparedContributionConsumed || !Resource.IsValid()
+			|| Resource->Owner.Get() != this || Resource->Character.Get() != CharacterOwner
+			|| (ActiveMontageActionResource != Resource && CompletedMontageActionResource != Resource)
+			|| (CompletedMontageActionResource == Resource && bCompletedMontageActionNativeContributionConsumed)) continue;
+		CompletedMontageActionResource = Resource;
+		bCompletedMontageActionNativeContributionConsumed = true;
+		if (ActiveMontageActionResource == Resource)
+		{
+			ActiveMontageActionResource.Reset();
+			ActiveActionMotionHandle = INDEX_NONE;
+			ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
+		}
+		// All native physics for this move has completed. Detach before external cleanup/reentry.
+		if (ActionMotionCompletionResource == Resource)
+		{
+			FGGYGOActionMotionCompletionDelegate Callback = MoveTemp(ActionMotionCompletionCallback);
+			ActionMotionCompletionResource.Reset();
+			Callback.ExecuteIfBound(Resource->Handle);
+		}
+		return;
+	}
 }
 
 bool UGGYGOCharacterMovementComponent::ObserveMontageActionMotionFailure(
@@ -2785,23 +2908,31 @@ bool UGGYGOCharacterMovementComponent::ReleaseMontageActionMotion(
 		OutError = FString::Printf(TEXT("[Movement.ActionMotion] token=%d is not the original active/completed resource"), OriginalHandle);
 		return false;
 	}
+	if (Reason == EGGYGOActionMotionReleaseReason::Completed
+		&& (Resource->Owner.Get() != this || Resource->Character.Get() != CharacterOwner || IsBeingDestroyed()))
+	{
+		OutError = TEXT("[Movement.ActionMotion] natural completion request no longer belongs to its original owner");
+		return false;
+	}
 	FGGYGOActionMotionFailureDelegate RetiredCallback;
-	if (Reason != EGGYGOActionMotionReleaseReason::Completed && ActionMotionFailureResource == Resource)
+	FGGYGOActionMotionCompletionDelegate RetiredCompletionCallback;
+	const bool bNativeComplete = CompletedMontageActionResource == Resource
+		&& bCompletedMontageActionNativeContributionConsumed;
+	if ((Reason != EGGYGOActionMotionReleaseReason::Completed || bNativeComplete)
+		&& MontageActionNaturalBlendOutResource == Resource) MontageActionNaturalBlendOutResource.Reset();
+	if ((Reason != EGGYGOActionMotionReleaseReason::Completed || bNativeComplete) && ActionMotionFailureResource == Resource)
 	{
 		RetiredCallback = MoveTemp(ActionMotionFailureCallback);
 		ActionMotionFailureResource.Reset();
 	}
+	if (Reason != EGGYGOActionMotionReleaseReason::Completed && ActionMotionCompletionResource == Resource)
+	{
+		RetiredCompletionCallback = MoveTemp(ActionMotionCompletionCallback);
+		ActionMotionCompletionResource.Reset();
+	}
 	if (Reason == EGGYGOActionMotionReleaseReason::Completed)
 	{
 		if (CompletedMontageActionResource == Resource) return true;
-		UAnimInstance* Anim = Resource->AnimInstance.Get();
-		FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(Resource->MontageInstanceId) : nullptr;
-		if (!Instance || Instance->Montage != Resource->Source->Montage.Get()
-			|| Instance->GetPosition() < Resource->Source->MontageEndSeconds)
-		{
-			OutError = TEXT("[Movement.ActionMotion] Completed requires the original instance to reach the original section end");
-			return false;
-		}
 		const auto Complete = [&Resource](const auto& Sources)
 		{
 			for (const auto& Base : Sources)
@@ -2813,13 +2944,20 @@ bool UGGYGOCharacterMovementComponent::ReleaseMontageActionMotion(
 		};
 		Complete(CurrentRootMotion.RootMotionSources);
 		Complete(CurrentRootMotion.PendingAddRootMotionSources);
-		CompletedMontageActionResource = Resource; // Keep the genuine final native interval and the GA's End identity.
+		// The caller reports its authenticated original Task Completed, not a new motion grant.
+		// Continue only the original bounded RMS clock until its final contribution is consumed.
+		CompletedMontageActionResource = Resource;
+		bCompletedMontageActionNativeContributionConsumed = false;
 	}
 	else
 	{
 		NeutralizeMontageActionSource(Resource);
 		LastRetiredMontageActionHandle = OriginalHandle;
-		if (CompletedMontageActionResource == Resource) CompletedMontageActionResource.Reset();
+		if (CompletedMontageActionResource == Resource)
+		{
+			CompletedMontageActionResource.Reset();
+			bCompletedMontageActionNativeContributionConsumed = false;
+		}
 	}
 	if (ActiveMontageActionResource == Resource)
 	{
@@ -2929,8 +3067,13 @@ int32 UGGYGOCharacterMovementComponent::BeginActionMotion(const UGGYGOActionMoti
 	if (CompletedMontageActionResource.IsValid()) LastRetiredMontageActionHandle = CompletedMontageActionResource->Handle;
 	NeutralizeMontageActionSource(CompletedMontageActionResource);
 	CompletedMontageActionResource.Reset();
+	bCompletedMontageActionNativeContributionConsumed = false;
 	const auto RetiredActionFailureCallback = MoveTemp(ActionMotionFailureCallback);
 	ActionMotionFailureResource.Reset();
+	const auto RetiredActionCompletionCallback = MoveTemp(ActionMotionCompletionCallback);
+	ActionMotionCompletionResource.Reset();
+	bMontageActionCompletionObserverInstalled = false;
+	MontageActionNaturalBlendOutResource.Reset();
 	ActionMotionSourceID = ApplyRootMotionSource(Source);
 	if (ActionMotionSourceID == static_cast<uint16>(ERootMotionSourceID::Invalid)) return INDEX_NONE;
 
@@ -3584,6 +3727,7 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateAfterMovement(float D
 	bNativeVelocityIntervalCanRetain = false;
 	NativeVelocityIntervalCharacter.Reset();
 	NativeVelocityIntervalComponent.Reset();
+	PublishMontageActionMotionCompletion();
 }
 
 bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const

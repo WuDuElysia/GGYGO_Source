@@ -66,6 +66,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage)
 	{
 		bPreparedContributionConsumed = false;
+		bPreparedNaturalEnd = false;
 		const auto Retire = [this]()
 		{
 			bExplicitlyCancelled = true;
@@ -76,7 +77,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		if (bExplicitlyCancelled) { Retire(); return; }
 		FString Error;
 		const UGGYGOCharacterMovementComponent* CMC = Cast<UGGYGOCharacterMovementComponent>(&MoveComponent);
-		if (!CMC || !CMC->ValidateMontageActionRuntime(*this, Error)
+		if (!CMC || !CMC->ValidateMontageActionRuntime(*this, SimulationTime, Error)
 			|| !FMath::IsFinite(SimulationTime) || SimulationTime < 0.0f
 			|| !FMath::IsFinite(MovementTickTime) || MovementTickTime <= 0.0f
 			|| !FMath::IsFinite(GetTime()) || !FMath::IsFinite(Duration) || Duration <= 0.0f
@@ -117,6 +118,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		}
 		RootMotionParams.Set(FTransform(OverrideVelocity));
 		SetTime(GetTime() + SimulationTime); // The only action clock, including zero-displacement intervals.
+		bPreparedNaturalEnd = To == OriginalBinding->MontageEndSeconds && GetTime() >= Duration;
 		return;
 	}
 	// Keep gravity under CMC control. Leaving the ground stops this ground-only source.
@@ -152,6 +154,7 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 	{
 		OriginalResource.Reset(); OriginalBinding.Reset(); bNativeImported = false;
 		bPreparedContributionConsumed = false;
+		bPreparedNaturalEnd = false;
 	}
 	else if (static_cast<uint8>(SourceMode) > static_cast<uint8>(EGGYGOActionCurveSourceMode::OriginalMontage)) return false;
 	if (!FRootMotionSource::NetSerialize(Ar, Map, bOutSuccess)) return false;
@@ -178,6 +181,18 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 		Ar << Wire.SlotName << Wire.SectionName << Wire.TrackIndex << Wire.SectionIndex;
 		Ar << Wire.TrackSegmentCount << Wire.SectionCount << Wire.MontageStartSeconds << Wire.MontageEndSeconds;
 		Ar << Wire.MontageLength << Wire.MontageRateScale << Wire.bMontageHasRootMotion;
+		uint16 SectionRangeCount = static_cast<uint16>(Wire.Sections.Num());
+		if (Ar.IsSaving() && (Wire.Sections.Num() <= 0 || Wire.Sections.Num() > 4096))
+		{ bOutSuccess = false; return false; }
+		Ar << SectionRangeCount;
+		if (SectionRangeCount == 0 || SectionRangeCount > 4096 || SectionRangeCount > Wire.SectionCount)
+		{ bOutSuccess = false; return false; }
+		if (Ar.IsLoading()) Wire.Sections.SetNum(SectionRangeCount);
+		for (FGGYGOActionMotionSourceSection& Section : Wire.Sections)
+		{
+			Ar << Section.SectionName << Section.SectionIndex;
+			Ar << Section.MontageStartSeconds << Section.MontageEndSeconds;
+		}
 		uint16 Count = static_cast<uint16>(Wire.Segments.Num());
 		if (Ar.IsSaving() && (Wire.Segments.Num() <= 0 || Wire.Segments.Num() > 4096)) { bOutSuccess = false; return false; }
 		Ar << Count;
@@ -199,6 +214,7 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 			OriginalBinding.Reset();
 			bNativeImported = true;
 			bPreparedContributionConsumed = false;
+			bPreparedNaturalEnd = false;
 			FString Error;
 			if (Ar.IsError() || !GGYGOActionMotionEvaluation::ValidateSource(Wire, Error))
 			{

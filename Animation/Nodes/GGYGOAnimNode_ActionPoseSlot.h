@@ -12,7 +12,7 @@ class USkeletalMesh;
 class UGGYGOMontageGuardAnimInstance;
 
 /**
- * Native Slot playback with component alignment and body/trajectory Z separation.
+ * Native Slot playback with component alignment and body/trajectory translation separation.
  * The native slot remains the only pose mixer. No montage position or pose survives Evaluate.
  * This contract supports nonadditive, uniform slot blending and fixed reference ancestors.
  */
@@ -27,7 +27,7 @@ struct GGYGO_API FGGYGOAnimNode_ActionPoseSlot : public FAnimNode_Slot
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Action Pose", meta = (NeverAsPin))
 	FName TrajectoryBoneName = NAME_None;
 
-	/** The role's existing full component translation alignment, in mesh component space. */
+	/** Component alignment plus the action's authored body/trajectory offset from mesh reference. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Action Pose", meta = (NeverAsPin))
 	FVector ComponentAlignment = FVector::ZeroVector;
 
@@ -72,14 +72,14 @@ private:
 		FTransform BodyParent;
 		FTransform TrajectoryParent;
 		TArray<FReferenceAncestor> Ancestors;
-		double ReferenceResidualZ = 0.;
+		FVector ReferenceResidual = FVector::ZeroVector;
 	};
 
 	bool BuildReferenceCache(const FBoneContainer& Bones, FReferenceCache& OutCache, FString& OutDiagnostic) const;
 	static bool SameReference(const FReferenceCache& A, const FReferenceCache& B);
 	bool HasCurrentBoneIndices(const FBoneContainer& Bones) const;
 	bool ValidateAncestors(const FCompactPose& Pose, double NativeCoefficientSum, FString& OutDiagnostic) const;
-	double ReadResidualZ(const FCompactPose& Pose) const;
+	FVector ReadResidualTranslation(const FCompactPose& Pose) const;
 	bool GetBodyParentTransform(const FCompactPose& Pose, FTransform& OutParent) const;
 	void RecordFailure(const FAnimInstanceProxy* Proxy, const FString& Reason);
 	void ClearEvaluationScratch();
@@ -114,6 +114,6 @@ private:
 	// Borrowed from the native hook during this one Evaluate call; cleared at both boundaries.
 	bool bInEvaluation = false;
 	bool bSourceResidualReady = false;
-	double SourceResidualZ = 0.;
+	FVector SourceResidual = FVector::ZeroVector;
 	FString EvaluationFailure;
 };

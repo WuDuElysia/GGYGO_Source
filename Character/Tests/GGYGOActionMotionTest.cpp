@@ -315,6 +315,28 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	}
 	TestTrue(TEXT("Per-loop differences preserve displacement and remove original origin only through differencing"),
 		OriginalDelta.Equals(FVector(100.0, 0.0, 0.0), .001));
+	UAnimMontage* RangeMontage = NewObject<UAnimMontage>(Character, NAME_None, RF_Transient);
+	RangeMontage->SetSkeleton(OriginalLoopFixtureSkeleton);
+	RangeMontage->SetCompositeLength(2.25f);
+	RangeMontage->SlotAnimTracks = OriginalMontage->SlotAnimTracks;
+	FAnimSegment RangeEndSegment = Segment;
+	RangeEndSegment.StartPos = 2.0f;
+	RangeEndSegment.AnimEndTime = 0.25f;
+	RangeEndSegment.LoopingCount = 1;
+	RangeMontage->SlotAnimTracks[0].AnimTrack.AnimSegments.Add(RangeEndSegment);
+	RangeMontage->AddAnimCompositeSection(TEXT("Main"), 0.0f);
+	RangeMontage->AddAnimCompositeSection(TEXT("End"), 2.0f);
+	FGGYGOActionMotionSourceBindingPtr RangeBinding;
+	if (!TestTrue(TEXT("Explicit original Main through End range resolves"),
+		GGYGOActionMotionSource::BuildSourceBindingRange(RangeMontage, TEXT("FullBody"), TEXT("Main"), TEXT("End"), RangeBinding, Error))) return false;
+	TestTrue(TEXT("Range retains both original section boundaries"), RangeBinding->Sections.Num() == 2
+		&& RangeBinding->FindSection(TEXT("End")) && RangeBinding->MontageEndSeconds == 2.25f);
+	TestTrue(TEXT("Main End crossing differences each reset original segment independently"),
+		GGYGOActionMotionEvaluation::EvaluateInterval(*RangeBinding, 1.875f, 2.125f, OriginalDelta, Error)
+		&& OriginalDelta.Equals(FVector(25.0, 0.0, 0.0), .001));
+	TestTrue(TEXT("Entire natural range includes End displacement despite cumulative curve reset"),
+		GGYGOActionMotionEvaluation::EvaluateInterval(*RangeBinding, 0.0f, 2.25f, OriginalDelta, Error)
+		&& OriginalDelta.Equals(FVector(225.0, 0.0, 0.0), .001));
 	OriginalSequence->bEnableRootMotion = true;
 	OriginalDelta = FVector(17.0);
 	TestFalse(TEXT("Native animation root motion cannot also execute position curves"),
@@ -376,8 +398,8 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 		XYZController.SetFrameRate(FFrameRate(32, 1), false);
 		XYZController.SetNumberOfFrames(FFrameNumber(40), false);
 		const float XYZTimes[] = {0.0f, 0.25f, 0.5f, 1.0f, 1.25f};
-		const float XYZPositions[3][5] = {{47.0f, 52.0f, 57.0f, 67.0f, 67.0f},
-			{13.0f, 15.0f, 17.0f, 21.0f, 21.0f}, {5.0f, 25.0f, 45.0f, 5.0f, 5.0f}};
+		const float XYZPositions[3][5] = {{47.0f, 52.0f, 57.0f, 67.0f, 77.0f},
+			{13.0f, 15.0f, 17.0f, 21.0f, 25.0f}, {5.0f, 25.0f, 45.0f, 5.0f, 5.0f}};
 		for (int32 XYZAxis = 0; XYZAxis < 3; ++XYZAxis)
 		{
 			TArray<FRichCurveKey> XYZKeys;
@@ -400,7 +422,8 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	XYZMontage->SetSkeleton(OriginalLoopFixtureSkeleton);
 	XYZMontage->SetCompositeLength(1.25f);
 	XYZMontage->BlendIn.SetBlendTime(0.0f);
-	XYZMontage->BlendOut.SetBlendTime(0.0f);
+	XYZMontage->BlendOut.SetBlendTime(0.25f);
+	XYZMontage->BlendOutTriggerTime = 1.0f / XYZSequence->GetSamplingFrameRate().AsDecimal();
 	XYZMontage->SlotAnimTracks.SetNum(1);
 	XYZMontage->SlotAnimTracks[0].SlotName = TEXT("FullBody");
 	FAnimSegment XYZSegment;
@@ -414,12 +437,13 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	XYZMontage->AddAnimCompositeSection(TEXT("End"), 1.0f);
 	XYZMontage->CompositeSections[0].NextSectionName = TEXT("End");
 	FGGYGOActionMotionSourceBindingPtr XYZBinding;
-	if (!TestTrue(TEXT("XYZ original Main binding resolves"),
-		GGYGOActionMotionSource::BuildSourceBinding(XYZMontage, TEXT("FullBody"), TEXT("Main"), XYZBinding, Error))) return false;
+	if (!TestTrue(TEXT("XYZ original Main through End binding resolves"),
+		GGYGOActionMotionSource::BuildSourceBindingRange(XYZMontage, TEXT("FullBody"), TEXT("Main"), TEXT("End"), XYZBinding, Error))) return false;
 	int32 XYZMontageInstanceId = INDEX_NONE;
-	const auto BeginXYZ = [&]() -> int32
+	const auto BeginXYZ = [&](float StartPosition = 0.0f) -> int32
 	{
-		if (!TestTrue(TEXT("XYZ native Montage playback starts"), XYZAnim->Montage_Play(XYZMontage) > 0.0f)) return INDEX_NONE;
+		if (!TestTrue(TEXT("XYZ native Montage playback starts"),
+			XYZAnim->Montage_Play(XYZMontage, 1.0f, EMontagePlayReturnType::MontageLength, StartPosition) > 0.0f)) return INDEX_NONE;
 		FAnimMontageInstance* XYZInstance = XYZAnim->GetActiveInstanceForMontage(XYZMontage);
 		if (!TestNotNull(TEXT("XYZ playback has an actual original instance"), XYZInstance)) return INDEX_NONE;
 		int32 XYZHandle = INDEX_NONE;
@@ -427,6 +451,13 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 			XYZMove->BeginMontageActionMotion(XYZBinding, XYZInstance->GetInstanceID(), XYZInstance->GetPosition(),
 				XYZInstance->GetPlayRate() * XYZMontage->RateScale, 1.0f, XYZHandle, Error))) return INDEX_NONE;
 		XYZMontageInstanceId = XYZInstance->GetInstanceID();
+		XYZInstance->OnMontageBlendingOutStarted.BindLambda(
+			[&, OriginalHandle = XYZHandle, OriginalInstance = XYZMontageInstanceId](UAnimMontage* Montage, bool bInterrupted)
+			{
+				if (!bInterrupted && Montage == XYZMontage)
+					TestTrue(TEXT("Original native non-interrupted BlendOut authenticates only its configured final window"),
+						XYZMove->NotifyMontageActionNaturalBlendOut(OriginalHandle, OriginalInstance, Error));
+			});
 		return XYZHandle;
 	};
 	const float XYZNativeStep = 0.125f;
@@ -446,6 +477,17 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	const float XYZOriginalGravityScale = XYZMove->GravityScale;
 	const int32 XYZNaturalHandle = BeginXYZ();
 	if (!TestTrue(TEXT("XYZ original action receives a real token"), XYZNaturalHandle != INDEX_NONE)) return false;
+	int32 XYZNaturalCompletionCount = 0;
+	if (!TestTrue(TEXT("Original natural completion observer installs once"),
+		XYZMove->ObserveMontageActionMotionCompletion(XYZNaturalHandle,
+			FGGYGOActionMotionCompletionDelegate::CreateLambda([&](int32 Handle)
+			{
+				TestEqual(TEXT("AfterMovement completion preserves its original handle"), Handle, XYZNaturalHandle);
+				const FVector ActualDelta = XYZCharacter->GetActorLocation() - XYZEntryLocation;
+				TestTrue(TEXT("Completion observes the final End displacement already consumed by the real capsule"),
+					FVector(ActualDelta.X, ActualDelta.Y, 0.0).Equals(FVector(-24.0, 60.0, 0.0), 0.05));
+				++XYZNaturalCompletionCount;
+			}), Error))) return false;
 	const TSharedPtr<FRootMotionSource> XYZNaturalSource = XYZMove->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
 	if (!TestTrue(TEXT("XYZ native source overrides Z and enables sensitive liftoff"), XYZNaturalSource.IsValid()
 		&& !XYZNaturalSource->Settings.HasFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate)
@@ -457,12 +499,37 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Actual capsule XYZ applies Actor basis and mesh scale exactly once"),
 		(XYZCharacter->GetActorLocation() - XYZEntryLocation).Equals(FVector(-8.0, 20.0, 80.0), 0.05));
 	for (int32 XYZStepIndex = 4; XYZStepIndex < 8; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
-	TestTrue(TEXT("Original native End releases the XYZ Main resource"),
+	TestTrue(TEXT("Entering End retains the same original action and native source"), XYZMove->HasActiveActionMotion()
+		&& XYZMove->GetRootMotionSource(TEXT("GGYGO.ActionCurve")) == XYZNaturalSource);
+	TestEqual(TEXT("Main boundary is not natural range completion"), XYZNaturalCompletionCount, 0);
+	for (int32 XYZStepIndex = 8; XYZStepIndex < 10; ++XYZStepIndex) if (!AdvanceXYZ()) return false;
+	TestEqual(TEXT("The natural final contribution publishes exactly once"), XYZNaturalCompletionCount, 1);
+	TestTrue(TEXT("Original Task completion cleanup preserves the already consumed full range"),
+		XYZMove->ReleaseMontageActionMotion(XYZNaturalHandle, EGGYGOActionMotionReleaseReason::Completed, Error));
+	TestTrue(TEXT("Original completed cleanup is idempotent"),
 		XYZMove->ReleaseMontageActionMotion(XYZNaturalHandle, EGGYGOActionMotionReleaseReason::Completed, Error));
 	for (int32 XYZGravityStep = 0; XYZGravityStep < 3; ++XYZGravityStep)
 		XYZMove->MoveAutonomous(0.0f, XYZNativeStep, 0, FVector::ZeroVector);
 	TestTrue(TEXT("Native collision lands after the finite XYZ source releases gravity"), XYZMove->IsMovingOnGround());
 	TestEqual(TEXT("XYZ execution never mutates native GravityScale"), XYZMove->GravityScale, XYZOriginalGravityScale);
+	const FVector XYZEndStartLocation = XYZCharacter->GetActorLocation();
+	const int32 XYZEndStartHandle = BeginXYZ(1.0625f);
+	if (!TestTrue(TEXT("An original correction inside End executes its remaining natural trajectory"), XYZEndStartHandle != INDEX_NONE)) return false;
+	if (!AdvanceXYZ() || !AdvanceXYZ()) return false;
+	const FVector XYZRemainingEndDelta = XYZCharacter->GetActorLocation() - XYZEndStartLocation;
+	TestTrue(TEXT("Remaining End includes its partial final native interval exactly once"),
+		FVector(XYZRemainingEndDelta.X, XYZRemainingEndDelta.Y, 0.0).Equals(FVector(-6.0, 15.0, 0.0), 0.05));
+	int32 XYZLateCompletionCount = 0;
+	TestTrue(TEXT("Late observer replays the exact original consumed completion"),
+		XYZMove->ObserveMontageActionMotionCompletion(XYZEndStartHandle,
+			FGGYGOActionMotionCompletionDelegate::CreateLambda([&](int32 Handle)
+			{ TestEqual(TEXT("Late replay retains the End-start handle"), Handle, XYZEndStartHandle); ++XYZLateCompletionCount; }), Error));
+	TestEqual(TEXT("Late replay delivers one original fact"), XYZLateCompletionCount, 1);
+	TestFalse(TEXT("The same completed resource cannot install a second completion recipient"),
+		XYZMove->ObserveMontageActionMotionCompletion(XYZEndStartHandle,
+			FGGYGOActionMotionCompletionDelegate::CreateLambda([](int32) {}), Error));
+	TestTrue(TEXT("Remaining End cleanup accepts the original native completion"),
+		XYZMove->ReleaseMontageActionMotion(XYZEndStartHandle, EGGYGOActionMotionReleaseReason::Completed, Error));
 
 	// A ceiling constrains the capsule, and landing during Main keeps that original action alive.
 	UBoxComponent* XYZCeiling = MakeXYZCollisionBox(
@@ -489,6 +556,10 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	XYZMove->SetMovementMode(MOVE_Walking);
 	const int32 XYZCancelledHandle = BeginXYZ();
 	if (!TestTrue(TEXT("Air cancellation action receives its original token"), XYZCancelledHandle != INDEX_NONE)) return false;
+	int32 XYZCancelledCompletionCount = 0;
+	TestTrue(TEXT("Cancellation fixture observes only its original natural completion"),
+		XYZMove->ObserveMontageActionMotionCompletion(XYZCancelledHandle,
+			FGGYGOActionMotionCompletionDelegate::CreateLambda([&](int32) { ++XYZCancelledCompletionCount; }), Error));
 	if (!AdvanceXYZ()) return false;
 	const FVector XYZVelocityAtCancellation = XYZMove->Velocity;
 	TestTrue(TEXT("XYZ original airborne token cancels exactly"),
@@ -504,6 +575,7 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Retired XYZ cancellation remains idempotent"),
 		XYZMove->ReleaseMontageActionMotion(XYZCancelledHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
 	TestTrue(TEXT("Retired XYZ token does not cancel its airborne successor"), XYZMove->HasActiveActionMotion());
+	TestEqual(TEXT("Cancelled original callback cannot become its successor's natural completion"), XYZCancelledCompletionCount, 0);
 	TestTrue(TEXT("XYZ fixture releases its exact successor"),
 		XYZMove->ReleaseMontageActionMotion(XYZSuccessorHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error));
 #endif

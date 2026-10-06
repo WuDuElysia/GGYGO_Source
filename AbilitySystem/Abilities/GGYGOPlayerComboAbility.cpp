@@ -62,6 +62,9 @@ struct UGGYGOPlayerComboAbility::FStepMotionResources
 	float TranslationScale = 0.0f;
 	FName EndSection;
 	FString AbilityPath;
+	/** Authenticated facts from this original Task and CMC handle, never a copied playback clock. */
+	bool bMontageCompleted = false;
+	bool bMotionCompleted = false;
 
 	void Release(EGGYGOActionMotionReleaseReason Reason)
 	{
@@ -116,6 +119,11 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 {
 	OutError.Reset();
 	if (ComboSteps.IsEmpty()) { OutError = TEXT("ComboSteps 为空。"); return false; }
+	if (!FMath::IsFinite(MontageCompletionGraceSeconds) || MontageCompletionGraceSeconds < 0.0f)
+	{
+		OutError = TEXT("MontageCompletionGraceSeconds 必须是非负有限秒数。");
+		return false;
+	}
 	if (!FMath::IsFinite(InputBufferSeconds) || InputBufferSeconds < 0.0f || InputBufferSeconds > 1.0f)
 	{
 		OutError = TEXT("InputBufferSeconds 必须是 0 到 1 秒之间的有限值。");
@@ -124,6 +132,14 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 	for (int32 Index = 0; Index < ComboSteps.Num(); ++Index)
 	{
 		const FGGYGOComboStep& Step = ComboSteps[Index];
+		if (Step.Montage && (!Step.Montage->bEnableAutoBlendOut
+			|| !FMath::IsFinite(Step.Montage->BlendOutTriggerTime)
+			|| !FMath::IsFinite(Step.Montage->GetDefaultBlendOutTime()) || Step.Montage->GetDefaultBlendOutTime() < 0.0f))
+		{
+			OutError = FString::Printf(TEXT("段 %d Montage [%s] 必须启用自然混出，触发时间必须有限，混出时长必须有限且非负。"),
+				Index, *GetPathNameSafe(Step.Montage));
+			return false;
+		}
 		if (Step.MotionSlotName.IsNone() || !FMath::IsFinite(Step.MotionTranslationScale) || Step.MotionTranslationScale <= 0.0f)
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 必须显式配置 MotionSlotName，MotionTranslationScale 必须有限且大于0。"),
@@ -147,10 +163,17 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 		}
 		FGGYGOActionMotionSourceBindingPtr Source;
 		FString MotionError;
-		if (!GGYGOActionMotionSource::BuildSourceBinding(Step.Montage, Step.MotionSlotName, Step.MainSection, Source, MotionError)
+		if (!GGYGOActionMotionSource::BuildSourceBindingRange(Step.Montage, Step.MotionSlotName,
+			Step.MainSection, Step.EndSection, Source, MotionError)
 			|| !GGYGOActionMotionEvaluation::ValidateSource(*Source, MotionError))
 		{
 			OutError = FString::Printf(TEXT("段 %d 的原动画动作来源无效：%s"), Index, *MotionError);
+			return false;
+		}
+		if (Source->Sections.Num() != 2)
+		{
+			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 Main→End 必须相邻，原生默认路径不能跳过绑定内的 Section。"),
+				Index, *GetPathNameSafe(Step.Montage));
 			return false;
 		}
 		if (Step.NextStepIndex != INDEX_NONE && (Step.NextStepIndex <= Index || !ComboSteps.IsValidIndex(Step.NextStepIndex)))
@@ -453,7 +476,10 @@ bool UGGYGOPlayerComboAbility::IsMotionResourceCurrent(const TSharedPtr<FStepMot
 {
 	return Resource.IsValid() && StepMotionResources == Resource && Resource->Section != FStepMotionResources::ESection::Retired
 		&& CurrentStep == Resource->StepIndex
-		&& IsStepCurrent(Resource->Activation, Resource->StepToken, Resource->Task.Get());
+		&& IsActivationCurrent(Resource->Activation) && Resource->StepToken != 0 && CurrentStepToken == Resource->StepToken
+		// Completed is authenticated while the original Task is live. Its subsequent EndTask
+		// may invalidate the weak sender before CMC consumes the final native movement interval.
+		&& (Resource->bMontageCompleted || IsStepCurrent(Resource->Activation, Resource->StepToken, Resource->Task.Get()));
 }
 
 void UGGYGOPlayerComboAbility::FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason)
@@ -481,18 +507,19 @@ bool UGGYGOPlayerComboAbility::InitializeStepMotion(const TSharedPtr<FStepMotion
 	}
 	if (!IsMotionResourceCurrent(Resource)) { return false; }
 	Resource->MontageInstanceId = Snapshot.MontageInstanceId;
-	const int32 EndSectionIndex = Resource->Source->Montage->GetSectionIndex(Resource->EndSection);
-	float EndStartSeconds = 0.0f, EndEndSeconds = 0.0f;
-	if (EndSectionIndex != INDEX_NONE)
+	const auto* MainSource = Resource->Source->FindSection(Resource->Source->SectionName);
+	const auto* EndSource = Resource->Source->FindSection(Resource->EndSection);
+	if (!MainSource || !EndSource || Resource->Source->Sections.Num() != 2)
 	{
-		Resource->Source->Montage->GetSectionStartAndEndTime(EndSectionIndex, EndStartSeconds, EndEndSeconds);
+		FailStepMotion(Resource, TEXT("Original binding does not contain the configured adjacent Main→End sections."));
+		return false;
 	}
 	UE_LOG(LogGGYGOAbilitySystem, Display,
 		TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=OriginalSnapshot Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d Section='%s' Position=%.9g Main='%s' MainRange=[%.9g,%.9g] End='%s' EndRangeAvailable=%d EndRange=[%.9g,%.9g] MontageLength=%.9g EffectiveRate=%.9g"),
 		*Resource->AbilityPath, Resource->StepIndex, static_cast<unsigned long long>(Resource->StepToken),
 		*GetPathNameSafe(Snapshot.Montage), Snapshot.MontageInstanceId, *Snapshot.SectionName.ToString(), Snapshot.PositionSeconds,
-		*Resource->Source->SectionName.ToString(), Resource->Source->MontageStartSeconds, Resource->Source->MontageEndSeconds,
-		*Resource->EndSection.ToString(), EndSectionIndex != INDEX_NONE, EndStartSeconds, EndEndSeconds,
+		*Resource->Source->SectionName.ToString(), MainSource->MontageStartSeconds, MainSource->MontageEndSeconds,
+		*Resource->EndSection.ToString(), true, EndSource->MontageStartSeconds, EndSource->MontageEndSeconds,
 		Resource->Source->MontageLength, Resource->EffectiveRate);
 	FString Error;
 	if (!Resource->Movement.IsValid() || !Resource->Movement->GetMovementOwnerSyncScope(Resource->Scope, Error))
@@ -500,12 +527,8 @@ bool UGGYGOPlayerComboAbility::InitializeStepMotion(const TSharedPtr<FStepMotion
 		FailStepMotion(Resource, FString::Printf(TEXT("Original movement owner scope is unavailable: %s"), *Error));
 		return false;
 	}
-	if (Snapshot.SectionName == Resource->EndSection)
-	{
-		EnterStepEnd(Resource); // Nonzero correction can start in End, with no Main resource to invent.
-		return IsMotionResourceCurrent(Resource);
-	}
-	if (Snapshot.SectionName != Resource->Source->SectionName)
+	const bool bStartsInEnd = Snapshot.SectionName == Resource->EndSection;
+	if (!bStartsInEnd && Snapshot.SectionName != Resource->Source->SectionName)
 	{
 		FailStepMotion(Resource, FString::Printf(TEXT("Original initial section [%s] is neither configured Main nor End."), *Snapshot.SectionName.ToString()));
 		return false;
@@ -520,7 +543,7 @@ bool UGGYGOPlayerComboAbility::InitializeStepMotion(const TSharedPtr<FStepMotion
 	}
 	if (!bStarted || Resource->MotionHandle == INDEX_NONE)
 	{
-		FailStepMotion(Resource, FString::Printf(TEXT("Original Main action request was rejected: %s"), *Error));
+		FailStepMotion(Resource, FString::Printf(TEXT("Original Main→End action request was rejected: %s"), *Error));
 		return false;
 	}
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
@@ -538,10 +561,28 @@ bool UGGYGOPlayerComboAbility::InitializeStepMotion(const TSharedPtr<FStepMotion
 	if (!IsMotionResourceCurrent(Resource)) { return false; }
 	if (!bObserved)
 	{
-		FailStepMotion(Resource, FString::Printf(TEXT("Original Main resource failure observation could not be installed: %s"), *Error));
+		FailStepMotion(Resource, FString::Printf(TEXT("Original action resource failure observation could not be installed: %s"), *Error));
 		return false;
 	}
-	return true;
+	const bool bCompletionObserved = Resource->Movement->ObserveMontageActionMotionCompletion(Resource->MotionHandle,
+		FGGYGOActionMotionCompletionDelegate::CreateLambda([WeakThis, WeakResource](int32 OriginalHandle)
+		{
+			ThisClass* Self = WeakThis.Get();
+			const TSharedPtr<FStepMotionResources> OriginalResource = WeakResource.Pin();
+			if (!Self || !Self->IsMotionResourceCurrent(OriginalResource)
+				|| OriginalResource->MotionHandle != OriginalHandle || OriginalResource->bMotionCompleted) { return; }
+			OriginalResource->bMotionCompleted = true;
+			Self->TryCompleteStepMotion(OriginalResource);
+		}), Error);
+	if (!IsMotionResourceCurrent(Resource)) { return false; }
+	if (!bCompletionObserved)
+	{
+		FailStepMotion(Resource, FString::Printf(TEXT("Original action resource completion observation could not be installed: %s"), *Error));
+		return false;
+	}
+	// A correction starting inside End still executes its genuine remaining trajectory.
+	if (bStartsInEnd) { EnterStepEnd(Resource); }
+	return IsMotionResourceCurrent(Resource);
 }
 
 void UGGYGOPlayerComboAbility::HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource,
@@ -585,13 +626,7 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 		FailStepMotion(Resource, TEXT("Original CMC expired at End."));
 		return;
 	}
-	if (Resource->MotionHandle != INDEX_NONE
-		&& !Resource->Movement->ReleaseMontageActionMotion(Resource->MotionHandle, EGGYGOActionMotionReleaseReason::Completed, Error))
-	{
-		FailStepMotion(Resource, FString::Printf(TEXT("Original Main resource could not complete: %s"), *Error));
-		return;
-	}
-	if (!IsMotionResourceCurrent(Resource)) { return; }
+	// Entering End changes interruption permission; the same CMC handle retains the trajectory.
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
 	const TWeakPtr<FStepMotionResources> WeakResource(Resource);
 	const auto ReceiveIntent = [WeakThis, WeakResource](EGGYGOQualifiedMovementIntentQueryResult Result,
@@ -603,7 +638,8 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 			|| OriginalResource->Section != FStepMotionResources::ESection::End) { return; }
 		// Read the exact Task once at this boundary; an unavailable snapshot is diagnostic only.
 		FGGYGOMontageSectionSnapshot CurrentSnapshot;
-		const bool bSnapshotAvailable = OriginalResource->Task->TryGetOriginalSectionSnapshot(CurrentSnapshot);
+		const auto* OriginalTask = OriginalResource->Task.Get();
+		const bool bSnapshotAvailable = OriginalTask && OriginalTask->TryGetOriginalSectionSnapshot(CurrentSnapshot);
 		const FString OriginalLogContext = FString::Printf(
 			TEXT("Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d MotionHandle=%d Scope=%llu"),
 			*OriginalResource->AbilityPath, OriginalResource->StepIndex, static_cast<unsigned long long>(OriginalResource->StepToken),
@@ -657,7 +693,7 @@ void UGGYGOPlayerComboAbility::EnterStepEnd(const TSharedPtr<FStepMotionResource
 		}
 		if (!Self->IsMotionResourceCurrent(OriginalResource)) { return; }
 		OriginalResource->MotionHandle = INDEX_NONE;
-		// This is the GA's selected End lifecycle rule, including its no-Main-resource correction path.
+		// The original CMC cancellation precedes this GA's selected End lifecycle rule.
 		const FGGYGOAbilityTerminationResult EndResult = Self->RequestAbilityEnd(OriginalResource->Activation, true, true);
 		switch (EndResult.Outcome)
 		{
@@ -729,8 +765,8 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 	FString MotionError;
 	UGGYGOCharacterMovementComponent* const Movement = Cast<UGGYGOCharacterMovementComponent>(
 		GetCharacterFromActorInfo() ? GetCharacterFromActorInfo()->GetCharacterMovement() : nullptr);
-	if (!Movement || !GGYGOActionMotionSource::BuildSourceBinding(Step.Montage, Step.MotionSlotName,
-		Step.MainSection, MotionSource, MotionError))
+	if (!Movement || !GGYGOActionMotionSource::BuildSourceBindingRange(Step.Montage, Step.MotionSlotName,
+		Step.MainSection, Step.EndSection, MotionSource, MotionError))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Montage [%s] Slot [%s] motion rejected: CMC [%s], %s"),
 			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *Step.MotionSlotName.ToString(), *GetPathNameSafe(Movement), *MotionError);
@@ -809,6 +845,7 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 	StartedMontageTask->SetStartTimeSeconds(Position);
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> WeakTask(StartedMontageTask);
+	const TWeakPtr<FStepMotionResources> WeakMotion(Motion);
 	const auto ResolveOriginalCaller = [WeakThis, WeakTask, Original, ThisStepToken]() -> ThisClass*
 	{
 		ThisClass* Self = WeakThis.Get();
@@ -816,9 +853,9 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 	};
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks;
 	Callbacks.OnCompleted = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
-		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
+		[ResolveOriginalCaller, WeakMotion](FGameplayTag Tag, FGameplayEventData Data)
 		{
-			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageCompleted(Original, Tag, Data); }
+			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageCompleted(WeakMotion.Pin()); }
 		});
 	Callbacks.OnInterrupted = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
 		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
@@ -836,7 +873,6 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		{
 			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageEvent(Original, Tag, Data); }
 		});
-	const TWeakPtr<FStepMotionResources> WeakMotion(Motion);
 	Callbacks.SectionReceived = FGGYGOMontageSectionFactDelegate::CreateLambda(
 		[WeakThis, WeakMotion](const FGGYGOMontageSectionFact& Fact)
 		{
@@ -946,19 +982,38 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		return false;
 	}
 	if (!InitializeStepMotion(Motion) || !IsMotionResourceCurrent(Motion)) { return false; }
-	const float RemainingPlayTime = FMath::Max(0.0f, MontageLength - Position);
-	const float Timeout = RemainingPlayTime / EffectivePlayRate + 2.0f;
+	UAnimInstance* const OriginalAnimInstance = ActiveMesh->GetAnimInstance();
+	const FAnimMontageInstance* const OriginalPlayback = OriginalAnimInstance
+		? OriginalAnimInstance->GetMontageInstanceForID(Motion->MontageInstanceId) : nullptr;
+	if (!OriginalPlayback || OriginalPlayback->Montage != Step.Montage || !OriginalPlayback->bEnableAutoBlendOut
+		|| !FMath::IsFinite(OriginalPlayback->DefaultBlendTimeMultiplier) || OriginalPlayback->DefaultBlendTimeMultiplier < 0.0f)
+	{
+		FailStepMotion(Motion, TEXT("Original native playback or its natural blend-out budget is unavailable/invalid."));
+		return false;
+	}
+	// UE applies this native instance multiplier to asset BlendOut seconds, independently of play rate.
+	// Conservatively include the whole configured mix: its last-frame trigger may extend past the motion endpoint.
+	const float NativeBlendOutSeconds = Step.Montage->GetDefaultBlendOutTime() * OriginalPlayback->DefaultBlendTimeMultiplier;
+	const float RemainingPlayTime = FMath::Max(0.0f, Motion->Source->MontageEndSeconds - Position);
+	const float Timeout = RemainingPlayTime / EffectivePlayRate + NativeBlendOutSeconds + MontageCompletionGraceSeconds;
 	UWorld* const World = StepWorld.Get();
-	if (!World || !FMath::IsFinite(Timeout))
+	if (!World || !FMath::IsFinite(NativeBlendOutSeconds) || NativeBlendOutSeconds < 0.0f
+		|| !FMath::IsFinite(MontageCompletionGraceSeconds) || MontageCompletionGraceSeconds < 0.0f
+		|| !FMath::IsFinite(Timeout) || Timeout <= 0.0f)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d watchdog rejected: original World or timeout is invalid."),
 			*GetPathNameSafe(this), Index);
-		RequestAbilityCancel(Original, true);
+		RequestAbilityEnd(Original, true, true);
 		return false;
 	}
-	const FTimerDelegate WatchdogDelegate = FTimerDelegate::CreateLambda([ResolveOriginalCaller, Original, ThisStepToken]()
+	const FTimerDelegate WatchdogDelegate = FTimerDelegate::CreateLambda([WeakThis, WeakMotion, Original, ThisStepToken]()
 	{
-		if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleWatchdog(Original, ThisStepToken); }
+		ThisClass* Self = WeakThis.Get();
+		const TSharedPtr<FStepMotionResources> OriginalMotion = WeakMotion.Pin();
+		if (Self && OriginalMotion.IsValid() && Self->StepMotionResources == OriginalMotion)
+		{
+			Self->HandleWatchdog(Original, ThisStepToken);
+		}
 	});
 	FTimerHandle StartedWatchdog;
 	World->GetTimerManager().SetTimer(StartedWatchdog, WatchdogDelegate, Timeout, false);
@@ -1229,11 +1284,32 @@ void UGGYGOPlayerComboAbility::CorrectPredictedStepForActivation(const FGGYGOAbi
 		RequestId, bAccepted ? TEXT("确认") : TEXT("拒绝"), ServerStep + 1);
 }
 
-void UGGYGOPlayerComboAbility::HandleMontageCompleted(const FGGYGOAbilityActivationHandle& Original,
-	FGameplayTag EventTag, FGameplayEventData EventData)
+void UGGYGOPlayerComboAbility::HandleMontageCompleted(const TSharedPtr<FStepMotionResources>& Resource)
 {
-	if (!IsActivationCurrent(Original)) { return; }
-	RequestAbilityEnd(Original, HasAuthority(&CurrentActivationInfo), false);
+	if (!IsMotionResourceCurrent(Resource) || Resource->bMontageCompleted) { return; }
+	Resource->bMontageCompleted = true;
+	FString Error;
+	if (!Resource->Movement.IsValid() || Resource->MotionHandle == INDEX_NONE
+		|| !Resource->Movement->ReleaseMontageActionMotion(Resource->MotionHandle, EGGYGOActionMotionReleaseReason::Completed, Error))
+	{
+		FailStepMotion(Resource, FString::Printf(TEXT("Original Task completed but its CMC natural drain was rejected: %s"), *Error));
+		return;
+	}
+	if (IsMotionResourceCurrent(Resource)) { TryCompleteStepMotion(Resource); }
+}
+
+void UGGYGOPlayerComboAbility::TryCompleteStepMotion(const TSharedPtr<FStepMotionResources>& Resource)
+{
+	if (!IsMotionResourceCurrent(Resource)) { return; }
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[Combat.PlayerCombo.EndDiagnostics] Boundary=NaturalCompletion Ability='%s' Step=%d StepToken=%llu Montage='%s' Instance=%d MotionHandle=%d TaskCompleted=%d MotionCompleted=%d"),
+		*Resource->AbilityPath, Resource->StepIndex, static_cast<unsigned long long>(Resource->StepToken),
+		*GetPathNameSafe(Resource->Source->Montage.Get()), Resource->MontageInstanceId, Resource->MotionHandle,
+		Resource->bMontageCompleted, Resource->bMotionCompleted);
+	if (Resource->bMontageCompleted && Resource->bMotionCompleted)
+	{
+		RequestAbilityEnd(Resource->Activation, HasAuthority(&CurrentActivationInfo), false);
+	}
 }
 
 void UGGYGOPlayerComboAbility::HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original,
@@ -1246,6 +1322,18 @@ void UGGYGOPlayerComboAbility::HandleMontageBlendOut(const FGGYGOAbilityActivati
 	FGameplayTag EventTag, FGameplayEventData EventData)
 {
 	if (!IsActivationCurrent(Original)) { return; }
+	const TSharedPtr<FStepMotionResources> Resource = StepMotionResources;
+	if (!IsMotionResourceCurrent(Resource)) { return; }
+	FString Error;
+	// The original Task sends this callback only for a native non-interrupted blend-out.
+	// It grants CMC permission to consume the configured last-frame tail, never motion completion.
+	if (!Resource->Movement.IsValid() || Resource->MotionHandle == INDEX_NONE
+		|| !Resource->Movement->NotifyMontageActionNaturalBlendOut(Resource->MotionHandle, Resource->MontageInstanceId, Error))
+	{
+		FailStepMotion(Resource, FString::Printf(TEXT("Original natural blend-out fact was rejected by CMC: %s"), *Error));
+		return;
+	}
+	if (!IsMotionResourceCurrent(Resource)) { return; }
 	const int32 Pending = Window.PendingRequestId;
 	Window.Close();
 	const uint64 ExpectedStepToken = CurrentStepToken;
@@ -1257,8 +1345,18 @@ void UGGYGOPlayerComboAbility::HandleMontageBlendOut(const FGGYGOAbilityActivati
 void UGGYGOPlayerComboAbility::HandleWatchdog(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken)
 {
 	if (!IsActivationCurrent(Original) || CurrentStepToken != ExpectedStepToken) { return; }
-	UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("PlayerCombo：动画完成回调超时，释放动作。"));
-	RequestAbilityCancel(Original, true);
+	const TSharedPtr<FStepMotionResources> Resource = StepMotionResources;
+	if (!Resource.IsValid() || Resource->Section == FStepMotionResources::ESection::Retired
+		|| Resource->StepToken != ExpectedStepToken || CurrentStep != Resource->StepIndex
+		|| !Resource->Activation.HasSameActivation(Original)) { return; }
+	// Missing completion may include a vanished Task. Authenticate our exact owned resource,
+	// rather than requiring the failed dependency to stay alive before we can end its owner.
+	UE_LOG(LogGGYGOAbilitySystem, Error,
+		TEXT("PlayerCombo [%s] Step %d Montage [%s] CMC [%s] bounded natural completion timed out: StepToken=%llu Instance=%d Handle=%d TaskCompleted=%d MotionCompleted=%d TaskAvailable=%d."),
+		*Resource->AbilityPath, Resource->StepIndex, *GetPathNameSafe(Resource->Source->Montage.Get()),
+		*GetPathNameSafe(Resource->Movement.Get()), static_cast<unsigned long long>(Resource->StepToken),
+		Resource->MontageInstanceId, Resource->MotionHandle, Resource->bMontageCompleted, Resource->bMotionCompleted, Resource->Task.IsValid());
+	RequestAbilityEnd(Original, true, true);
 }
 
 void UGGYGOPlayerComboAbility::HandleMeleeHit(const FGGYGOAbilityActivationHandle& Original, uint64 ExpectedStepToken,
@@ -1396,7 +1494,14 @@ void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYG
 	bAddedMeshPrerequisite = false;
 	bSavedUpdateRateOptimizations = false;
 	SavedMeshTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
-	if (EndingMotion.IsValid()) { EndingMotion->Release(EGGYGOActionMotionReleaseReason::OwnerInvalidated); }
+	if (EndingMotion.IsValid())
+	{
+		const EGGYGOActionMotionReleaseReason MotionReason = !Context.WasCancelled()
+			&& EndingMotion->bMontageCompleted && EndingMotion->bMotionCompleted
+			? EGGYGOActionMotionReleaseReason::Completed
+			: (Context.WasCancelled() ? EGGYGOActionMotionReleaseReason::Cancelled : EGGYGOActionMotionReleaseReason::OwnerInvalidated);
+		EndingMotion->Release(MotionReason);
+	}
 
 	if (EndingWorld.IsValid()) { EndingWorld->GetTimerManager().ClearTimer(EndingWatchdog); }
 	if (EndingTraceComponent.IsValid())

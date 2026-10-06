@@ -6,7 +6,7 @@
 /** Pure original-position evaluation. No playback, movement permission, clock or cache. */
 namespace GGYGOActionMotionEvaluation
 {
-	/** Position-only ground action contract: the three original cm curves are required; native RM is mutually exclusive. */
+	/** Original complete-range XYZ contract: all three cm curves are required; native RM is mutually exclusive. */
 	GGYGO_API bool ValidateSource(const FGGYGOActionMotionSourceBinding& Source, FString& OutError);
 
 	/**
