@@ -7,6 +7,7 @@
 #include "Character/Data/GGYGOActionMotionProfile.h"
 #include "Character/Data/GGYGOActionMotionEvaluation.h"
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
+#include "Character/Data/GGYGOLocomotionSteeringEvaluation.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Input/GGYGOPlayerInput.h"
@@ -20,6 +21,7 @@
 #include "GameFramework/PlayerController.h"
 #include "Engine/NetConnection.h"
 #include "Engine/NetDriver.h"
+#include "Engine/World.h"
 #include "Net/UnrealNetwork.h"
 #include "Misc/ScopeExit.h"
 #include "System/GGYGOGameplayTags.h"
@@ -1001,6 +1003,7 @@ bool UGGYGOCharacterMovementComponent::EnsureMovementOwnerSyncLifetime()
 
 void UGGYGOCharacterMovementComponent::StopMovementImmediately()
 {
+	ResetLocomotionSteeringObservation();
 	NativeMovementVelocityResult.Reset();
 	NativeVelocityBeforeRootMotion.Reset();
 	bNativeVelocityIntervalCanRetain = false;
@@ -1013,6 +1016,7 @@ void UGGYGOCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewU
 	Super::SetUpdatedComponent(NewUpdatedComponent);
 	if (UpdatedComponent != OriginalComponent)
 	{
+		ResetLocomotionSteeringObservation();
 		NativeMovementVelocityResult.Reset();
 		NativeVelocityBeforeRootMotion.Reset();
 		bNativeVelocityIntervalOpen = false;
@@ -1034,6 +1038,7 @@ void UGGYGOCharacterMovementComponent::BeginPlay()
 
 void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	ResetLocomotionSteeringObservation();
 	bMovementOwnerSyncClosed = true;
 	NativeMovementVelocityResult.Reset();
 	NativeVelocityBeforeRootMotion.Reset();
@@ -1314,6 +1319,7 @@ void UGGYGOCharacterMovementComponent::RetireMovementOwnerSyncScope(FName Reason
 	const TSharedPtr<FMovementOwnerSyncContext> Context = MovementOwnerSyncContext;
 	if (!Context.IsValid() || Context->bRetired) return;
 	Context->bRetired = true;
+	ResetLocomotionSteeringObservation();
 	MovementOwnerSyncContext.Reset(); // Seal first; callbacks cannot reopen the old scope.
 	if (MovementInputNativeSource.IsValid() && MovementInputNativeSource->OwnerScope == Context->Scope)
 	{
@@ -2000,6 +2006,7 @@ bool UGGYGOCharacterMovementComponent::InvalidateMovementInputSession(
 	}
 	// Seal the grant before cleanup. Preserve the old value for exact idempotent teardown.
 	bMovementInputBindingActive = false;
+	ResetLocomotionSteeringObservation();
 	bMovementInputSessionOpened = false;
 	ConsumedMovementInputSessionMode = EGGYGOMovementInputSessionMode::Invalid;
 	bMovementInputColdStartWindowOpen = false;
@@ -3229,6 +3236,8 @@ void UGGYGOCharacterMovementComponent::CacheAbilitySystemComponent()
 
 bool UGGYGOCharacterMovementComponent::SetMovementSet(const UGGYGOMovementSet* InMovementSet, FString* OutError)
 {
+	bMovementSetConfigurationSubmitted = true;
+	MovementSetConfigurationError.Reset();
 	bGroundAdmissionDiagnosticReported = false;
 	if (OutError)
 	{
@@ -3242,6 +3251,7 @@ bool UGGYGOCharacterMovementComponent::SetMovementSet(const UGGYGOMovementSet* I
 
 	if (!InMovementSet)
 	{
+		MovementSetConfigurationError = TEXT("original SetMovementSet entry explicitly submitted no configuration (unbound/detached).");
 		return false;
 	}
 
@@ -3261,6 +3271,7 @@ bool UGGYGOCharacterMovementComponent::SetMovementSet(const UGGYGOMovementSet* I
 	{
 		*OutError = Error;
 	}
+	MovementSetConfigurationError = FString::Printf(TEXT("original SetMovementSet rejected '%s': %s"), *GetPathNameSafe(InMovementSet), *Error);
 	bGroundAdmissionDiagnosticReported = true;
 	UE_LOG(LogGGYGOMovement, Error,
 		TEXT("Movement SetMovementSet rejected: Component='%s', Owner='%s', MovementSet='%s', Reason='%s'."),
@@ -3298,6 +3309,7 @@ bool UGGYGOCharacterMovementComponent::PublishLocomotionSourceBinding(
 	LastLocomotionSourceProducer = Producer;
 	LastLocomotionSourceConfigurationGeneration = Identity.ConfigurationGeneration;
 	LocomotionSourceBinding = MakeShared<const FGGYGOLocomotionSourceBinding, ESPMode::ThreadSafe>(Binding);
+	ResetLocomotionSteeringObservation();
 	// Receipt acknowledges the original publication, including explicit Missing/Invalid states.
 	// Curve execution alone requires Available + validated sources; Fixed/GA modes do not consume this optional capability.
 	return true;
@@ -3313,6 +3325,7 @@ void UGGYGOCharacterMovementComponent::RetireLocomotionSourceBinding(
 	CompletedLocomotionCurveOrigin.Reset();
 	CurveMotion.Reset();
 	LocomotionSourceBinding.Reset();
+	ResetLocomotionSteeringObservation();
 }
 
 bool UGGYGOCharacterMovementComponent::IsLocomotionSourceBindingCurrent(
@@ -3348,6 +3361,7 @@ bool UGGYGOCharacterMovementComponent::GetLocomotionSourceBinding(
 
 void UGGYGOCharacterMovementComponent::ResetLocomotionState()
 {
+	ResetLocomotionSteeringObservation();
 	RetireLocomotionCurveRootMotion();
 	CompletedLocomotionCurveOrigin.Reset();
 	EndLocomotionCurveReplay();
@@ -3488,6 +3502,24 @@ float UGGYGOCharacterMovementComponent::GetMinAnalogSpeed() const
 bool UGGYGOCharacterMovementComponent::HasAcceptedMovementSet() const
 {
 	return IsValid(MovementSet.Get());
+}
+
+bool UGGYGOCharacterMovementComponent::IsOriginalMovementSetInitializationPending() const
+{
+	if (bMovementSetConfigurationSubmitted || LocomotionSteeringIntervalSerial != 0
+		|| bMovementOwnerSyncClosed || !IsValid(CharacterOwner) || !GetWorld() || !GetWorld()->IsGameWorld()) return false;
+	const UGGYGOPawnExtensionComponent* Extension =
+		UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(CharacterOwner);
+	if (!IsValid(Extension) || Extension->IsBeingDestroyed() || Extension->GetOwner() != CharacterOwner
+		|| Extension->GetWorld() != GetWorld()
+		|| Extension->HasReachedInitState(GGYGOGameplayTags::InitState_DataInitialized)) return false;
+	// Mesh/Anim registration can precede the original Extension's registration/BeginPlay.
+	// After native BeginPlay, only the original initializer's synchronous call in progress
+	// can keep this presentation window open. A stalled feature tag never grants waiting.
+	// Set submission or any actual movement
+	// interval closes it permanently; the accepted pointer remains sole movement admission.
+	if (!CharacterOwner->HasActorBegunPlay()) return true;
+	return Extension->IsPawnDataInitializationInProgress();
 }
 
 bool UGGYGOCharacterMovementComponent::HasIndependentGroundRootMotion() const
@@ -3645,12 +3677,38 @@ void UGGYGOCharacterMovementComponent::CalcVelocity(float DeltaTime, float Frict
 		bUseRVOAvoidance = bOriginalRVOAvoidance;
 		return;
 	}
+	const FVector SteeringPreviousVelocity = Velocity;
+	const bool bOrdinarySteering = CanExecuteOrdinaryLocomotionSteering();
 	Super::CalcVelocity(DeltaTime, Friction, bFluid, BrakingDeceleration);
+	if (bOrdinarySteering && CanExecuteOrdinaryLocomotionSteering())
+	{
+		const float StartingYaw = SteeringPreviousVelocity.SizeSquared2D() > UE_KINDA_SMALL_NUMBER
+			? SteeringPreviousVelocity.Rotation().Yaw : UpdatedComponent->GetComponentRotation().Yaw;
+		const float DesiredError = FMath::FindDeltaAngleDegrees(StartingYaw, Acceleration.Rotation().Yaw);
+		float Budget = 0.0f;
+		FString Error;
+		if (!SteeringPreviousVelocity.ContainsNaN() && !Velocity.ContainsNaN() && !Acceleration.ContainsNaN()
+			&& FMath::IsFinite(SteeringPreviousVelocity.SizeSquared2D()) && FMath::IsFinite(Velocity.SizeSquared2D())
+			&& GGYGOLocomotionSteeringEvaluation::EvaluateAngularBudget(*MovementSet, DesiredError, WalkRunBlendAlpha, DeltaTime, Budget, Error))
+		{
+			// Preserve native speed, Z, friction/braking and collision. Only heading has an angular budget.
+			Velocity = GGYGOLocomotionSteeringEvaluation::ConstrainPlanarHeading(SteeringPreviousVelocity, Velocity, StartingYaw, Budget);
+			bLocomotionSteeringIntervalOrdinary = bLocomotionSteeringIntervalOpen;
+		}
+		else
+		{
+			if (Error.IsEmpty()) Error = TEXT("native steering velocity is not finite.");
+			Velocity = SteeringPreviousVelocity; // Original subinterval momentum; rejected input cannot accelerate it.
+			RejectLocomotionSteering(Error);
+		}
+	}
 	if (!GetUnsupportedGroundRootMotionSource()) MarkNativeMovementVelocityResult();
 }
 
 void UGGYGOCharacterMovementComponent::ApplyRootMotionToVelocity(float DeltaTime)
 {
+	if (HasAnimRootMotion() || CurrentRootMotion.HasOverrideVelocity() || CurrentRootMotion.HasAdditiveVelocity())
+		bLocomotionSteeringIntervalExcluded = true;
 	if (ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
 		|| ShouldRejectUnownedCurveGroundLocomotion())
 	{
@@ -3768,6 +3826,7 @@ void UGGYGOCharacterMovementComponent::RequestRunOnNextMove()
 
 void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float DeltaSeconds)
 {
+	BeginLocomotionSteeringInterval();
 	BeginNativeMovementVelocityInterval();
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> VelocityIntervalSelf(this);
 	ON_SCOPE_EXIT
@@ -4986,7 +5045,11 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 {
 	// The final PrepareRootMotion can mark Finished before this call. Retain the entry rotation for that tick.
-	if (ActiveActionMotionHandle != INDEX_NONE || (IsMovingOnGround() && HasRegisteredActionCurveSource())) return;
+	if (ActiveActionMotionHandle != INDEX_NONE || (IsMovingOnGround() && HasRegisteredActionCurveSource()))
+	{
+		bLocomotionSteeringIntervalExcluded = true;
+		return;
+	}
 	if (ShouldRejectUnconfiguredGroundLocomotion() || ShouldRejectMovementInputGroundLocomotion()
 		|| ShouldRejectUnownedCurveGroundLocomotion())
 	{
@@ -5006,6 +5069,7 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 		&& CharacterOwner->GetLocalRole() != ROLE_SimulatedProxy;
 	if (bCanApplyLocalCurveYaw && IsTurnBackCurveDriven() && UpdatedComponent)
 	{
+		bLocomotionSteeringIntervalExcluded = true;
 		const float YawDelta = FMath::IsFinite(CurveMotion.YawDeltaDegrees)
 			? CurveMotion.YawDeltaDegrees
 			: 0.0f;
@@ -5023,7 +5087,221 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 		return;
 	}
 
+	LocomotionSteeringRotationBudget.Reset();
+	if (CanExecuteOrdinaryLocomotionSteering() && Velocity.SizeSquared2D() > UE_KINDA_SMALL_NUMBER)
+	{
+		float Budget = 0.0f;
+		FString Error;
+		const float ErrorDegrees = FMath::FindDeltaAngleDegrees(UpdatedComponent->GetComponentRotation().Yaw, Velocity.Rotation().Yaw);
+		if (!GGYGOLocomotionSteeringEvaluation::EvaluateAngularBudget(*MovementSet, ErrorDegrees, WalkRunBlendAlpha, DeltaTime, Budget, Error))
+		{
+			RejectLocomotionSteering(Error);
+			return;
+		}
+		LocomotionSteeringRotationBudget = Budget;
+	}
 	Super::PhysicsRotation(DeltaTime);
+	LocomotionSteeringRotationBudget.Reset();
+}
+
+void UGGYGOCharacterMovementComponent::ResetLocomotionSteeringObservation()
+{
+	if (LocomotionSteeringSourceEpoch != MAX_uint64) ++LocomotionSteeringSourceEpoch;
+	LocomotionSteeringSnapshot = {};
+	LocomotionSteeringSnapshot.OriginalMovement = this;
+	LocomotionSteeringSnapshot.OriginalCharacter = CharacterOwner;
+	LocomotionSteeringSnapshot.OriginalUpdatedComponent = UpdatedComponent.Get();
+	LocomotionSteeringSnapshot.SourceEpoch = LocomotionSteeringSourceEpoch;
+	LocomotionSteeringOriginalSet = MovementSet.Get();
+	LocomotionSteeringOriginalSource = LocomotionSourceBinding;
+	bLocomotionSteeringIntervalOpen = false;
+	bLocomotionSteeringIntervalOrdinary = false;
+	bLocomotionSteeringIntervalExcluded = false;
+	LocomotionSteeringIntervalError.Reset();
+	LocomotionSteeringRotationBudget.Reset();
+	bLocomotionSteeringDiagnosticReported = false;
+}
+
+void UGGYGOCharacterMovementComponent::BeginLocomotionSteeringInterval()
+{
+	if (LocomotionSteeringSnapshot.OriginalCharacter.Get() != CharacterOwner
+		|| LocomotionSteeringSnapshot.OriginalUpdatedComponent.Get() != UpdatedComponent
+		|| LocomotionSteeringOriginalSet.Get() != MovementSet
+		|| LocomotionSteeringOriginalSource != LocomotionSourceBinding)
+		ResetLocomotionSteeringObservation();
+	bLocomotionSteeringIntervalOpen = IsValid(CharacterOwner) && IsValid(UpdatedComponent)
+		&& !CharacterOwner->bClientUpdating;
+	bLocomotionSteeringIntervalOrdinary = false;
+	bLocomotionSteeringIntervalExcluded = HasActiveActionMotion() || HasIndependentGroundRootMotion()
+		|| HasCurveRootMotionSource() || IsTurnBackCurveDriven();
+	LocomotionSteeringIntervalError.Reset();
+	LocomotionSteeringRotationBudget.Reset();
+	LocomotionSteeringEntryYaw = UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : 0.0f;
+}
+
+bool UGGYGOCharacterMovementComponent::CanExecuteOrdinaryLocomotionSteering() const
+{
+	return IsValid(CharacterOwner) && IsValid(UpdatedComponent) && HasAcceptedMovementSet()
+		&& MovementSet->bEnableLocomotionSteering && bOrientRotationToMovement && IsMovingOnGround()
+		&& CharacterOwner->GetLocalRole() != ROLE_SimulatedProxy && HasMoveInput()
+		&& !ShouldRejectMovementInputGroundLocomotion() && !ShouldRejectUnownedCurveGroundLocomotion()
+		&& !HasActiveActionMotion() && !HasIndependentGroundRootMotion() && !IsTurnBackCurveDriven()
+		&& !CurrentRootMotion.HasOverrideVelocity() && !CurrentRootMotion.HasAdditiveVelocity()
+		&& !GetUnsupportedGroundRootMotionSource();
+}
+
+void UGGYGOCharacterMovementComponent::RejectLocomotionSteering(const FString& Error)
+{
+	const FString Diagnostic = FString::Printf(
+		TEXT("[Movement.LocomotionSteering] Component='%s', Character='%s', MovementSet='%s': %s"),
+		*GetPathName(), *GetPathNameSafe(CharacterOwner), *GetPathNameSafe(MovementSet.Get()), *Error);
+	const bool bReport = !bLocomotionSteeringDiagnosticReported;
+	RejectLocomotionEvaluation(LocomotionRequestSerial, Diagnostic);
+	LocomotionSteeringIntervalError = Diagnostic;
+	LocomotionSteeringSnapshot.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+	LocomotionSteeringSnapshot.Diagnostic = Diagnostic;
+	LocomotionSteeringSnapshot.bHasVelocityYawRate = false;
+	bLocomotionSteeringDiagnosticReported = true;
+	if (bReport) UE_LOG(LogGGYGOMovement, Error, TEXT("%s"), *Diagnostic);
+}
+
+FRotator UGGYGOCharacterMovementComponent::ComputeOrientToMovementRotation(
+	const FRotator& CurrentRotation, float DeltaTime, FRotator& DeltaRotation) const
+{
+	if (LocomotionSteeringRotationBudget.IsSet())
+	{
+		DeltaRotation.Yaw = LocomotionSteeringRotationBudget.GetValue();
+		return FVector(Velocity.X, Velocity.Y, 0.0).Rotation();
+	}
+	return Super::ComputeOrientToMovementRotation(CurrentRotation, DeltaTime, DeltaRotation);
+}
+
+void UGGYGOCharacterMovementComponent::OnMovementUpdated(
+	float DeltaSeconds, const FVector& OldLocation, const FVector& OldVelocity)
+{
+	Super::OnMovementUpdated(DeltaSeconds, OldLocation, OldVelocity);
+	// Historical prediction/correction never certifies a new live presentation sample.
+	if (!bLocomotionSteeringIntervalOpen || !CharacterOwner || CharacterOwner->bClientUpdating) return;
+	bLocomotionSteeringIntervalOpen = false;
+	if (LocomotionSteeringIntervalSerial == MAX_uint64 || LocomotionSteeringSourceEpoch == MAX_uint64)
+	{
+		RejectLocomotionSteering(TEXT("derived observation serial/epoch exhausted; cannot certify a new native interval."));
+		return;
+	}
+	FGGYGOLocomotionSteeringSnapshot Completed;
+	Completed.OriginalMovement = this;
+	Completed.OriginalCharacter = CharacterOwner;
+	Completed.OriginalUpdatedComponent = UpdatedComponent.Get();
+	Completed.SourceEpoch = LocomotionSteeringSourceEpoch;
+	Completed.CompletedIntervalSerial = ++LocomotionSteeringIntervalSerial;
+	Completed.CompletedFrame = GFrameCounter;
+	Completed.NativeDeltaSeconds = DeltaSeconds;
+	Completed.Status = EGGYGOLocomotionSteeringStatus::NotApplicable;
+	if (!LocomotionSteeringIntervalError.IsEmpty())
+	{
+		Completed.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+		Completed.Diagnostic = LocomotionSteeringIntervalError;
+	}
+	else if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds <= 0.0f || !UpdatedComponent
+		|| !FMath::IsFinite(LocomotionSteeringEntryYaw) || UpdatedComponent->GetComponentRotation().ContainsNaN()
+		|| OldVelocity.ContainsNaN() || Velocity.ContainsNaN() || Acceleration.ContainsNaN())
+	{
+		Completed.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+		Completed.Diagnostic = TEXT("native completed steering interval has invalid dt/transform/velocity/acceleration.");
+	}
+	else if (bLocomotionSteeringIntervalExcluded || !bLocomotionSteeringIntervalOrdinary
+		|| !CanExecuteOrdinaryLocomotionSteering())
+	{
+		Completed.Diagnostic = TEXT("original interval was not wholly ordinary ground steering (Action/TurnBack/root motion/passive/proxy/no input).");
+	}
+	else
+	{
+		Completed.Status = EGGYGOLocomotionSteeringStatus::Valid;
+		Completed.ActualSignedYawRate = FMath::FindDeltaAngleDegrees(
+			LocomotionSteeringEntryYaw, UpdatedComponent->GetComponentRotation().Yaw) / DeltaSeconds;
+		Completed.bHasVelocityYawRate = GGYGOLocomotionSteeringEvaluation::CalculateVelocityYawRate(
+			OldVelocity, Velocity, DeltaSeconds, Completed.ActualSignedVelocityYawRate);
+		Completed.DesiredDirectionError = FMath::FindDeltaAngleDegrees(
+			UpdatedComponent->GetComponentRotation().Yaw, Acceleration.Rotation().Yaw);
+		if (!FMath::IsFinite(Completed.ActualSignedYawRate) || !FMath::IsFinite(Completed.DesiredDirectionError))
+		{
+			Completed.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+			Completed.bHasVelocityYawRate = false;
+			Completed.Diagnostic = TEXT("native completed capsule yaw derivative or admitted direction error is not finite.");
+		}
+	}
+	if (Completed.Status == EGGYGOLocomotionSteeringStatus::Invalid)
+	{
+		Completed.Diagnostic = FString::Printf(TEXT("[Movement.LocomotionSteering] Component='%s', Character='%s', MovementSet='%s': %s"),
+			*GetPathName(), *GetPathNameSafe(CharacterOwner), *GetPathNameSafe(MovementSet.Get()), *Completed.Diagnostic);
+	}
+	LocomotionSteeringCompletedVelocity = Velocity;
+	LocomotionSteeringCompletedYaw = UpdatedComponent ? UpdatedComponent->GetComponentRotation().Yaw : 0.0f;
+	LocomotionSteeringSnapshot = MoveTemp(Completed);
+}
+
+FGGYGOLocomotionSteeringSnapshot UGGYGOCharacterMovementComponent::GetLocomotionSteeringSnapshot() const
+{
+	FGGYGOLocomotionSteeringSnapshot Result = LocomotionSteeringSnapshot;
+	const auto Qualify = [this, &Result](EGGYGOLocomotionSteeringStatus Status, const FString& Reason)
+	{
+		Result.Status = Status;
+		Result.bHasVelocityYawRate = false;
+		Result.Diagnostic = FString::Printf(TEXT("[Movement.LocomotionSteering] Component='%s', Character='%s', MovementSet='%s': %s"),
+			*GetPathName(), *GetPathNameSafe(CharacterOwner), *GetPathNameSafe(MovementSet.Get()), *Reason);
+		return Result;
+	};
+	if (!IsInGameThread())
+	{
+		Result.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+		Result.Diagnostic = TEXT("Movement steering capture requires the game thread.");
+		return Result;
+	}
+	if (!IsValid(CharacterOwner) || !IsValid(UpdatedComponent) || IsBeingDestroyed()
+		|| CharacterOwner->IsActorBeingDestroyed() || bMovementOwnerSyncClosed)
+		return Qualify(EGGYGOLocomotionSteeringStatus::Invalid, TEXT("original Character/UpdatedComponent lifecycle is missing or closed."));
+	if (Result.CompletedIntervalSerial == 0)
+	{
+		Result.OriginalMovement = const_cast<UGGYGOCharacterMovementComponent*>(this);
+		Result.OriginalCharacter = CharacterOwner;
+		Result.OriginalUpdatedComponent = UpdatedComponent.Get();
+		Result.SourceEpoch = LocomotionSteeringSourceEpoch;
+	}
+	if (!HasAcceptedMovementSet())
+	{
+		if (IsOriginalMovementSetInitializationPending())
+			return Qualify(EGGYGOLocomotionSteeringStatus::Initial,
+				TEXT("original PawnExtension configuration initialization is not complete; Set entry has not submitted and no native interval has executed."));
+		return Qualify(EGGYGOLocomotionSteeringStatus::Invalid, MovementSetConfigurationError.IsEmpty()
+			? TEXT("required accepted MovementSet is missing outside the original initialization window.")
+			: MovementSetConfigurationError);
+	}
+	FString Error;
+	if (!GGYGOLocomotionSteeringEvaluation::ValidateConfiguration(*MovementSet, Error))
+		return Qualify(EGGYGOLocomotionSteeringStatus::Invalid, Error);
+	if (!MovementSet->bEnableLocomotionSteering)
+		return Qualify(EGGYGOLocomotionSteeringStatus::NotApplicable, TEXT("ordinary steering is explicitly disabled in MovementSet."));
+	if (MovementSet->bUseCurveDrivenSpeed && !IsLocomotionSourceBindingCurrent(LocomotionSourceBinding, Error))
+		return Qualify(EGGYGOLocomotionSteeringStatus::Invalid, Error);
+	if (Result.Status == EGGYGOLocomotionSteeringStatus::Invalid) return Result;
+	if (Result.CompletedIntervalSerial == 0)
+	{
+		Result.Status = EGGYGOLocomotionSteeringStatus::Initial;
+		Result.Diagnostic = TEXT("original dependencies accepted; no completed native steering interval yet.");
+		return Result;
+	}
+	if (Result.OriginalMovement.Get() != this || Result.OriginalCharacter.Get() != CharacterOwner
+		|| Result.OriginalUpdatedComponent.Get() != UpdatedComponent
+		|| LocomotionSteeringOriginalSet.Get() != MovementSet || LocomotionSteeringOriginalSource != LocomotionSourceBinding)
+		return Qualify(EGGYGOLocomotionSteeringStatus::Invalid, TEXT("completed sample no longer belongs to the original movement dependencies."));
+	if (CharacterOwner->bClientUpdating || GFrameCounter < Result.CompletedFrame
+		|| GFrameCounter - Result.CompletedFrame > 1
+		|| !Velocity.Equals(LocomotionSteeringCompletedVelocity, UE_KINDA_SMALL_NUMBER)
+		|| !FMath::IsNearlyZero(FMath::FindDeltaAngleDegrees(LocomotionSteeringCompletedYaw, UpdatedComponent->GetComponentRotation().Yaw)))
+		return Qualify(EGGYGOLocomotionSteeringStatus::NotApplicable, TEXT("original completed native sample is stale or native correction/replay replaced its result."));
+	if (Result.Status == EGGYGOLocomotionSteeringStatus::Valid && !CanExecuteOrdinaryLocomotionSteering())
+		return Qualify(EGGYGOLocomotionSteeringStatus::NotApplicable, TEXT("ordinary steering control was released or native mode/root motion took over."));
+	return Result;
 }
 
 EGGYGOTurnBackPhase UGGYGOCharacterMovementComponent::GetTurnBackPhase() const

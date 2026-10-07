@@ -13,6 +13,7 @@
 
 #include "Character/Data/GGYGOMovementTypes.h"
 #include "Engine/DataAsset.h"
+#include "Curves/CurveFloat.h"
 
 #include "GGYGOMovementSet.generated.h"
 
@@ -73,6 +74,28 @@ public:
 	/** 朝向对齐的角速度（度/秒）。只有 Yaw 有意义，Pitch/Roll 由动画负责。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation", meta = (ClampMin = "0.0", UIMin = "0.0"))
 	float RotationYawRate = 720.0f;
+
+	/** Smooth actual planar velocity and capsule yaw in the existing native movement interval. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering")
+	bool bEnableLocomotionSteering = false;
+
+	/** X: absolute heading error, 0..180 degrees. Y: angular response, 0..1. Required when enabled. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering", meta = (EditCondition = "bEnableLocomotionSteering"))
+	FRuntimeFloatCurve SteeringAngleResponse;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering", meta = (EditCondition = "bEnableLocomotionSteering", ClampMin = "0.0", ForceUnits = "deg/s"))
+	float SteeringMinYawRate = 90.0f;
+
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering", meta = (EditCondition = "bEnableLocomotionSteering", ClampMin = "0.0", ForceUnits = "deg/s"))
+	float SteeringMaxYawRate = 720.0f;
+
+	/** Higher scale follows input sooner, producing a weaker curved trajectory. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering", meta = (EditCondition = "bEnableLocomotionSteering", ClampMin = "0.001"))
+	float SteeringWalkAngularRateScale = 1.0f;
+
+	/** Lower than Walk creates stronger Run curvature; continuously blended by original Alpha. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Rotation|Locomotion Steering", meta = (EditCondition = "bEnableLocomotionSteering", ClampMin = "0.001"))
+	float SteeringRunAngularRateScale = 0.5f;
 
 	/** 最大加速度（cm/s²）。越大越"贴手"，越小越有惯性。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Acceleration", meta = (ClampMin = "0.0", UIMin = "0.0"))

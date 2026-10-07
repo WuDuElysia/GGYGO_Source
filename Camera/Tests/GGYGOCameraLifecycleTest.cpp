@@ -59,7 +59,7 @@ void UGGYGOCameraLifecycleTestModeBase::OnActivation()
 	BlendExponent = Defaults->BlendExponent;
 }
 
-void UGGYGOCameraLifecycleTestModeBase::UpdateView(float DeltaTime)
+FGGYGOCameraEvaluationResult UGGYGOCameraLifecycleTestModeBase::UpdateView(float DeltaTime)
 {
 	View.Location = TestViewLocation;
 	View.Rotation = TestViewRotation;
@@ -70,6 +70,22 @@ void UGGYGOCameraLifecycleTestModeBase::UpdateView(float DeltaTime)
 	CameraPenetrationRequest.PivotLocation = TestPenetrationPivot;
 	CameraPenetrationRequest.ProbeRadius = TestPenetrationProbeRadius;
 	CameraPenetrationRequest.RecoverySpeed = TestPenetrationRecoverySpeed;
+	return FGGYGOCameraEvaluationResult::Success();
+}
+
+void UGGYGOCameraSteeringTestMode::ConfigureSteeringForTest()
+{
+	bEnableWalkRunSteeringOffset = true;
+	SteeringOffsetResponse.ExternalCurve = nullptr;
+	SteeringOffsetResponse.EditorCurveData.Reset();
+	SteeringOffsetResponse.EditorCurveData.AddKey(0.0f, 0.0f);
+	SteeringOffsetResponse.EditorCurveData.AddKey(100.0f, 1.0f);
+	SteeringOffsetAmplitude = 40.0f;
+	SteeringOffsetMaxDistance = 30.0f;
+	WalkSteeringOffsetScale = 0.25f;
+	RunSteeringOffsetScale = 1.0f;
+	SteeringOffsetEnterSpeed = 6.0f;
+	SteeringOffsetReturnSpeed = 4.0f;
 }
 
 FGGYGOCameraEvaluationResult UGGYGOCameraLifecycleTestComponent::PushModeForTest(TSubclassOf<UGGYGOCameraMode> ModeClass)
@@ -354,6 +370,97 @@ namespace
 	};
 }
 
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCameraWalkRunSteeringCompositionTest,
+	"GGYGO.Camera.WalkRunSteeringComposition",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOCameraWalkRunSteeringCompositionTest::RunTest(const FString& Parameters)
+{
+	FGGYGOCameraLifecycleTestWorld TestWorld(GEngine);
+	AGGYGOCameraLifecycleTestPawn* Pawn = SpawnCameraTestPawn(TestWorld.World);
+	if (!TestNotNull(TEXT("composition fixture Pawn"), Pawn)) { return false; }
+	UGGYGOCameraModeStack* Stack = NewObject<UGGYGOCameraModeStack>(Pawn->GetCameraForTest());
+	UGGYGOCameraSteeringTestMode* Mode = NewObject<UGGYGOCameraSteeringTestMode>(Stack);
+	Mode->ConfigureSteeringForTest();
+	if (!TestTrue(TEXT("authored inline response admitted"), Mode->ValidateConfiguration().IsSuccess())) { return false; }
+
+	// These are geometric inputs, not injected native Movement results or production steering evidence.
+	float RunTarget = 0.0f;
+	TestTrue(TEXT("rear view right turn target evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator::ZeroRotator, RunTarget).IsSuccess());
+	TestTrue(TEXT("rear right turn shifts left, bounded by authored world cap"), FMath::IsNearlyEqual(RunTarget, -30.0f));
+	float Target = 0.0f;
+	TestTrue(TEXT("rear left turn target evaluated"),
+		Mode->EvaluateTargetForTest(-100.0f, FVector::ForwardVector, 1.0f, FRotator::ZeroRotator, Target).IsSuccess());
+	TestTrue(TEXT("rear left turn shifts right"), FMath::IsNearlyEqual(Target, 30.0f));
+	TestTrue(TEXT("front view target evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator(0.0f, 180.0f, 0.0f), Target).IsSuccess());
+	TestTrue(TEXT("front view reverses screen sign for the same world outside"), FMath::IsNearlyEqual(Target, 30.0f));
+	TestTrue(TEXT("side view target evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator(0.0f, 90.0f, 0.0f), Target).IsSuccess());
+	TestTrue(TEXT("side view horizontal projection vanishes"), FMath::IsNearlyZero(Target));
+	// Retain the exact failing R1 scene and print its old basis; changing the assertion tolerance
+	// or snapping a side-view deadzone would conceal the degree-factor precision error.
+	const double OriginalMatrixSideTarget = 30.0 * FVector::DotProduct(-FVector::RightVector,
+		FRotationMatrix(FRotator(0.0f, 90.0f, 0.0f)).GetUnitAxis(EAxis::Y));
+	AddInfo(FString::Printf(TEXT("Exact side view: original matrix target=%.12g cm, double basis target=%.12g cm."),
+		OriginalMatrixSideTarget, static_cast<double>(Target)));
+	TestTrue(TEXT("view just before side-on evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator(0.0, 89.99, 0.0), Target).IsSuccess());
+	TestTrue(TEXT("before side-on keeps small left projection without snapping"), Target < -0.004f && Target > -0.006f);
+	TestTrue(TEXT("view just after side-on evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator(0.0, 90.01, 0.0), Target).IsSuccess());
+	TestTrue(TEXT("after side-on keeps small right projection without snapping"), Target > 0.004f && Target < 0.006f);
+	TestTrue(TEXT("pitched and rolled camera target evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 1.0f, FRotator(30.0, 90.0, 90.0), Target).IsSuccess());
+	TestTrue(TEXT("combined pitch and roll use UE Euler right axis, giving half outside projection"), FMath::IsNearlyEqual(Target, -15.0f));
+	TestTrue(TEXT("walk target evaluated"),
+		Mode->EvaluateTargetForTest(100.0f, FVector::ForwardVector, 0.0f, FRotator::ZeroRotator, Target).IsSuccess());
+	TestTrue(TEXT("walk composition is weaker than run"), FMath::IsNearlyEqual(Target, -10.0f) && FMath::Abs(Target) < FMath::Abs(RunTarget));
+
+	TestTrue(TEXT("presentation enters via original camera delta"), Mode->AdvancePresentationForTest(0.1f, RunTarget).IsSuccess());
+	const float Entered = Mode->GetLateralOffsetForTest();
+	TestTrue(TEXT("entry moves continuously toward target"), Entered < 0.0f && Entered > RunTarget);
+	TestTrue(TEXT("normal inapplicability can return toward zero"), Mode->AdvancePresentationForTest(0.1f, 0.0f).IsSuccess());
+	TestTrue(TEXT("return reduces retained presentation"), FMath::Abs(Mode->GetLateralOffsetForTest()) < FMath::Abs(Entered));
+	Mode->OnDeactivation();
+	TestEqual(TEXT("deactivation clears mode presentation"), Mode->GetLateralOffsetForTest(), 0.0f);
+	Mode->AdvancePresentationForTest(0.1f, RunTarget);
+	Mode->OnActivation();
+	TestEqual(TEXT("reused activation starts without retained steering"), Mode->GetLateralOffsetForTest(), 0.0f);
+
+	Mode->ClearResponseForTest();
+	Target = 123.0f;
+	const FGGYGOCameraEvaluationResult MissingCurve = Mode->EvaluateTargetForTest(
+		100.0f, FVector::ForwardVector, 1.0f, FRotator::ZeroRotator, Target);
+	TestFalse(TEXT("enabled missing response fails explicitly"), MissingCurve.IsSuccess());
+	TestEqual(TEXT("curve failure identifies configuration"), MissingCurve.Field, FName(TEXT("SteeringOffsetResponse")));
+	TestEqual(TEXT("failure does not replace caller target with normal zero"), Target, 123.0f);
+	Mode->SetSteeringEnabledForTest(false);
+	TestTrue(TEXT("explicit disabled mode does not require unused response"), Mode->UpdateCameraMode(0.0f).IsSuccess());
+	const FGGYGOCameraModeView BaselineView = Mode->GetCameraModeView();
+	Mode->ConfigureSteeringForTest();
+	Mode->SetAmplitudeForTest(-1.0f);
+	const FGGYGOCameraEvaluationResult InvalidAmplitude = Mode->UpdateCameraMode(0.0f);
+	TestFalse(TEXT("enabled illegal amplitude fails mode admission"), InvalidAmplitude.IsSuccess());
+	TestEqual(TEXT("illegal amplitude names original field"), InvalidAmplitude.Field, FName(TEXT("SteeringOffsetAmplitude")));
+	TestTrue(TEXT("failed mode admission does not replace view"), Mode->GetCameraModeView().Location == BaselineView.Location);
+	Mode->ConfigureSteeringForTest();
+	Target = 123.0f;
+	const FGGYGOCameraEvaluationResult InvalidSample = Mode->EvaluateTargetForTest(
+		std::numeric_limits<float>::quiet_NaN(), FVector::ForwardVector, 1.0f, FRotator::ZeroRotator, Target);
+	TestFalse(TEXT("non-finite geometric input fails"), InvalidSample.IsSuccess());
+	TestEqual(TEXT("invalid input does not pretend to be zero turn"), Target, 123.0f);
+	const FGGYGOCameraEvaluationResult MissingMovement = Mode->UpdateCameraMode(0.1f);
+	TestFalse(TEXT("enabled source failure returns through UpdateView result seam"), MissingMovement.IsSuccess());
+	TestEqual(TEXT("source failure names original dependency"), MissingMovement.Field, FName(TEXT("SteeringSource")));
+	TestTrue(TEXT("source failure retains mode and target diagnostic provenance"),
+		MissingMovement.Mode.Get() == Mode && MissingMovement.Reason.Contains(Pawn->GetPathName()));
+	TestTrue(TEXT("source failure does not publish replacement mode view"), Mode->GetCameraModeView().Location == BaselineView.Location);
+	TestEqual(TEXT("source failure clears only retained steering presentation"), Mode->GetLateralOffsetForTest(), 0.0f);
+	return true;
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCameraPhotographyPublicationAdmissionTest,
 	"GGYGO.Camera.PhotographyPublicationAdmission",

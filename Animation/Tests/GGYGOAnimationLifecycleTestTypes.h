@@ -71,6 +71,12 @@ public:
 	void InvokeNativeUpdateAnimation(float DeltaSeconds) { NativeUpdateAnimation(DeltaSeconds); }
 
 	void SeedDirtyRuntimeStateForTest();
+	/** Consumer unit input only; this does not exercise or impersonate the CMC getter. */
+	void InvokeWalkRunLeanForTest(const FGGYGOAnimationStateFrame& InFrame, float DeltaSeconds)
+	{
+		AnimationState = InFrame;
+		UpdateWalkRunLeanPresentation(DeltaSeconds);
+	}
 
 	const FZZZAnimSnapshot& GetSnapshotForTest() const { return Snap; }
 	const FGGYGOAnimationDebugFrame& GetDebugFrameForTest() const { return GetAnimationDebugFrame(); }

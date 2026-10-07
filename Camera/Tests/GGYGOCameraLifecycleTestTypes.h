@@ -4,6 +4,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Camera/GGYGOCameraComponent.h"
 #include "Camera/GGYGOCameraMode.h"
+#include "Camera/GGYGOCameraMode_ThirdPerson.h"
 #include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Combatants/GGYGOCombatantState.h"
@@ -24,7 +25,7 @@ public:
 
 protected:
 	virtual void OnActivation() override;
-	virtual void UpdateView(float DeltaTime) override;
+	virtual FGGYGOCameraEvaluationResult UpdateView(float DeltaTime) override;
 
 private:
 	UPROPERTY()
@@ -65,6 +66,31 @@ UCLASS(Transient)
 class UGGYGOCameraLifecycleTestModeC : public UGGYGOCameraLifecycleTestModeBase
 {
 	GENERATED_BODY()
+};
+
+/** Authored transient configuration for camera composition; does not manufacture Movement samples. */
+UCLASS(Transient)
+class UGGYGOCameraSteeringTestMode : public UGGYGOCameraMode_ThirdPerson
+{
+	GENERATED_BODY()
+
+public:
+	void ConfigureSteeringForTest();
+	void SetSteeringEnabledForTest(bool bEnabled) { bEnableWalkRunSteeringOffset = bEnabled; }
+	void SetAmplitudeForTest(float Amplitude) { SteeringOffsetAmplitude = Amplitude; }
+	void ClearResponseForTest() { SteeringOffsetResponse.EditorCurveData.Reset(); }
+	FGGYGOCameraEvaluationResult EvaluateTargetForTest(float YawRate, const FVector& Direction,
+		float WalkRunAlpha, const FRotator& CameraRotation, float& OutTarget) const
+	{
+		const FGGYGOCameraEvaluationResult Result = ValidateConfiguration();
+		return Result.IsSuccess() ? ComputeSteeringLateralTarget(YawRate, Direction, WalkRunAlpha, CameraRotation, OutTarget) : Result;
+	}
+	FGGYGOCameraEvaluationResult AdvancePresentationForTest(float DeltaTime, float Target)
+	{
+		const FGGYGOCameraEvaluationResult Result = ValidateConfiguration();
+		return Result.IsSuccess() ? UpdateSteeringPresentation(DeltaTime, Target) : Result;
+	}
+	float GetLateralOffsetForTest() const { return SteeringLateralOffset; }
 };
 
 /** Exposes only the protected production camera entry points needed by tests. */

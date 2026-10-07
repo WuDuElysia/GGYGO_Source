@@ -7,6 +7,7 @@
 #include "CoreMinimal.h"
 #include "GameplayTagContainer.h"
 #include "Character/Data/GGYGOMovementTypes.h"
+#include "Character/Data/GGYGOLocomotionSteeringTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 
 #include "GGYGOAnimationStateFrame.generated.h"
@@ -49,6 +50,13 @@ struct FGGYGOAnimationStateFrame
 	/** Movement 权威的 WalkRun BlendSpace 混合值：0 = Walk，1 = Run。 */
 	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
 	float WalkRunBlendAlpha = 0.0f;
+
+	/** False before a Character context exists; this is not a completed zero-rate sample. */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")
+	bool bLocomotionSteeringCaptured = false;
+
+	/** Native immutable interval fact. Only GT interprets weak identity; graph workers read values. */
+	FGGYGOLocomotionSteeringSnapshot LocomotionSteering;
 
 	/** Movement 权威的停止动作语义，供旧 AnimBP 分支索引适配。 */
 	UPROPERTY(BlueprintReadOnly, Category = "Animation|Movement")

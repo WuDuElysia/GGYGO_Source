@@ -13,6 +13,7 @@
 #pragma once
 
 #include "Character/Data/GGYGOMovementTypes.h"
+#include "Character/Data/GGYGOLocomotionSteeringTypes.h"
 #include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
 #include "Input/GGYGOMovementInputTypes.h"
@@ -487,6 +488,8 @@ public:
 
 	/** 转身的曲线接管段朝向由动画曲线驱动，其余情况交回基类。 */
 	virtual void PhysicsRotation(float DeltaTime) override;
+	virtual FRotator ComputeOrientToMovementRotation(const FRotator& CurrentRotation, float DeltaTime, FRotator& DeltaRotation) const override;
+	virtual void OnMovementUpdated(float DeltaSeconds, const FVector& OldLocation, const FVector& OldVelocity) override;
 	virtual void ClientHandleMoveResponse(const FCharacterMoveResponseDataContainer& MoveResponse) override;
 	virtual bool ClientUpdatePositionAfterServerUpdate() override;
 	virtual void ServerMove_PerformMovement(const FCharacterNetworkMoveData& MoveData) override;
@@ -596,6 +599,9 @@ public:
 	/** WalkRun BlendSpace1D 的唯一混合输入：0=Walk，1=Run。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	float GetWalkRunBlendAlpha() const { return WalkRunBlendAlpha; }
+
+	/** GT-only, original native interval qualification and lifecycle validation owned here. */
+	FGGYGOLocomotionSteeringSnapshot GetLocomotionSteeringSnapshot() const;
 
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	EGGYGOStopMotionType GetStopMotionType() const { return StopMotionType; }
@@ -972,8 +978,32 @@ private:
 	void MarkNativeMovementVelocityResult();
 	void StoreNativeMovementVelocityResult();
 
+	/** Derived observation/scratch for the original native interval; never saved-move authority. */
+	FGGYGOLocomotionSteeringSnapshot LocomotionSteeringSnapshot;
+	TWeakObjectPtr<const UGGYGOMovementSet> LocomotionSteeringOriginalSet;
+	FGGYGOLocomotionSourceBindingPtr LocomotionSteeringOriginalSource;
+	uint64 LocomotionSteeringSourceEpoch = 1;
+	uint64 LocomotionSteeringIntervalSerial = 0;
+	float LocomotionSteeringEntryYaw = 0.0f;
+	float LocomotionSteeringCompletedYaw = 0.0f;
+	FVector LocomotionSteeringCompletedVelocity = FVector::ZeroVector;
+	bool bLocomotionSteeringIntervalOpen = false;
+	bool bLocomotionSteeringIntervalOrdinary = false;
+	bool bLocomotionSteeringIntervalExcluded = false;
+	FString LocomotionSteeringIntervalError;
+	TOptional<float> LocomotionSteeringRotationBudget;
+	void ResetLocomotionSteeringObservation();
+	void BeginLocomotionSteeringInterval();
+	bool CanExecuteOrdinaryLocomotionSteering() const;
+	void RejectLocomotionSteering(const FString& Error);
+
 	/** 只从已接受配置指针派生，不代表原动画源本帧求值成功。 */
 	bool HasAcceptedMovementSet() const;
+	/** Presentation-only startup qualification; never permits ground execution without an accepted Set. */
+	bool IsOriginalMovementSetInitializationPending() const;
+	/** Original Set entry has made a decision; resets/stops cannot reopen this startup window. */
+	bool bMovementSetConfigurationSubmitted = false;
+	FString MovementSetConfigurationError;
 
 	/** 实际动画 RootMotion 或符合已有提交契约的 ActionCurve；未知 RMS 不构成豁免。 */
 	bool HasIndependentGroundRootMotion() const;
@@ -995,6 +1025,7 @@ private:
 	 * 首个普通地面拒绝诊断置 true，后续有效绑定/合法解绑开启新周期。无资源句柄。
 	 */
 	bool bGroundAdmissionDiagnosticReported = false;
+	bool bLocomotionSteeringDiagnosticReported = false;
 
 protected:
 	/** 订阅原 Extension 的身份通知；真实 Ready/Released 维护唯一派生 ASC 缓存。 */

@@ -4,6 +4,7 @@
  */
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
+#include "Character/Data/GGYGOLocomotionSteeringEvaluation.h"
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
 #endif
@@ -130,7 +131,7 @@ bool UGGYGOMovementSet::ValidateMovementSet(FString& OutError) const
 	// Motion sources are resolved from Animation's original source binding.
 	// Serialized profile copies are retained only as migration history; their
 	// presence or contents cannot admit (or replace) a runtime animation source.
-	return true;
+	return GGYGOLocomotionSteeringEvaluation::ValidateConfiguration(*this, OutError);
 }
 
 #if WITH_EDITOR

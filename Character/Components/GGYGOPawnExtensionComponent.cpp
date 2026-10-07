@@ -11,6 +11,7 @@
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/Interfaces/GGYGOAvatarBindingHostInterface.h"
 #include "Components/GameFrameworkComponentManager.h"
+#include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "Net/UnrealNetwork.h"
@@ -20,6 +21,41 @@
 
 class FLifetimeProperty;
 class UActorComponent;
+
+struct UGGYGOPawnExtensionComponent::FPawnDataInitializationScope final
+{
+	explicit FPawnDataInitializationScope(UGGYGOPawnExtensionComponent& InExtension)
+		: Extension(&InExtension), Pawn(InExtension.GetPawn<APawn>()), World(InExtension.GetWorld()),
+		  Previous(InExtension.PawnDataInitializationScope)
+	{
+		if (IsInGameThread() && !InExtension.bPawnDataInitializationClosed && IsValid(&InExtension)
+			&& InExtension.IsRegistered() && !InExtension.IsBeingDestroyed()
+			&& !InExtension.HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& Pawn.IsValid() && !Pawn->IsActorBeingDestroyed() && World.IsValid()
+			&& World->IsGameWorld() && Pawn->GetWorld() == World.Get())
+		{
+			InExtension.PawnDataInitializationScope = this;
+		}
+	}
+
+	~FPawnDataInitializationScope()
+	{
+		// A lifecycle invalidation or a successor scope must not restore this old call's parent.
+		if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get();
+			OriginalExtension && OriginalExtension->PawnDataInitializationScope == this)
+		{
+			OriginalExtension->PawnDataInitializationScope = Previous;
+		}
+	}
+
+	FPawnDataInitializationScope(const FPawnDataInitializationScope&) = delete;
+	FPawnDataInitializationScope& operator=(const FPawnDataInitializationScope&) = delete;
+
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
+	const TWeakObjectPtr<APawn> Pawn;
+	const TWeakObjectPtr<UWorld> World;
+	const FPawnDataInitializationScope* const Previous;
+};
 
 struct FGGYGOPawnASCResourceHandle::FLocalResource
 {
@@ -142,6 +178,12 @@ void UGGYGOPawnExtensionComponent::OnRegister()
 	RegisterInitStateFeature();
 }
 
+void UGGYGOPawnExtensionComponent::OnUnregister()
+{
+	PawnDataInitializationScope = nullptr;
+	Super::OnUnregister();
+}
+
 void UGGYGOPawnExtensionComponent::BeginPlay()
 {
 	// 首次 PreBegin 默认开放；只在真实组件 BeginPlay 入口重开上一生命周期。
@@ -150,6 +192,7 @@ void UGGYGOPawnExtensionComponent::BeginPlay()
 		&& Pawn && !Pawn->IsActorBeingDestroyed()
 		&& (Pawn->IsActorBeginningPlay() || Pawn->HasActorBegunPlay()))
 	{
+		bPawnDataInitializationClosed = false;
 		bLocalAbilitySystemAdmissionClosed = false;
 	}
 	Super::BeginPlay();
@@ -166,6 +209,8 @@ void UGGYGOPawnExtensionComponent::BeginPlay()
 
 void UGGYGOPawnExtensionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	bPawnDataInitializationClosed = true;
+	PawnDataInitializationScope = nullptr;
 	// 先关闭新 Install/Ready/回放，再处理原 H；关闭的 Released 只退休义务并返回真实失败。
 	bLocalAbilitySystemAdmissionClosed = true;
 	UninitializeAbilitySystem();
@@ -376,6 +421,7 @@ void UGGYGOPawnExtensionComponent::SetupPlayerInputComponent()
 
 void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 {
+	const FPawnDataInitializationScope InitializationScope(*this);
 	if (!PawnData)
 	{
 		return;
@@ -405,6 +451,8 @@ void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 
 void UGGYGOPawnExtensionComponent::CheckDefaultInitialization()
 {
+	// Include synchronous implementer callbacks before our own DataInitialized distribution.
+	const FPawnDataInitializationScope InitializationScope(*this);
 	// 先推进别人再推进自己。
 	// 本组件的 DataInitialized 依赖所有 feature 到达 DataAvailable，
 	// 如果不先给它们一次推进机会，第一次调用时它们可能还卡在 Spawned，
@@ -420,6 +468,24 @@ void UGGYGOPawnExtensionComponent::CheckDefaultInitialization()
 
 	// 一次调用可能连续推进多级，直到某一级的条件不满足为止。
 	ContinueInitStateChain(StateChain);
+}
+
+bool UGGYGOPawnExtensionComponent::IsPawnDataInitializationInProgress() const
+{
+	if (!IsInGameThread() || bPawnDataInitializationClosed || !IsValid(this) || !IsRegistered()
+		|| IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		|| !PawnDataInitializationScope)
+	{
+		return false;
+	}
+	const APawn* OriginalPawn = GetPawn<APawn>();
+	const UWorld* OriginalWorld = GetWorld();
+	return IsValid(OriginalPawn) && !OriginalPawn->IsActorBeingDestroyed()
+		&& IsValid(OriginalWorld) && OriginalWorld->IsGameWorld()
+		&& OriginalPawn->GetWorld() == OriginalWorld
+		&& PawnDataInitializationScope->Extension.Get() == this
+		&& PawnDataInitializationScope->Pawn.Get() == OriginalPawn
+		&& PawnDataInitializationScope->World.Get() == OriginalWorld;
 }
 
 bool UGGYGOPawnExtensionComponent::CanChangeInitState(UGameFrameworkComponentManager* Manager, FGameplayTag CurrentState, FGameplayTag DesiredState) const

@@ -247,8 +247,8 @@ public:
 	float BlendExponent = 4.0f;
 
 protected:
-	/** 派生类在这里算出 `View`。 */
-	virtual void UpdateView(float DeltaTime);
+	/** 派生类计算 `View`；必需来源或运行求值失败须返回原诊断，不能发布替代视角。 */
+	virtual FGGYGOCameraEvaluationResult UpdateView(float DeltaTime);
 
 	/** Subclass-specific data only; the nonvirtual public wrapper always validates common fields. */
 	virtual FGGYGOCameraEvaluationResult ValidateModeConfiguration() const;

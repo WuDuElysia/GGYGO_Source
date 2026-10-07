@@ -649,7 +649,7 @@ void UGGYGOPlayerComboAbility::HandleMontageSection(const TSharedPtr<FStepMotion
 void UGGYGOPlayerComboAbility::HandleMontageNotify(const TSharedPtr<FStepMotionResources>& Resource,
 	const FGGYGOMontageNotifyFact& Fact)
 {
-	if (!IsMotionResourceCurrent(Resource)) { return; }
+	if (!IsMotionResourceCurrent(Resource) || Resource->bMontageCompleted) { return; }
 	if (Fact.Montage != Resource->Source->Montage.Get() || Fact.Mesh != ActiveMesh
 		|| Fact.NotifyName != Resource->InterruptionNotifyName || Fact.MontageInstanceId == INDEX_NONE
 		|| Fact.NotifyPositionSeconds != Resource->InterruptionNotifyPosition
@@ -675,7 +675,7 @@ void UGGYGOPlayerComboAbility::HandleMontageNotify(const TSharedPtr<FStepMotionR
 
 void UGGYGOPlayerComboAbility::EnableStepInterruption(const TSharedPtr<FStepMotionResources>& Resource)
 {
-	if (!IsMotionResourceCurrent(Resource) || Resource->bInterruptionOpen) { return; }
+	if (!IsMotionResourceCurrent(Resource) || Resource->bMontageCompleted || Resource->bInterruptionOpen) { return; }
 	if (Resource->MontageInstanceId == INDEX_NONE || Resource->MotionHandle == INDEX_NONE || !Resource->Scope.IsSet())
 	{
 		FailStepMotion(Resource, TEXT("Author interruption permission cannot open without its original playback and issued CMC Scope/Handle."));
@@ -1389,6 +1389,10 @@ void UGGYGOPlayerComboAbility::HandleMontageCompleted(const TSharedPtr<FStepMoti
 {
 	if (!IsMotionResourceCurrent(Resource) || Resource->bMontageCompleted) { return; }
 	Resource->bMontageCompleted = true;
+	// The original playback has ended. Keep the CMC handle and completion receiver
+	// alive for its final native contribution, without retaining playback permission.
+	Resource->bInterruptionOpen = false;
+	Resource->PendingNotifyInstanceId = INDEX_NONE;
 	FString Error;
 	if (!Resource->Movement.IsValid() || Resource->MotionHandle == INDEX_NONE
 		|| !Resource->Movement->ReleaseMontageActionMotion(Resource->MotionHandle, EGGYGOActionMotionReleaseReason::Completed, Error))

@@ -36,6 +36,13 @@ void UGGYGOAnimationLifecycleTestAnimInstance::SeedDirtyRuntimeStateForTest()
 	AnimationState.LocalVelocityAngle = 42.0f;
 	AnimationState.LocalVelocityBlend = FVector2D(0.25f, 0.75f);
 	AnimationState.WalkRunBlendAlpha = 0.6f;
+	AnimationState.bLocomotionSteeringCaptured = true;
+	AnimationState.LocomotionSteering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	AnimationState.LocomotionSteering.SourceEpoch = 27;
+	AnimationState.LocomotionSteering.CompletedIntervalSerial = 9;
+	AnimationState.LocomotionSteering.ActualSignedVelocityYawRate = 123.0f;
+	AnimationState.LocomotionSteering.bHasVelocityYawRate = true;
+	AnimationState.LocomotionSteering.Diagnostic = TEXT("previous captured interval");
 	AnimationState.StopMotionType = EGGYGOStopMotionType::RunStop;
 	AnimationState.Gait = EGGYGOGait::Run;
 	AnimationState.MovementMode = MOVE_Falling;
@@ -88,6 +95,9 @@ void UGGYGOAnimationLifecycleTestAnimInstance::SeedDirtyRuntimeStateForTest()
 	ActualVelocityBlendY = 0.7f;
 	ActualVelocityAngle = 90.0f;
 	bTurnBackRunOut = true;
+	WalkRunLeanAngleDegrees = 7.25f;
+	bWalkRunLeanPresentationValid = true;
+	WalkRunLeanFailureReason = TEXT("seeded previous presentation failure");
 }
 
 namespace
@@ -161,6 +171,17 @@ namespace
 		TEST_FIELD_DEFAULT(Frame, LocalVelocityAngle, DefaultFrame);
 		TEST_FIELD_DEFAULT(Frame, LocalVelocityBlend, DefaultFrame);
 		TEST_FIELD_DEFAULT(Frame, WalkRunBlendAlpha, DefaultFrame);
+		TEST_FIELD_DEFAULT(Frame, bLocomotionSteeringCaptured, DefaultFrame);
+		Test.TestEqual(Label(TEXT("Steering.Status")), static_cast<uint8>(Frame.LocomotionSteering.Status),
+			static_cast<uint8>(DefaultFrame.LocomotionSteering.Status));
+		Test.TestEqual(Label(TEXT("Steering.SourceEpoch")), Frame.LocomotionSteering.SourceEpoch, uint64(0));
+		Test.TestEqual(Label(TEXT("Steering.CompletedIntervalSerial")), Frame.LocomotionSteering.CompletedIntervalSerial, uint64(0));
+		Test.TestEqual(Label(TEXT("Steering.ActualSignedVelocityYawRate")), Frame.LocomotionSteering.ActualSignedVelocityYawRate, 0.0f);
+		Test.TestFalse(Label(TEXT("Steering.bHasVelocityYawRate")), Frame.LocomotionSteering.bHasVelocityYawRate);
+		Test.TestTrue(Label(TEXT("Steering.Diagnostic empty")), Frame.LocomotionSteering.Diagnostic.IsEmpty());
+		Test.TestFalse(Label(TEXT("Steering.OriginalMovement cleared")), Frame.LocomotionSteering.OriginalMovement.IsValid());
+		Test.TestFalse(Label(TEXT("Steering.OriginalCharacter cleared")), Frame.LocomotionSteering.OriginalCharacter.IsValid());
+		Test.TestFalse(Label(TEXT("Steering.OriginalUpdatedComponent cleared")), Frame.LocomotionSteering.OriginalUpdatedComponent.IsValid());
 		TEST_FIELD_DEFAULT(Frame, StopMotionType, DefaultFrame);
 		TEST_FIELD_DEFAULT(Frame, Gait, DefaultFrame);
 		TEST_FIELD_DEFAULT(Frame, MovementMode, DefaultFrame);
@@ -209,6 +230,9 @@ namespace
 		Test.TestEqual(Label(TEXT("ActualVelocityBlendY")), AnimInstance.ActualVelocityBlendY, 0.0f);
 		Test.TestEqual(Label(TEXT("ActualVelocityAngle")), AnimInstance.ActualVelocityAngle, 0.0f);
 		Test.TestFalse(Label(TEXT("bTurnBackRunOut")), AnimInstance.bTurnBackRunOut);
+		Test.TestEqual(Label(TEXT("WalkRunLeanAngleDegrees")), AnimInstance.WalkRunLeanAngleDegrees, 0.0f);
+		Test.TestFalse(Label(TEXT("bWalkRunLeanPresentationValid")), AnimInstance.bWalkRunLeanPresentationValid);
+		Test.TestTrue(Label(TEXT("WalkRunLeanFailureReason empty")), AnimInstance.WalkRunLeanFailureReason.IsEmpty());
 
 #undef TEST_FIELD_DEFAULT
 	}
@@ -316,6 +340,11 @@ bool FGGYGOAnimationLifecycleResetTest::RunTest(const FString& Parameters)
 	}
 
 	AnimInstance->SetTestPawnOwner(nullptr);
+	AnimInstance->Tuning.WalkRunLean.FullLeanYawRateDegreesPerSecond = 180.0f;
+	AnimInstance->Tuning.WalkRunLean.WalkMaxAngleDegrees = 2.0f;
+	AnimInstance->Tuning.WalkRunLean.RunMaxAngleDegrees = 6.0f;
+	AnimInstance->Tuning.WalkRunLean.EnterResponseSpeed = 12.0f;
+	AnimInstance->Tuning.WalkRunLean.RecoveryResponseSpeed = 8.0f;
 	AnimInstance->InvokeNativeInitializeAnimation();
 	TestClearedLifecycleState(*this, *AnimInstance, TEXT("empty Owner initialize"));
 
@@ -330,6 +359,9 @@ bool FGGYGOAnimationLifecycleResetTest::RunTest(const FString& Parameters)
 	AnimInstance->SeedDirtyRuntimeStateForTest();
 	AnimInstance->InvokeNativeUninitializeAnimation();
 	TestClearedLifecycleState(*this, *AnimInstance, TEXT("repeated uninitialize"));
+	TestFalse(TEXT("reset preserves explicit disabled lean mode"), AnimInstance->Tuning.WalkRunLean.bEnabled);
+	TestEqual(TEXT("reset preserves authored full lean rate"), AnimInstance->Tuning.WalkRunLean.FullLeanYawRateDegreesPerSecond, 180.0f);
+	TestEqual(TEXT("reset preserves authored Run maximum"), AnimInstance->Tuning.WalkRunLean.RunMaxAngleDegrees, 6.0f);
 	return true;
 }
 
@@ -453,6 +485,119 @@ bool FGGYGOAnimationLocomotionEventsResetTest::RunTest(const FString& Parameters
 	Events.MapMovementState();
 	TestEqual(TEXT("reset detaches old Snapshot from Memory"), Memory.GaitBlendY, 0.75f);
 	TestEqual(TEXT("reset prevents old Stop semantic from writing"), Memory.StopValue, 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(
+	FGGYGOAnimationWalkRunLeanTest,
+	"GGYGO.Animation.WalkRunLean.PresentationAndReset",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOAnimationWalkRunLeanTest::RunTest(const FString& Parameters)
+{
+	// Deliberately test the captured consumer contract. Real CMC qualification and the
+	// production WalkRun graph remain integration smoke gates, not proof from this fixture.
+	FScopedAnimationTestWorld TestWorld;
+	if (!TestNotNull(TEXT("World"), TestWorld.World))
+	{
+		return false;
+	}
+	AGGYGOAnimationLifecycleTestCharacter* SourceA = TestWorld.World->SpawnActor<AGGYGOAnimationLifecycleTestCharacter>();
+	AGGYGOAnimationLifecycleTestCharacter* SourceB = TestWorld.World->SpawnActor<AGGYGOAnimationLifecycleTestCharacter>();
+	if (!TestNotNull(TEXT("Source A"), SourceA) || !TestNotNull(TEXT("Source B"), SourceB))
+	{
+		return false;
+	}
+	TStrongObjectPtr<USkeletalMeshComponent> Mesh(NewObject<USkeletalMeshComponent>(GetTransientPackage()));
+	TStrongObjectPtr<UGGYGOAnimationLifecycleTestAnimInstance> Anim(NewObject<UGGYGOAnimationLifecycleTestAnimInstance>(Mesh.Get()));
+	FZZZWalkRunLeanTuning& Config = Anim->Tuning.WalkRunLean;
+	Config.bEnabled = true;
+	Config.FullLeanYawRateDegreesPerSecond = 180.0f;
+	Config.WalkMaxAngleDegrees = 2.0f;
+	Config.RunMaxAngleDegrees = 6.0f;
+	Config.EnterResponseSpeed = 12.0f;
+	Config.RecoveryResponseSpeed = 8.0f;
+
+	FGGYGOAnimationStateFrame Frame;
+	Frame.bLocomotionSteeringCaptured = true;
+	FGGYGOLocomotionSteeringSnapshot& Steering = Frame.LocomotionSteering;
+	Steering.OriginalMovement = Cast<UGGYGOCharacterMovementComponent>(SourceA->GetCharacterMovement());
+	Steering.OriginalCharacter = SourceA;
+	Steering.OriginalUpdatedComponent = SourceA->GetCapsuleComponent();
+	Steering.SourceEpoch = 1;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+	TestFalse(TEXT("Initial does not manufacture an observed zero rate"), Anim->bWalkRunLeanPresentationValid);
+	TestTrue(TEXT("Initial is a normal wait"), Anim->WalkRunLeanFailureReason.IsEmpty());
+
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Steering.CompletedIntervalSerial = 1;
+	Steering.NativeDeltaSeconds = 1.0f / 60.0f;
+	Steering.bHasVelocityYawRate = true;
+	Steering.ActualSignedVelocityYawRate = 180.0f;
+	Steering.ActualSignedYawRate = -180.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+	const float WalkAngle = Anim->WalkRunLeanAngleDegrees;
+	TestTrue(TEXT("right trajectory wins over opposite capsule correction"), WalkAngle > 0.0f);
+	TestTrue(TEXT("Walk stays within its authored limit"), WalkAngle <= Config.WalkMaxAngleDegrees);
+	Anim->InvokeNativeUninitializeAnimation();
+	Frame.WalkRunBlendAlpha = 1.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+	const float RunAngle = Anim->WalkRunLeanAngleDegrees;
+	TestTrue(TEXT("same turn has stronger Run presentation"), RunAngle > WalkAngle && RunAngle <= Config.RunMaxAngleDegrees);
+
+	Steering.bHasVelocityYawRate = false;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("missing trajectory observation recovers without capsule substitution"),
+		Anim->WalkRunLeanAngleDegrees > 0.0f && Anim->WalkRunLeanAngleDegrees < RunAngle);
+	const float BeforeNotApplicable = Anim->WalkRunLeanAngleDegrees;
+	Steering.Status = EGGYGOLocomotionSteeringStatus::NotApplicable;
+	Steering.bHasVelocityYawRate = true;
+	Frame.bHasMoveInput = true;
+	Frame.Gait = EGGYGOGait::Run;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("NotApplicable overrides otherwise moving Run frame"),
+		Anim->WalkRunLeanAngleDegrees < BeforeNotApplicable);
+
+	++Steering.SourceEpoch;
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("epoch change retires prior lean immediately"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestTrue(TEXT("new epoch uses only its own completed observation"), Anim->bWalkRunLeanPresentationValid);
+	Steering.ActualSignedVelocityYawRate = -180.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+	TestTrue(TEXT("left trajectory produces left lean"), Anim->WalkRunLeanAngleDegrees < 0.0f);
+	Steering.OriginalMovement = Cast<UGGYGOCharacterMovementComponent>(SourceB->GetCharacterMovement());
+	Steering.OriginalCharacter = SourceB;
+	Steering.OriginalUpdatedComponent = SourceB->GetCapsuleComponent();
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("different CMC with equal epoch cannot inherit lean"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+
+	AddExpectedError(TEXT("[Animation][WalkRunLean]"), EAutomationExpectedErrorFlags::Contains, 2);
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+	Steering.Diagnostic = TEXT("original movement provider retired");
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestEqual(TEXT("Invalid retires the original pose value"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestFalse(TEXT("Invalid is failure rather than a usable neutral pose"), Anim->bWalkRunLeanPresentationValid);
+	TestTrue(TEXT("original provider diagnostic remains visible"), Anim->WalkRunLeanFailureReason.Contains(TEXT("retired")));
+	Config.FullLeanYawRateDegreesPerSecond = 0.0f;
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("missing enabled tuning fails explicitly"), Anim->WalkRunLeanFailureReason.Contains(TEXT("FullLeanYawRate")));
+	TestEqual(TEXT("failure does not replace required tuning"), Config.FullLeanYawRateDegreesPerSecond, 0.0f);
+	Anim->InvokeNativeUninitializeAnimation();
+	TestClearedLifecycleState(*this, *Anim, TEXT("lean lifecycle uninitialize"));
+	TestTrue(TEXT("lifecycle preserves authored enable mode"), Config.bEnabled);
+
+	Config.bEnabled = false;
+	Anim->SeedDirtyRuntimeStateForTest();
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestFalse(TEXT("explicit disabled mode stops only lean presentation"), Anim->bWalkRunLeanPresentationValid);
+	TestTrue(TEXT("disabled mode has no failure diagnostic"), Anim->WalkRunLeanFailureReason.IsEmpty());
+	TestEqual(TEXT("lean disable does not clear another presentation resource"), Anim->StateMemory.GaitBlendY, 0.73f);
+	Anim->InvokeNativeUninitializeAnimation();
 	return true;
 }
 

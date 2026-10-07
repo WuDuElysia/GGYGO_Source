@@ -30,9 +30,8 @@
  * `WalkStartEnd` / `WalkEnd` / `RunEnd` 之间选，`WalkRun` 用 `WalkRun` BlendSpace
  * 并以 `StateMemory.GaitBlendY` 驱动它的 **X 轴**（BlendSpace1D 的单轴是 X）。
  *
- * AnimGraph 顶层在状态机之后还接了一个作用于 `Bip001` 的 `Transform (Modify) Bone`
- * （组件空间、只有 Z 平移 50.802）用于把骨架对齐胶囊体，以及一个惯性化节点。
- * 那两个与 root motion 无关，动画的 in-place 化只扣水平位移与 yaw，不影响它们。
+ * AnimGraph 顶层由 ActionPoseSlot 保留 Body XYZ 余量及原组件对齐，再进入原惯性化。
+ * WalkRun 倾身仅作用于其内部姿态分支，不修改动作轨迹、Body 平移或胶囊。
  *
  * ## 蓝图当前读取面
  * 过渡图读取 `AnimationState.bHasMoveInput` 与两个通用语义查询；状态图读取
@@ -164,6 +163,18 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
 	bool bTurnBackRunOut = false;
 
+	/** Filtered presentation angle; positive means lean toward a right turn. AnimBP owns bone axis/sign. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	float WalkRunLeanAngleDegrees = 0.0f;
+
+	/** A usable pose result, including normal recovery; false for disabled, initial waiting or failure. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	bool bWalkRunLeanPresentationValid = false;
+
+	/** An enabled dependency/configuration failure stays visible; neutral pose is cleanup, not success. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	FString WalkRunLeanFailureReason;
+
 protected:
 	/** 迁移期表现快照（游戏线程写入，表现记忆只读）。 */
 	FZZZAnimSnapshot Snap;
@@ -173,6 +184,11 @@ protected:
 	virtual void ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const override;
 	virtual bool IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const override;
 
+	/** Consume the already captured frame in the existing native update; never queries movement. */
+	void UpdateWalkRunLeanPresentation(float DeltaSeconds);
+	/** Retire only this instance's presentation state while preserving authored Tuning. */
+	void ResetWalkRunLeanPresentation();
+
 private:
 	/** 通用语义帧适配成旧快照，再映射到现有 AnimBP 表现存储。 */
 	void RefreshDecisionContext();
@@ -180,4 +196,10 @@ private:
 	/** 把通用 AnimationStateFrame 转成现有 AnimBP 仍在使用的旧快照。 */
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
 	FZZZLocomotionEvents LocomotionEvents;
+
+	void FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason);
+	FName LastWalkRunLeanFailureCode = NAME_None;
+	/** Borrowed identity for retiring a presentation filter; never authorizes movement. */
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> WalkRunLeanSource;
+	uint64 WalkRunLeanSourceEpoch = 0;
 };

@@ -6,6 +6,7 @@
 #include "AI/Boss/GGYGOBossDefinition.h"
 #include "AI/Boss/GGYGOBossState.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "BehaviorTree/BehaviorTree.h"
 #include "BrainComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Components/GGYGOHealthComponent.h"

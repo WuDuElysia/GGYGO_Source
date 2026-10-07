@@ -197,6 +197,9 @@ public:
 	virtual void CheckDefaultInitialization() override;
 	//~End of IGameFrameworkInitStateInterface interface
 
+	/** Game thread only: an original synchronous initialization call is on the stack, not configuration acceptance or Ready. */
+	bool IsPawnDataInitializationInProgress() const;
+
 	/** 取某个 Actor 上的本组件。没有则返回 nullptr。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Pawn")
 	static UGGYGOPawnExtensionComponent* FindPawnExtensionComponent(const AActor* Actor)
@@ -258,6 +261,7 @@ public:
 
 protected:
 	virtual void OnRegister() override;
+	virtual void OnUnregister() override;
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
@@ -293,8 +297,14 @@ protected:
 	UPROPERTY(EditInstanceOnly, ReplicatedUsing = OnRep_PawnData, Category = "GGYGO|Pawn")
 	TObjectPtr<const UGGYGOPawnData> PawnData;
 
-// K4-Character-L1 private local resources begin.
 private:
+	struct FPawnDataInitializationScope;
+	/** Borrowed only while the original stack scope exists; unregister/EndPlay invalidate it immediately. */
+	const FPawnDataInitializationScope* PawnDataInitializationScope = nullptr;
+	/** EndPlay closes scope publication; only a real subsequent BeginPlay reopens it. */
+	bool bPawnDataInitializationClosed = false;
+
+// K4-Character-L1 private local resources begin.
 	bool OwnsLocalAbilitySystemResource(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
 	/** 本组件生命周期准入：EndPlay 关闭，真实下一次 BeginPlay 重开；不发行 Binding/Ready。 */
 	bool bLocalAbilitySystemAdmissionClosed = false;

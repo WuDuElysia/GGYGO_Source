@@ -206,7 +206,7 @@ FRotator UGGYGOCameraMode::GetPivotRotation() const
 	return TargetActor->GetActorRotation();
 }
 
-void UGGYGOCameraMode::UpdateView(float DeltaTime)
+FGGYGOCameraEvaluationResult UGGYGOCameraMode::UpdateView(float DeltaTime)
 {
 	const FVector PivotLocation = GetPivotLocation();
 	FRotator PivotRotation = GetPivotRotation();
@@ -218,6 +218,7 @@ void UGGYGOCameraMode::UpdateView(float DeltaTime)
 	View.Rotation = PivotRotation;
 	View.ControlRotation = View.Rotation;
 	View.FieldOfView = FieldOfView;
+	return FGGYGOCameraEvaluationResult::Success();
 }
 
 FGGYGOCameraEvaluationResult UGGYGOCameraMode::ValidateConfiguration() const
@@ -336,7 +337,11 @@ FGGYGOCameraEvaluationResult UGGYGOCameraMode::UpdateCameraMode(float DeltaTime)
 	}
 
 	CameraPenetrationRequest = FGGYGOCameraPenetrationRequest();
-	UpdateView(DeltaTime);
+	Result = UpdateView(DeltaTime);
+	if (!Result.IsSuccess())
+	{
+		return Result;
+	}
 	// A subclass callback cannot bypass common admission by changing configuration during UpdateView.
 	Result = ValidateConfiguration();
 	if (!Result.IsSuccess())

@@ -34,10 +34,26 @@ void FGGYGOAnimationStateCapture::Capture(
 
 	const UGGYGOCharacterMovementComponent* MoveComp =
 		Cast<UGGYGOCharacterMovementComponent>(InOwner->GetCharacterMovement());
+	OutState.bLocomotionSteeringCaptured = true;
 	if (!MoveComp)
 	{
-		// 编辑器预览可以使用裸 Character。没有项目 CMC 时保持待机默认值。
+		// Preserve the existing bare-Character preview fields. An enabled lean consumer
+		// still sees the missing required provider as failure rather than a valid zero rate.
+		OutState.LocomotionSteering.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+		OutState.LocomotionSteering.Diagnostic = FString::Printf(
+			TEXT("[Animation][SteeringCapture] Character=%s Provider=GGYGOCharacterMovementComponent Reason=required project CMC is missing"),
+			*GetPathNameSafe(InOwner));
 		return;
+	}
+	OutState.LocomotionSteering = MoveComp->GetLocomotionSteeringSnapshot();
+	if (OutState.LocomotionSteering.Status != EGGYGOLocomotionSteeringStatus::Invalid
+		&& (OutState.LocomotionSteering.OriginalMovement.Get() != MoveComp
+			|| OutState.LocomotionSteering.OriginalCharacter.Get() != InOwner))
+	{
+		OutState.LocomotionSteering.Status = EGGYGOLocomotionSteeringStatus::Invalid;
+		OutState.LocomotionSteering.Diagnostic = FString::Printf(
+			TEXT("[Animation][SteeringCapture] Character=%s Provider=%s Reason=returned interval belongs to another original source"),
+			*GetPathNameSafe(InOwner), *GetPathNameSafe(MoveComp));
 	}
 
 	OutState.WorldVelocity = MoveComp->Velocity;
