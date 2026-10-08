@@ -53,18 +53,7 @@ struct FGGYGOAbilityActivationHandle::FActivationProof
 	FPredictionKey ActivationKey; // Native coherence only; Serial/proof is the activation identity.
 	FGGYGOAvatarBindingContext BindingContext;
 	TWeakPtr<const FGameplayAbilityActorInfo> Allocation;
-	TWeakObjectPtr<UAbilitySystemComponent> ActorInfoASC;
-	TWeakObjectPtr<AActor> OwnerActor;
-	TWeakObjectPtr<AActor> AvatarActor;
-	TWeakObjectPtr<APlayerController> PlayerController;
-	TWeakObjectPtr<USkeletalMeshComponent> SkeletalMeshComponent;
-	TWeakObjectPtr<UMovementComponent> MovementComponent;
-	TWeakObjectPtr<UAnimInstance> ActorInfoAnimInstance;
-	TWeakObjectPtr<UAnimInstance> ActualAnimInstance;
-	TWeakObjectPtr<AActor> CachedOwnerActor;
-	TWeakObjectPtr<AActor> CachedAvatarActor;
-	FName ActorInfoAffectedAnimInstanceTag = NAME_None;
-	FName ASCAffectedAnimInstanceTag = NAME_None;
+	FGGYGOActorInfoSource Source;
 };
 
 FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
@@ -109,18 +98,7 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::IssueControlledActivation(
 	Proof->ActivationKey = CurrentActivationInfo.GetActivationPredictionKey();
 	Proof->BindingContext = OriginalASC->GetAvatarBindingContext();
 	Proof->Allocation = Snapshot.Allocation;
-	Proof->ActorInfoASC = Snapshot.AbilitySystemComponent;
-	Proof->OwnerActor = Snapshot.OwnerActor;
-	Proof->AvatarActor = Snapshot.AvatarActor;
-	Proof->PlayerController = Snapshot.PlayerController;
-	Proof->SkeletalMeshComponent = Snapshot.SkeletalMeshComponent;
-	Proof->MovementComponent = Snapshot.MovementComponent;
-	Proof->ActorInfoAnimInstance = Snapshot.ActorInfoAnimInstance;
-	Proof->ActualAnimInstance = Snapshot.ActualAnimInstance;
-	Proof->CachedOwnerActor = Snapshot.CachedOwnerActor;
-	Proof->CachedAvatarActor = Snapshot.CachedAvatarActor;
-	Proof->ActorInfoAffectedAnimInstanceTag = Snapshot.ActorInfoAffectedAnimInstanceTag;
-	Proof->ASCAffectedAnimInstanceTag = Snapshot.ASCAffectedAnimInstanceTag;
+	Proof->Source = Snapshot.Source;
 	CurrentControlledActivation.Proof = Proof;
 	NativeCleanupActivation = CurrentControlledActivation;
 	OutReason = EGGYGOAbilityActivationRequestReason::None;
@@ -212,18 +190,7 @@ FGGYGOAbilityActivationHandle UGGYGOGameplayAbility::ValidateCurrentControlledAc
 	}
 	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Original;
 	Original.Allocation = Proof.Allocation.Pin();
-	Original.AbilitySystemComponent = Proof.ActorInfoASC;
-	Original.OwnerActor = Proof.OwnerActor;
-	Original.AvatarActor = Proof.AvatarActor;
-	Original.PlayerController = Proof.PlayerController;
-	Original.SkeletalMeshComponent = Proof.SkeletalMeshComponent;
-	Original.MovementComponent = Proof.MovementComponent;
-	Original.ActorInfoAnimInstance = Proof.ActorInfoAnimInstance;
-	Original.ActualAnimInstance = Proof.ActualAnimInstance;
-	Original.CachedOwnerActor = Proof.CachedOwnerActor;
-	Original.CachedAvatarActor = Proof.CachedAvatarActor;
-	Original.ActorInfoAffectedAnimInstanceTag = Proof.ActorInfoAffectedAnimInstanceTag;
-	Original.ASCAffectedAnimInstanceTag = Proof.ASCAffectedAnimInstanceTag;
+	Original.Source = Proof.Source;
 	UGGYGOAbilitySystemComponent::FActualAvatarBindingActorInfoSnapshot Actual;
 	EGGYGOAvatarBindingReason SnapshotReason;
 	if (Purpose == EControlledActivationValidationPurpose::Termination && Proof.BindingContext.HasIssuedContext())

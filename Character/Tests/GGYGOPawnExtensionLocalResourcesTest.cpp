@@ -3,6 +3,12 @@
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "AbilitySystem/Tests/GGYGOAvatarActorInfoTransactionTestTypes.h"
+#include "System/GGYGOGameplayTags.h"
+#include "Input/GGYGOInputComponent.h"
+#include "Input/Tests/GGYGOInputTestTypes.h"
+#include "Teams/Tests/GGYGOSquadSwitchTestTypes.h"
+#include "EnhancedInputSubsystems.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
@@ -116,6 +122,128 @@ namespace GGYGOPawnExtensionLocalResourcesTests
 			return bPassed;
 		}
 	};
+
+	bool CheckClosingReleaseFailure(FAutomationTestBase& Test)
+	{
+		FGGYGOInputTestFixture Fixture;
+		if (!Fixture.Initialize(Test)) { return false; }
+		AGGYGOInputTestPawn* Pawn = Fixture.GetPawn();
+		UGGYGOInputTestHeroComponent* Hero = Pawn->GetHeroForTest();
+		UGGYGOPawnExtensionComponent* Extension = Pawn->GetPawnExtensionForTest();
+		UGGYGOAbilitySystemComponent* ASC = Pawn->GetASCForTest();
+		UGGYGOInputComponent* Input = Pawn->GetInputComponentForTest();
+		const FGGYGOPawnASCResourceHandle OriginalResource = Extension->GetCurrentLocalAbilitySystemResource();
+		const FGGYGOAvatarBindingContext OriginalContext = ASC->GetAvatarBindingContext();
+		const FGameplayAbilityActorInfo* OriginalActorInfo = ASC->AbilityActorInfo.Get();
+		const TWeakObjectPtr<AActor> OriginalOwner(ASC->GetOwnerActor());
+		const int32 OriginalBindingCount = Input->GetActionEventBindings().Num();
+		FGameplayAbilitySpec InputSpec(UGGYGOSquadSwitchTestAbility::StaticClass(), 1);
+		InputSpec.GetDynamicSpecSourceTags().AddTag(GGYGOGameplayTags::InputTag_Attack_Light);
+		const FGameplayAbilitySpecHandle InputHandle = ASC->GiveAbility(InputSpec);
+		const FGameplayAbilitySpec* GrantedInput = ASC->FindAbilitySpecFromHandle(InputHandle);
+		UGGYGOSquadSwitchTestAbility* InputProbe = GrantedInput
+			? Cast<UGGYGOSquadSwitchTestAbility>(GrantedInput->GetPrimaryInstance()) : nullptr;
+		if (!Test.TestNotNull(TEXT("Closing real input probe"), InputProbe)
+			|| !Test.TestTrue(TEXT("Closing starts from original Ready H/input association"),
+				Extension->IsLocalAbilitySystemResourceReady(OriginalResource) && Hero->HasAbilityInputAssociationForTest(ASC))
+			|| !Test.TestEqual(TEXT("Closing accepts a real pending Hero Action"), Fixture.ExecuteAbilityBinding(ETriggerEvent::Triggered), 1))
+		{
+			return false;
+		}
+		const double OtherDeadline = static_cast<double>(Fixture.GetWorld()->GetTimeSeconds()) + 5.0;
+		const FGGYGOAbilityInputRequestResult OtherSource = ASC->ReceiveAbilityInputRequest(
+			GGYGOGameplayTags::InputTag_Attack_Light, {}, OtherDeadline);
+		if (!Test.TestTrue(TEXT("Closing retains a separately accepted source of the same Spec"),
+			OtherSource.Outcome == EGGYGOAbilityInputRequestOutcome::Accepted && OtherSource.Identity.IsAssigned())) { return false; }
+		const FGameplayAbilitySpecHandle ExitHandle = ASC->GiveAbility(
+			FGameplayAbilitySpec(UGGYGOAvatarBindingRefreshEndTestAbility::StaticClass(), 1));
+		const FGameplayAbilitySpec* ExitSpec = ASC->FindAbilitySpecFromHandle(ExitHandle);
+		UGGYGOAvatarBindingRefreshEndTestAbility* ExitProbe = ExitSpec
+			? Cast<UGGYGOAvatarBindingRefreshEndTestAbility>(ExitSpec->GetPrimaryInstance()) : nullptr;
+		if (!Test.TestNotNull(TEXT("Closing real authoritative exit probe"), ExitProbe)) { return false; }
+		ExitProbe->HoldControlledActivationForTest();
+		const auto Activation = ASC->TryActivateAbilityWithTerminationBoundary(ExitHandle);
+		if (!Test.TestTrue(TEXT("Closing probe has a real controlled activation"), Activation.bNativeAccepted && ExitProbe->IsActive())) { return false; }
+		// The fixture has already driven InitState before World BeginPlay. Start only the
+		// registered component's native engine lifecycle, without replaying that feature chain.
+		// DestroyComponent will then route the production Extension EndPlay override.
+		Extension->RegisterAllComponentTickFunctions(true);
+		Extension->UActorComponent::BeginPlay();
+		if (!Test.TestTrue(TEXT("Closing component has genuinely begun play before destruction"), Extension->HasBegunPlay())) { return false; }
+		int32 ClosingCount = 0;
+		int32 ReleasedCount = 0;
+		int32 NativeEndCount = 0;
+		bool bCallbackChecksPassed = true;
+		const FDelegateHandle ClosingHandle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
+			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda([&](const FGGYGOPawnASCLocalNotice& Notice)
+			{
+				if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { ++ReleasedCount; return; }
+				if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Closing) { return; }
+				++ClosingCount;
+				bCallbackChecksPassed &= Test.TestTrue(TEXT("Closing names the captured original H"), Notice.Resource.HasSameResource(OriginalResource));
+				bCallbackChecksPassed &= Test.TestTrue(TEXT("Closing carries no Ready Context"), IsEmptyContext(Notice.PublishedContext));
+				bCallbackChecksPassed &= Test.TestFalse(TEXT("Closing admission is closed before observers"), Extension->IsLocalAbilitySystemResourceReady(OriginalResource));
+				bCallbackChecksPassed &= Test.TestTrue(TEXT("Closing precedes original Host withdrawal"),
+					Extension->GetCurrentLocalAbilitySystemResource().HasSameResource(OriginalResource));
+			}));
+		const FDelegateHandle NativeEndHandle = ExitProbe->OnGameplayAbilityEndedWithData.AddLambda([&](const FAbilityEndedData& Data)
+		{
+			if (Data.AbilityThatEnded.Get() != ExitProbe || Data.AbilitySpecHandle != ExitHandle) { return; }
+			++NativeEndCount;
+			Extension->DestroyComponent();
+			bCallbackChecksPassed &= Test.TestFalse(TEXT("Closing leaves the original Hero association unavailable"), Hero->HasAbilityInputAssociationForTest(ASC));
+			bCallbackChecksPassed &= Test.TestTrue(TEXT("Failed release leaves actual ActorInfo and endpoints unchanged"),
+				ASC->AbilityActorInfo.Get() == OriginalActorInfo && ASC->GetOwnerActor() == OriginalOwner.Get()
+				&& ASC->GetAvatarActor() == Pawn && OriginalActorInfo->OwnerActor.Get() == OriginalOwner.Get()
+				&& OriginalActorInfo->AvatarActor.Get() == Pawn);
+			EGGYGOAvatarBindingReason Reason;
+			bCallbackChecksPassed &= Test.TestTrue(TEXT("Exit-scope release failed before native Clear; only binding metadata was revoked"),
+				ASC->GetAvatarBindingContext().HasSameContext(OriginalContext)
+				&& ASC->CheckAvatarBindingContext(OriginalContext, Reason) == EGGYGOAvatarBindingOutcome::Stale
+				&& Reason == EGGYGOAvatarBindingReason::OperationInvalidated);
+		});
+		ON_SCOPE_EXIT
+		{
+			if (IsValid(Extension)) { Extension->UnregisterLocalAbilitySystemNotice(ClosingHandle); }
+			if (IsValid(ExitProbe)) { ExitProbe->OnGameplayAbilityEndedWithData.Remove(NativeEndHandle); }
+		};
+		// Revoking this issued binding inside native End invalidates the original controlled
+		// termination witness. Expect only this exact negative fixture's diagnostic once.
+		Test.AddExpectedMessagePlain(FString::Printf(
+			TEXT("AbilitySystem original termination Ability [%s] ASC [%s] Spec [%s] failed: reason=%d."),
+			*ExitProbe->GetPathName(), *ASC->GetPathName(), *ExitHandle.ToString(),
+			static_cast<int32>(EGGYGOAbilityTerminationReason::ActivationChanged)),
+			ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1);
+		const auto Exit = ASC->TryExitAbilitiesForAvatarSwitch(OriginalContext, [&]()
+		{
+			return Extension->IsLocalAbilitySystemResourceReady(OriginalResource);
+		});
+		bool bPassed = bCallbackChecksPassed;
+		bPassed &= Test.TestTrue(TEXT("Closing stops the original switch instead of granting transfer"),
+			Exit.Outcome == EGGYGOAvatarSwitchAbilityExitOutcome::Failed
+			&& Exit.Reason == EGGYGOAvatarSwitchAbilityExitReason::TerminationNotCompleted
+			&& Exit.TerminationReason == EGGYGOAbilityTerminationReason::ActivationChanged);
+		bPassed &= Test.TestTrue(TEXT("Failed original termination names only the canceled original Spec"), Exit.BlockingSpec == ExitHandle);
+		bPassed &= Test.TestFalse(TEXT("Native GAS End still retired the original activation"), ExitProbe->IsActive());
+		bPassed &= Test.TestEqual(TEXT("Closing occurred inside one real native End"), NativeEndCount, 1);
+		bPassed &= Test.TestEqual(TEXT("Original H receives one Closing fact"), ClosingCount, 1);
+		bPassed &= Test.TestEqual(TEXT("Failed closed release never emits Released success"), ReleasedCount, 0);
+		bPassed &= Test.TestFalse(TEXT("Only the original Extension was destroyed"), IsValid(Extension));
+		bPassed &= Test.TestTrue(TEXT("Closing keeps the original Pawn and Hero alive"), IsValid(Pawn) && IsValid(Hero) && !Pawn->IsActorBeingDestroyed());
+		bPassed &= Test.TestEqual(TEXT("Closing preserves the independent native input bindings"), Input->GetActionEventBindings().Num(), OriginalBindingCount);
+		bPassed &= Test.TestTrue(TEXT("Closing preserves the independent native IMC"), Fixture.GetInputSubsystem()->HasMappingContext(Fixture.GetMappingContext()));
+		const auto Retained = ASC->ReceiveAbilityInputRequest(GGYGOGameplayTags::InputTag_Attack_Light, OtherSource.Identity, OtherDeadline);
+		bPassed &= Test.TestTrue(TEXT("Closing exact cleanup preserves other source and original input revision"),
+			Retained.Outcome == EGGYGOAbilityInputRequestOutcome::AlreadyApplied && Retained.Identity == OtherSource.Identity);
+		const auto Returned = ASC->EndAbilityInputRequest(OtherSource.Identity, EGGYGOAbilityInputRequestEndKind::Invalidated);
+		bPassed &= Test.TestTrue(TEXT("Fixture returns only its separate original source"), Returned.Outcome == EGGYGOAbilityInputRequestOutcome::Accepted);
+		ASC->ProcessAbilityInput(0.0f, false);
+		bPassed &= Test.TestEqual(TEXT("Closed original Hero IDs leave no held or pending activation"), InputProbe->ActivationCalls, 0);
+		bPassed &= Test.TestEqual(TEXT("Closing keeps the existing physical Action binding"), Fixture.ExecuteAbilityBinding(ETriggerEvent::Triggered), 1);
+		ASC->ProcessAbilityInput(0.0f, false);
+		bPassed &= Test.TestEqual(TEXT("Closing does not replay an active Action's first observation"), InputProbe->ActivationCalls, 0);
+		return bPassed;
+	}
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPawnExtensionLocalResourcesLifecycleTest,
@@ -142,6 +270,7 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 	int32 ReplayReleasedCount = 0;
 	int32 UnreadyReadyCount = 0;
 	int32 UnreadyReleasedCount = 0;
+	int32 OriginalClosingCount = 0;
 	bool bBridgeArmed = true;
 	bool bOriginalReleaseArmed = true;
 	bool bCallbackChecksPassed = true;
@@ -323,6 +452,15 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 	const FDelegateHandle EarlyHandle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
 		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda([&](const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Closing)
+			{
+				++OriginalClosingCount;
+				bCallbackChecksPassed &= TestTrue(TEXT("Withdraw Closing names original H1 with no Ready Context"),
+					Notice.Resource.HasSameResource(H1) && IsEmptyContext(Notice.PublishedContext));
+				bCallbackChecksPassed &= TestFalse(TEXT("Withdraw Closing runs after original slot retirement"),
+					Extension->GetCurrentLocalAbilitySystemResource().HasResource());
+				return;
+			}
 			if (!CheckOriginalNotice(TEXT("Early observer"), Notice)) { bCallbackChecksPassed = false; return; }
 			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready) { ++EarlyReadyCount; return; }
 			++EarlyReleasedCount;
@@ -373,6 +511,7 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 			const FDelegateHandle ReplayHandle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
 				FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda([&](const FGGYGOPawnASCLocalNotice& LocalNotice)
 				{
+					if (LocalNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Closing) { return; }
 					if (!CheckOriginalNotice(TEXT("Replay observer"), LocalNotice)) { bCallbackChecksPassed = false; return; }
 					if (LocalNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready) { ++ReplayReadyCount; }
 					else { ++ReplayReleasedCount; }
@@ -403,6 +542,7 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 		|| !TestFalse(TEXT("Withdrawn H1 not Installed"), Extension->IsLocalAbilitySystemResourceInstalled(H1))
 		|| !TestFalse(TEXT("Withdrawn H1 not Ready"), Extension->IsLocalAbilitySystemResourceReady(H1))
 		|| !CheckBoundState(TEXT("Withdraw H1"), false)) { return false; }
+	if (!TestEqual(TEXT("Original withdrawal emits one Closing fact"), OriginalClosingCount, 1)) { return false; }
 	// Deliberately outside the completed Publish: no policy assertion about an active R authorizing H2.
 	const FGGYGOPawnASCLocalResult Reinstall = Extension->InstallLocalAbilitySystemResources(ASC, Fixture.Pawn, Context);
 	H2 = Reinstall.Resource;
@@ -414,6 +554,7 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 	const FDelegateHandle UnreadyHandle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
 		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda([&](const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Closing) { return; }
 			if (!CheckOriginalNotice(TEXT("Unready registration observer"), Notice)) { bCallbackChecksPassed = false; return; }
 			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready) { ++UnreadyReadyCount; }
 			else { ++UnreadyReleasedCount; }
@@ -436,6 +577,7 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, H1, false)
 		|| !bCallbackChecksPassed
 		|| !CheckLocalSlot(TEXT("H2 after duplicate Withdraw"), H2, false)) { return false; }
+	if (!TestEqual(TEXT("Duplicate old withdrawal cannot repeat Closing or retire successor"), OriginalClosingCount, 1)) { return false; }
 	const FGGYGOPawnASCLocalResult DuplicateReleased = Extension->NotifyLocalResourcesReleased(H1);
 	if (!ExpectLocalResult(*this, TEXT("Duplicate original Released"), DuplicateReleased,
 		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, H1, false)
@@ -465,7 +607,8 @@ bool FGGYGOPawnExtensionLocalResourcesLifecycleTest::RunTest(const FString& Para
 		|| !TestEqual(TEXT("Original unready subscription returned"), UnreadyReleasedCount, 1)) { return false; }
 	const bool bCleanupPassed = Cleanup();
 	return bCleanupPassed && bCallbackChecksPassed
-		&& TestEqual(TEXT("Original ASC subscription returned before Clear Publish"), ASCNoticeCount, 1);
+		&& TestEqual(TEXT("Original ASC subscription returned before Clear Publish"), ASCNoticeCount, 1)
+		&& CheckClosingReleaseFailure(*this);
 }
 
 #endif // WITH_DEV_AUTOMATION_TESTS

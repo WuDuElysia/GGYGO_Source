@@ -1,6 +1,7 @@
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOActionMotionEvaluation.h"
+#include "Character/Data/GGYGOActionMotionProfile.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/AnimSequence.h"
 #include "GameFramework/Character.h"
@@ -26,10 +27,10 @@ bool FRootMotionSource_GGYGOActionCurve::Matches(const FRootMotionSource* Other)
 	if (!FRootMotionSource::Matches(Other)) return false;
 	const auto* Typed = static_cast<const FRootMotionSource_GGYGOActionCurve*>(Other);
 	if (SourceMode != Typed->SourceMode) return false;
+	if (OriginalResource.IsValid() && Typed->OriginalResource.IsValid()
+		&& OriginalResource != Typed->OriginalResource) return false;
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage)
 	{
-		if (OriginalResource.IsValid() && Typed->OriginalResource.IsValid()
-			&& OriginalResource != Typed->OriginalResource) return false;
 		return OriginalBinding.IsValid() && Typed->OriginalBinding.IsValid()
 			&& OriginalBinding->HasSameConfiguration(*Typed->OriginalBinding)
 			&& MontageStartSeconds == Typed->MontageStartSeconds && PlayRate == Typed->PlayRate
@@ -121,30 +122,72 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		bPreparedNaturalEnd = To == OriginalBinding->MontageEndSeconds && GetTime() >= Duration;
 		return;
 	}
-	// Keep gravity under CMC control. Leaving the ground stops this ground-only source.
-	if (!TranslationCurve || !MoveComponent.IsMovingOnGround() || Duration <= 0.f || PlayRate <= 0.f)
+	const auto RetireProfile = [this]()
+	{
+		bExplicitlyCancelled = true;
+		RootMotionParams.Set(FTransform::Identity);
+		AccumulateMode = ERootMotionAccumulateMode::Additive;
+		Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+	};
+	if (bExplicitlyCancelled) { RetireProfile(); return; }
+	const auto* CMC = Cast<UGGYGOCharacterMovementComponent>(&MoveComponent);
+	const auto FailProfile = [&](const FString& Reason)
+	{
+		UE_LOG(LogRootMotion, Error, TEXT("[Movement.ActionMotion] Owner='%s' Profile='%s' Curve='%s' Reason='%s'"),
+			*Character.GetPathName(), OriginalResource.IsValid() ? *GetPathNameSafe(OriginalResource->Profile.Get()) : TEXT("Standalone"),
+			*GetPathNameSafe(TranslationCurve.Get()), *Reason);
+		RetireProfile();
+		if (CMC) const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailProfileActionMotion(OriginalResource, Reason);
+	};
+	if (SourceMode != EGGYGOActionCurveSourceMode::Profile)
+	{
+		FailProfile(TEXT("explicit action source mode is invalid"));
+		return;
+	}
+	// Leaving the ground normally ends this explicit ground-only source.
+	if (!MoveComponent.IsMovingOnGround())
 	{
 		RootMotionParams.Set(FTransform(FVector::ZeroVector));
 		Status.SetFlag(ERootMotionSourceStatusFlags::Finished);
 		return;
 	}
-	if (MovementTickTime > UE_SMALL_NUMBER && SimulationTime > 0.f)
+	FString Error;
+	if (!TranslationCurve || !FMath::IsFinite(Duration) || Duration <= 0.0f
+		|| !FMath::IsFinite(PlayRate) || PlayRate <= 0.0f
+		|| !FMath::IsFinite(SimulationTime) || SimulationTime < 0.0f
+		|| !FMath::IsFinite(MovementTickTime) || MovementTickTime <= 0.0f
+		|| !FMath::IsFinite(GetTime()) || GetTime() < 0.0f
+		|| TranslationScale.ContainsNaN() || EntryMeshRotation.ContainsNaN() || !EntryMeshRotation.IsNormalized()
+		|| (OriginalResource.IsValid() && (!CMC || !CMC->ValidateProfileActionRuntime(*this, Error))))
 	{
-		const float From = FMath::Clamp(GetTime(), 0.f, Duration) * PlayRate;
-		const float To = FMath::Clamp(GetTime() + SimulationTime, 0.f, Duration) * PlayRate;
-		const FVector Delta = (TranslationCurve->GetVectorValue(To) - TranslationCurve->GetVectorValue(From)) * TranslationScale;
-		FVector WorldDelta = EntryMeshRotation.RotateVector(Delta);
-		WorldDelta.Z = 0.;
-		if (WorldDelta.ContainsNaN())
-		{
-			Status.SetFlag(ERootMotionSourceStatusFlags::Finished);
-			WorldDelta = FVector::ZeroVector;
-		}
-		// RMS translation is velocity; integrate the complete interval, including a partial last tick.
-		RootMotionParams.Set(FTransform(WorldDelta / MovementTickTime));
+		FailProfile(Error.IsEmpty() ? TEXT("original Profile curve, native interval, playback mapping or entry transform is invalid") : Error);
+		return;
 	}
-	// A zero-displacement interval remains an override until the duration expires.
-	SetTime(GetTime() + SimulationTime);
+	const double NativeEndTime = static_cast<double>(GetTime()) + SimulationTime;
+	if (!FMath::IsFinite(NativeEndTime) || NativeEndTime > TNumericLimits<float>::Max())
+	{
+		FailProfile(TEXT("original Profile native interval end time is outside finite float range"));
+		return;
+	}
+	const float From = FMath::Clamp(GetTime(), 0.0f, Duration) * PlayRate;
+	const float To = FMath::Clamp(static_cast<float>(NativeEndTime), 0.0f, Duration) * PlayRate;
+	const FVector Delta = (TranslationCurve->GetVectorValue(To) - TranslationCurve->GetVectorValue(From)) * TranslationScale;
+	FVector WorldDelta = EntryMeshRotation.RotateVector(Delta);
+	if (!FMath::IsFinite(From) || !FMath::IsFinite(To) || WorldDelta.ContainsNaN())
+	{
+		FailProfile(TEXT("scaled original Profile position interval is non-finite"));
+		return;
+	}
+	WorldDelta.Z = 0.0;
+	const FVector OverrideVelocity = WorldDelta / MovementTickTime;
+	if (OverrideVelocity.ContainsNaN())
+	{
+		FailProfile(TEXT("original Profile interval velocity is non-finite"));
+		return;
+	}
+	// RMS translation is velocity; include the partial last tick and legitimate zero displacement.
+	RootMotionParams.Set(FTransform(OverrideVelocity));
+	SetTime(static_cast<float>(NativeEndTime));
 }
 
 bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)

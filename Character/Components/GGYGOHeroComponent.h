@@ -8,7 +8,8 @@
  * 队伍换角色时正好利用这一点：只有当前出战的角色挂着能响应输入的组件。
  *
  * ## 职责边界
- * 输入侧注册 IMC、把输入绑到 Native 函数或翻译成 InputTag；
+ * 输入侧持有原绑定、IMC 与 Action 观察，只向原 ASC 接收/结束请求；
+ * 请求等待、Queued 许可、held 聚合和重试执行由 ASC 唯一持有。
  * 相机侧只仲裁“能力覆盖 / PawnData 默认模式”，不自己 Tick、不计算视角。
  * 它**不消费** ASC 的输入缓存 —— 那需要 `PostProcessInput` 的时机，
  * 只有 PlayerController 有（见 `AGGYGOPlayerController`）。
@@ -21,13 +22,12 @@
  */
 #pragma once
 
+#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
+
 #include "Components/GameFrameworkInitStateInterface.h"
 #include "Components/PawnComponent.h"
 #include "GameplayAbilitySpecHandle.h"
-#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
-// Input-Hero-LocalIdentity includes begin.
 #include "Templates/SharedPointer.h"
-// Input-Hero-LocalIdentity includes end.
 
 #include "GGYGOHeroComponent.generated.h"
 
@@ -48,11 +48,8 @@ class UInputAction;
 class UInputComponent;
 class UInputMappingContext;
 class UObject;
-// Input-Hero-LocalIdentity forward declarations begin.
 class UGGYGOPawnExtensionComponent;
-class FGGYGOPawnASCResourceHandle;
 struct FGGYGOPawnASCLocalNotice;
-// Input-Hero-LocalIdentity forward declarations end.
 struct FActorInitStateChangedParams;
 struct FGameplayTag;
 struct FInputActionInstance;
@@ -159,16 +156,9 @@ protected:
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Input")
 	int32 InputMappingPriority = 0;
 
-	/** 订阅 ASC 的重试通知与组空出通知。ASC 就绪后调用。 */
-	void BindAbilityRetryDelegates();
-
-	/** 只缓冲完整原请求；不从 Tag 或失败时刻推测来源。 */
-	void BufferAbilityInput(const FGGYGOAbilityInputRetryRequest& OriginalRequest);
-
-	/** 某个能力组空出，重试缓冲中的请求。 */
-	void HandleAbilityGroupFreed(FGameplayTag GroupTag);
-
 private:
+	/** Continues the native entry after its camera-provider boundary was qualified on this stack. */
+	void InitializePlayerInputBindings(UInputComponent* PlayerInputComponent);
 	/** Consumes actual local provider readiness; returns whether this original native init may continue.
 	 *  Camera failure is reported separately and does not become an input readiness gate. */
 	bool ConsumeLocalCameraProviderReady(APawn* ExpectedPawn, const TCHAR* NativeEntry);
@@ -180,21 +170,13 @@ private:
 	/** 全生命周期单调递增；不随解绑或 EndPlay 重置。0 表示无有效请求。 */
 	uint64 LastAbilityCameraModeRequestGeneration = 0;
 
-	/** 会话资源来源；换 InputComponent/Controller 后仍从原来源释放，不重新查找。 */
-	TWeakObjectPtr<UGGYGOInputComponent> InputSessionComponent;
-	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> InputSessionSubsystem;
-	TWeakObjectPtr<UEnhancedPlayerInput> InputSessionPlayerInput;
-	TWeakObjectPtr<UGGYGOCharacterMovementComponent> InputSessionMovementComponent;
-	/** Native、Ability 与 ForceWalk 的全部实际绑定句柄。 */
-	TArray<uint32> InputSessionBindHandles;
-
-	struct FRegisteredInputMapping
-	{
-		TWeakObjectPtr<const UInputMappingContext> MappingContext;
-		int32 RegisteredPriority = 0;
-	};
-	/** 每项对应一次由本会话实际 Add 的 CountRegistrations 注册。 */
-	TArray<FRegisteredInputMapping> InputSessionMappings;
+	struct FPlayerInputSession;
+	struct FAbilityInputAssociation;
+	struct FAbilityActionBinding;
+	struct FAbilityInputObservation;
+	struct FLocalAbilitySystemSubscription;
+	/** Owns this original input component's bindings, IMC registrations and Action associations. */
+	TSharedPtr<FPlayerInputSession> PlayerInputSession;
 	/** 只用于使同步回调中的旧初始化失效；不保存物理输入事实。 */
 	uint64 InputSessionGeneration = 0;
 	bool bEndingPlay = false;
@@ -208,62 +190,39 @@ private:
 	void HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
 	void Input_Move(const FInputActionInstance& Instance, const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
 
-	struct FAbilityRetryBinding;
-	bool IsAbilityRetryBindingCurrent(const TSharedPtr<FAbilityRetryBinding>& Binding) const;
+	bool IsAbilityInputAssociationCurrent(const TSharedPtr<FAbilityInputAssociation>& Association) const;
 	bool HasValidPlayerInputSession() const;
-	UGGYGOAbilitySystemComponent* GetInputSessionAbilitySystem() const;
-	bool IsInputSessionAbilitySystemCurrent(TWeakObjectPtr<UGGYGOAbilitySystemComponent> ExpectedASC, uint64 ExpectedGeneration, uint64 ExpectedSubscriptionGeneration) const;
-	void UnbindAbilityRetryDelegates();
-	void PruneExpiredInputRequests(double Now);
-	struct FAbilityActionBinding;
-	struct FAbilityInputObservation;
+	void AssociateReadyAbilitySystemWithInput();
+	/** Retires the original association locally; returned IDs still require exact ASC cleanup. */
+	TArray<FGGYGOAbilityInputRequestIdentity> RetireAbilityInputAssociation(const TSharedPtr<FPlayerInputSession>& Session);
+	void PruneEndedAbilityInputObservations(double Now);
 	bool IsAbilityActionBindingCurrent(const TSharedPtr<FAbilityActionBinding>& Binding) const;
 	void Input_AbilityActionTriggered(const FInputActionInstance& ActionInstance,
 		const TSharedPtr<FAbilityActionBinding>& Binding);
 	void Input_AbilityActionReleased(const FInputActionInstance& ActionInstance,
 		const TSharedPtr<FAbilityActionBinding>& Binding);
-	TSharedPtr<FAbilityInputObservation> FindAbilityInputObservation(
-		const FGGYGOAbilityInputRequestIdentity& Identity) const;
+	/** Seals records and removes only their own session membership before any cleanup callout. */
+	static TArray<FGGYGOAbilityInputRequestIdentity> RetireAbilityInputObservations(
+		const TArray<TSharedPtr<FAbilityInputObservation>>& Observations);
 	void InvalidateAbilityInputObservations(const TArray<TSharedPtr<FAbilityInputObservation>>& Observations);
 	void InvalidateAbilityActionBinding(const TSharedPtr<FAbilityActionBinding>& Binding);
-
-	/** 仅拥有自己在原 ASC 上建立的两个订阅，不用全生命周期 bool 猜测是否已绑定。 */
-	TWeakObjectPtr<UGGYGOAbilitySystemComponent> InputSessionAbilitySystem;
-	/** Immutable origin of the existing ASC subscriptions; no Ready or held authority. */
-	TSharedPtr<FAbilityRetryBinding> AbilityRetryBinding;
-	FDelegateHandle AbilityInputRetryableDelegateHandle;
-	FDelegateHandle AbilityGroupFreedDelegateHandle;
-	/** 单独使已移除订阅的在途回调失效，不打断 C 正在建立的 IMC 会话。 */
-	uint64 AbilityInputSubscriptionGeneration = 0;
-
-	/** 原 Action/组件/会话绑定；其观察寿命不随 ASC 订阅重绑重置。 */
-	TArray<TSharedPtr<FAbilityActionBinding>> AbilityActionBindings;
-	/** 本组件原观察关联；活动观察不因 retry 截止过期而被移除。 */
-	TArray<TSharedPtr<FAbilityInputObservation>> AbilityInputObservations;
-	/** 等待组释放的完整原请求；ASC 仍唯一决定 queued/held 与激活。 */
-	TArray<FGGYGOAbilityInputRetryRequest> BufferedInputs;
-
-// Input-Hero-LocalIdentity declarations begin.
-private:
-	struct FLocalAbilitySystemSubscription;
 
 protected:
 	/** Register before replay; Ready associates only an already established input session. */
 	bool PrepareLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
 	/** Derived query of the exact consumed resource; no input or movement permission. */
 	UGGYGOAbilitySystemComponent* GetReadyLocalAbilitySystemComponent() const;
-	/** Retire this original notice record and its own ASC retry subscription. */
+	/** @return ASC of this input session's exact Ready H association, or nullptr when unavailable.
+	 *  Read-only: never follows a successor ASC or changes input/held state. */
+	UGGYGOAbilitySystemComponent* GetInputSessionAbilitySystem() const;
+	/** Retire this original notice record and its own accepted input requests. */
 	void ReleaseLocalAbilitySystemSubscription();
-	/** Associate existing input identity with H; exact Released may then retire that original session. */
-	bool AssociateInputSessionWithLocalResource(const FGGYGOPawnASCResourceHandle& ExpectedResource,
-		uint64 ExpectedInputSessionGeneration, FString& OutError);
 
 private:
 	void ConsumeLocalAbilitySystemNotice(
 		const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
 		const FGGYGOPawnASCLocalNotice& Notice);
 	TSharedPtr<FLocalAbilitySystemSubscription> LocalAbilitySystemSubscription;
-// Input-Hero-LocalIdentity declarations end.
 };
 
 /** Original context for the native parameterless dynamic notification; never a movement source. */

@@ -39,6 +39,9 @@ protected:
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	/** Prepare this original batch's actual Mesh restoration resource; no lifecycle state is issued. */
 	bool PrepareOriginalMeleeMesh(const FGGYGOAbilityActivationHandle& Original, USkeletalMeshComponent* Mesh);
+	/** Start and observe this batch's Profile motion; CMC owns execution and observer retirement. */
+	bool BeginOriginalMeleeMotion(const FGGYGOAbilityActivationHandle& Original,
+		UGGYGOCharacterMovementComponent* Movement, const UGGYGOActionMotionProfile* Profile, float PlayRate);
 	bool HasOriginalMeleeMeshResource() const;
 	FGGYGOAbilityActivationHandle GetOriginalMeleeResourceActivation() const;
 
@@ -81,6 +84,8 @@ private:
 	TSharedPtr<FOriginalMeleeResources> OriginalResources;
 	enum class EMontageCallback : uint8 { Completed, Interrupted, BlendOut, Event };
 
+	bool OwnsOriginalResources(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original) const;
 	bool IsOriginalResourcesCurrent(const TSharedPtr<FOriginalMeleeResources>& Resources,
 		const FGGYGOAbilityActivationHandle& Original) const;
 	bool AreOriginalReceiversCurrent(const TSharedPtr<FOriginalMeleeResources>& Resources) const;

@@ -3,13 +3,14 @@
 #include "AI/Boss/Abilities/GGYGOBossMeleeAbility.h"
 #include "GGYGOBossMeleeLifecycleTestAbility.generated.h"
 
-/** 仅隔离 Montage 业务，使用原请求及生产 Mesh/Cleanup hook 验证原结束同步重入。 */
+/** 隔离 Montage 业务，复用生产 Mesh/Motion/Cleanup 与原 GAS 请求。 */
 UCLASS(Transient)
 class UGGYGOBossMeleeLifecycleTestAbility : public UGGYGOBossMeleeAbility
 {
 	GENERATED_BODY()
 public:
 	void FinishForTest(const FGGYGOAbilityActivationHandle& Original);
+	bool BeginMotionForTest(const FGGYGOAbilityActivationHandle& Original, const UGGYGOActionMotionProfile* Profile);
 	bool HasActiveMeshForTest() const { return HasOriginalMeleeMeshResource(); }
 	FGGYGOAbilityActivationHandle GetInitializedOriginalForTest() const { return GetOriginalMeleeResourceActivation(); }
 protected:

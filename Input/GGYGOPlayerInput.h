@@ -1,3 +1,9 @@
+/**
+ * @file GGYGOPlayerInput.h
+ * @brief Native 物理输入事实、原始移动输入会话及同步事件发布。
+ *
+ * Source 持有硬件观察与会话身份；CMC 持有位移执行和准入，ASC 持有能力输入状态。
+ */
 #pragma once
 
 #include "EnhancedPlayerInput.h"
@@ -152,7 +158,11 @@ private:
 	bool ValidateOriginalOrigin(FString& OutError) const;
 	void RetireOriginalQualification(FName Reason, bool bEstablishBarrier = false);
 	bool HasParticipatingMovementSources() const;
-	bool IssuePhysicalRequest(EGGYGOMovementInputStartProof Proof,
+	/** Commits the original physical request and publishes its prepared Started fact synchronously.
+	 *  @pre UpdateRequestFromSource validated this route in the same call, with no intervening callout.
+	 *  Successful qualification consumption must remain free of external callbacks.
+	 *  @return Whether the original session is still live after fact delivery. */
+	bool CommitPhysicalRequest(EGGYGOMovementInputStartProof Proof,
 		const FGGYGOMovementInputSessionIdentity& ExpectedSession);
 	ESourceProof ReadSourceProof() const;
 	FString DescribeSourceProof() const;

@@ -112,6 +112,8 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	Character->GetMesh()->SetRelativeScale3D(FVector(2.));
 	const int32 First = Move->BeginActionMotion(Profile);
 	TestTrue(TEXT("Authority accepts grounded action"), First != INDEX_NONE);
+	AddExpectedMessage(FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Profile='%s' Reason='action execution slot is occupied or original token allocator is exhausted'"),
+		*Move->GetPathName(), *Profile->GetPathName()), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
 	TestEqual(TEXT("Concurrent action rejected"), Move->BeginActionMotion(Profile), INDEX_NONE);
 	const auto FirstSource = Move->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
 	if (!TestTrue(TEXT("Pending RMS immediately visible"), FirstSource.IsValid())) return false;
@@ -226,6 +228,49 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 	EndedMove->PhysicsRotation(NativeTick);
 	TestTrue(TEXT("Prepared finished marked final frame keeps heading after explicit owner cleanup"),
 		EndedCharacter->GetActorRotation().Equals(EndedHeading, .001));
+
+	// Runtime-invalid Profile data must retire the exact resource before its sole failure observer.
+	ACharacter* FailedCharacter = World->SpawnActor<ACharacter>();
+	if (!TestNotNull(TEXT("Profile-failure fixture character"), FailedCharacter)) return false;
+	FailedCharacter->GetCharacterMovement()->SetComponentTickEnabled(false);
+	auto* FailedMove = NewObject<UGGYGOCharacterMovementComponent>(FailedCharacter);
+	FailedMove->RegisterComponent();
+	FailedMove->SetUpdatedComponent(FailedCharacter->GetCapsuleComponent());
+	FailedMove->SetMovementMode(MOVE_Walking);
+	UGGYGOActionMotionProfile* FailedProfile = DuplicateObject<UGGYGOActionMotionProfile>(Profile, FailedCharacter);
+	FailedProfile->TranslationCurve = DuplicateObject<UCurveVector>(Profile->TranslationCurve, FailedProfile);
+	const int32 FailedHandle = FailedMove->BeginActionMotion(FailedProfile);
+	if (!TestTrue(TEXT("Profile-failure fixture begins a genuine action"), FailedHandle != INDEX_NONE)) return false;
+	const auto FailedBase = FailedMove->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
+	if (!TestTrue(TEXT("Profile-failure fixture retains the actual issued source"), FailedBase.IsValid())) return false;
+	auto* FailedSource = static_cast<FRootMotionSource_GGYGOActionCurve*>(FailedBase.Get());
+	TestFalse(TEXT("Montage-only failure observer rejects a Profile handle"),
+		FailedMove->ObserveMontageActionMotionFailure(FailedHandle,
+			FGGYGOActionMotionFailureDelegate::CreateLambda([](int32, const FString&) {}), Error));
+	int32 FailureCalls = 0;
+	bool bRetiredBeforeCallback = false;
+	TestTrue(TEXT("Profile accepts its sole original failure observer"),
+		FailedMove->ObserveActionMotionFailure(FailedHandle,
+			FGGYGOActionMotionFailureDelegate::CreateLambda([&](int32 Handle, const FString& Reason)
+			{
+				++FailureCalls;
+				bRetiredBeforeCallback = Handle == FailedHandle && !Reason.IsEmpty()
+					&& !FailedMove->HasActiveActionMotion()
+					&& FailedSource->bExplicitlyCancelled
+					&& FailedSource->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval)
+					&& !FailedSource->Status.HasFlag(ERootMotionSourceStatusFlags::Finished);
+			}), Error));
+	FailedProfile->TranslationCurve = nullptr;
+	AddExpectedMessage(FString::Printf(TEXT("[Movement.ActionMotion] Owner='%s' Profile='%s' Curve='%s' Reason='original Profile configuration, owner or playback mapping was retired or changed'"),
+		*FailedCharacter->GetPathName(), *FailedProfile->GetPathName(), *FailedSource->TranslationCurve->GetPathName()),
+		ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+	FailedMove->CurrentRootMotion.PrepareRootMotion(0.04f, *FailedCharacter, *FailedMove, true);
+	TestTrue(TEXT("Runtime Profile failure is explicit and retires before callback"), bRetiredBeforeCallback);
+	TestEqual(TEXT("Original Profile failure is delivered exactly once"), FailureCalls, 1);
+	FailedSource->PrepareRootMotion(0.04f, 0.04f, *FailedCharacter, *FailedMove);
+	FailedMove->EndActionMotion(FailedHandle);
+	TestEqual(TEXT("Repeated original preparation and cleanup cannot replay failure"), FailureCalls, 1);
+	TestFalse(TEXT("Invalid Profile contributes no native override"), FailedMove->CurrentRootMotion.HasOverrideVelocity());
 
 	// The new mode reads the original sequence, including a nonzero cumulative origin and loop boundary.
 	// Keep this in the original timing/ownership leaf; none of the legacy final-frame assertions are replaced.

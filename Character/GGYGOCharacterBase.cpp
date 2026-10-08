@@ -395,6 +395,10 @@ void AGGYGOCharacterBase::ConsumeLocalAbilitySystemNotice(
 		bSucceeded = Health->RefreshLocalAbilitySystemResource(
 			Extension, OwnNotice.Resource, OwnNotice.PublishedContext, Error);
 		break;
+	case EGGYGOPawnASCLocalNoticeKind::Closing:
+		// This fact retires input associations, not Health's resources. Health keeps
+		// its existing Released/Character EndPlay cleanup; no native success is implied.
+		return;
 	case EGGYGOPawnASCLocalNoticeKind::Released:
 		// Withdrawal has already invalidated Ready; only the delivered historical H is released.
 		bSucceeded = Health->UninitializeFromLocalAbilitySystemResource(OwnNotice.Resource, Error);

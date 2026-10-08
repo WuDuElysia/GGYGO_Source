@@ -72,6 +72,7 @@ struct FGGYGOPawnASCResourceHandle::FLocalResource
 	FGGYGOAvatarBindingContext PublishedContext{};
 	bool bInstalled = true;
 	bool bEverReady = false;
+	bool bClosingNotified = false;
 	bool bReleasedNotified = false;
 };
 
@@ -209,14 +210,21 @@ void UGGYGOPawnExtensionComponent::BeginPlay()
 
 void UGGYGOPawnExtensionComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
 	bPawnDataInitializationClosed = true;
 	PawnDataInitializationScope = nullptr;
-	// 先关闭新 Install/Ready/回放，再处理原 H；关闭的 Released 只退休义务并返回真实失败。
+	// Closing is an original lifecycle fact, independent of fallible native Host cleanup.
 	bLocalAbilitySystemAdmissionClosed = true;
-	UninitializeAbilitySystem();
-	UnregisterInitStateFeature();
+	if (OriginalResource.HasResource()) { NotifyLocalResourcesClosing(OriginalResource); }
+	UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
+	if (!LiveExtension) { return; }
+	LiveExtension->UninitializeLocalAbilitySystemResource(OriginalResource);
+	LiveExtension = OriginalExtension.Get();
+	if (!LiveExtension || !LiveExtension->bLocalAbilitySystemAdmissionClosed) { return; }
+	LiveExtension->UnregisterInitStateFeature();
 
-	Super::EndPlay(EndPlayReason);
+	LiveExtension->Super::EndPlay(EndPlayReason);
 }
 
 void UGGYGOPawnExtensionComponent::SetPawnData(const UGGYGOPawnData* InPawnData)
@@ -299,7 +307,6 @@ void UGGYGOPawnExtensionComponent::InitializeAbilitySystem(UGGYGOAbilitySystemCo
 void UGGYGOPawnExtensionComponent::UninitializeAbilitySystem(UGGYGOAbilitySystemComponent* ExpectedASC)
 {
 	check(IsInGameThread());
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
 	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
 	if (!OriginalResource.HasResource()) { return; }
 	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
@@ -308,6 +315,16 @@ void UGGYGOPawnExtensionComponent::UninitializeAbilitySystem(UGGYGOAbilitySystem
 	{
 		return;
 	}
+	UninitializeLocalAbilitySystemResource(OriginalResource);
+}
+
+void UGGYGOPawnExtensionComponent::UninitializeLocalAbilitySystemResource(
+	const FGGYGOPawnASCResourceHandle& OriginalResource)
+{
+	check(IsInGameThread());
+	if (!OwnsLocalAbilitySystemResource(OriginalResource)) { return; }
+	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
+	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
 	FGGYGOAvatarBindingHostRequest Request;
 	Request.Operation = EGGYGOAvatarBindingHostOperation::Release;
 	Request.ExpectedASC = Identity.ASC;
@@ -566,57 +583,6 @@ void UGGYGOPawnExtensionComponent::OnActorInitStateChanged(const FActorInitState
 	}
 }
 
-void UGGYGOPawnExtensionComponent::OnAbilitySystemInitialized_RegisterAndCall(FSimpleMulticastDelegate::FDelegate Delegate)
-{
-	check(IsInGameThread());
-	if (!Delegate.IsBound() || bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
-		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("[Character/PawnExtension] Initialized registration rejected: Extension=%s, unbound delegate or closed lifecycle."),
-			*GetPathNameSafe(this));
-		return;
-	}
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(this);
-	const FGGYGOPawnASCResourceHandle OriginalResource = LocalAbilitySystemResource;
-	if (!OnAbilitySystemInitialized.IsBoundToObject(Delegate.GetUObject()))
-	{
-		OnAbilitySystemInitialized.Add(Delegate);
-	}
-	if (IsLocalAbilitySystemResourceReady(OriginalResource))
-	{
-		const FGGYGOAvatarBindingContext OriginalContext = OriginalResource.Resource->PublishedContext;
-		Delegate.Execute();
-		UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
-		if (!LiveExtension || !LiveExtension->IsLocalAbilitySystemResourceReady(OriginalResource)
-			|| !OriginalResource.Resource->PublishedContext.HasSameContext(OriginalContext))
-		{
-			UE_LOG(LogGGYGOAbilitySystem, Verbose,
-				TEXT("[Character/PawnExtension] Initialized replay invalidated: Extension=%s Binding=%llu Write=%llu."),
-				*GetPathNameSafe(OriginalExtension.Get()),
-				static_cast<unsigned long long>(OriginalContext.Binding.Serial),
-				static_cast<unsigned long long>(OriginalContext.LastActorInfoWrite.Serial));
-		}
-	}
-}
-
-void UGGYGOPawnExtensionComponent::OnAbilitySystemUninitialized_Register(FSimpleMulticastDelegate::FDelegate Delegate)
-{
-	check(IsInGameThread());
-	if (!Delegate.IsBound() || bLocalAbilitySystemAdmissionClosed || !IsValid(this) || IsBeingDestroyed()
-		|| HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("[Character/PawnExtension] Uninitialized registration rejected: Extension=%s, unbound delegate or closed lifecycle."),
-			*GetPathNameSafe(this));
-		return;
-	}
-	if (!OnAbilitySystemUninitialized.IsBoundToObject(Delegate.GetUObject()))
-	{
-		OnAbilitySystemUninitialized.Add(Delegate);
-	}
-}
-
 // K4-Character-L1 local resource implementation begin.
 namespace
 {
@@ -769,8 +735,24 @@ FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::WithdrawLocalAbilitySyste
 	// Detach before any future callbacks. Expired ASC/Pawn identities are not dereferenced.
 	LocalAbilitySystemResource = FGGYGOPawnASCResourceHandle{};
 	OriginalResource.Resource->bInstalled = false;
+	NotifyLocalResourcesClosing(OriginalResource);
 	return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
 		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);
+}
+
+void UGGYGOPawnExtensionComponent::NotifyLocalResourcesClosing(
+	const FGGYGOPawnASCResourceHandle& OriginalResource)
+{
+	check(IsInGameThread());
+	check(OwnsLocalAbilitySystemResource(OriginalResource)
+		&& (bLocalAbilitySystemAdmissionClosed || !OriginalResource.Resource->bInstalled));
+	if (OriginalResource.Resource->bClosingNotified) { return; }
+	// This bit owns only one notification obligation; Installed/Ready remain the admission authority.
+	OriginalResource.Resource->bClosingNotified = true;
+	FGGYGOPawnASCLocalNotice Notice;
+	Notice.Kind = EGGYGOPawnASCLocalNoticeKind::Closing;
+	Notice.Resource = OriginalResource;
+	LocalAbilitySystemNotice.Broadcast(Notice);
 }
 
 bool UGGYGOPawnExtensionComponent::IsLocalAbilitySystemResourceInstalled(
@@ -863,13 +845,7 @@ FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::NotifyLocalResourcesRelea
 	UGGYGOPawnExtensionComponent* LiveExtension = OriginalExtension.Get();
 	if (LiveExtension->LocalAbilitySystemResource.HasResource())
 	{
-		// Identity consumers may finish old cleanup; a no-argument observer cannot identify a successor.
-		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
-			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
-	}
-	LiveExtension->OnAbilitySystemUninitialized.Broadcast();
-	if (!RecheckReleased() || OriginalExtension.Get()->LocalAbilitySystemResource.HasResource())
-	{
+		// The original release is consumed; a replacement local slot retains the Stale result contract.
 		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
 			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
 	}
@@ -961,15 +937,6 @@ FGGYGOPawnASCLocalResult UGGYGOPawnExtensionComponent::NotifyLocalResourcesReady
 	{
 		return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
 			EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
-	}
-	if (bInitialized)
-	{
-		OriginalExtension.Get()->OnAbilitySystemInitialized.Broadcast();
-		if (!RecheckReady())
-		{
-			return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
-				EGGYGOPawnASCLocalOutcome::Stale, EGGYGOPawnASCLocalReason::CallbackInvalidated, true);
-		}
 	}
 	return MakePawnASCLocalResourceResult(OriginalExtension, OriginalResource,
 		EGGYGOPawnASCLocalOutcome::Succeeded, EGGYGOPawnASCLocalReason::None, true);

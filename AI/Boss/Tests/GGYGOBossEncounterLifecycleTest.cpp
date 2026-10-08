@@ -102,6 +102,7 @@ namespace
 	{
 		UWorld* World = nullptr;
 		UEngine* Engine = nullptr;
+		TArray<TPair<TWeakObjectPtr<UGGYGOPawnExtensionComponent>, FDelegateHandle>> LocalNoticeHandles;
 		bool Initialize()
 		{
 			Engine = GEngine;
@@ -119,6 +120,13 @@ namespace
 		}
 		~FEncounterTestWorld()
 		{
+			for (const auto& Registration : LocalNoticeHandles)
+			{
+				if (UGGYGOPawnExtensionComponent* Extension = Registration.Key.Get())
+				{
+					Extension->UnregisterLocalAbilitySystemNotice(Registration.Value);
+				}
+			}
 			if (World)
 			{
 				// No BeginPlay: explicitly release production resources before DestroyWorld.
@@ -168,7 +176,7 @@ namespace
 		return Count;
 	}
 
-	void ObserveCleanup(UGGYGOEncounterLifecycleObserver* Observer,
+	void ObserveCleanup(FEncounterTestWorld& Fixture, UGGYGOEncounterLifecycleObserver* Observer,
 		AGGYGOEncounterLifecycleTestEncounter* Encounter, AGGYGOEncounterLifecycleTestPawn* CurrentAvatar)
 	{
 		Observer->Encounter = Encounter;
@@ -178,9 +186,14 @@ namespace
 		Observer->CurrentAvatar = CurrentAvatar;
 		Observer->ASC = Observer->State->GetGGYGOAbilitySystemComponent();
 		CurrentAvatar->Observer = Observer;
-		CurrentAvatar->GetPawnExtensionComponent()->OnAbilitySystemUninitialized_Register(
-			FSimpleMulticastDelegate::FDelegate::CreateUObject(Observer,
-				&UGGYGOEncounterLifecycleObserver::HandleUninitialized));
+		UGGYGOPawnExtensionComponent* Extension = CurrentAvatar->GetPawnExtensionComponent();
+		const FDelegateHandle Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
+			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(Observer,
+				[Observer](const FGGYGOPawnASCLocalNotice& Notice)
+				{
+					if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { Observer->HandleUninitialized(); }
+				}));
+		Fixture.LocalNoticeHandles.Emplace(TWeakObjectPtr<UGGYGOPawnExtensionComponent>(Extension), Handle);
 		Observer->CreatedAvatar->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);
 		Observer->Controller->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);
 		Observer->State->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);
@@ -233,7 +246,7 @@ bool FGGYGOEncounterCleanupLifecycleTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("repeat rejection preserves actual assembly"), Encounter->GetBossState() == State
 		&& Encounter->GetBossController() == Controller && Encounter->GetBossAvatar() == Avatar);
 	TStrongObjectPtr<UGGYGOEncounterLifecycleObserver> Observer(NewObject<UGGYGOEncounterLifecycleObserver>());
-	ObserveCleanup(Observer.Get(), Encounter, Avatar);
+	ObserveCleanup(Fixture, Observer.Get(), Encounter, Avatar);
 	Observer->bReenterEndPlay = true;
 	Encounter->CleanupForTest();
 	VerifyCleanupOrder(*this, Observer.Get());
@@ -332,7 +345,7 @@ bool FGGYGOEncounterCreationOwnershipTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("created Avatar Owner changed"), CreatedAvatar->GetOwner(), DifferentOwner);
 	TestEqual(TEXT("external Avatar Owner points at Encounter"), External->GetOwner(), static_cast<AActor*>(Encounter));
 	TStrongObjectPtr<UGGYGOEncounterLifecycleObserver> Observer(NewObject<UGGYGOEncounterLifecycleObserver>());
-	ObserveCleanup(Observer.Get(), Encounter, External);
+	ObserveCleanup(Fixture, Observer.Get(), Encounter, External);
 	Encounter->EndPlayForTest();
 	VerifyCleanupOrder(*this, Observer.Get());
 	TestTrue(TEXT("initial Avatar reclaimed despite different Owner"), CreatedAvatar->IsActorBeingDestroyed());

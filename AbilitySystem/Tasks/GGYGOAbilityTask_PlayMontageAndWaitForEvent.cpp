@@ -403,7 +403,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalMontageNot
 		&& Fact.NotifyPositionSeconds == ConfiguredMontageNotifyPositionSeconds;
 }
 
-void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageNotifyFact(
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchValidatedOriginalMontageNotifyFact(
 	const FGGYGOMontageNotifyFact& Fact, const FGGYGOMontagePlayGuardIdentity& Original)
 {
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
@@ -416,7 +416,6 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageNotify
 			&& OriginalASC.HasSameIndexAndSerialNumber(TWeakObjectPtr<UAbilitySystemComponent>(Task->AbilitySystemComponent.Get()))
 			&& Task->CanDispatchOriginalMontageNotifyFact(Fact, Original) ? Task : nullptr;
 	};
-	if (!Recheck()) { return; }
 	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = NativeCallbackRegistration;
 	if (NativeSnapshot.IsValid()) { NativeSnapshot->Callbacks.NotifyReceived.ExecuteIfBound(Fact); }
 	NativeSnapshot.Reset(); // Capture destructors are external code too; recheck after they return.
@@ -427,7 +426,8 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageNotify
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
 	FName NotifyName, const FBranchingPointNotifyPayload& Payload)
 {
-	if (NotifyName != ConfiguredMontageNotifyName || Payload.MontageInstanceID == INDEX_NONE
+	if (NotifyName != ConfiguredMontageNotifyName || !IsValid(ConfiguredMontageNotify)
+		|| Payload.MontageInstanceID == INDEX_NONE
 		|| Payload.MontageInstanceID != MontageInstanceId || Payload.SkelMeshComponent != ActivatedMesh.Get()
 		|| Payload.SequenceAsset != MontageToPlay || !Payload.NotifyEvent) { return; }
 	const FAnimNotifyEvent* Event = nullptr;
@@ -436,11 +436,19 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
 	if (!ResolveNativeMontageNotify(MontageToPlay, NotifyName, Event, Position, Diagnostic)
 		|| Event != Payload.NotifyEvent || Event->Notify != ConfiguredMontageNotify
 		|| Position != ConfiguredMontageNotifyPositionSeconds) { return; }
-	FGGYGOMontageNotifyFact Fact;
-	float CurrentPosition = 0.0f;
-	if (!TryGetOriginalMontageNotifySnapshot(Fact, CurrentPosition)) { return; }
 	const FGGYGOMontagePlayGuardIdentity Original = OriginalGuardIdentity;
-	DispatchOriginalMontageNotifyFact(Fact, Original); // Never forward the borrowed engine payload.
+	if (!CanDispatchOriginalInstanceFact(Original)) { return; }
+	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
+	if (!Instance || !FMath::IsFinite(Instance->GetPosition())) { return; }
+	// Payload, authored declaration and original instance were checked without an external call.
+	// Copy the fact once; never forward or retain the borrowed engine payload.
+	FGGYGOMontageNotifyFact Fact;
+	Fact.Montage = MontageToPlay;
+	Fact.Mesh = ActivatedMesh.Get();
+	Fact.MontageInstanceId = Instance->GetInstanceID();
+	Fact.NotifyName = ConfiguredMontageNotifyName;
+	Fact.NotifyPositionSeconds = ConfiguredMontageNotifyPositionSeconds;
+	DispatchValidatedOriginalMontageNotifyFact(Fact, Original);
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(

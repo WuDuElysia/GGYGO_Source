@@ -535,7 +535,6 @@ void UGGYGOHealthComponent::HandleHealthChanged(
 	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
 		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OnHealthChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
 void UGGYGOHealthComponent::HandleMaxHealthChanged(
@@ -548,7 +547,6 @@ void UGGYGOHealthComponent::HandleMaxHealthChanged(
 	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
 		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OnMaxHealthChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
 void UGGYGOHealthComponent::HandlePoiseChanged(
@@ -561,7 +559,6 @@ void UGGYGOHealthComponent::HandlePoiseChanged(
 	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
 		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OnPoiseChanged.Broadcast(OriginalResource->Health.Get(), OldValue, NewValue, Instigator);
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
 void UGGYGOHealthComponent::HandlePoiseBroken(
@@ -574,7 +571,6 @@ void UGGYGOHealthComponent::HandlePoiseBroken(
 	if (!OriginalResource.IsValid() || OriginalResource->Health.Get() != this
 		|| !IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OnPoiseBroken.Broadcast(OriginalResource->Pawn.Get());
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }
 
 void UGGYGOHealthComponent::HandleOutOfHealth(
@@ -602,7 +598,6 @@ void UGGYGOHealthComponent::HandleOutOfHealth(
 	FScopedPredictionWindow NewScopedWindow(OriginalASC, true);
 	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OriginalASC->HandleGameplayEvent(Payload.EventTag, &Payload);
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 #endif // WITH_SERVER_CODE
 }
 
@@ -773,5 +768,4 @@ void UGGYGOHealthComponent::DamageSelfDestruct(bool bFellOutOfWorld)
 
 	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 	OriginalASC->ApplyGameplayEffectSpecToSelf(*Spec);
-	if (!IsOriginalResourceCurrent(OriginalResource, OriginalContext)) { return; }
 }

@@ -3,6 +3,7 @@
 #if WITH_DEV_AUTOMATION_TESTS
 #include "Combatants/Tests/GGYGOCombatantBindingLifecycleTestTypes.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Components/GameFrameworkComponentManager.h"
 #include "Engine/Engine.h"
 #include "Engine/GameInstance.h"
@@ -39,6 +40,8 @@ namespace
 		UGGYGOPawnExtensionComponent* OldExtension = nullptr;
 		UGGYGOPawnExtensionComponent* CandidateExtension = nullptr;
 		TSharedPtr<FBindingSuccessorProbe> Probe;
+		FDelegateHandle OldNoticeHandle;
+		FDelegateHandle CandidateNoticeHandle;
 		bool bGameInstanceInitialized = false;
 		FNetDelegates::FReceivedNetworkEncryptionToken SavedEncryptionToken = FNetDelegates::OnReceivedNetworkEncryptionToken;
 		FNetDelegates::FReceivedNetworkEncryptionAck SavedEncryptionAck = FNetDelegates::OnReceivedNetworkEncryptionAck;
@@ -251,8 +254,10 @@ namespace
 
 		int32 GetTargetInitializedCount() const { return bSamePawn ? OldInitializedCount : CandidateInitializedCount; }
 
-		void HandleOldUninitialized()
+		void HandleOldLocalNotice(const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready) { HandleOldInitialized(); return; }
+			if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Released) { return; }
 			if (!bObserving) { return; }
 			++OldUninitializedCount;
 			Events.Add(FName(TEXT("OldUninitialized")));
@@ -283,8 +288,10 @@ namespace
 			if (bTakeoverCompleted) { Events.Add(FName(TEXT("TakeoverSucceeded"))); }
 		}
 
-		void HandleCandidateUninitialized()
+		void HandleCandidateLocalNotice(const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready) { HandleCandidateInitialized(); return; }
+			if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Released) { return; }
 			if (!bObserving) { return; }
 			++CandidateUninitializedCount;
 			Events.Add(FName(TEXT("CandidateUninitialized")));
@@ -305,14 +312,10 @@ namespace
 	void FBindingSuccessorFixture::StartObserving(FAutomationTestBase& Test, bool bSamePawn)
 	{
 		Probe = MakeShared<FBindingSuccessorProbe>(*this, Test, bSamePawn);
-		OldExtension->OnAbilitySystemUninitialized_Register(
-			FSimpleMulticastDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleOldUninitialized));
-		CandidateExtension->OnAbilitySystemUninitialized_Register(
-			FSimpleMulticastDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleCandidateUninitialized));
-		OldExtension->OnAbilitySystemInitialized_RegisterAndCall(
-			FSimpleMulticastDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleOldInitialized));
-		CandidateExtension->OnAbilitySystemInitialized_RegisterAndCall(
-			FSimpleMulticastDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleCandidateInitialized));
+		OldNoticeHandle = OldExtension->RegisterLocalAbilitySystemNoticeAndCall(
+			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleOldLocalNotice));
+		CandidateNoticeHandle = CandidateExtension->RegisterLocalAbilitySystemNoticeAndCall(
+			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateSP(Probe.ToSharedRef(), &FBindingSuccessorProbe::HandleCandidateLocalNotice));
 		// Registration priming precedes the diagnostic action and is not a takeover notification.
 		Probe->bObserving = true;
 		Probe->bTakeoverArmed = true;
@@ -325,7 +328,10 @@ namespace
 			Probe->bObserving = false;
 			Probe->bTakeoverArmed = false;
 		}
-		// Public registration has no Remove API. Expire the weak target before fixture cleanup.
+		if (IsValid(OldExtension)) { OldExtension->UnregisterLocalAbilitySystemNotice(OldNoticeHandle); }
+		if (IsValid(CandidateExtension)) { CandidateExtension->UnregisterLocalAbilitySystemNotice(CandidateNoticeHandle); }
+		OldNoticeHandle.Reset();
+		CandidateNoticeHandle.Reset();
 		Probe.Reset();
 	}
 

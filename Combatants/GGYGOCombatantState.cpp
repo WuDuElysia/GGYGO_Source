@@ -631,6 +631,20 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 		{
 			return;
 		}
+		const auto CleanupScope = [&]()
+		{
+			AGGYGOCombatantState* CurrentHost = OriginalHost.Get();
+			UGGYGOPawnExtensionComponent* CurrentExtension = Request.ExpectedExtension.Get();
+			UGGYGOAbilitySystemComponent* CurrentASC = Request.ExpectedASC.Get();
+			APawn* OriginalPawn = Request.ExpectedPawn.Get();
+			// Original-resource cleanup scope, including Closing; never new-work or Ready admission.
+			return CurrentHost && CurrentExtension && CurrentASC && OriginalPawn
+				&& CurrentHost->AbilitySystemComponent == CurrentASC && CurrentASC->GetOwner() == CurrentHost
+				&& CurrentExtension->GetOwner() == OriginalPawn
+				&& !CurrentHost->AvatarResource.HasResource()
+				&& OriginalSelection.HasSameIndexAndSerialNumber(TWeakObjectPtr<APawn>(CurrentHost->AvatarPawn))
+				&& !CurrentExtension->GetCurrentLocalAbilitySystemResource().HasResource();
+		};
 		const FGGYGOPawnASCResourceHandle Local = LiveExtension->GetCurrentLocalAbilitySystemResource();
 		if (Local.HasResource())
 		{
@@ -645,6 +659,14 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 				return;
 			}
 		}
+		// Withdrawal may synchronously publish Closing and replace or destroy the original endpoints.
+		if (!CleanupScope())
+		{
+			return;
+		}
+		Host = OriginalHost.Get();
+		LiveASC = Request.ExpectedASC.Get();
+		LiveExtension = Request.ExpectedExtension.Get();
 		FGGYGOAvatarBindingRequest Clear;
 		Clear.Kind = EGGYGOAvatarBindingKind::Clear;
 		Clear.ExpectedContext = Initialized.CommittedContext;
@@ -652,21 +674,17 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 		const bool bClosingOriginalHost = !Host->bAvatarBindingPermitted || Host->IsActorBeingDestroyed();
 		Clear.ClearMode = bClosingOriginalHost || (OriginalOwner && OriginalOwner->IsActorBeingDestroyed())
 			? EGGYGOAvatarBindingClearMode::ClearActorInfo : EGGYGOAvatarBindingClearMode::PreserveOwner;
-		Clear.IsRequestContextCurrent = [&]()
-		{
-			AGGYGOCombatantState* CurrentHost = OriginalHost.Get();
-			UGGYGOPawnExtensionComponent* CurrentExtension = Request.ExpectedExtension.Get();
-			UGGYGOAbilitySystemComponent* CurrentASC = Request.ExpectedASC.Get();
-			// Original-resource cleanup scope, including Closing; never new-work or Ready admission.
-			return CurrentHost && CurrentExtension && CurrentASC
-				&& CurrentHost->AbilitySystemComponent == CurrentASC && CurrentASC->GetOwner() == CurrentHost
-				&& !CurrentHost->AvatarResource.HasResource()
-				&& OriginalSelection.HasSameIndexAndSerialNumber(TWeakObjectPtr<APawn>(CurrentHost->AvatarPawn))
-				&& !CurrentExtension->GetCurrentLocalAbilitySystemResource().HasResource();
-		};
+		Clear.IsRequestContextCurrent = CleanupScope;
 		FGGYGOAvatarBindingPublicationReceipt ClearPublication;
 		const FGGYGOAvatarBindingResult Cleared = LiveASC->TryExecuteAvatarActorInfoTransaction(Clear, ClearPublication);
 		AppendASCStep(History, EHostStep::ActorInfoClear, Cleared);
+		if (!CleanupScope())
+		{
+			return;
+		}
+		Host = OriginalHost.Get();
+		LiveASC = Request.ExpectedASC.Get();
+		LiveExtension = Request.ExpectedExtension.Get();
 		if (Cleared.Outcome == EOutcome::Succeeded && Cleared.bCommitted)
 		{
 			if (InstalledResource.HasResource())
@@ -676,12 +694,11 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 			}
 			else
 			{
-				const auto CleanupQuery = Clear.IsRequestContextCurrent;
-				const FGGYGOAvatarBindingResult Published = LiveASC->PublishAvatarBindingNotice(ClearPublication, CleanupQuery);
+				const FGGYGOAvatarBindingResult Published = LiveASC->PublishAvatarBindingNotice(ClearPublication, CleanupScope);
 				AppendASCStep(History, EHostStep::PublishNotice, Published);
 			}
 		}
-		else if (InstalledResource.HasResource() && Clear.IsRequestContextCurrent())
+		else if (InstalledResource.HasResource())
 		{
 			// Local retirement is still required; it cannot turn the failed Init into success.
 			const FGGYGOPawnASCLocalResult Released = LiveExtension->NotifyLocalResourcesReleased(InstalledResource);
@@ -907,6 +924,7 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 	Host->RetireHostAvatarResource(Request.ExpectedResource);
 	History.Outcome = EOutcome::Succeeded;
 	History.Reason = EHostReason::None;
+	Extension = Request.ExpectedExtension.Get();
 	const FGGYGOAvatarBindingResult Published = Host->PublishAvatarResources(Publication,
 		Cleared.CommittedContext, Request.ExpectedResource, Extension, true, History);
 	if (Published.Outcome != EOutcome::Succeeded)

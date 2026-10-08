@@ -21,15 +21,24 @@ class UGGYGOLocomotionTestSequence : public UAnimSequence
 public:
 	float TestLength = 1.0f;
 	TMap<FName, FRichCurve> TestCurves;
+	/** Once-only actual sampling boundary; metadata validation never invokes it. */
+	mutable TFunction<void()> OnCurveRead;
+	void InvokeCurveReadOnce() const
+	{
+		auto Callback = MoveTemp(OnCurveRead);
+		if (Callback) Callback();
+	}
 	virtual float GetPlayLength() const override { return TestLength; }
 	virtual bool HasCurveData(FName Name, bool bForceUseRawData) const override { return TestCurves.Contains(Name); }
 	virtual float EvaluateCurveData(FName Name, const FAnimExtractContext& Context, bool bForceUseRawData) const override
 	{
+		InvokeCurveReadOnce();
 		const FRichCurve* Curve = TestCurves.Find(Name);
 		return Curve ? Curve->Eval(static_cast<float>(Context.CurrentTime)) : 0.0f;
 	}
 	virtual void EvaluateCurveData(FBlendedCurve& OutCurve, const FAnimExtractContext& Context, bool bForceUseRawData) const override
 	{
+		InvokeCurveReadOnce();
 		OutCurve.Empty();
 		for (const TPair<FName, FRichCurve>& Curve : TestCurves)
 			OutCurve.Set(Curve.Key, Curve.Value.Eval(static_cast<float>(Context.CurrentTime)));
@@ -105,19 +114,24 @@ public:
 		LocomotionMotionTime = Time;
 		StopMotionType = Stop;
 	}
-	void AdvanceTestMotion(float DeltaSeconds, bool bHadMoveInput, EGGYGOGait PreviousGait)
+	void StageTestMotion(float DeltaSeconds, bool bHadMoveInput, EGGYGOGait PreviousGait)
 	{
 		CurrentRootMotion.CleanUpInvalidRootMotion(DeltaSeconds, *CharacterOwner, *this);
 		UpdateLocomotionMotion(DeltaSeconds, bHadMoveInput, PreviousGait);
+	}
+	void AdvanceTestMotion(float DeltaSeconds, bool bHadMoveInput, EGGYGOGait PreviousGait)
+	{
+		StageTestMotion(DeltaSeconds, bHadMoveInput, PreviousGait);
 		CurrentRootMotion.PrepareRootMotion(DeltaSeconds, *CharacterOwner, *this, true);
 	}
-	void AdvanceTestBlend(float DeltaSeconds) { UpdateWalkRunBlend(DeltaSeconds); }
+	void AdvanceTestBlend(float DeltaSeconds) { AdvanceTestMotion(DeltaSeconds, true, ResolvedGait); }
 	void SetTestGait(EGGYGOGait Gait) { ResolvedGait = Gait; }
 	void SetTestTurnBackPhase(EGGYGOTurnBackPhase Phase) { TurnBackPhase = Phase; }
 	/** Inject a previously evaluated sample to check per-update cleanup after rebinding. */
 	void SetTestCurveMotion(const FGGYGOLocomotionCurveSample& InSample) { CurveMotion = InSample; }
 	void SetAuthorityReplayForTest(bool bEnabled) { bReplayLocomotionFromAuthority = bEnabled; }
 	void SetTestSequence(uint16 Sequence) { LocomotionMotionSequence = Sequence; }
+	bool GetPublishedTurnBackForTest() const { return bReplicatedTurnBackCurveDriven; }
 	float GetTestMotionTime() const { return LocomotionMotionTime; }
 	uint16 GetTestSequence() const { return LocomotionMotionSequence; }
 	const FGGYGOLocomotionCurveSample& GetTestCurveMotion() const { return CurveMotion; }

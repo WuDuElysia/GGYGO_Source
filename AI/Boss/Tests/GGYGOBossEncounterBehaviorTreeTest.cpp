@@ -322,6 +322,19 @@ namespace
 		UEngine* Engine = nullptr;
 		bool bHasContext = false;
 		TStrongObjectPtr<UGGYGOEncounterBTProbe> Probe{NewObject<UGGYGOEncounterBTProbe>()};
+		TArray<TPair<TWeakObjectPtr<UGGYGOPawnExtensionComponent>, FDelegateHandle>> LocalNoticeHandles;
+
+		void ObserveLocalResourceRelease(UGGYGOPawnExtensionComponent* Extension)
+		{
+			UGGYGOEncounterBTProbe* OriginalProbe = Probe.Get();
+			const FDelegateHandle Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
+				FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(OriginalProbe,
+					[OriginalProbe](const FGGYGOPawnASCLocalNotice& Notice)
+					{
+						if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { OriginalProbe->HandleUninitialized(); }
+					}));
+			LocalNoticeHandles.Emplace(TWeakObjectPtr<UGGYGOPawnExtensionComponent>(Extension), Handle);
+		}
 
 		bool Initialize()
 		{
@@ -345,6 +358,13 @@ namespace
 			// Assertions finish before this guard. Teardown can never supply DUT evidence.
 			Probe->bRecording = false;
 			Probe->MessageWitness.Reset();
+			for (const auto& Registration : LocalNoticeHandles)
+			{
+				if (UGGYGOPawnExtensionComponent* Extension = Registration.Key.Get())
+				{
+					Extension->UnregisterLocalAbilitySystemNotice(Registration.Value);
+				}
+			}
 			if (World)
 			{
 				for (TActorIterator<AGGYGOEncounterBTTestEncounter> It(World); It; ++It)
@@ -449,8 +469,7 @@ namespace
 					Avatar->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
 					if (UGGYGOPawnExtensionComponent* Extension = Avatar->GetPawnExtensionComponent())
 					{
-						Extension->OnAbilitySystemUninitialized_Register(FSimpleMulticastDelegate::FDelegate::CreateUObject(
-							Probe, &UGGYGOEncounterBTProbe::HandleUninitialized));
+						Fixture.ObserveLocalResourceRelease(Extension);
 					}
 				}
 			}));
@@ -544,8 +563,7 @@ namespace
 		Brain->TickComponent(BTTickDelta, LEVELTICK_All, nullptr);
 		if (!Test.TestEqual(TEXT("active task actually received probe"), Probe->TaskMessageCount, 1)
 			|| !Test.TestEqual(TEXT("independent witness actually received probe"), Probe->WitnessMessageCount, 1)) { return false; }
-		Avatar->GetPawnExtensionComponent()->OnAbilitySystemUninitialized_Register(
-			FSimpleMulticastDelegate::FDelegate::CreateUObject(Probe, &UGGYGOEncounterBTProbe::HandleUninitialized));
+		Fixture.ObserveLocalResourceRelease(Avatar->GetPawnExtensionComponent());
 		Avatar->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
 		Controller->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);
 		State->OnDestroyed.AddDynamic(Probe, &UGGYGOEncounterBTProbe::HandleDestroyed);

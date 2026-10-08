@@ -68,6 +68,11 @@ void AGGYGOInputTestController::InitInputSystem()
 	Super::InitInputSystem();
 }
 
+bool UGGYGOInputTestHeroComponent::HasAbilityInputAssociationForTest(const UGGYGOAbilitySystemComponent* ExpectedASC) const
+{
+	return ExpectedASC && GetInputSessionAbilitySystem() == ExpectedASC;
+}
+
 bool AGGYGOInputTestController::EnableNativeInputInitializationForTest()
 {
 	if (PlayerInput || bUseNativeInputInitialization)
@@ -482,13 +487,14 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 				State->Pawn->IsLocallyControlled() && GetInputSubsystem()->GetPlayerInput() == GetPlayerInput()
 				&& GetInputSubsystem()->HasMappingContext(State->Mapping.Get()));
 	}
-	// Actual Hero initialization binds its original ASC after the real coordinator
+	// Actual Hero initialization associates its original ASC after the real coordinator
 	// initialized it. No fabricated notification or private session-validity override.
 	State->Pawn->GetHeroForTest()->InitializePlayerInput(State->Pawn->GetInputComponentForTest());
 	return Test.TestTrue(TEXT("real local Hero source gate established"), State->Pawn->IsLocallyControlled()
 		&& State->Pawn->GetASCForTest()->GetAvatarActor() == State->Pawn
-		&& State->Pawn->GetASCForTest()->OnAbilityInputRetryable.IsBoundToObject(State->Pawn->GetHeroForTest())
-		&& State->Pawn->GetASCForTest()->OnAbilityGroupFreed.IsBoundToObject(State->Pawn->GetHeroForTest())
+		&& State->Pawn->GetHeroForTest()->HasAbilityInputAssociationForTest(State->Pawn->GetASCForTest())
+		&& !State->Pawn->GetASCForTest()->OnAbilityInputRetryable.IsBoundToObject(State->Pawn->GetHeroForTest())
+		&& !State->Pawn->GetASCForTest()->OnAbilityGroupFreed.IsBoundToObject(State->Pawn->GetHeroForTest())
 		&& GetInputSubsystem()->GetPlayerInput() == GetPlayerInput()
 		&& GetInputSubsystem()->HasMappingContext(State->Mapping.Get()));
 }
@@ -622,8 +628,9 @@ bool FGGYGOInputFixtureLocalSessionReadyTest::RunTest(const FString& Parameters)
 		static_cast<UObject*>(Fixture.GetController()));
 	TestEqual(TEXT("PawnExtension exposes the real ASC"), Pawn->GetPawnExtensionForTest()->GetGGYGOAbilitySystemComponent(), ASC);
 	TestEqual(TEXT("ASC Avatar matches this Pawn"), ASC->GetAvatarActor(), static_cast<AActor*>(Pawn));
-	TestTrue(TEXT("Hero owns a real retry subscription"), ASC->OnAbilityInputRetryable.IsBoundToObject(Hero));
-	TestTrue(TEXT("Hero owns a real group subscription"), ASC->OnAbilityGroupFreed.IsBoundToObject(Hero));
+	TestTrue(TEXT("Hero has the real original H/input association"), Hero->HasAbilityInputAssociationForTest(ASC));
+	TestFalse(TEXT("Hero does not own retry waiting subscriptions"), ASC->OnAbilityInputRetryable.IsBoundToObject(Hero));
+	TestFalse(TEXT("Hero does not own group wake subscriptions"), ASC->OnAbilityGroupFreed.IsBoundToObject(Hero));
 	TestTrue(TEXT("fixture IMC is actually registered"), Fixture.GetInputSubsystem()->HasMappingContext(Fixture.GetMappingContext()));
 
 	FGameplayAbilitySpec ProbeSpec(UGGYGOInputTestAbility::StaticClass(), 1);
@@ -642,7 +649,15 @@ bool FGGYGOInputFixtureLocalSessionReadyTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("one real Completed binding executes"), Fixture.ExecuteAbilityBinding(ETriggerEvent::Completed), 1);
 	Fixture.GetController()->ConsumeInputForTest();
 
+	ASC->CancelAbilityHandle(ProbeHandle);
+	ActivatedSpec = ASC->FindAbilitySpecFromHandle(ProbeHandle);
+	if (!TestNotNull(TEXT("probe remains granted before request retirement"), ActivatedSpec)
+		|| !TestFalse(TEXT("probe is inactive before pending-request retirement"), ActivatedSpec->IsActive())) { return false; }
+	TestEqual(TEXT("a second original request is pending before release"), Fixture.ExecuteAbilityBinding(ETriggerEvent::Triggered), 1);
 	Hero->ReleasePlayerInput();
+	Fixture.GetController()->ConsumeInputForTest();
+	TestEqual(TEXT("retired original request cannot activate after Hero release"), Probe->GetActivationCountForTest(), 1);
+	TestFalse(TEXT("original H/input association returned"), Hero->HasAbilityInputAssociationForTest(ASC));
 	TestEqual(TEXT("fixture input bindings returned"), Input->GetActionEventBindings().Num(), 0);
 	TestFalse(TEXT("fixture IMC returned"), Fixture.GetInputSubsystem()->HasMappingContext(Fixture.GetMappingContext()));
 	TestFalse(TEXT("fixture retry subscription returned"), ASC->OnAbilityInputRetryable.IsBoundToObject(Hero));

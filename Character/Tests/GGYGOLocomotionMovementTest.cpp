@@ -158,7 +158,8 @@ namespace
 		return Profile;
 	}
 
-	bool BindMovementFixture(UGGYGOCharacterMovementComponent* Move, const UGGYGOMovementSet* Set, FString* OutError = nullptr)
+	bool BindMovementFixture(UGGYGOCharacterMovementComponent* Move, const UGGYGOMovementSet* Set, FString* OutError = nullptr,
+		UGGYGOLocomotionTestSequence** OutTurnBackSequence = nullptr)
 	{
 		if (!Move->SetMovementSet(Set, OutError)) return false;
 		if (!Set->bUseCurveDrivenSpeed) return true;
@@ -217,6 +218,8 @@ namespace
 		FString Error;
 		const bool bPublished = Move->PublishLocomotionSourceBinding(Binding, Error);
 		if (OutError) *OutError = Error;
+		if (bPublished && OutTurnBackSequence)
+			*OutTurnBackSequence = CastChecked<UGGYGOLocomotionTestSequence>(Binding.GetSingleSource(EGGYGOLocomotionMotionType::TurnBack)->Sequence.Get());
 		return bPublished;
 	}
 }
@@ -535,6 +538,54 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	// Failure qualification does not assert the pending GetMaxSpeed failure-propagation contract.
 	if (!SpeedSource.Close()) return false;
 	if (!MovementSource.Close()) return false;
+	// Stage must not publish an unconsumed TurnBack; the actual native interval owns the commit.
+	AGGYGOLocomotionTestCharacter* CommitCharacter = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
+	if (!TestNotNull(TEXT("Commit fixture character"), CommitCharacter)) return false;
+	auto* CommitMove = CastChecked<UGGYGOLocomotionTestMovementComponent>(CommitCharacter->GetCharacterMovement());
+	CommitMove->SetComponentTickEnabled(false);
+	CommitMove->SetUpdatedComponent(CommitCharacter->GetCapsuleComponent());
+	CommitMove->SetMovementMode(MOVE_Walking);
+	UGGYGOLocomotionTestSequence* CommitSequence = nullptr;
+	if (!TestTrue(TEXT("Commit fixture binds original curve configuration"),
+		BindMovementFixture(CommitMove, FirstSet, nullptr, &CommitSequence))) return false;
+	FLocomotionMovementConsumerFixture CommitSource(*this, CommitMove, TEXT("Native TurnBack commit"));
+	if (!CommitSource.Bind() || !CommitSource.StartFreshRequest(TEXT("Committed phase"))) return false;
+	CommitMove->SetTestAcceleration(-CommitCharacter->GetActorForwardVector());
+	CommitMove->SetTestGait(EGGYGOGait::Run);
+	CommitMove->StageTestMotion(0.016f, true, EGGYGOGait::Run);
+	if (!TestTrue(TEXT("Stage preserves the uncommitted phase and published flag"),
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None && !CommitMove->GetPublishedTurnBackForTest())) return false;
+	CommitMove->CurrentRootMotion.PrepareRootMotion(0.016f, *CommitCharacter, *CommitMove, true);
+	if (!TestTrue(TEXT("Actual native TurnBack commit publishes the authority phase"),
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::Turning && CommitMove->GetPublishedTurnBackForTest())) return false;
+	CommitMove->SetMovementMode(MOVE_Falling);
+	CommitMove->UpdateCharacterStateBeforeMovement(0.016f);
+	if (!TestTrue(TEXT("Normal ground exit clears the committed TurnBack publication"),
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None && !CommitMove->GetPublishedTurnBackForTest())) return false;
+
+	// Invalidate the exact input at a real curve-read boundary, after Prepare's initial admission checks.
+	CommitMove->SetMovementMode(MOVE_Walking);
+	if (!TestTrue(TEXT("Consumer rejection fixture republishes the original configuration"),
+		BindMovementFixture(CommitMove, FirstSet, nullptr, &CommitSequence))) return false;
+	if (!CommitSource.StartFreshRequest(TEXT("Consumer rejection"))) return false;
+	CommitMove->SetTestAcceleration(-CommitCharacter->GetActorForwardVector());
+	CommitMove->SetTestGait(EGGYGOGait::Run);
+	CommitMove->StageTestMotion(0.016f, true, EGGYGOGait::Run);
+	const auto RejectingSource = CommitMove->GetRootMotionSource(TEXT("GGYGO.CurveTurnBack"));
+	if (!TestTrue(TEXT("Consumer rejection uses the actual staged native source"),
+		RejectingSource.IsValid() && RejectingSource->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct())) return false;
+	bool bClosedAtRead = false;
+	CommitSequence->OnCurveRead = [&]() { bClosedAtRead = CommitSource.Close(); };
+	TSharedPtr<const FGGYGOCurveRootMotionPrepared> RejectedPrepared;
+	FString CommitError;
+	const auto RejectedResult = CommitMove->PrepareLocomotionCurveRootMotion(
+		static_cast<const FRootMotionSource_GGYGOCurve&>(*RejectingSource), 0.016f, 0.016f, RejectedPrepared, CommitError);
+	if (!TestTrue(TEXT("Consumer rejection cannot publish sampled output as success"),
+		bClosedAtRead && RejectedResult == EGGYGOCurveRootMotionPrepareResult::Stale
+			&& !RejectedPrepared.IsValid() && !CommitError.IsEmpty()
+			&& CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None
+			&& !CommitMove->GetPublishedTurnBackForTest())) return false;
+
 	return true;
 }
 

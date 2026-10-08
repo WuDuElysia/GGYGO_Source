@@ -284,7 +284,8 @@ private:
 	bool IsOriginalMontageNotifySourceCurrent() const;
 	bool CanDispatchOriginalMontageNotifyFact(const FGGYGOMontageNotifyFact& Fact,
 		const FGGYGOMontagePlayGuardIdentity& Original) const;
-	void DispatchOriginalMontageNotifyFact(const FGGYGOMontageNotifyFact& Fact,
+	/** Caller validates the payload/source on this stack; only the external callback return needs revalidation. */
+	void DispatchValidatedOriginalMontageNotifyFact(const FGGYGOMontageNotifyFact& Fact,
 		const FGGYGOMontagePlayGuardIdentity& Original);
 	UFUNCTION()
 	void OnOriginalMontageNotifyBegin(FName NotifyName, const FBranchingPointNotifyPayload& Payload);

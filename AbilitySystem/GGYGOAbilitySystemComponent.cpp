@@ -3,6 +3,8 @@
  * @brief 项目 ASC 实现
  */
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "AbilitySystem/GGYGOAttributeCalculation.h"
+#include "AbilitySystem/Private/GGYGOAvatarBindingProtocol.h"
 #include "Animation/AnimInstance.h"
 #include "GameFramework/MovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -20,133 +22,12 @@
 #include "System/GGYGOGameplayTags.h"
 #include "Templates/UnrealTemplate.h"
 
-#include <limits>
-
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilitySystemComponent)
 
 UE_DEFINE_GAMEPLAY_TAG(TAG_GGYGO_Gameplay_AbilityInputBlocked, "Gameplay.AbilityInputBlocked");
 
 namespace
 {
-	// Native snapshots omit EvaluationMetaData. Preserve the original capture's already evaluated
-	// qualification bits; these comparisons never dereference the copied GE tag-requirement pointers.
-	bool HasSameAttributeAggregation(const FAggregator& First, const FAggregator& Second)
-	{
-		if (First.GetBaseValue() != Second.GetBaseValue()) { return false; }
-		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> FirstMods;
-		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> SecondMods;
-		First.GetAllAggregatorMods(FirstMods);
-		Second.GetAllAggregatorMods(SecondMods);
-		if (FirstMods.Num() != SecondMods.Num()) { return false; }
-		for (const auto& Entry : FirstMods)
-		{
-			const TArray<FAggregatorMod>* const* Other = SecondMods.Find(Entry.Key);
-			if (!Other) { return false; }
-			for (int32 Op = 0; Op < EGameplayModOp::Max; ++Op)
-			{
-				const TArray<FAggregatorMod>& A = Entry.Value[Op];
-				const TArray<FAggregatorMod>& B = (*Other)[Op];
-				if (A.Num() != B.Num()) { return false; }
-				for (int32 Index = 0; Index < A.Num(); ++Index)
-				{
-					const FAggregatorMod& Left = A[Index];
-					const FAggregatorMod& Right = B[Index];
-					if (Left.Qualifies() != Right.Qualifies() || Left.IsPredicted != Right.IsPredicted
-						|| Left.ActiveHandle != Right.ActiveHandle || Left.SourceTagReqs != Right.SourceTagReqs
-						|| Left.TargetTagReqs != Right.TargetTagReqs
-						|| FMemory::Memcmp(&Left.EvaluatedMagnitude, &Right.EvaluatedMagnitude, sizeof(float)) != 0
-						|| FMemory::Memcmp(&Left.StackCount, &Right.StackCount, sizeof(float)) != 0)
-					{
-						return false;
-					}
-				}
-			}
-		}
-		return true;
-	}
-
-	EGGYGOAttributeBaseCalculationReason PrepareNativeAttributeCalculationChannels(
-		const FAggregator& QualifiedSnapshot, const FAggregatorEvaluateParameters& Parameters,
-		FAggregatorModChannelContainer& OutChannels, TArray<EGameplayModEvaluationChannel>& OutOrder)
-	{
-		using EReason = EGGYGOAttributeBaseCalculationReason;
-		TMap<EGameplayModEvaluationChannel, const TArray<FAggregatorMod>*> Mods;
-		QualifiedSnapshot.GetAllAggregatorMods(Mods);
-		Mods.GetKeys(OutOrder);
-		OutOrder.Sort([](EGameplayModEvaluationChannel A, EGameplayModEvaluationChannel B)
-		{
-			return static_cast<uint8>(A) < static_cast<uint8>(B);
-		});
-		for (EGameplayModEvaluationChannel Channel : OutOrder)
-		{
-			const TArray<FAggregatorMod>* Arrays = Mods.FindChecked(Channel);
-			FAggregatorModChannel& NativeChannel = OutChannels.FindOrAddModChannel(Channel);
-			FAggregatorModChannel CompoundOnly;
-			FAggregatorModChannel GainOnly;
-			for (int32 Op = 0; Op < EGameplayModOp::Max; ++Op)
-			{
-				for (const FAggregatorMod& Mod : Arrays[Op])
-				{
-					if (!Mod.Qualifies()) { continue; }
-					if (!FMath::IsFinite(Mod.EvaluatedMagnitude)) { return EReason::NonFiniteModifier; }
-					if (Op == EGameplayModOp::Override) { return EReason::NonInvertibleChannel; }
-					// A stack-only projection into UE's own evaluator, not a second aggregation formula.
-					// Qualification is already frozen; no GE pointers/dependents or new qualification policy.
-					const EGameplayModOp::Type NativeOp = static_cast<EGameplayModOp::Type>(Op);
-					NativeChannel.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
-						FActiveGameplayEffectHandle());
-					if (NativeOp == EGameplayModOp::MultiplyAdditive || NativeOp == EGameplayModOp::DivideAdditive
-						|| NativeOp == EGameplayModOp::MultiplyCompound)
-					{
-						GainOnly.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
-							FActiveGameplayEffectHandle());
-					}
-					if (NativeOp == EGameplayModOp::MultiplyCompound)
-					{
-						CompoundOnly.AddMod(Mod.EvaluatedMagnitude, NativeOp, nullptr, nullptr, false,
-							FActiveGameplayEffectHandle());
-					}
-				}
-			}
-			FAggregatorModInfo Info;
-			Info.Channel = Channel;
-			const auto SetQualified = [](const FAggregatorModInfo& ModInfo)
-			{
-				ModInfo.Mod->SetExplicitQualifies(true);
-			};
-			NativeChannel.ForEachMod(Info, SetQualified);
-			CompoundOnly.ForEachMod(Info, SetQualified);
-			GainOnly.ForEachMod(Info, SetQualified);
-
-			// Native ReverseEvaluate silently substitutes 1 for a zero divisor. Reject before calling it.
-			const float Division = FAggregatorModChannel::SumMods(Arrays[EGameplayModOp::DivideAdditive],
-				GameplayEffectUtilities::GetModifierBiasByModifierOp(EGameplayModOp::DivideAdditive), Parameters);
-			if (!FMath::IsFinite(Division) || FMath::IsNearlyZero(Division)) { return EReason::InvalidDivisor; }
-			const float Multiplier = FAggregatorModChannel::SumMods(Arrays[EGameplayModOp::MultiplyAdditive],
-				GameplayEffectUtilities::GetModifierBiasByModifierOp(EGameplayModOp::MultiplyAdditive), Parameters);
-			if (!FMath::IsFinite(Multiplier)) { return EReason::NonFiniteResult; }
-			if (Multiplier <= UE_SMALL_NUMBER) { return EReason::NonInvertibleChannel; }
-			// The native compound product helper is private. Evaluate a native compound-only channel,
-			// including its real float underflow/overflow, without copying its multiplication algorithm.
-			const float Compound = CompoundOnly.EvaluateWithBase(1.0f, Parameters);
-			if (!FMath::IsFinite(Compound)) { return EReason::NonFiniteResult; }
-			if (Compound == 0.0f) { return EReason::NonInvertibleChannel; }
-			const float Gain = GainOnly.EvaluateWithBase(1.0f, Parameters);
-			if (!FMath::IsFinite(Gain)) { return EReason::NonFiniteResult; }
-			if (Gain == 0.0f) { return EReason::NonInvertibleChannel; }
-		}
-		return EReason::None;
-	}
-
-	bool IsAttributeForwardValueConfirmed(float Actual, float Desired)
-	{
-		// Only float arithmetic roundoff is admitted; no gameplay clamp or success-value substitution.
-		const double Scale = FMath::Max(1.0, FMath::Abs(static_cast<double>(Desired)));
-		const double Tolerance = FMath::Max(static_cast<double>(UE_KINDA_SMALL_NUMBER),
-			4.0 * std::numeric_limits<float>::epsilon() * Scale);
-		return FMath::IsFinite(Actual)
-			&& FMath::Abs(static_cast<double>(Actual) - static_cast<double>(Desired)) <= Tolerance;
-	}
 
 	bool IsCommittedAvatarBindingCleanupKind(EGGYGOAvatarBindingKind Kind)
 	{
@@ -215,11 +96,14 @@ namespace
 
 UGGYGOAbilitySystemComponent::UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
+	, AvatarBindingProtocol(MakeUnique<FGGYGOAvatarBindingProtocol>())
 {
 	InputHeldSpecHandles.Reset();
 
 	ActiveAbilitiesByGroup.Reset();
 }
+
+UGGYGOAbilitySystemComponent::~UGGYGOAbilitySystemComponent() = default;
 
 FGGYGOAttributeBaseCalculationResult UGGYGOAbilitySystemComponent::TryCalculateNumericAttributeBaseForCurrentValue(
 	const UAttributeSet* ExpectedAttributeSet, const FGameplayAttribute& Attribute,
@@ -332,7 +216,7 @@ FGGYGOAttributeBaseCalculationResult UGGYGOAbilitySystemComponent::TryCalculateN
 	if (Snapshot.GetBaseValue() != OriginalBase) { return Fail(EOutcome::Stale, EReason::SourceChanged); }
 	FAggregatorModChannelContainer Channels;
 	TArray<EGameplayModEvaluationChannel> Order;
-	const EReason Preparation = PrepareNativeAttributeCalculationChannels(Snapshot, Parameters, Channels, Order);
+	const EReason Preparation = GGYGOAttributeCalculation::PrepareNativeAttributeCalculationChannels(Snapshot, Parameters, Channels, Order);
 	if (Preparation != EReason::None) { return Fail(EOutcome::Rejected, Preparation); }
 	if (!FMath::IsFinite(Channels.EvaluateWithBase(OriginalBase, Parameters)))
 	{
@@ -349,7 +233,7 @@ FGGYGOAttributeBaseCalculationResult UGGYGOAbilitySystemComponent::TryCalculateN
 		if (!FMath::IsFinite(PreviousChannelValue)) { return Fail(EOutcome::Rejected, EReason::NonFiniteResult); }
 		CalculatedBase = PreviousChannelValue;
 	}
-	if (!IsAttributeForwardValueConfirmed(Channels.EvaluateWithBase(CalculatedBase, Parameters), DesiredCurrent))
+	if (!GGYGOAttributeCalculation::IsAttributeForwardValueConfirmed(Channels.EvaluateWithBase(CalculatedBase, Parameters), DesiredCurrent))
 	{
 		return Fail(EOutcome::Rejected, EReason::ForwardMismatch);
 	}
@@ -369,12 +253,12 @@ FGGYGOAttributeBaseCalculationResult UGGYGOAbilitySystemComponent::TryCalculateN
 	{
 		return Fail(EOutcome::Rejected, EReason::CaptureFailed);
 	}
-	if (!HasSameAttributeAggregation(Snapshot, CurrentSnapshot))
+	if (!GGYGOAttributeCalculation::HasSameAttributeAggregation(Snapshot, CurrentSnapshot))
 	{
 		return Fail(EOutcome::Stale, EReason::AggregationChanged);
 	}
 	if (!FMath::IsFinite(NativeForwardValue)) { return Fail(EOutcome::Rejected, EReason::NonFiniteResult); }
-	if (!IsAttributeForwardValueConfirmed(NativeForwardValue, DesiredCurrent))
+	if (!GGYGOAttributeCalculation::IsAttributeForwardValueConfirmed(NativeForwardValue, DesiredCurrent))
 	{
 		return Fail(EOutcome::Rejected, EReason::ForwardMismatch);
 	}
@@ -1234,7 +1118,7 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 	EGGYGOAvatarBindingReason SnapshotReason;
 	if (!CaptureAvatarBindingActualSnapshot(Actual, SnapshotReason)
 		|| !ValidateAvatarBindingActualSnapshot(Actual, SnapshotReason)
-		|| !Actual.OwnerActor.IsValid() || !Actual.AvatarActor.IsValid()
+		|| !Actual.Source.OwnerActor.IsValid() || !Actual.Source.AvatarActor.IsValid()
 		|| !HasSameAvatarBindingActualSnapshot(Call.OriginalActual, Actual)
 		|| !HasSameAvatarBindingContextValue(Call.OriginalContext, GetAvatarBindingContext()))
 	{
@@ -1614,17 +1498,25 @@ void UGGYGOAbilitySystemComponent::RebuildAbilityInputHeldHandles()
 void UGGYGOAbilitySystemComponent::PruneAbilityInputRequests()
 {
 	TArray<FGGYGOAbilityInputRequestIdentity> Retired;
-	for (const TPair<uint64, FAbilityInputRequestRecord>& Entry : AbilityInputRequests)
+	for (TPair<uint64, FAbilityInputRequestRecord>& Entry : AbilityInputRequests)
 	{
-		const FAbilityInputRequestRecord& Record = Entry.Value;
+		FAbilityInputRequestRecord& Record = Entry.Value;
 		if (!IsAbilityInputContextCurrent(Record.OwnerActor, Record.AvatarActor, Record.World))
 		{
 			Retired.Add(Record.Request.Identity);
 			continue;
 		}
+		const bool bRetryExpired = static_cast<double>(Record.World->GetTimeSeconds()) >= Record.Request.OriginalDeadline;
+		if (bRetryExpired)
+		{
+			Record.RetryableSpecHandles.Reset();
+			Record.QueuedWaitOrder = 0;
+			PendingAbilityInputRetries.RemoveAll([&Record](const FGGYGOAbilityInputRetryRequest& Pending)
+				{ return Pending.Identity == Record.Request.Identity; });
+		}
 		// Held survives its retry deadline. Released storage also survives pending real edges/in-flight snapshots.
 		if (!Record.bHeld && !bProcessingAbilityInput
-			&& static_cast<double>(Record.World->GetTimeSeconds()) >= Record.Request.OriginalDeadline
+			&& bRetryExpired
 			&& !PendingAbilityInputEdges.ContainsByPredicate([&Record](const FAbilityInputEdge& Edge)
 				{ return Edge.Sources.Contains(Record.Request.Identity); }))
 		{
@@ -1834,11 +1726,29 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::EndAbilityInputReq
 FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::QueueAbilityInputRetry(
 	const FGGYGOAbilityInputRetryRequest& Request)
 {
+	const FGGYGOAbilityInputRequestResult Result = QueueAbilityInputRetryInternal(Request);
+	if (Result.Outcome != EGGYGOAbilityInputRequestOutcome::Accepted
+		&& Result.Outcome != EGGYGOAbilityInputRequestOutcome::AlreadyApplied)
+	{
+		return MakeAbilityInputRequestFailure(
+			Result.Outcome, Result.Reason, Request.Identity, Request.InputTag, Request.OriginalDeadline);
+	}
+	return Result;
+}
+
+FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::QueueAbilityInputRetryInternal(
+	const FGGYGOAbilityInputRetryRequest& Request)
+{
 	check(IsInGameThread());
 	using EOutcome = EGGYGOAbilityInputRequestOutcome;
 	using EReason = EGGYGOAbilityInputRequestReason;
-	const auto Fail = [&](EOutcome Outcome, EReason Reason)
-		{ return MakeAbilityInputRequestFailure(Outcome, Reason, Request.Identity, Request.InputTag, Request.OriginalDeadline); };
+	const auto Fail = [](EOutcome Outcome, EReason Reason)
+	{
+		FGGYGOAbilityInputRequestResult Result;
+		Result.Outcome = Outcome;
+		Result.Reason = Reason;
+		return Result;
+	};
 	if (!IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return Fail(EOutcome::Rejected, EReason::InvalidASC); }
 	if (!Request.InputTag.IsValid()) { return Fail(EOutcome::Rejected, EReason::InvalidTag); }
 	if (!Request.Identity.IsAssigned()) { return Fail(EOutcome::Rejected, EReason::InvalidRequest); }
@@ -1875,6 +1785,53 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::QueueAbilityInputR
 	if (!bQueued) { PendingAbilityInputRetries.Add(Request); }
 	return FGGYGOAbilityInputRequestResult{bQueued ? EOutcome::AlreadyApplied : EOutcome::Accepted, EReason::None, Request.Identity};
 }
+
+void UGGYGOAbilitySystemComponent::RecordAbilityInputQueuedWait(FAbilityInputRequestRecord& Record)
+{
+	check(IsInGameThread());
+	if (Record.QueuedWaitOrder != 0) { return; }
+	if (LastAbilityInputWaitOrder == MAX_uint64)
+	{
+		// These ordinals are not identities. Renumber the live wait set without changing its order.
+		TArray<FAbilityInputRequestRecord*> WaitingRecords;
+		for (TPair<uint64, FAbilityInputRequestRecord>& Entry : AbilityInputRequests)
+		{
+			if (Entry.Value.QueuedWaitOrder != 0) { WaitingRecords.Add(&Entry.Value); }
+		}
+		WaitingRecords.Sort([](const FAbilityInputRequestRecord& A, const FAbilityInputRequestRecord& B)
+			{ return A.QueuedWaitOrder < B.QueuedWaitOrder; });
+		LastAbilityInputWaitOrder = 0;
+		for (FAbilityInputRequestRecord* Waiting : WaitingRecords)
+		{
+			Waiting->QueuedWaitOrder = ++LastAbilityInputWaitOrder;
+		}
+	}
+	Record.QueuedWaitOrder = ++LastAbilityInputWaitOrder;
+}
+
+void UGGYGOAbilitySystemComponent::WakeQueuedAbilityInputRequests()
+{
+	check(IsInGameThread());
+	TArray<TPair<uint64, FGGYGOAbilityInputRetryRequest>> WaitingRequests;
+	for (TPair<uint64, FAbilityInputRequestRecord>& Entry : AbilityInputRequests)
+	{
+		FAbilityInputRequestRecord& Record = Entry.Value;
+		if (Record.QueuedWaitOrder != 0)
+		{
+			WaitingRequests.Emplace(Record.QueuedWaitOrder, Record.Request);
+			Record.QueuedWaitOrder = 0; // Take the whole wait set before any queue/observer callback.
+		}
+	}
+	LastAbilityInputWaitOrder = 0;
+	WaitingRequests.Sort([](const auto& A, const auto& B) { return A.Key < B.Key; });
+	for (const TPair<uint64, FGGYGOAbilityInputRetryRequest>& Waiting : WaitingRequests)
+	{
+		// Active, blocked, expired and otherwise rejected candidates are also consumed.
+		// Only a new actual Queued failure can put the original request at the tail again.
+		QueueAbilityInputRetryInternal(Waiting.Value);
+	}
+}
+
 
 void UGGYGOAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGamePaused)
 {
@@ -2093,6 +2050,7 @@ void UGGYGOAbilitySystemComponent::ClearAbilityInput()
 	}
 	for (const FAbilityInputEdge& Edge : PendingAbilityInputEdges) { Affected.AddUnique(Edge.Handle); }
 	AbilityInputRequests.Reset();
+	LastAbilityInputWaitOrder = 0;
 	PendingAbilityInputEdges.Reset();
 	PendingAbilityInputRetries.Reset();
 	InputHeldSpecHandles.Reset();
@@ -2563,6 +2521,8 @@ void UGGYGOAbilitySystemComponent::BroadcastAbilityGroupFreedIfEmpty(FGameplayTa
 
 	// 清掉弱引用空槽后再广播；同步订阅者可能立即激活并重新登记同组能力。
 	ActiveAbilitiesByGroup.Remove(GroupTag);
+	// Queued wait belongs to the original ASC request; listeners observe after work is queued.
+	WakeQueuedAbilityInputRequests();
 	OnAbilityGroupFreed.Broadcast(GroupTag);
 }
 
@@ -2627,12 +2587,9 @@ void UGGYGOAbilitySystemComponent::NotifyAbilityFailed(const FGameplayAbilitySpe
 		// Native early rejection may notify without reaching Can. Its callbacks cannot claim the permit.
 		AbilityInputActivationAttempt.bClaimed = true;
 	}
-	Super::NotifyAbilityFailed(Handle, Ability, FailureTags);
-	if (!OriginalASC.IsValid())
-	{
-		return;
-	}
-
+	// Commit actual failure permission before native observers can release its blocker.
+	// The external retry notice remains after Super, with fresh original-source admission.
+	TArray<FGGYGOAbilityInputRetryRequest> RetryableNotices;
 	if (bHasInputOrigin && FailedAbility.IsValid()
 		&& FailureTags.HasTagExact(GGYGOGameplayTags::Ability_ActivateFail_ActivationGroupQueued)
 		&& IsAbilityActivationFailureOriginCurrent(Origin))
@@ -2649,10 +2606,31 @@ void UGGYGOAbilitySystemComponent::NotifyAbilityFailed(const FGameplayAbilitySpe
 				false, bWhileHeld)) { continue; }
 			FAbilityInputRequestRecord* Record = AbilityInputRequests.Find(Request.Identity.RequestSerial);
 			check(Record);
+			RecordAbilityInputQueuedWait(*Record);
 			Record->RetryableSpecHandles.AddUnique(Handle); // Permission is only this real Queued Spec.
+			RetryableNotices.Add(Request);
+		}
+	}
+	Super::NotifyAbilityFailed(Handle, Ability, FailureTags);
+	if (!OriginalASC.IsValid())
+	{
+		return;
+	}
+
+	if (!RetryableNotices.IsEmpty() && IsAbilityActivationFailureOriginCurrent(Origin))
+	{
+		for (const FGGYGOAbilityInputRetryRequest& Request : RetryableNotices)
+		{
+			if (!OriginalASC.IsValid() || !FailedAbility.IsValid()) { break; }
+			const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
+			const UGGYGOGameplayAbility* CDO = Spec ? Cast<UGGYGOGameplayAbility>(Spec->Ability) : nullptr;
+			if (!CDO || HasMatchingGameplayTag(TAG_GGYGO_Gameplay_AbilityInputBlocked)) { continue; }
+			const bool bWhileHeld = CDO->GetActivationPolicy() == EGGYGOAbilityActivationPolicy::WhileInputActive;
+			if (!IsAbilityInputRequestCurrent(Request, Handle, true, true, bWhileHeld)) { continue; }
 			OnAbilityInputRetryable.Broadcast(Request);
 		}
 	}
+
 	if (!OriginalASC.IsValid() || !FailedAbility.IsValid())
 	{
 		return;
@@ -2746,34 +2724,10 @@ void UGGYGOAbilitySystemComponent::GetAbilityTargetData(const FGameplayAbilitySp
 	// 查不到时不动输出参数，保留调用方的原值。
 }
 
-namespace
-{
-	bool IsGGYGOAvatarBindingInvalidationReason(EGGYGOAvatarBindingReason Reason)
-	{
-		switch (Reason)
-		{
-		case EGGYGOAvatarBindingReason::LifecycleClosed:
-		case EGGYGOAvatarBindingReason::ActorInfoMismatch:
-		case EGGYGOAvatarBindingReason::OperationInvalidated:
-		case EGGYGOAvatarBindingReason::RequestContextExpired:
-			return true;
-		default:
-			return false;
-		}
-	}
-
-	bool IsGGYGOAvatarBindingActorInfoKind(EGGYGOAvatarBindingKind Kind)
-	{
-		return Kind == EGGYGOAvatarBindingKind::Init
-			|| Kind == EGGYGOAvatarBindingKind::Clear
-			|| Kind == EGGYGOAvatarBindingKind::Refresh;
-	}
-}
-
 FGGYGOAvatarBindingContext UGGYGOAbilitySystemComponent::GetAvatarBindingContext() const
 {
 	check(IsInGameThread());
-	return AvatarBindingContext;
+	return AvatarBindingProtocol->GetContext();
 }
 
 bool UGGYGOAbilitySystemComponent::CaptureAvatarBindingActualSnapshot(
@@ -2794,18 +2748,18 @@ bool UGGYGOAbilitySystemComponent::CaptureAvatarBindingActualSnapshot(
 
 	FActualAvatarBindingActorInfoSnapshot Candidate;
 	Candidate.Allocation = AbilityActorInfo;
-	Candidate.AbilitySystemComponent = AbilityActorInfo->AbilitySystemComponent;
-	Candidate.OwnerActor = AbilityActorInfo->OwnerActor;
-	Candidate.AvatarActor = AbilityActorInfo->AvatarActor;
-	Candidate.PlayerController = AbilityActorInfo->PlayerController;
-	Candidate.SkeletalMeshComponent = AbilityActorInfo->SkeletalMeshComponent;
-	Candidate.MovementComponent = AbilityActorInfo->MovementComponent;
-	Candidate.ActorInfoAnimInstance = AbilityActorInfo->AnimInstance;
-	Candidate.ActualAnimInstance = AbilityActorInfo->GetAnimInstance();
-	Candidate.CachedOwnerActor = GetOwnerActor();
-	Candidate.CachedAvatarActor = GetAvatarActor_Direct();
-	Candidate.ActorInfoAffectedAnimInstanceTag = AbilityActorInfo->AffectedAnimInstanceTag;
-	Candidate.ASCAffectedAnimInstanceTag = AffectedAnimInstanceTag;
+	Candidate.Source.AbilitySystemComponent = AbilityActorInfo->AbilitySystemComponent;
+	Candidate.Source.OwnerActor = AbilityActorInfo->OwnerActor;
+	Candidate.Source.AvatarActor = AbilityActorInfo->AvatarActor;
+	Candidate.Source.PlayerController = AbilityActorInfo->PlayerController;
+	Candidate.Source.SkeletalMeshComponent = AbilityActorInfo->SkeletalMeshComponent;
+	Candidate.Source.MovementComponent = AbilityActorInfo->MovementComponent;
+	Candidate.Source.ActorInfoAnimInstance = AbilityActorInfo->AnimInstance;
+	Candidate.Source.ActualAnimInstance = AbilityActorInfo->GetAnimInstance();
+	Candidate.Source.CachedOwnerActor = GetOwnerActor();
+	Candidate.Source.CachedAvatarActor = GetAvatarActor_Direct();
+	Candidate.Source.ActorInfoAffectedAnimInstanceTag = AbilityActorInfo->AffectedAnimInstanceTag;
+	Candidate.Source.ASCAffectedAnimInstanceTag = AffectedAnimInstanceTag;
 	OutSnapshot = MoveTemp(Candidate);
 	OutReason = EGGYGOAvatarBindingReason::None;
 	return true;
@@ -2836,28 +2790,28 @@ bool UGGYGOAbilitySystemComponent::ValidateAvatarBindingActualSnapshotForPurpose
 	}
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> Self(
 		const_cast<UGGYGOAbilitySystemComponent*>(this));
-	if (!Snapshot.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self)
-		|| !Snapshot.OwnerActor.HasSameIndexAndSerialNumber(Snapshot.CachedOwnerActor)
-		|| !Snapshot.AvatarActor.HasSameIndexAndSerialNumber(Snapshot.CachedAvatarActor))
+	if (!Snapshot.Source.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self)
+		|| !Snapshot.Source.OwnerActor.HasSameIndexAndSerialNumber(Snapshot.Source.CachedOwnerActor)
+		|| !Snapshot.Source.AvatarActor.HasSameIndexAndSerialNumber(Snapshot.Source.CachedAvatarActor))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ActorInfoMismatch;
 		return false;
 	}
 
 	// A fully cleared context is a valid recorded state, not a usable Owner/Avatar.
-	if (Snapshot.OwnerActor.IsExplicitlyNull())
+	if (Snapshot.Source.OwnerActor.IsExplicitlyNull())
 	{
-		if (!Snapshot.AvatarActor.IsExplicitlyNull() || !Snapshot.PlayerController.IsExplicitlyNull()
-			|| !Snapshot.SkeletalMeshComponent.IsExplicitlyNull()
-			|| !Snapshot.MovementComponent.IsExplicitlyNull()
-			|| !Snapshot.ActualAnimInstance.IsExplicitlyNull())
+		if (!Snapshot.Source.AvatarActor.IsExplicitlyNull() || !Snapshot.Source.PlayerController.IsExplicitlyNull()
+			|| !Snapshot.Source.SkeletalMeshComponent.IsExplicitlyNull()
+			|| !Snapshot.Source.MovementComponent.IsExplicitlyNull()
+			|| !Snapshot.Source.ActualAnimInstance.IsExplicitlyNull())
 		{
 			return false;
 		}
 		OutReason = EGGYGOAvatarBindingReason::None;
 		return true;
 	}
-	const AActor* Owner = Snapshot.OwnerActor.Get();
+	const AActor* Owner = Snapshot.Source.OwnerActor.Get();
 	if (!Owner)
 	{
 		OutReason = EGGYGOAvatarBindingReason::InvalidOwner;
@@ -2868,22 +2822,22 @@ bool UGGYGOAbilitySystemComponent::ValidateAvatarBindingActualSnapshotForPurpose
 		OutReason = EGGYGOAvatarBindingReason::LifecycleClosed;
 		return false;
 	}
-	if (!Snapshot.PlayerController.IsExplicitlyNull() && !Snapshot.PlayerController.IsValid())
+	if (!Snapshot.Source.PlayerController.IsExplicitlyNull() && !Snapshot.Source.PlayerController.IsValid())
 	{
 		return false;
 	}
-	if (Snapshot.AvatarActor.IsExplicitlyNull())
+	if (Snapshot.Source.AvatarActor.IsExplicitlyNull())
 	{
-		if (!Snapshot.SkeletalMeshComponent.IsExplicitlyNull()
-			|| !Snapshot.MovementComponent.IsExplicitlyNull()
-			|| !Snapshot.ActualAnimInstance.IsExplicitlyNull())
+		if (!Snapshot.Source.SkeletalMeshComponent.IsExplicitlyNull()
+			|| !Snapshot.Source.MovementComponent.IsExplicitlyNull()
+			|| !Snapshot.Source.ActualAnimInstance.IsExplicitlyNull())
 		{
 			return false;
 		}
 		OutReason = EGGYGOAvatarBindingReason::None;
 		return true;
 	}
-	const AActor* Avatar = Snapshot.AvatarActor.Get();
+	const AActor* Avatar = Snapshot.Source.AvatarActor.Get();
 	if (!Avatar)
 	{
 		OutReason = EGGYGOAvatarBindingReason::InvalidAvatar;
@@ -2894,27 +2848,27 @@ bool UGGYGOAbilitySystemComponent::ValidateAvatarBindingActualSnapshotForPurpose
 		OutReason = EGGYGOAvatarBindingReason::LifecycleClosed;
 		return false;
 	}
-	if (!Snapshot.SkeletalMeshComponent.IsExplicitlyNull())
+	if (!Snapshot.Source.SkeletalMeshComponent.IsExplicitlyNull())
 	{
-		const USkeletalMeshComponent* Mesh = Snapshot.SkeletalMeshComponent.Get();
+		const USkeletalMeshComponent* Mesh = Snapshot.Source.SkeletalMeshComponent.Get();
 		if (!Mesh || Mesh->GetOwner() != Avatar)
 		{
 			return false;
 		}
 	}
-	if (!Snapshot.MovementComponent.IsExplicitlyNull())
+	if (!Snapshot.Source.MovementComponent.IsExplicitlyNull())
 	{
-		const UMovementComponent* Movement = Snapshot.MovementComponent.Get();
+		const UMovementComponent* Movement = Snapshot.Source.MovementComponent.Get();
 		if (!Movement || Movement->GetOwner() != Avatar)
 		{
 			return false;
 		}
 	}
-	if (!Snapshot.ActualAnimInstance.IsExplicitlyNull())
+	if (!Snapshot.Source.ActualAnimInstance.IsExplicitlyNull())
 	{
-		const UAnimInstance* Anim = Snapshot.ActualAnimInstance.Get();
+		const UAnimInstance* Anim = Snapshot.Source.ActualAnimInstance.Get();
 		if (!Anim || Anim->GetOwningActor() != Avatar
-			|| Anim->GetSkelMeshComponent() != Snapshot.SkeletalMeshComponent.Get())
+			|| Anim->GetSkelMeshComponent() != Snapshot.Source.SkeletalMeshComponent.Get())
 		{
 			return false;
 		}
@@ -2939,14 +2893,14 @@ bool UGGYGOAbilitySystemComponent::CheckOriginalAbilityBindingForTermination(
 	// CheckAvatarBindingIdentity has authenticated the current committed full snapshot.
 	// Refresh may change Controller/Mesh/Anim/Movement, never the original allocation,
 	// ASC or Owner/Avatar endpoints. No current endpoint is used to manufacture a source.
-	const FActualAvatarBindingActorInfoSnapshot& Committed = AvatarBindingActorInfoSnapshot;
+	const FActualAvatarBindingActorInfoSnapshot& Committed = AvatarBindingProtocol->GetCommittedSource();
 	return OriginalSource.Allocation.IsValid() && Committed.Allocation.IsValid()
 		&& OriginalSource.Allocation.Get() == Committed.Allocation.Get()
-		&& OriginalSource.AbilitySystemComponent.HasSameIndexAndSerialNumber(Committed.AbilitySystemComponent)
-		&& OriginalSource.OwnerActor.HasSameIndexAndSerialNumber(Committed.OwnerActor)
-		&& OriginalSource.AvatarActor.HasSameIndexAndSerialNumber(Committed.AvatarActor)
-		&& OriginalSource.CachedOwnerActor.HasSameIndexAndSerialNumber(Committed.CachedOwnerActor)
-		&& OriginalSource.CachedAvatarActor.HasSameIndexAndSerialNumber(Committed.CachedAvatarActor);
+		&& OriginalSource.Source.AbilitySystemComponent.HasSameIndexAndSerialNumber(Committed.Source.AbilitySystemComponent)
+		&& OriginalSource.Source.OwnerActor.HasSameIndexAndSerialNumber(Committed.Source.OwnerActor)
+		&& OriginalSource.Source.AvatarActor.HasSameIndexAndSerialNumber(Committed.Source.AvatarActor)
+		&& OriginalSource.Source.CachedOwnerActor.HasSameIndexAndSerialNumber(Committed.Source.CachedOwnerActor)
+		&& OriginalSource.Source.CachedAvatarActor.HasSameIndexAndSerialNumber(Committed.Source.CachedAvatarActor);
 }
 
 bool UGGYGOAbilitySystemComponent::HasSameAvatarBindingActualSnapshot(
@@ -2956,18 +2910,18 @@ bool UGGYGOAbilitySystemComponent::HasSameAvatarBindingActualSnapshot(
 	check(IsInGameThread());
 	return First.Allocation.IsValid() && Second.Allocation.IsValid()
 		&& First.Allocation.Get() == Second.Allocation.Get()
-		&& First.AbilitySystemComponent.HasSameIndexAndSerialNumber(Second.AbilitySystemComponent)
-		&& First.OwnerActor.HasSameIndexAndSerialNumber(Second.OwnerActor)
-		&& First.AvatarActor.HasSameIndexAndSerialNumber(Second.AvatarActor)
-		&& First.PlayerController.HasSameIndexAndSerialNumber(Second.PlayerController)
-		&& First.SkeletalMeshComponent.HasSameIndexAndSerialNumber(Second.SkeletalMeshComponent)
-		&& First.MovementComponent.HasSameIndexAndSerialNumber(Second.MovementComponent)
-		&& First.ActorInfoAnimInstance.HasSameIndexAndSerialNumber(Second.ActorInfoAnimInstance)
-		&& First.ActualAnimInstance.HasSameIndexAndSerialNumber(Second.ActualAnimInstance)
-		&& First.CachedOwnerActor.HasSameIndexAndSerialNumber(Second.CachedOwnerActor)
-		&& First.CachedAvatarActor.HasSameIndexAndSerialNumber(Second.CachedAvatarActor)
-		&& First.ActorInfoAffectedAnimInstanceTag == Second.ActorInfoAffectedAnimInstanceTag
-		&& First.ASCAffectedAnimInstanceTag == Second.ASCAffectedAnimInstanceTag;
+		&& First.Source.AbilitySystemComponent.HasSameIndexAndSerialNumber(Second.Source.AbilitySystemComponent)
+		&& First.Source.OwnerActor.HasSameIndexAndSerialNumber(Second.Source.OwnerActor)
+		&& First.Source.AvatarActor.HasSameIndexAndSerialNumber(Second.Source.AvatarActor)
+		&& First.Source.PlayerController.HasSameIndexAndSerialNumber(Second.Source.PlayerController)
+		&& First.Source.SkeletalMeshComponent.HasSameIndexAndSerialNumber(Second.Source.SkeletalMeshComponent)
+		&& First.Source.MovementComponent.HasSameIndexAndSerialNumber(Second.Source.MovementComponent)
+		&& First.Source.ActorInfoAnimInstance.HasSameIndexAndSerialNumber(Second.Source.ActorInfoAnimInstance)
+		&& First.Source.ActualAnimInstance.HasSameIndexAndSerialNumber(Second.Source.ActualAnimInstance)
+		&& First.Source.CachedOwnerActor.HasSameIndexAndSerialNumber(Second.Source.CachedOwnerActor)
+		&& First.Source.CachedAvatarActor.HasSameIndexAndSerialNumber(Second.Source.CachedAvatarActor)
+		&& First.Source.ActorInfoAffectedAnimInstanceTag == Second.Source.ActorInfoAffectedAnimInstanceTag
+		&& First.Source.ASCAffectedAnimInstanceTag == Second.Source.ASCAffectedAnimInstanceTag;
 }
 
 EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingIdentity(
@@ -2987,12 +2941,12 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingIdent
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> Self(
 		const_cast<UGGYGOAbilitySystemComponent*>(this));
 	if (!Expected.Issuer.HasSameIndexAndSerialNumber(Self)
-		|| !AvatarBindingContext.Binding.HasSameIdentity(Expected))
+		|| !AvatarBindingProtocol->GetContext().Binding.HasSameIdentity(Expected))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ExpectedContextMismatch;
 		return EGGYGOAvatarBindingOutcome::Stale;
 	}
-	if (AvatarBindingIdentityState != EAvatarBindingIdentityState::Current)
+	if (AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Current)
 	{
 		OutReason = EGGYGOAvatarBindingReason::OperationInvalidated;
 		return EGGYGOAvatarBindingOutcome::Stale;
@@ -3004,7 +2958,7 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingIdent
 		return OutReason == EGGYGOAvatarBindingReason::ActorInfoMismatch
 			? EGGYGOAvatarBindingOutcome::Stale : EGGYGOAvatarBindingOutcome::Failed;
 	}
-	if (!HasSameAvatarBindingActualSnapshot(AvatarBindingActorInfoSnapshot, Actual))
+	if (!HasSameAvatarBindingActualSnapshot(AvatarBindingProtocol->GetCommittedSource(), Actual))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ActorInfoMismatch;
 		return EGGYGOAvatarBindingOutcome::Stale;
@@ -3022,7 +2976,7 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingConte
 	{
 		return EGGYGOAvatarBindingOutcome::Rejected;
 	}
-	if (!AvatarBindingContext.HasSameContext(Expected))
+	if (!AvatarBindingProtocol->GetContext().HasSameContext(Expected))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ExpectedContextMismatch;
 		return EGGYGOAvatarBindingOutcome::Stale;
@@ -3068,14 +3022,14 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingClean
 		const_cast<UGGYGOAbilitySystemComponent*>(this));
 	if (!Expected.Binding.Issuer.HasSameIndexAndSerialNumber(Self)
 		|| !Expected.LastActorInfoWrite.Issuer.HasSameIndexAndSerialNumber(Self)
-		|| !AvatarBindingContext.HasSameContext(Expected))
+		|| !AvatarBindingProtocol->GetContext().HasSameContext(Expected))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ExpectedContextMismatch;
 		return EGGYGOAvatarBindingOutcome::Stale;
 	}
-	if ((AvatarBindingIdentityState != EAvatarBindingIdentityState::Current
-		&& AvatarBindingIdentityState != EAvatarBindingIdentityState::Revoked)
-		|| !AvatarBindingActorInfoSnapshot.Allocation.IsValid())
+	if ((AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Current
+		&& AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Revoked)
+		|| !AvatarBindingProtocol->GetCommittedSource().Allocation.IsValid())
 	{
 		OutReason = EGGYGOAvatarBindingReason::OperationInvalidated;
 		return EGGYGOAvatarBindingOutcome::Stale;
@@ -3088,7 +3042,7 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingClean
 		return OutReason == EGGYGOAvatarBindingReason::ActorInfoMismatch
 			? EGGYGOAvatarBindingOutcome::Stale : EGGYGOAvatarBindingOutcome::Failed;
 	}
-	if (!HasSameAvatarBindingActualSnapshot(AvatarBindingActorInfoSnapshot, Actual))
+	if (!HasSameAvatarBindingActualSnapshot(AvatarBindingProtocol->GetCommittedSource(), Actual))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ActorInfoMismatch;
 		return EGGYGOAvatarBindingOutcome::Stale;
@@ -3101,23 +3055,7 @@ bool UGGYGOAbilitySystemComponent::InvalidateAvatarBinding(
 	const FGGYGOAvatarBindingContext& Expected, EGGYGOAvatarBindingReason Reason,
 	EGGYGOAvatarBindingReason& OutRejectionReason)
 {
-	OutRejectionReason = EGGYGOAvatarBindingReason::InvalidRequest;
-	check(IsInGameThread());
-	if (!IsGGYGOAvatarBindingInvalidationReason(Reason) || !Expected.HasIssuedContext())
-	{
-		return false;
-	}
-	if (!AvatarBindingContext.HasSameContext(Expected))
-	{
-		OutRejectionReason = EGGYGOAvatarBindingReason::ExpectedContextMismatch;
-		return false;
-	}
-	AvatarBindingIdentityState = EAvatarBindingIdentityState::Revoked;
-	// Logical revocation retains exact committed cleanup provenance, never work/Ready permission.
-	ReleaseAvatarBindingPublicationForContext(Expected);
-	// Deliberately retain the pending operation: its own ID is required to revoke it.
-	OutRejectionReason = EGGYGOAvatarBindingReason::None;
-	return true;
+	return AvatarBindingProtocol->InvalidateBinding(Expected, Reason, OutRejectionReason);
 }
 
 bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
@@ -3165,7 +3103,7 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 		OutReason = EGGYGOAvatarBindingReason::MissingContextQuery;
 		return false;
 	}
-	if (ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity())
+	if (AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity())
 	{
 		// Only an occupied identity slot; native-window admission is not implemented here.
 		OutReason = EGGYGOAvatarBindingReason::NativeWriteBusy;
@@ -3195,8 +3133,8 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 		break;
 	case EAvatarBindingIdentityAdmission::BootstrapNeverCommitted:
 		if (Request.Kind != EGGYGOAvatarBindingKind::Init
-			|| AvatarBindingIdentityState != EAvatarBindingIdentityState::Unissued
-			|| AvatarBindingContext.HasIssuedContext()
+			|| AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Unissued
+			|| AvatarBindingProtocol->GetContext().HasIssuedContext()
 			|| Request.ExpectedContext.Binding.Serial != 0
 			|| !Request.ExpectedContext.Binding.Issuer.IsExplicitlyNull()
 			|| Request.ExpectedContext.LastActorInfoWrite.Serial != 0
@@ -3207,9 +3145,9 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 		break;
 	case EAvatarBindingIdentityAdmission::ReplaceRevokedContext:
 		if ((Request.Kind != EGGYGOAvatarBindingKind::Init && Request.Kind != EGGYGOAvatarBindingKind::Clear)
-			|| AvatarBindingIdentityState != EAvatarBindingIdentityState::Revoked
+			|| AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Revoked
 			|| !Request.ExpectedContext.HasIssuedContext()
-			|| !AvatarBindingContext.HasSameContext(Request.ExpectedContext))
+			|| !AvatarBindingProtocol->GetContext().HasSameContext(Request.ExpectedContext))
 		{
 			return false;
 		}
@@ -3231,7 +3169,7 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 	Candidate.Kind = Request.Kind;
 	Candidate.ClearMode = Request.ClearMode;
 	Candidate.Admission = Admission;
-	Candidate.BeforeContext = AvatarBindingContext;
+	Candidate.BeforeContext = AvatarBindingProtocol->GetContext();
 	if (!CaptureAvatarBindingActualSnapshot(Candidate.BeforeActual, OutReason))
 	{
 		return false;
@@ -3246,9 +3184,9 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 		if (Request.ClearMode == EGGYGOAvatarBindingClearMode::PreserveOwner)
 		{
 			if (!IsAvatarBindingNewWorkLifecycleOpen(OutReason)) { return false; }
-			Candidate.ExpectedOwnerActor = Candidate.BeforeActual.OwnerActor;
-			if (!Candidate.BeforeActual.OwnerActor.HasSameIndexAndSerialNumber(
-				Candidate.BeforeActual.CachedOwnerActor))
+			Candidate.ExpectedOwnerActor = Candidate.BeforeActual.Source.OwnerActor;
+			if (!Candidate.BeforeActual.Source.OwnerActor.HasSameIndexAndSerialNumber(
+				Candidate.BeforeActual.Source.CachedOwnerActor))
 			{
 				OutReason = EGGYGOAvatarBindingReason::ActorInfoMismatch;
 				return false;
@@ -3257,8 +3195,8 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 	}
 	else
 	{
-		Candidate.ExpectedOwnerActor = Candidate.BeforeActual.OwnerActor;
-		Candidate.ExpectedAvatarActor = Candidate.BeforeActual.AvatarActor;
+		Candidate.ExpectedOwnerActor = Candidate.BeforeActual.Source.OwnerActor;
+		Candidate.ExpectedAvatarActor = Candidate.BeforeActual.Source.AvatarActor;
 	}
 	if (Request.Kind != EGGYGOAvatarBindingKind::Clear
 		|| Request.ClearMode != EGGYGOAvatarBindingClearMode::ClearActorInfo)
@@ -3290,32 +3228,12 @@ bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
 			return false;
 		}
 	}
-	if (LastIssuedAvatarBindingSerial == MAX_uint64)
-	{
-		OutReason = EGGYGOAvatarBindingReason::SerialExhausted;
-		return false;
-	}
-
-	Candidate.Identity.Issuer = this;
-	Candidate.Identity.Serial = ++LastIssuedAvatarBindingSerial;
-	ActiveAvatarBindingIdentityOperation = MoveTemp(Candidate);
-	OutOperation = ActiveAvatarBindingIdentityOperation.Identity;
-	OutReason = EGGYGOAvatarBindingReason::None;
-	return true;
+	return AvatarBindingProtocol->ReserveValidatedOperation(this, MoveTemp(Candidate), OutOperation, OutReason);
 }
 
 void UGGYGOAbilitySystemComponent::DiscardActiveAvatarBindingIdentityOperation(bool bRevokeBeforeContext)
 {
-	check(IsInGameThread());
-	if (bRevokeBeforeContext
-		&& IsGGYGOAvatarBindingActorInfoKind(ActiveAvatarBindingIdentityOperation.Kind)
-		&& AvatarBindingContext.HasSameContext(ActiveAvatarBindingIdentityOperation.BeforeContext))
-	{
-		AvatarBindingIdentityState = EAvatarBindingIdentityState::Revoked;
-		// A pre-write failure keeps old cleanup provenance; actual writes already retired it.
-		ReleaseAvatarBindingPublicationForContext(ActiveAvatarBindingIdentityOperation.BeforeContext);
-	}
-	ActiveAvatarBindingIdentityOperation = {};
+	AvatarBindingProtocol->DiscardOperation(bRevokeBeforeContext);
 }
 
 bool UGGYGOAbilitySystemComponent::TryCommitAvatarBindingActorInfoIdentity(
@@ -3325,67 +3243,16 @@ bool UGGYGOAbilitySystemComponent::TryCommitAvatarBindingActorInfoIdentity(
 	OutCommittedContext = {};
 	OutReason = EGGYGOAvatarBindingReason::OperationInvalidated;
 	check(IsInGameThread());
-	if (!ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(Operation))
-	{
-		return false;
-	}
-	const auto RejectCommit = [this, &OutReason](EGGYGOAvatarBindingReason Reason)
-	{
-		OutReason = Reason;
-		DiscardActiveAvatarBindingIdentityOperation(/*bRevokeBeforeContext=*/true);
-		return false;
-	};
-	const FAvatarBindingIdentityOperation& Pending = ActiveAvatarBindingIdentityOperation;
-	if (!IsGGYGOAvatarBindingActorInfoKind(Pending.Kind))
-	{
-		return RejectCommit(EGGYGOAvatarBindingReason::InvalidRequest);
-	}
-	if (Pending.Admission == EAvatarBindingIdentityAdmission::BootstrapNeverCommitted)
-	{
-		if (AvatarBindingIdentityState != EAvatarBindingIdentityState::Unissued
-			|| AvatarBindingContext.HasIssuedContext())
-		{
-			return RejectCommit(EGGYGOAvatarBindingReason::ExpectedContextMismatch);
-		}
-	}
-	else if (!AvatarBindingContext.HasSameContext(Pending.BeforeContext)
-		|| (Pending.Kind == EGGYGOAvatarBindingKind::Refresh
-			&& AvatarBindingIdentityState != EAvatarBindingIdentityState::Current))
-	{
-		return RejectCommit(EGGYGOAvatarBindingReason::OperationInvalidated);
-	}
-
+	if (!AvatarBindingProtocol->CheckCommitOperation(Operation, OutReason)) { return false; }
 	FActualAvatarBindingActorInfoSnapshot Actual;
 	if (!CaptureAvatarBindingActualSnapshot(Actual, OutReason)
 		|| !ValidateAvatarBindingActualSnapshot(Actual, OutReason))
 	{
-		return RejectCommit(OutReason);
+		AvatarBindingProtocol->DiscardOperation(/*bRevokeBeforeContext=*/true);
+		return false;
 	}
-	if (Actual.Allocation.Get() != Pending.BeforeActual.Allocation.Get()
-		|| !Actual.OwnerActor.HasSameIndexAndSerialNumber(Pending.ExpectedOwnerActor)
-		|| !Actual.AvatarActor.HasSameIndexAndSerialNumber(Pending.ExpectedAvatarActor)
-		|| ((Pending.Kind == EGGYGOAvatarBindingKind::Init || Pending.Kind == EGGYGOAvatarBindingKind::Refresh)
-			&& Actual.ActorInfoAffectedAnimInstanceTag != Actual.ASCAffectedAnimInstanceTag))
-	{
-		return RejectCommit(EGGYGOAvatarBindingReason::ActorInfoMismatch);
-	}
-
-	FGGYGOAvatarBindingContext Committed;
-	Committed.Binding = Pending.Kind == EGGYGOAvatarBindingKind::Refresh
-		? AvatarBindingContext.Binding : FGGYGOAvatarBindingIdentity{};
-	if (Pending.Kind != EGGYGOAvatarBindingKind::Refresh)
-	{
-		Committed.Binding.Issuer = this;
-		Committed.Binding.Serial = Operation.Serial;
-	}
-	Committed.LastActorInfoWrite = Operation;
-	AvatarBindingContext = Committed;
-	AvatarBindingActorInfoSnapshot = MoveTemp(Actual);
-	AvatarBindingIdentityState = EAvatarBindingIdentityState::Current;
-	DiscardActiveAvatarBindingIdentityOperation(/*bRevokeBeforeContext=*/false);
-	OutCommittedContext = Committed;
-	OutReason = EGGYGOAvatarBindingReason::None;
-	return true;
+	return AvatarBindingProtocol->CommitValidatedSource(
+		Operation, MoveTemp(Actual), OutCommittedContext, OutReason);
 }
 
 bool UGGYGOAbilitySystemComponent::TryCompleteAvatarBindingIdentityOperation(
@@ -3393,22 +3260,22 @@ bool UGGYGOAbilitySystemComponent::TryCompleteAvatarBindingIdentityOperation(
 {
 	OutReason = EGGYGOAvatarBindingReason::OperationInvalidated;
 	check(IsInGameThread());
-	if (!ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(Operation))
+	if (!AvatarBindingProtocol->GetOperation().Identity.HasSameIdentity(Operation))
 	{
 		return false;
 	}
-	if (ActiveAvatarBindingIdentityOperation.Kind != EGGYGOAvatarBindingKind::CancelAbilities
-		&& ActiveAvatarBindingIdentityOperation.Kind != EGGYGOAvatarBindingKind::RemoveGameplayCues)
+	if (AvatarBindingProtocol->GetOperation().Kind != EGGYGOAvatarBindingKind::CancelAbilities
+		&& AvatarBindingProtocol->GetOperation().Kind != EGGYGOAvatarBindingKind::RemoveGameplayCues)
 	{
 		OutReason = EGGYGOAvatarBindingReason::InvalidRequest;
 		DiscardActiveAvatarBindingIdentityOperation(/*bRevokeBeforeContext=*/true);
 		return false;
 	}
 	FActualAvatarBindingActorInfoSnapshot Actual;
-	if (CheckAvatarBindingCleanupContext(ActiveAvatarBindingIdentityOperation.BeforeContext, OutReason)
+	if (CheckAvatarBindingCleanupContext(AvatarBindingProtocol->GetOperation().BeforeContext, OutReason)
 			!= EGGYGOAvatarBindingOutcome::Succeeded
 		|| !CaptureAvatarBindingActualSnapshot(Actual, OutReason)
-		|| !HasSameAvatarBindingActualSnapshot(ActiveAvatarBindingIdentityOperation.BeforeActual, Actual))
+		|| !HasSameAvatarBindingActualSnapshot(AvatarBindingProtocol->GetOperation().BeforeActual, Actual))
 	{
 		if (OutReason == EGGYGOAvatarBindingReason::None)
 		{
@@ -3425,14 +3292,7 @@ bool UGGYGOAbilitySystemComponent::TryCompleteAvatarBindingIdentityOperation(
 bool UGGYGOAbilitySystemComponent::InvalidateAvatarBindingIdentityOperation(
 	const FGGYGOAvatarBindingOperationIdentity& ExpectedOperation, EGGYGOAvatarBindingReason Reason)
 {
-	check(IsInGameThread());
-	if (!IsGGYGOAvatarBindingInvalidationReason(Reason)
-		|| !ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(ExpectedOperation))
-	{
-		return false;
-	}
-	DiscardActiveAvatarBindingIdentityOperation(/*bRevokeBeforeContext=*/true);
-	return true;
+	return AvatarBindingProtocol->InvalidateOperation(ExpectedOperation, Reason);
 }
 
 /**
@@ -3755,11 +3615,7 @@ UGGYGOAbilitySystemComponent::FScopedAvatarBindingNativeWrite::FScopedAvatarBind
 	: ASC(InASC), Operation(InOperation)
 {
 	check(IsInGameThread());
-	if (InASC && !InASC->bAvatarBindingNativeWriteBusy)
-	{
-		InASC->bAvatarBindingNativeWriteBusy = true;
-		bEntered = true;
-	}
+	if (InASC) { bEntered = InASC->AvatarBindingProtocol->TryEnterNativeWrite(); }
 }
 
 UGGYGOAbilitySystemComponent::FScopedAvatarBindingNativeWrite::~FScopedAvatarBindingNativeWrite()
@@ -3777,7 +3633,7 @@ UGGYGOAbilitySystemComponent::FScopedAvatarBindingNativeWrite::~FScopedAvatarBin
 		}
 		if (bEntered)
 		{
-			OwnerASC->bAvatarBindingNativeWriteBusy = false;
+			OwnerASC->AvatarBindingProtocol->LeaveNativeWrite();
 		}
 	}
 }
@@ -3785,26 +3641,20 @@ UGGYGOAbilitySystemComponent::FScopedAvatarBindingNativeWrite::~FScopedAvatarBin
 bool UGGYGOAbilitySystemComponent::IsAvatarBindingNativeWriteBusy() const
 {
 	check(IsInGameThread());
-	return bAvatarBindingNativeWriteBusy;
+	return AvatarBindingProtocol->IsNativeWriteBusy();
 }
 
 void UGGYGOAbilitySystemComponent::ReleaseAvatarBindingPublicationForContext(
 	const FGGYGOAvatarBindingContext& Expected)
 {
-	check(IsInGameThread());
-	if (AvatarBindingPublicationRecord.Context.HasSameContext(Expected))
-	{
-		// This also closes successful Consumed metadata after its strong proof was released.
-		AvatarBindingPublicationRecord.Publication = FGGYGOAvatarBindingPublicationReceipt{};
-		AvatarBindingPublicationRecord.Phase = EAvatarBindingPublicationPhase::Closed;
-	}
+	AvatarBindingProtocol->ReleasePublicationForContext(Expected);
 }
 
 void UGGYGOAbilitySystemComponent::InvalidateAvatarBindingForLegacyActorInfoWrite()
 {
 	check(IsInGameThread());
-	const FGGYGOAvatarBindingOperationIdentity Operation = ActiveAvatarBindingIdentityOperation.Identity;
-	const FGGYGOAvatarBindingContext Before = AvatarBindingContext;
+	const FGGYGOAvatarBindingOperationIdentity Operation = AvatarBindingProtocol->GetOperation().Identity;
+	const FGGYGOAvatarBindingContext Before = AvatarBindingProtocol->GetContext();
 	if (Operation.HasIssuedIdentity())
 	{
 		InvalidateAvatarBindingIdentityOperation(Operation, EGGYGOAvatarBindingReason::OperationInvalidated);
@@ -3816,7 +3666,7 @@ void UGGYGOAbilitySystemComponent::InvalidateAvatarBindingForLegacyActorInfoWrit
 	}
 	// This admitted legacy writer creates no commit proof, even if it restores the same endpoints.
 	RetireFailedAvatarActorInfoInitCleanup();
-	AvatarBindingActorInfoSnapshot = {};
+	AvatarBindingProtocol->RetireCommittedSource();
 }
 
 void UGGYGOAbilitySystemComponent::LogLegacyAvatarActorInfoWriteRejected(
@@ -3876,18 +3726,18 @@ bool UGGYGOAbilitySystemComponent::RecheckAvatarBindingExecutionOperation(
 		OutReason = EGGYGOAvatarBindingReason::InvalidASC;
 		return false;
 	}
-	if (!ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(Operation))
+	if (!AvatarBindingProtocol->GetOperation().Identity.HasSameIdentity(Operation))
 	{
 		return false;
 	}
-	const FAvatarBindingIdentityOperation& Pending = ActiveAvatarBindingIdentityOperation;
+	const FAvatarBindingIdentityOperation& Pending = AvatarBindingProtocol->GetOperation();
 	const bool bCommittedCleanup = Pending.Admission == EAvatarBindingIdentityAdmission::MatchCommittedCleanupContext
 		|| (Pending.Admission == EAvatarBindingIdentityAdmission::ReplaceRevokedContext
 			&& Pending.Kind == EGGYGOAvatarBindingKind::Clear);
 	// Cleanup admission is sealed to original committed-resource kinds, never Init/Refresh.
 	if (bCommittedCleanup && (!IsCommittedAvatarBindingCleanupKind(Pending.Kind)
 		|| (bCheckBeforeActual && !HasSameAvatarBindingActualSnapshot(
-			AvatarBindingActorInfoSnapshot, Pending.BeforeActual))))
+			AvatarBindingProtocol->GetCommittedSource(), Pending.BeforeActual))))
 	{
 		return false;
 	}
@@ -3895,37 +3745,37 @@ bool UGGYGOAbilitySystemComponent::RecheckAvatarBindingExecutionOperation(
 	switch (Pending.Admission)
 	{
 	case EAvatarBindingIdentityAdmission::MatchCommittedCleanupContext:
-		if ((AvatarBindingIdentityState != EAvatarBindingIdentityState::Current
-			&& AvatarBindingIdentityState != EAvatarBindingIdentityState::Revoked)
-			|| !AvatarBindingContext.HasSameContext(Pending.BeforeContext))
+		if ((AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Current
+			&& AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Revoked)
+			|| !AvatarBindingProtocol->GetContext().HasSameContext(Pending.BeforeContext))
 		{
 			return false;
 		}
 		break;
 	case EAvatarBindingIdentityAdmission::MatchCurrentContext:
-		if (AvatarBindingIdentityState != EAvatarBindingIdentityState::Current
-			|| !AvatarBindingContext.HasSameContext(Pending.BeforeContext))
+		if (AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Current
+			|| !AvatarBindingProtocol->GetContext().HasSameContext(Pending.BeforeContext))
 		{
 			return false;
 		}
 		break;
 	case EAvatarBindingIdentityAdmission::BootstrapNeverCommitted:
-		if (AvatarBindingIdentityState != EAvatarBindingIdentityState::Unissued
+		if (AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Unissued
 			|| Pending.BeforeContext.Binding.Serial != 0
 			|| !Pending.BeforeContext.Binding.Issuer.IsExplicitlyNull()
 			|| Pending.BeforeContext.LastActorInfoWrite.Serial != 0
 			|| !Pending.BeforeContext.LastActorInfoWrite.Issuer.IsExplicitlyNull()
-			|| AvatarBindingContext.Binding.Serial != 0
-			|| !AvatarBindingContext.Binding.Issuer.IsExplicitlyNull()
-			|| AvatarBindingContext.LastActorInfoWrite.Serial != 0
-			|| !AvatarBindingContext.LastActorInfoWrite.Issuer.IsExplicitlyNull())
+			|| AvatarBindingProtocol->GetContext().Binding.Serial != 0
+			|| !AvatarBindingProtocol->GetContext().Binding.Issuer.IsExplicitlyNull()
+			|| AvatarBindingProtocol->GetContext().LastActorInfoWrite.Serial != 0
+			|| !AvatarBindingProtocol->GetContext().LastActorInfoWrite.Issuer.IsExplicitlyNull())
 		{
 			return false;
 		}
 		break;
 	case EAvatarBindingIdentityAdmission::ReplaceRevokedContext:
-		if (AvatarBindingIdentityState != EAvatarBindingIdentityState::Revoked
-			|| !AvatarBindingContext.HasSameContext(Pending.BeforeContext))
+		if (AvatarBindingProtocol->GetIdentityState() != EAvatarBindingIdentityState::Revoked
+			|| !AvatarBindingProtocol->GetContext().HasSameContext(Pending.BeforeContext))
 		{
 			return false;
 		}
@@ -3990,8 +3840,8 @@ UGGYGOAbilitySystemComponent::CaptureReturnedAvatarActorInfoInitCleanup(
 	if (!IsAvatarBindingNativeWriteBusy() || Original.Kind != EGGYGOAvatarBindingKind::Init
 		|| !Original.Identity.HasIssuedIdentity()
 		|| !Original.Identity.Issuer.HasSameIndexAndSerialNumber(Self)
-		|| !ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(Original.Identity)
-		|| ActiveAvatarBindingIdentityOperation.Kind != EGGYGOAvatarBindingKind::Init)
+		|| !AvatarBindingProtocol->GetOperation().Identity.HasSameIdentity(Original.Identity)
+		|| AvatarBindingProtocol->GetOperation().Kind != EGGYGOAvatarBindingKind::Init)
 	{
 		return {};
 	}
@@ -4002,11 +3852,11 @@ UGGYGOAbilitySystemComponent::CaptureReturnedAvatarActorInfoInitCleanup(
 	}
 	// Invalid dependent fields may be why commit fails. Certify this writer, not work readiness.
 	if (Written.Allocation.Get() != Original.BeforeActual.Allocation.Get()
-		|| !Written.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self)
-		|| !Written.OwnerActor.HasSameIndexAndSerialNumber(Original.ExpectedOwnerActor)
-		|| !Written.AvatarActor.HasSameIndexAndSerialNumber(Original.ExpectedAvatarActor)
-		|| !Written.CachedOwnerActor.HasSameIndexAndSerialNumber(Written.OwnerActor)
-		|| !Written.CachedAvatarActor.HasSameIndexAndSerialNumber(Written.AvatarActor))
+		|| !Written.Source.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self)
+		|| !Written.Source.OwnerActor.HasSameIndexAndSerialNumber(Original.ExpectedOwnerActor)
+		|| !Written.Source.AvatarActor.HasSameIndexAndSerialNumber(Original.ExpectedAvatarActor)
+		|| !Written.Source.CachedOwnerActor.HasSameIndexAndSerialNumber(Written.Source.OwnerActor)
+		|| !Written.Source.CachedAvatarActor.HasSameIndexAndSerialNumber(Written.Source.AvatarActor))
 	{
 		OutReason = EGGYGOAvatarBindingReason::ActorInfoMismatch;
 		return {};
@@ -4040,14 +3890,14 @@ bool UGGYGOAbilitySystemComponent::ValidateFailedAvatarActorInfoInitCleanupSourc
 	if (!Original->OriginalOperation.HasIssuedIdentity()
 		|| !Original->OriginalOperation.Issuer.HasSameIndexAndSerialNumber(Self)
 		|| !Original->WrittenActual.Allocation.IsValid()
-		|| !Original->WrittenActual.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self))
+		|| !Original->WrittenActual.Source.AbilitySystemComponent.HasSameIndexAndSerialNumber(Self))
 	{
 		return false;
 	}
-	if (AvatarBindingContext.LastActorInfoWrite.HasSameIdentity(Original->OriginalOperation)
-		|| !HasSameAvatarBindingContextValue(AvatarBindingContext, Original->Before)
-		|| (ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity()
-			&& !ActiveAvatarBindingIdentityOperation.Identity.HasSameIdentity(Original->OriginalOperation)))
+	if (AvatarBindingProtocol->GetContext().LastActorInfoWrite.HasSameIdentity(Original->OriginalOperation)
+		|| !HasSameAvatarBindingContextValue(AvatarBindingProtocol->GetContext(), Original->Before)
+		|| (AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity()
+			&& !AvatarBindingProtocol->GetOperation().Identity.HasSameIdentity(Original->OriginalOperation)))
 	{
 		return false;
 	}
@@ -4074,14 +3924,13 @@ bool UGGYGOAbilitySystemComponent::RetainFailedAvatarActorInfoInitCleanup(
 	{
 		return false;
 	}
-	FailedAvatarActorInfoInitCleanupProof = Original;
+	AvatarBindingProtocol->RetainValidatedFailedInitCleanup(Original);
 	return true;
 }
 
 void UGGYGOAbilitySystemComponent::RetireFailedAvatarActorInfoInitCleanup()
 {
-	check(IsInGameThread());
-	FailedAvatarActorInfoInitCleanupProof.Reset();
+	AvatarBindingProtocol->RetireFailedInitCleanup();
 }
 
 FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarActorInfoInit(
@@ -4106,12 +3955,12 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::ExpectedContextMismatch);
 	}
 	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope
-		|| ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity())
+		|| AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity())
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
 	const TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof> Original =
-		FailedAvatarActorInfoInitCleanupProof;
+		AvatarBindingProtocol->GetFailedInitCleanup();
 	if (!Original.IsValid() || !Original->OriginalOperation.HasSameIdentity(OriginalOperation))
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::OperationInvalidated);
@@ -4135,12 +3984,12 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 			Reason = EGGYGOAvatarBindingReason::InvalidASC;
 			return false;
 		}
-		if (LiveASC->FailedAvatarActorInfoInitCleanupProof != Original)
+		if (LiveASC->AvatarBindingProtocol->GetFailedInitCleanup() != Original)
 		{
 			Reason = EGGYGOAvatarBindingReason::OperationInvalidated;
 			return false;
 		}
-		if (LiveASC->ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity())
+		if (LiveASC->AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity())
 		{
 			Reason = EGGYGOAvatarBindingReason::NativeWriteBusy;
 			return false;
@@ -4163,17 +4012,17 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 
 	// Exact native Clear postcondition; retained AnimInstance/tag fields are not cleared by GAS.
 	FActualAvatarBindingActorInfoSnapshot Cleared = Original->WrittenActual;
-	Cleared.OwnerActor.Reset();
-	Cleared.AvatarActor.Reset();
-	Cleared.PlayerController.Reset();
-	Cleared.SkeletalMeshComponent.Reset();
-	Cleared.MovementComponent.Reset();
-	Cleared.ActualAnimInstance.Reset();
-	Cleared.CachedOwnerActor.Reset();
-	Cleared.CachedAvatarActor.Reset();
+	Cleared.Source.OwnerActor.Reset();
+	Cleared.Source.AvatarActor.Reset();
+	Cleared.Source.PlayerController.Reset();
+	Cleared.Source.SkeletalMeshComponent.Reset();
+	Cleared.Source.MovementComponent.Reset();
+	Cleared.Source.ActualAnimInstance.Reset();
+	Cleared.Source.CachedOwnerActor.Reset();
+	Cleared.Source.CachedAvatarActor.Reset();
 	ReleaseAvatarBindingPublicationForContext(Original->Before);
 	RetireFailedAvatarActorInfoInitCleanup(); // Consume before native callbacks; never reissue on failure.
-	AvatarBindingActorInfoSnapshot = {};
+	AvatarBindingProtocol->RetireCommittedSource();
 	RetireMontagePlaybackOwnership();
 	Super::ClearActorInfo();
 
@@ -4185,9 +4034,9 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 			Reason = EGGYGOAvatarBindingReason::InvalidASC;
 			return false;
 		}
-		if (LiveASC->FailedAvatarActorInfoInitCleanupProof.IsValid()
-			|| LiveASC->ActiveAvatarBindingIdentityOperation.Identity.HasIssuedIdentity()
-			|| !HasSameAvatarBindingContextValue(LiveASC->AvatarBindingContext, Original->Before))
+		if (LiveASC->AvatarBindingProtocol->GetFailedInitCleanup().IsValid()
+			|| LiveASC->AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity()
+			|| !HasSameAvatarBindingContextValue(LiveASC->AvatarBindingProtocol->GetContext(), Original->Before))
 		{
 			Reason = EGGYGOAvatarBindingReason::OperationInvalidated;
 			return false;
@@ -4252,7 +4101,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
-	if (!IsGGYGOAvatarBindingActorInfoKind(Request.Kind))
+	if (!FGGYGOAvatarBindingProtocol::IsActorInfoKind(Request.Kind))
 	{
 		return Result;
 	}
@@ -4263,16 +4112,16 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 		return MakeAvatarBindingExecutionFailure(Result, Reason);
 	}
 	Result.Operation = Operation;
-	Result.Before = ActiveAvatarBindingIdentityOperation.BeforeContext;
-	const FAvatarBindingIdentityOperation OriginalOperationRecord = ActiveAvatarBindingIdentityOperation;
+	Result.Before = AvatarBindingProtocol->GetOperation().BeforeContext;
+	const FAvatarBindingIdentityOperation OriginalOperationRecord = AvatarBindingProtocol->GetOperation();
 	const FString OriginalASCName = GetPathNameSafe(this);
 	// Reserve owns these values. Keep operation-local history before Commit clears its slot.
-	const EGGYGOAvatarBindingKind OriginalKind = ActiveAvatarBindingIdentityOperation.Kind;
-	const EGGYGOAvatarBindingClearMode ClearMode = ActiveAvatarBindingIdentityOperation.ClearMode;
-	const TWeakObjectPtr<AActor> BeforeOwner = ActiveAvatarBindingIdentityOperation.BeforeActual.OwnerActor;
-	const TWeakObjectPtr<AActor> BeforeAvatar = ActiveAvatarBindingIdentityOperation.BeforeActual.AvatarActor;
-	const TWeakObjectPtr<AActor> AfterOwner = ActiveAvatarBindingIdentityOperation.ExpectedOwnerActor;
-	const TWeakObjectPtr<AActor> AfterAvatar = ActiveAvatarBindingIdentityOperation.ExpectedAvatarActor;
+	const EGGYGOAvatarBindingKind OriginalKind = AvatarBindingProtocol->GetOperation().Kind;
+	const EGGYGOAvatarBindingClearMode ClearMode = AvatarBindingProtocol->GetOperation().ClearMode;
+	const TWeakObjectPtr<AActor> BeforeOwner = AvatarBindingProtocol->GetOperation().BeforeActual.Source.OwnerActor;
+	const TWeakObjectPtr<AActor> BeforeAvatar = AvatarBindingProtocol->GetOperation().BeforeActual.Source.AvatarActor;
+	const TWeakObjectPtr<AActor> AfterOwner = AvatarBindingProtocol->GetOperation().ExpectedOwnerActor;
+	const TWeakObjectPtr<AActor> AfterAvatar = AvatarBindingProtocol->GetOperation().ExpectedAvatarActor;
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC(this);
 	FScopedAvatarBindingNativeWrite NativeWrite(this, Operation);
 	if (!NativeWrite.HasEntered())
@@ -4346,7 +4195,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 	}
 	// Only this pending operation keeps BeforeActual. Old committed cleanup rights end at the write.
 	RetireFailedAvatarActorInfoInitCleanup();
-	AvatarBindingActorInfoSnapshot = {};
+	AvatarBindingProtocol->RetireCommittedSource();
 	// Never call the legacy project entry: it revokes evidence and owns old notifications.
 	switch (OriginalKind)
 	{
@@ -4421,7 +4270,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 	FGGYGOAvatarBindingPublicationReceipt Publication;
 	Publication.Proof = MakeShared<FGGYGOAvatarBindingPublicationReceipt::FCommitPublicationProof>(
 		OriginalKind, Result.Before, BeforeOwner, BeforeAvatar, Result, Notice);
-	AvatarBindingPublicationRecord = {Publication, Committed, EAvatarBindingPublicationPhase::Pending};
+	AvatarBindingProtocol->InstallCommittedPublication(Publication, Committed);
 	OutPublication = Publication;
 	return Result;
 }
@@ -4447,14 +4296,10 @@ void UGGYGOAbilitySystemComponent::CloseAvatarBindingPublicationIfMatching(
 	const FGGYGOAvatarBindingPublicationReceipt& Publication)
 {
 	check(IsInGameThread());
-	if (Publication.Proof.IsValid()
-		&& AvatarBindingPublicationRecord.Publication.Proof == Publication.Proof
-		&& AvatarBindingPublicationRecord.Context.HasSameContext(Publication.Proof->CommitResult.CommittedContext)
-		&& (AvatarBindingPublicationRecord.Phase == EAvatarBindingPublicationPhase::Pending
-			|| AvatarBindingPublicationRecord.Phase == EAvatarBindingPublicationPhase::Dispatching))
+	if (Publication.Proof.IsValid())
 	{
-		AvatarBindingPublicationRecord.Publication = FGGYGOAvatarBindingPublicationReceipt{};
-		AvatarBindingPublicationRecord.Phase = EAvatarBindingPublicationPhase::Closed;
+		AvatarBindingProtocol->ClosePublicationIfMatching(
+			Publication, Publication.Proof->CommitResult.CommittedContext);
 	}
 }
 
@@ -4532,7 +4377,7 @@ bool UGGYGOAbilitySystemComponent::RecheckAvatarBindingPublication(
 	{
 		return false;
 	}
-	if (bAvatarBindingNativeWriteBusy)
+	if (AvatarBindingProtocol->IsNativeWriteBusy())
 	{
 		OutReason = EGGYGOAvatarBindingReason::NativeWriteBusy;
 		return false;
@@ -4542,9 +4387,9 @@ bool UGGYGOAbilitySystemComponent::RecheckAvatarBindingPublication(
 	{
 		return false;
 	}
-	if (AvatarBindingPublicationRecord.Phase != ExpectedPhase
-		|| AvatarBindingPublicationRecord.Publication.Proof != Publication.Proof
-		|| !AvatarBindingPublicationRecord.Context.HasSameContext(Committed))
+	if (AvatarBindingProtocol->GetPublication().Phase != ExpectedPhase
+		|| AvatarBindingProtocol->GetPublication().Publication.Proof != Publication.Proof
+		|| !AvatarBindingProtocol->GetPublication().Context.HasSameContext(Committed))
 	{
 		OutReason = EGGYGOAvatarBindingReason::OperationInvalidated;
 		return false;
@@ -4572,10 +4417,10 @@ bool UGGYGOAbilitySystemComponent::IsAvatarBindingPublicationContextCurrent(
 {
 	check(IsInGameThread());
 	if (!IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| bAvatarBindingNativeWriteBusy
-		|| (AvatarBindingPublicationRecord.Phase != EAvatarBindingPublicationPhase::Dispatching
-			&& AvatarBindingPublicationRecord.Phase != EAvatarBindingPublicationPhase::Consumed)
-		|| !AvatarBindingPublicationRecord.Context.HasSameContext(Expected))
+		|| AvatarBindingProtocol->IsNativeWriteBusy()
+		|| (AvatarBindingProtocol->GetPublication().Phase != EAvatarBindingPublicationPhase::Dispatching
+			&& AvatarBindingProtocol->GetPublication().Phase != EAvatarBindingPublicationPhase::Consumed)
+		|| !AvatarBindingProtocol->GetPublication().Context.HasSameContext(Expected))
 	{
 		return false;
 	}
@@ -4606,7 +4451,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::PublishAvatarBindingNoti
 	{
 		return MakeAvatarBindingExecutionFailure(Result, Reason);
 	}
-	if (bAvatarBindingNativeWriteBusy)
+	if (AvatarBindingProtocol->IsNativeWriteBusy())
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
 	}
@@ -4616,16 +4461,16 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::PublishAvatarBindingNoti
 		CloseAvatarBindingPublicationIfMatching(OwnPublication);
 		return MakeAvatarBindingExecutionFailure(Result, Reason);
 	}
-	if (!AvatarBindingPublicationRecord.Context.HasSameContext(Result.CommittedContext))
+	if (!AvatarBindingProtocol->GetPublication().Context.HasSameContext(Result.CommittedContext))
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::OperationInvalidated);
 	}
-	if (AvatarBindingPublicationRecord.Phase == EAvatarBindingPublicationPhase::Consumed)
+	if (AvatarBindingProtocol->GetPublication().Phase == EAvatarBindingPublicationPhase::Consumed)
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::PublicationAlreadyConsumed);
 	}
-	if (AvatarBindingPublicationRecord.Phase == EAvatarBindingPublicationPhase::Dispatching
-		&& AvatarBindingPublicationRecord.Publication.Proof == OwnPublication.Proof)
+	if (AvatarBindingProtocol->GetPublication().Phase == EAvatarBindingPublicationPhase::Dispatching
+		&& AvatarBindingProtocol->GetPublication().Publication.Proof == OwnPublication.Proof)
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::PublicationInProgress);
 	}
@@ -4666,7 +4511,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::PublishAvatarBindingNoti
 		return true;
 	};
 	if (!Recheck()) { return MakeAvatarBindingExecutionFailure(Result, Reason); }
-	AvatarBindingPublicationRecord.Phase = EAvatarBindingPublicationPhase::Dispatching;
+	AvatarBindingProtocol->BeginValidatedPublicationDispatch();
 	ExpectedPhase = EAvatarBindingPublicationPhase::Dispatching;
 	const FGGYGOAvatarBindingNotice Notice = OwnPublication.Proof->Notice;
 	if (!Recheck()) { return MakeAvatarBindingExecutionFailure(Result, Reason); }
@@ -4733,8 +4578,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::PublishAvatarBindingNoti
 	}
 	if (!Recheck()) { return MakeAvatarBindingExecutionFailure(Result, Reason); }
 	// No external call between exact recheck and consumption. Scope cleanup cannot touch Consumed.
-	AvatarBindingPublicationRecord.Phase = EAvatarBindingPublicationPhase::Consumed;
-	AvatarBindingPublicationRecord.Publication = FGGYGOAvatarBindingPublicationReceipt{};
+	AvatarBindingProtocol->ConsumeValidatedPublication();
 	return Result;
 }
 
@@ -5006,7 +4850,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAb
 		return MakeAvatarBindingExecutionFailure(Result, Reason);
 	}
 	Result.Operation = Operation;
-	Result.Before = ActiveAvatarBindingIdentityOperation.BeforeContext;
+	Result.Before = AvatarBindingProtocol->GetOperation().BeforeContext;
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC(this);
 	FScopedAvatarBindingNativeWrite NativeWrite(this, Operation);
 	if (!NativeWrite.HasEntered())
@@ -5094,7 +4938,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryRemoveAvatarBindingGa
 		return MakeAvatarBindingExecutionFailure(Result, Reason);
 	}
 	Result.Operation = Operation;
-	Result.Before = ActiveAvatarBindingIdentityOperation.BeforeContext;
+	Result.Before = AvatarBindingProtocol->GetOperation().BeforeContext;
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC(this);
 	FScopedAvatarBindingNativeWrite NativeWrite(this, Operation);
 	if (!NativeWrite.HasEntered())

@@ -15,24 +15,33 @@ namespace
 	}
 }
 
+namespace
+{
+	/** Source metadata is validated by the caller in this same synchronous evaluation. */
+	bool ValidateExecutionCurves(const FGGYGOActionMotionSourceBinding& Source, FString& OutError)
+	{
+		if (Source.bMontageHasRootMotion)
+			return Reject(Source, Source.Montage.Get(), TEXT("NativeRootMotion"), TEXT("native animation root motion and position-curve execution are mutually exclusive"), OutError);
+		for (const FGGYGOActionMotionSourceSegment& Segment : Source.Segments)
+		{
+			UAnimSequence* Sequence = Segment.Sequence.Get();
+			if (Segment.bEnableRootMotion)
+				return Reject(Source, Sequence, TEXT("NativeRootMotion"), TEXT("source sequence enables native root motion"), OutError);
+			for (FName Name : PositionNames)
+			{
+				if (!Sequence->HasCurveData(Name, false))
+					return Reject(Source, Sequence, *Name.ToString(), TEXT("required runtime cumulative-position curve is missing"), OutError);
+			}
+		}
+		return true;
+	}
+}
+
 bool GGYGOActionMotionEvaluation::ValidateSource(const FGGYGOActionMotionSourceBinding& Source, FString& OutError)
 {
 	OutError.Reset();
-	if (!GGYGOActionMotionSource::ValidateSourceBinding(Source, OutError)) return false;
-	if (Source.bMontageHasRootMotion)
-		return Reject(Source, Source.Montage.Get(), TEXT("NativeRootMotion"), TEXT("native animation root motion and position-curve execution are mutually exclusive"), OutError);
-	for (const FGGYGOActionMotionSourceSegment& Segment : Source.Segments)
-	{
-		UAnimSequence* Sequence = Segment.Sequence.Get();
-		if (Segment.bEnableRootMotion)
-			return Reject(Source, Sequence, TEXT("NativeRootMotion"), TEXT("source sequence enables native root motion"), OutError);
-		for (FName Name : PositionNames)
-		{
-			if (!Sequence->HasCurveData(Name, false))
-				return Reject(Source, Sequence, *Name.ToString(), TEXT("required runtime cumulative-position curve is missing"), OutError);
-		}
-	}
-	return true;
+	return GGYGOActionMotionSource::ValidateSourceBinding(Source, OutError)
+		&& ValidateExecutionCurves(Source, OutError);
 }
 
 bool GGYGOActionMotionEvaluation::EvaluateInterval(const FGGYGOActionMotionSourceBinding& Source,
@@ -40,9 +49,9 @@ bool GGYGOActionMotionEvaluation::EvaluateInterval(const FGGYGOActionMotionSourc
 {
 	OutTranslation = FVector::ZeroVector;
 	OutError.Reset();
-	if (!ValidateSource(Source, OutError)) return false;
 	TArray<FGGYGOActionMotionSourceInterval> Pieces;
-	if (!GGYGOActionMotionSource::MapMontageInterval(Source, MontageStartSeconds, MontageEndSeconds, Pieces, OutError)) return false;
+	if (!GGYGOActionMotionSource::MapMontageInterval(Source, MontageStartSeconds, MontageEndSeconds, Pieces, OutError)
+		|| !ValidateExecutionCurves(Source, OutError)) return false;
 	FVector Candidate = FVector::ZeroVector;
 	for (const FGGYGOActionMotionSourceInterval& Piece : Pieces)
 	{

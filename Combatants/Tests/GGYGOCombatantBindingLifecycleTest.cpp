@@ -1,6 +1,7 @@
 #include "Combatants/Tests/GGYGOCombatantBindingLifecycleTestTypes.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Misc/AutomationTest.h"
@@ -39,6 +40,7 @@ namespace
 	{
 		UEngine* Engine = nullptr;
 		UWorld* World = nullptr;
+		TArray<TPair<TWeakObjectPtr<UGGYGOPawnExtensionComponent>, FDelegateHandle>> LocalNoticeHandles;
 
 		FCombatantBindingTestWorld()
 			: Engine(GEngine)
@@ -56,6 +58,13 @@ namespace
 
 		~FCombatantBindingTestWorld()
 		{
+			for (const auto& Registration : LocalNoticeHandles)
+			{
+				if (UGGYGOPawnExtensionComponent* Extension = Registration.Key.Get())
+				{
+					Extension->UnregisterLocalAbilitySystemNotice(Registration.Value);
+				}
+			}
 			if (World)
 			{
 				World->DestroyWorld(false);
@@ -81,12 +90,16 @@ namespace
 		return World ? World->SpawnActor<AGGYGOCombatantBindingTestPawn>() : nullptr;
 	}
 
-	void ObserveUninitialization(UGGYGOPawnExtensionComponent* Extension,
+	void ObserveUninitialization(FCombatantBindingTestWorld& Fixture, UGGYGOPawnExtensionComponent* Extension,
 		UGGYGOCombatantBindingTestObserver* Observer)
 	{
-		Extension->OnAbilitySystemUninitialized_Register(
-			FSimpleMulticastDelegate::FDelegate::CreateUObject(
-				Observer, &UGGYGOCombatantBindingTestObserver::HandleUninitialized));
+		const FDelegateHandle Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
+			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(Observer,
+				[Observer](const FGGYGOPawnASCLocalNotice& Notice)
+				{
+					if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { Observer->HandleUninitialized(); }
+				}));
+		Fixture.LocalNoticeHandles.Emplace(TWeakObjectPtr<UGGYGOPawnExtensionComponent>(Extension), Handle);
 	}
 }
 
@@ -210,7 +223,7 @@ bool FGGYGOCombatantBindingIdentityTest::RunTest(const FString& Parameters)
 
 	TStrongObjectPtr<UGGYGOCombatantBindingTestObserver> Observer(
 		NewObject<UGGYGOCombatantBindingTestObserver>(GetTransientPackage()));
-	ObserveUninitialization(Extension, Observer.Get());
+	ObserveUninitialization(Fixture, Extension, Observer.Get());
 
 	OldHost->DetachAvatar(Pawn);
 	TestEqual(TEXT("late old-host detach preserves the Pawn's new local ASC"),
@@ -242,7 +255,7 @@ bool FGGYGOCombatantBindingIdentityTest::RunTest(const FString& Parameters)
 	UGGYGOPawnExtensionComponent* EndPlayExtension = EndPlayPawn->GetPawnExtensionForTest();
 	TStrongObjectPtr<UGGYGOCombatantBindingTestObserver> EndPlayObserver(
 		NewObject<UGGYGOCombatantBindingTestObserver>(GetTransientPackage()));
-	ObserveUninitialization(EndPlayExtension, EndPlayObserver.Get());
+	ObserveUninitialization(Fixture, EndPlayExtension, EndPlayObserver.Get());
 	EndPlayHost->AttachAvatar(EndPlayPawn);
 	EndPlayHost->InvokeEndPlayForTest();
 	TestNull(TEXT("host EndPlay clears the Pawn's local ASC cache"),
@@ -289,6 +302,8 @@ namespace
 		bool bProbeArmed = false;
 		FDelegateHandle DestroyedHandle;
 		FDelegateHandle RemovedHandle;
+		FDelegateHandle OldNoticeHandle;
+		FDelegateHandle CandidateNoticeHandle;
 		FNetDelegates::FReceivedNetworkEncryptionToken SavedEncryptionToken = FNetDelegates::OnReceivedNetworkEncryptionToken;
 		FNetDelegates::FReceivedNetworkEncryptionAck SavedEncryptionAck = FNetDelegates::OnReceivedNetworkEncryptionAck;
 		FNetDelegates::FReceivedNetworkEncryptionFailure SavedEncryptionFailure = FNetDelegates::OnReceivedNetworkEncryptionFailure;
@@ -434,10 +449,10 @@ namespace
 				FOnActorDestroyed::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleNativeDestroy));
 			RemovedHandle = World->AddOnActorRemovedFromWorldHandler(
 				FOnActorRemovedFromWorld::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleRemoved));
-			OldExtension->OnAbilitySystemUninitialized_Register(
-				FSimpleMulticastDelegate::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleUninitialized));
-			CandidateExtension->OnAbilitySystemInitialized_RegisterAndCall(
-				FSimpleMulticastDelegate::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleCandidateInitialized));
+			OldNoticeHandle = OldExtension->RegisterLocalAbilitySystemNoticeAndCall(
+				FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleUninitialized));
+			CandidateNoticeHandle = CandidateExtension->RegisterLocalAbilitySystemNoticeAndCall(
+				FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateSP(AsShared(), &FCombatantRealDestroyFixture::HandleCandidateInitialized));
 		}
 
 		void HandleNativeDestroy(AActor* Actor)
@@ -448,8 +463,9 @@ namespace
 			NativeDestroy = Capture();
 		}
 
-		void HandleUninitialized()
+		void HandleUninitialized(const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Released) { return; }
 			++UninitializedCount;
 			if (!bProbeArmed) { return; }
 			Events.Add(FName(TEXT("Uninitialized")));
@@ -459,8 +475,9 @@ namespace
 			CleanupAfterAttach = Capture();
 		}
 
-		void HandleCandidateInitialized()
+		void HandleCandidateInitialized(const FGGYGOPawnASCLocalNotice& Notice)
 		{
+			if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Ready) { return; }
 			++CandidateInitializedCount;
 		}
 
@@ -475,6 +492,8 @@ namespace
 		~FCombatantRealDestroyFixture()
 		{
 			bProbeArmed = false;
+			if (IsValid(OldExtension)) { OldExtension->UnregisterLocalAbilitySystemNotice(OldNoticeHandle); }
+			if (IsValid(CandidateExtension)) { CandidateExtension->UnregisterLocalAbilitySystemNotice(CandidateNoticeHandle); }
 			if (World)
 			{
 				World->RemoveOnActorDestroyedHandler(DestroyedHandle);

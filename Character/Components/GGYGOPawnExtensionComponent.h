@@ -133,10 +133,15 @@ enum class EGGYGOPawnASCLocalNoticeKind : uint8
 	Invalid = 0,
 	Ready,
 	Released,
-	Refreshed
+	Refreshed,
+	Closing
 };
 
-/** Released carries an empty PublishedContext and proves only local withdrawal. */
+/**
+ * Ready/Refreshed carry an authenticated PublishedContext. Released/Closing carry an empty Context.
+ * Closing retires the original H's consumer associations when it is withdrawn or its Extension ends play.
+ * It does not prove native Cancel/Clear success. Consumers return only their original resources.
+ */
 struct GGYGO_API FGGYGOPawnASCLocalNotice
 {
 	EGGYGOPawnASCLocalNoticeKind Kind = EGGYGOPawnASCLocalNoticeKind::Invalid;
@@ -156,11 +161,11 @@ public:
 	UGGYGOPawnExtensionComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
 // K4-Character-L1 native APIs begin.
-	/** Game thread only. New local path is not connected to the legacy production cache. */
+	/** Game-thread installation of an original local H; does not establish Ready. */
 	FGGYGOPawnASCLocalResult InstallLocalAbilitySystemResources(
 		UGGYGOAbilitySystemComponent* ExpectedASC, APawn* ExpectedPawn,
 		const FGGYGOAvatarBindingContext& CommittedContext);
-	/** Local-only exact cleanup, including an expired/transferred ASC. No callbacks. */
+	/** Detach original H before synchronous Closing; expired/transferred ASC cleanup stays local. */
 	FGGYGOPawnASCLocalResult WithdrawLocalAbilitySystemResources(
 		const FGGYGOPawnASCResourceHandle& ExpectedResource);
 	/** Consume before callbacks. Never clear a successor or claim an ASC Clear commit. */
@@ -176,8 +181,14 @@ public:
 	bool IsLocalAbilitySystemResourceInstalled(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
 	/** Pure local/ASC publication gate; installation and historical receipts are insufficient. */
 	bool IsLocalAbilitySystemResourceReady(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
-	/** Identity-aware subscriptions. Replay only a currently authenticated local Ready resource. */
+	/**
+	 * Subscribe to original H/Context notices; synchronously replay only authenticated current Ready.
+	 * Caller owns the returned token and returns it to this Extension, including after replay retired the receiver.
+	 * Closing is delivered once per H after its withdrawal or after Extension admission closes in EndPlay.
+	 * A registration token does not grant Ready; a closed Extension accepts no new registrations or replay.
+	 */
 	FDelegateHandle RegisterLocalAbilitySystemNoticeAndCall(FGGYGOPawnASCLocalNoticeDelegate::FDelegate Delegate);
+	/** Remove only the supplied original registration token; no resource or Ready changes. */
 	void UnregisterLocalAbilitySystemNotice(FDelegateHandle Handle);
 // K4-Character-L1 native APIs end.
 
@@ -247,18 +258,6 @@ public:
 	/** 输入组件建立后由拥有者 Pawn 调用。 */
 	void SetupPlayerInputComponent();
 
-	/**
-	 * 订阅 ASC 就绪事件，**且如果已经就绪就立刻回调一次**。
-	 *
-	 * 这个"注册即可能立即触发"的语义是必需的：订阅方（如 HealthComponent）
-	 * 的 BeginPlay 与真实 Ready 谁先发生是不确定的；
-	 * 回放只认捕获的原 Ready H/Context，回调后不收养后继。
-	 */
-	void OnAbilitySystemInitialized_RegisterAndCall(FSimpleMulticastDelegate::FDelegate Delegate);
-
-	/** 订阅 ASC 反初始化事件。这个不需要补发，因为反初始化必然发生在订阅之后。 */
-	void OnAbilitySystemUninitialized_Register(FSimpleMulticastDelegate::FDelegate Delegate);
-
 protected:
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
@@ -282,12 +281,6 @@ protected:
 	// 因为 ASC 与属性集都归它持有。本组件只负责把 PawnData 里**属于 Pawn 的**部分
 	// （移动参数、Cue 预热）分发下去。
 
-	/** 原资源通过真实 ASC 发布认证成为 Ready 后广播；由本地通知接口唯一发出。 */
-	FSimpleMulticastDelegate OnAbilitySystemInitialized;
-
-	/** 本地 ASC 绑定解除后广播。 */
-	FSimpleMulticastDelegate OnAbilitySystemUninitialized;
-
 	/**
 	 * 本单位的静态配置。
 	 *
@@ -306,6 +299,10 @@ private:
 
 // K4-Character-L1 private local resources begin.
 	bool OwnsLocalAbilitySystemResource(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
+	/** Consume the original H's notification obligation before external exact consumer cleanup. */
+	void NotifyLocalResourcesClosing(const FGGYGOPawnASCResourceHandle& OriginalResource);
+	/** Release captured original H only; callbacks cannot redirect cleanup to the current slot. */
+	void UninitializeLocalAbilitySystemResource(const FGGYGOPawnASCResourceHandle& OriginalResource);
 	/** 本组件生命周期准入：EndPlay 关闭，真实下一次 BeginPlay 重开；不发行 Binding/Ready。 */
 	bool bLocalAbilitySystemAdmissionClosed = false;
 	FGGYGOPawnASCResourceHandle LocalAbilitySystemResource{};

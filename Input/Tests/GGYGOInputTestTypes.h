@@ -71,6 +71,8 @@ public:
 	/** Owns the real typed notice subscription while this fixture deliberately stays before BeginPlay. */
 	bool ObserveLocalAbilitySystemForTest(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
 	void StopObservingLocalAbilitySystemForTest();
+	/** Queries the real original H/input association without exposing its records. */
+	bool HasAbilityInputAssociationForTest(const UGGYGOAbilitySystemComponent* ExpectedASC) const;
 	bool ObserveNativeMappingRebuildForTest(UEnhancedInputLocalPlayerSubsystem* Subsystem);
 	void StopObservingNativeMappingRebuildForTest();
 	int32 GetNativeMappingRebuildCountForTest() const { return NativeMappingRebuildCount; }

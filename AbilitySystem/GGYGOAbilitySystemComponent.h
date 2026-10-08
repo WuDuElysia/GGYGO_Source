@@ -23,27 +23,29 @@
  * 同优先级后来者打断先激活者），受击组通常要配成 false 以免受击动画反复重播。
  * 未注入配置表时全部走内置默认规则。
  *
- * 仲裁只做"拒绝"，不做"排队"。`SingleInstanceQueued` 被拒时返回
- * `GroupOccupiedQueued` 原因，重试由意图层的输入缓冲负责，
- * 或订阅 `OnAbilityGroupFreed` 在组空出瞬间重试。
- * ASC 只暂存意图层提交给下一次输入消费的 retry 请求，不维护第二套组排队状态。
+ * 仲裁只做拒绝；真实输入 Queued 失败许可保存在原 ASC 请求中。
+ * 组释放唤醒已有许可并排入下一次 ProcessAbilityInput，不在广播栈中激活。
+ * OnAbilityGroupFreed 和 OnAbilityInputRetryable 是观察通知，不拥有输入等待。
  *
  * ## 3. Tag 关系扩展
  * 把 `UGGYGOAbilityTagRelationshipMapping` 的查询结果接进 GAS 的阻断/取消判定。
  *
  * ## 谁来调用 ProcessAbilityInput
- * PlayerController 的 PostProcessInput 是唯一帧末驱动；Hero 负责物理输入与重试意图。
+ * PlayerController 的 PostProcessInput 是唯一帧末驱动；Hero 负责原 Action 观察及精确归还。
  */
 #pragma once
 
 #include "AbilitySystemComponent.h"
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "AbilitySystem/GGYGOAvatarBindingTypes.h"
+#include "AbilitySystem/GGYGOActorInfoSource.h"
+#include "AbilitySystem/GGYGOAttributeBaseCalculationTypes.h"
 #include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
 #include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
 #include "NativeGameplayTags.h"
 #include "Templates/SharedPointer.h"
+#include "Templates/UniquePtr.h"
 
 #include "GGYGOAbilitySystemComponent.generated.h"
 
@@ -55,6 +57,7 @@ class UMovementComponent;
 class USkeletalMeshComponent;
 class UGameplayAbility;
 class UGGYGOAbilityGroupConfig;
+class FGGYGOAvatarBindingProtocol;
 class UGGYGOAbilityTagRelationshipMapping;
 class UObject;
 class UWorld;
@@ -62,43 +65,6 @@ struct FFrame;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOAbilityGroupRule;
 struct FGGYGOMontagePlayGuardResult;
-
-enum class EGGYGOAttributeBaseCalculationOutcome : uint8
-{
-	Rejected = 0,
-	Ready,
-	Stale
-};
-
-enum class EGGYGOAttributeBaseCalculationReason : uint8
-{
-	InvalidRequest = 0,
-	None,
-	WrongThread,
-	InvalidASC,
-	NotAuthority,
-	InvalidAttribute,
-	UnsupportedAttribute,
-	MissingAttributeSet,
-	SourceChanged,
-	CaptureFailed,
-	NonFiniteInput,
-	NonFiniteSource,
-	NonFiniteModifier,
-	InvalidDivisor,
-	NonInvertibleChannel,
-	NonFiniteResult,
-	ForwardMismatch,
-	AggregationChanged
-};
-
-/** Stack-call calculation only. CalculatedBase is finite and usable only for Ready/None. */
-struct GGYGO_API FGGYGOAttributeBaseCalculationResult
-{
-	EGGYGOAttributeBaseCalculationOutcome Outcome = EGGYGOAttributeBaseCalculationOutcome::Rejected;
-	EGGYGOAttributeBaseCalculationReason Reason = EGGYGOAttributeBaseCalculationReason::InvalidRequest;
-	float CalculatedBase = 0.0f;
-};
 
 enum class EGGYGOAvatarSwitchAbilityExitOutcome : uint8
 {
@@ -196,6 +162,7 @@ private:
 	TSharedPtr<const FCommitPublicationProof> Proof{};
 
 	friend class UGGYGOAbilitySystemComponent;
+	friend class FGGYGOAvatarBindingProtocol;
 };
 
 /**
@@ -239,8 +206,8 @@ GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(TAG_GGYGO_Gameplay_AbilityInputBlocked)
  * 某个能力组的最后一个实例结束时广播。
  * @param GroupTag 空出来的组。
  *
- * 主要给 `SingleInstanceQueued` 组用：意图层订阅它就能在组空出的瞬间立即重试
- * 被缓冲的请求，不必每帧轮询。连段的衔接感依赖这个即时性。
+ * ASC 先把原输入请求的真实 Queued 许可排入下次 Process，再发布此观察通知。
+ * 订阅者不能由组名制造输入来源，输入能力不在这个广播栈中重试。
  */
 DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityGroupFreed, FGameplayTag /*GroupTag*/);
 
@@ -259,6 +226,7 @@ class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
 
 public:
 	UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+	virtual ~UGGYGOAbilitySystemComponent() override;
 	/** Actual GAS destruction supplies a synchronous native cleanup source. */
 	virtual void DestroyActiveState() override;
 
@@ -657,6 +625,8 @@ private:
 		TWeakObjectPtr<UWorld> World;
 		TArray<FGameplayAbilitySpecHandle> SpecHandles;
 		TArray<FGameplayAbilitySpecHandle> RetryableSpecHandles;
+		/** Derived first-notice order; zero after this wait is taken for one group release. */
+		uint64 QueuedWaitOrder = 0;
 		bool bHeld = true;
 	};
 
@@ -684,10 +654,16 @@ private:
 	bool IsAbilityInputEdgeCurrent(const FAbilityInputEdge& Edge) const;
 	void RebuildAbilityInputHeldHandles();
 	void PruneAbilityInputRequests();
+	/** Same exact queue admission for callers and internal group wake; failures remain explicit values. */
+	FGGYGOAbilityInputRequestResult QueueAbilityInputRetryInternal(const FGGYGOAbilityInputRetryRequest& Request);
+	void RecordAbilityInputQueuedWait(FAbilityInputRequestRecord& Record);
+	/** Event-driven wake of existing real Queued permissions; never activates on the broadcast stack. */
+	void WakeQueuedAbilityInputRequests();
 	void ConsumeSuccessfulAbilityInputRequests(const TArray<FGGYGOAbilityInputRetryRequest>& Requests);
 
 	TMap<uint64, FAbilityInputRequestRecord> AbilityInputRequests;
 	uint64 LastAbilityInputRequestSerial = 0; // Never reset or borrowed from evaluation serials.
+	uint64 LastAbilityInputWaitOrder = 0; // Ordering only; reset when the waiting set is taken/cleared.
 	TArray<FAbilityInputEdge> PendingAbilityInputEdges;
 	TArray<FGGYGOAbilityInputRetryRequest> PendingAbilityInputRetries;
 
@@ -780,6 +756,7 @@ private:
 	uint64 AllocateAbilityActivationOriginSerial();
 
 	friend class UGGYGOGameplayAbility;
+	friend class FGGYGOAvatarBindingProtocol;
 
 	struct FAvatarSwitchAbilityExitCandidate
 	{
@@ -879,18 +856,7 @@ private:
 	struct FActualAvatarBindingActorInfoSnapshot
 	{
 		TSharedPtr<const FGameplayAbilityActorInfo> Allocation;
-		TWeakObjectPtr<UAbilitySystemComponent> AbilitySystemComponent;
-		TWeakObjectPtr<AActor> OwnerActor;
-		TWeakObjectPtr<AActor> AvatarActor;
-		TWeakObjectPtr<APlayerController> PlayerController;
-		TWeakObjectPtr<USkeletalMeshComponent> SkeletalMeshComponent;
-		TWeakObjectPtr<UMovementComponent> MovementComponent;
-		TWeakObjectPtr<UAnimInstance> ActorInfoAnimInstance;
-		TWeakObjectPtr<UAnimInstance> ActualAnimInstance;
-		TWeakObjectPtr<AActor> CachedOwnerActor;
-		TWeakObjectPtr<AActor> CachedAvatarActor;
-		FName ActorInfoAffectedAnimInstanceTag = NAME_None;
-		FName ASCAffectedAnimInstanceTag = NAME_None;
+		FGGYGOActorInfoSource Source;
 	};
 
 	/** One stack-local native Try request. This is provenance, never another GAS activation state. */
@@ -989,7 +955,6 @@ private:
 		FGGYGOAvatarBindingContext Before;
 		FActualAvatarBindingActorInfoSnapshot WrittenActual;
 	};
-	TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof> FailedAvatarActorInfoInitCleanupProof;
 	TSharedPtr<const FFailedAvatarActorInfoInitCleanupProof> CaptureReturnedAvatarActorInfoInitCleanup(
 		const FAvatarBindingIdentityOperation& Original, EGGYGOAvatarBindingReason& OutReason) const;
 	bool ValidateFailedAvatarActorInfoInitCleanupSource(
@@ -1089,15 +1054,8 @@ private:
 	void LogLegacyAvatarActorInfoWriteRejected(const TCHAR* Entry,
 		EGGYGOAvatarBindingReason Reason) const;
 
-	bool bAvatarBindingNativeWriteBusy = false;
-	/** One current reference plus exact consumption metadata; no history table or caller query. */
-	FAvatarBindingPublicationRecord AvatarBindingPublicationRecord;
 	FGGYGOAvatarBindingNoticeEvent AvatarBindingNoticeEvent;
 
-	/** Binding and operation identities share this issuer; zero is invalid, exhaustion never wraps. */
-	uint64 LastIssuedAvatarBindingSerial = 0;
-	FGGYGOAvatarBindingContext AvatarBindingContext;
-	EAvatarBindingIdentityState AvatarBindingIdentityState = EAvatarBindingIdentityState::Unissued;
-	FActualAvatarBindingActorInfoSnapshot AvatarBindingActorInfoSnapshot;
-	FAvatarBindingIdentityOperation ActiveAvatarBindingIdentityOperation;
+	/** Single ASC-owned protocol resource; native execution and external callback bridges stay here. */
+	TUniquePtr<FGGYGOAvatarBindingProtocol> AvatarBindingProtocol;
 };

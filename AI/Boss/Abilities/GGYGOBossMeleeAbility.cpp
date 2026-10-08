@@ -126,12 +126,18 @@ void UGGYGOBossMeleeAbility::InitializeAbilityActivation(const FGGYGOAbilityActi
 	Super::InitializeAbilityActivation(Original);
 }
 
-bool UGGYGOBossMeleeAbility::IsOriginalResourcesCurrent(
+bool UGGYGOBossMeleeAbility::OwnsOriginalResources(
 	const TSharedPtr<FOriginalMeleeResources>& Resources, const FGGYGOAbilityActivationHandle& Original) const
 {
 	return Resources && OriginalResources == Resources && Resources->Original.HasSameActivation(Original)
 		&& Resources->Ability.Get() == this && IsValid(this)
-		&& !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+		&& !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
+}
+
+bool UGGYGOBossMeleeAbility::IsOriginalResourcesCurrent(
+	const TSharedPtr<FOriginalMeleeResources>& Resources, const FGGYGOAbilityActivationHandle& Original) const
+{
+	return OwnsOriginalResources(Resources, Original)
 		// Read GA admission only to compare with the already fixed Original. Never replace its source.
 		&& CaptureCurrentActivation().HasSameActivation(Original);
 }
@@ -181,6 +187,77 @@ bool UGGYGOBossMeleeAbility::PrepareOriginalMeleeMesh(
 	return true;
 }
 
+bool UGGYGOBossMeleeAbility::BeginOriginalMeleeMotion(
+	const FGGYGOAbilityActivationHandle& Original, UGGYGOCharacterMovementComponent* Movement,
+	const UGGYGOActionMotionProfile* Profile, float PlayRate)
+{
+	const TSharedPtr<FOriginalMeleeResources> Resources = OriginalResources;
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
+	const ACharacter* Character = Cast<ACharacter>(Resources->Avatar.Get());
+	if (!AreOriginalReceiversCurrent(Resources) || !IsValid(Profile) || !IsValid(Movement)
+		|| !Character || Character->GetCharacterMovement() != Movement
+		|| Resources->MotionHandle != INDEX_NONE)
+	{
+		FailOriginalAction(Resources, Original, TEXT("Motion"),
+			FString::Printf(TEXT("原 MotionProfile [%s]、CMC [%s] 或未持有位移的原批次无效。"),
+				*GetNameSafe(Profile), *GetNameSafe(Movement)));
+		return false;
+	}
+	Resources->Movement = Movement;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalMovement = Movement;
+	const int32 MotionHandle = Movement->BeginActionMotion(Profile, PlayRate);
+	if (!IsOriginalResourcesCurrent(Resources, Original))
+	{
+		if (UGGYGOCharacterMovementComponent* Receiver = OriginalMovement.Get(); Receiver && MotionHandle != INDEX_NONE)
+		{
+			Receiver->EndActionMotion(MotionHandle);
+		}
+		return false;
+	}
+	Resources->MotionHandle = MotionHandle;
+	if (MotionHandle == INDEX_NONE)
+	{
+		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("原 CMC 拒绝动作位移。"));
+		return false;
+	}
+	Movement = OriginalMovement.Get();
+	if (!Movement || !AreOriginalReceiversCurrent(Resources))
+	{
+		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("位移启动返回后原接收者已失效/改变。"));
+		return false;
+	}
+	const TWeakObjectPtr<UGGYGOBossMeleeAbility> WeakAbility(this);
+	const TWeakPtr<FOriginalMeleeResources> WeakResources(Resources);
+	FString ObservationError;
+	const bool bObserved = Movement->ObserveActionMotionFailure(MotionHandle,
+		FGGYGOActionMotionFailureDelegate::CreateLambda(
+			[WeakAbility, WeakResources, Original, OriginalMovement](int32 FailedHandle, const FString& Reason)
+			{
+				UGGYGOBossMeleeAbility* Ability = WeakAbility.Get();
+				const TSharedPtr<FOriginalMeleeResources> Batch = WeakResources.Pin();
+				// Movement has already retired its slot. Original End eligibility belongs to GAS,
+				// independently of HasActiveActionMotion or the old resource-work admission.
+				if (Ability && Batch
+					&& Batch->Movement.HasSameIndexAndSerialNumber(OriginalMovement)
+					&& Batch->MotionHandle == FailedHandle)
+				{
+					Ability->FailOriginalAction(Batch, Original, TEXT("Motion"), Reason);
+				}
+			}), ObservationError);
+	if (!bObserved)
+	{
+		FailOriginalAction(Resources, Original, TEXT("Motion 失败观察"), ObservationError);
+		return false;
+	}
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
+	if (!AreOriginalReceiversCurrent(Resources))
+	{
+		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("位移观察返回后原接收者已失效/改变。"));
+		return false;
+	}
+	return true;
+}
+
 bool UGGYGOBossMeleeAbility::HasOriginalMeleeMeshResource() const
 {
 	return OriginalResources && OriginalResources->Mesh.IsValid() && OriginalResources->bRestoreMesh;
@@ -222,7 +299,8 @@ void UGGYGOBossMeleeAbility::FailOriginalAction(
 	const TSharedPtr<FOriginalMeleeResources>& Resources, const FGGYGOAbilityActivationHandle& Original,
 	const TCHAR* Stage, const FString& Reason)
 {
-	if (!IsOriginalResourcesCurrent(Resources, Original)) { return; }
+	// Failing a held original batch only requests termination; it never renews resource work.
+	if (!OwnsOriginalResources(Resources, Original)) { return; }
 	UE_LOG(LogGGYGOAbilitySystem, Error,
 		TEXT("BossMelee [%s] 原动作在 [%s] 失败：Avatar [%s] ASC [%s] Montage [%s] Trace [%s]；%s"),
 		*GetPathName(), Stage, *GetNameSafe(Resources->Avatar.Get()), *GetNameSafe(Resources->ASC.Get()),
@@ -312,7 +390,6 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	}
 	const TWeakObjectPtr<const UGGYGOActionMotionProfile> MotionProfile = ActionMotionProfile.Get();
 	const bool bRequiresMotion = ActionMotionProfile != nullptr;
-	const FString OriginalMotionProfileName = GetNameSafe(ActionMotionProfile.Get());
 	const float MontageLength = AttackMontage->GetPlayLength();
 
 	if (!PrepareOriginalMeleeMesh(Original, Mesh))
@@ -424,31 +501,7 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 
 	if (bRequiresMotion)
 	{
-		const UGGYGOActionMotionProfile* Profile = MotionProfile.Get();
-		Movement = Resources->Movement.Get();
-		if (!IsValid(Profile) || !IsValid(Movement))
-		{
-			FailOriginalAction(Resources, Original, TEXT("Motion"),
-				FString::Printf(TEXT("原 MotionProfile [%s] 或 CMC 已失效。"), *OriginalMotionProfileName));
-			return;
-		}
-		const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalMovement = Movement;
-		const int32 MotionHandle = Movement->BeginActionMotion(Profile, Resources->EffectivePlayRate);
-		if (!IsOriginalResourcesCurrent(Resources, Original))
-		{
-			if (UGGYGOCharacterMovementComponent* Receiver = OriginalMovement.Get(); Receiver && MotionHandle != INDEX_NONE)
-			{
-				Receiver->EndActionMotion(MotionHandle);
-			}
-			return;
-		}
-		Resources->MotionHandle = MotionHandle;
-		if (MotionHandle == INDEX_NONE)
-		{
-			FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("原 CMC 拒绝动作位移。"));
-			return;
-		}
-		if (!RecheckAfterExternal(TEXT("Motion"))) { return; }
+		if (!BeginOriginalMeleeMotion(Original, Resources->Movement.Get(), MotionProfile.Get(), Resources->EffectivePlayRate)) { return; }
 	}
 	UE_LOG(LogGGYGOAbilitySystem, Display,
 		TEXT("BossMelee: [%s] 开始原播放 [%s]。"),

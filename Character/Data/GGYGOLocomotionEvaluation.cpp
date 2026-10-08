@@ -48,13 +48,10 @@ namespace GGYGOLocomotionSourceEvaluation
 	}
 
 	/** Clip coordinates are explicit and can cross multiple loops; no clock is retained. */
-	bool SampleInterval(const FGGYGOLocomotionSequenceSource& Source, double Start, double End,
+	bool SampleValidatedInterval(const FGGYGOLocomotionSequenceSource& Source, double Start, double End,
 		double TimeRate, FGGYGOLocomotionCurveSample& Out, FString* Error)
 	{
 		UAnimSequence* Sequence = Source.Sequence.Get();
-		FString ValidationError;
-		if (!GGYGOLocomotionEvaluation::ValidateSource(Source, ValidationError))
-		{ if (Error) *Error = ValidationError; return false; }
 		if (!FMath::IsFinite(Start) || Start < 0.0 || !FMath::IsFinite(End) || End < Start
 			|| !FMath::IsFinite(TimeRate) || TimeRate <= 0.0)
 			return Fail(Error, Sequence, TEXT("Interval"), TEXT("requires finite ordered non-negative times and positive time rate"));
@@ -177,9 +174,11 @@ bool GGYGOLocomotionEvaluation::EvaluateSingleInterval(const FGGYGOLocomotionSeq
 {
 	using namespace GGYGOLocomotionSourceEvaluation;
 	OutResult = {}; if (OutError) OutError->Reset();
+	FString ValidationError;
+	if (!ValidateSource(Source, ValidationError)) { if (OutError) *OutError = ValidationError; return false; }
 	FGGYGOLocomotionCurveSample Sample;
 	FGGYGOLocomotionEvaluationResult Candidate;
-	if (!SampleInterval(Source, static_cast<double>(StartTime) * Source.SequenceRateScale,
+	if (!SampleValidatedInterval(Source, static_cast<double>(StartTime) * Source.SequenceRateScale,
 		static_cast<double>(EndTime) * Source.SequenceRateScale, Source.SequenceRateScale, Sample, OutError)
 		|| !Scale(Sample, RootMotionScale, Candidate, Source.Sequence.Get(), OutError)) return false;
 	OutResult = Candidate; return true;
@@ -218,7 +217,7 @@ bool GGYGOLocomotionEvaluation::EvaluateWalkRunInterval(const FGGYGOLocomotionSo
 			return Fail(OutError, BS, TEXT("NativeSamples"), TEXT("active sample has no original binding or finite weight"));
 		FGGYGOLocomotionCurveSample Sample;
 		const double Length = Source->Source.PlayLength;
-		if (!SampleInterval(Source->Source, static_cast<double>(StartCyclePosition) * Length,
+		if (!SampleValidatedInterval(Source->Source, static_cast<double>(StartCyclePosition) * Length,
 			static_cast<double>(Candidate.EndCyclePosition) * Length, Length / Period, Sample, OutError)) return false;
 		Velocity += Sample.Velocity * Weight;
 		YawDelta += static_cast<double>(Sample.YawDeltaDegrees) * Weight;

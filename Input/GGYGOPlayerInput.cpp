@@ -1,4 +1,11 @@
+/**
+ * @file GGYGOPlayerInput.cpp
+ * @brief 从真实 Native 输入观察生成原始会话事实，并按签发顺序同步交付。
+ */
 #include "Input/GGYGOPlayerInput.h"
+
+#include "Input/GGYGOMovementInputOriginResource.h"
+#include "Player/GGYGOLocalPlayer.h"
 
 #include "Components/InputComponent.h"
 #include "EnhancedActionKeyMapping.h"
@@ -7,10 +14,8 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "InputAction.h"
-#include "Input/GGYGOMovementInputOriginResource.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"
-#include "Player/GGYGOLocalPlayer.h"
 #include "UObject/Class.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMovementInput, Log, All);
@@ -737,7 +742,7 @@ bool UGGYGOPlayerInput::AttachMovementInputReceiver(const FGGYGOMovementInputSes
 	return true;
 }
 
-bool UGGYGOPlayerInput::IssuePhysicalRequest(EGGYGOMovementInputStartProof Proof,
+bool UGGYGOPlayerInput::CommitPhysicalRequest(EGGYGOMovementInputStartProof Proof,
 	const FGGYGOMovementInputSessionIdentity& ExpectedSession)
 {
 	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
@@ -749,9 +754,9 @@ bool UGGYGOPlayerInput::IssuePhysicalRequest(EGGYGOMovementInputStartProof Proof
 	}
 	if ((Proof != EGGYGOMovementInputStartProof::ColdPhysicalPress
 		&& Proof != EGGYGOMovementInputStartProof::ReleasedThenPhysicalPress)
-		|| !FactReceiver.IsBound() || !ReceiverBinding.Consumer.IsValid() || !ValidateCurrentRoute(Error))
+		|| !FactReceiver.IsBound() || !ReceiverBinding.Consumer.IsValid())
 	{
-		ReportOnce(TEXT("PhysicalRequestPreparationRejected"), Error.IsEmpty() ? TEXT("Physical proof/receiver is invalid.") : Error);
+		ReportOnce(TEXT("PhysicalRequestPreparationRejected"), TEXT("Physical proof/receiver is invalid."));
 		EndMovementInputSession(ExpectedSession, TEXT("PhysicalRequestPreparationRejected"));
 		return false;
 	}
@@ -794,23 +799,13 @@ bool UGGYGOPlayerInput::IssuePhysicalRequest(EGGYGOMovementInputStartProof Proof
 			return false;
 		}
 	}
-	UGGYGOPlayerInput* Producer = OriginalProducer.Get();
-	if (!Producer || !Producer->IsCurrentSession(ExpectedSession))
-	{
-		return false;
-	}
-	if (Producer->ReceiverBinding != Prepared.Binding || Producer->ActiveRequestSerial != Prepared.Fact.Request.RequestSerial
-		|| !OriginalResource.HasSameIndexAndSerialNumber(Producer->ProducerOriginResource)
-		|| !Producer->ValidateCurrentRoute(Error))
-	{
-		Producer->EndMovementInputSession(ExpectedSession, TEXT("PhysicalRequestCommitChanged"));
-		return false;
-	}
-	Producer->bRequestSourceUnresolved = false;
+	// The caller's route qualification covers this uninterrupted commit. Successful
+	// resource consumption only changes its one-shot stage; it cannot reenter this source.
+	bRequestSourceUnresolved = false;
 	// Queue only the prepared original fact after successful consumption, before any callout.
-	Producer->PendingFacts.Add(MoveTemp(Prepared));
-	Producer->DeliverPendingFacts();
-	Producer = OriginalProducer.Get();
+	PendingFacts.Add(MoveTemp(Prepared));
+	DeliverPendingFacts();
+	UGGYGOPlayerInput* Producer = OriginalProducer.Get();
 	return Producer && !Producer->bEndingInput && Producer->IsCurrentSession(ExpectedSession);
 }
 
@@ -1281,7 +1276,7 @@ void UGGYGOPlayerInput::UpdateRequestFromSource(const FPhysicalObservation& Obse
 	const bool bReleasedThenPhysicalPress = bNeutralConfirmed && Before == ESourceProof::Neutral && Observation.bRealHeldEdge;
 	if (ActiveRequestSerial == 0 && (bColdPhysicalPress || bReleasedThenPhysicalPress))
 	{
-		IssuePhysicalRequest(bColdPhysicalPress ? EGGYGOMovementInputStartProof::ColdPhysicalPress
+		CommitPhysicalRequest(bColdPhysicalPress ? EGGYGOMovementInputStartProof::ColdPhysicalPress
 			: EGGYGOMovementInputStartProof::ReleasedThenPhysicalPress, ExpectedSession);
 	}
 	else if (ActiveRequestSerial == 0)

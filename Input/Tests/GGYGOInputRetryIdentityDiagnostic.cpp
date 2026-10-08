@@ -140,9 +140,13 @@ namespace
 		UGGYGOAbilityAdmissionQueuedTestAbility* Original = Scenario.GetProbe(OriginalHandle);
 		if (!Test.TestNotNull(TEXT("Occupant primary instance"), Occupant)
 			|| !Test.TestNotNull(TEXT("Original primary instance"), Original)
-			|| !Test.TestTrue(TEXT("Specs have distinct real instances"), Occupant != Original)
-			|| !Test.TestTrue(TEXT("Occupant activates through GAS"),
-				Scenario.ASC->TryActivateAbility(OccupantHandle))) { return false; }
+			|| !Test.TestTrue(TEXT("Specs have distinct real instances"), Occupant != Original)) { return false; }
+		const FGGYGOAbilityActivationRequestResult OccupantActivation =
+			Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle);
+		if (!Test.TestTrue(TEXT("Occupant activates through GAS"), OccupantActivation.bNativeAccepted)
+			|| !Test.TestTrue(TEXT("Occupant is locally active"), Occupant->IsActive())
+			|| !Test.TestEqual(TEXT("Exactly one real occupant after initial activation"),
+				Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 		EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
 		if (!Test.TestTrue(TEXT("Original is blocked by real group occupancy"),
 			Scenario.ASC->IsActivationBlockedByGroup(Original, BlockReason))
@@ -218,16 +222,20 @@ namespace
 		Scenario.Fixture.GetController()->ConsumeInputForTest();
 		if (!Test.TestEqual(TEXT("Initial actual Queued failure"), Observation.InitialQueuedFailures, 1)
 			|| !Test.TestEqual(TEXT("Initial physical failure notice"), Observation.InitialRetryNotices, 1)
-			|| !Test.TestTrue(TEXT("Initial failure has no injected retry deadline"), Observation.InitialNoticeDeadline
-				== UGGYGOAbilitySystemComponent::NoAbilityInputRetryDeadline)
+			|| !Test.TestTrue(TEXT("Initial failure retains its first finite observation deadline"),
+				FMath::IsFinite(Observation.InitialNoticeDeadline) && Observation.InitialNoticeDeadline > OldPressTime)
+			|| !Test.TestEqual(TEXT("Initial deadline is exactly the first observation window"), Observation.InitialNoticeDeadline,
+				OldPressTime + static_cast<double>(Scenario.Hero->InputBufferWindow))
 			|| !Test.TestEqual(TEXT("Queued rejection does not activate Original"),
 				Original->GetBusinessActivationCountForTest(), 0)) { return false; }
 
-		// Only the real empty-group notification transfers Hero's initial buffer.
+		// Only the real empty-group notification wakes ASC's original waiting request.
 		Occupant->FinishForTest();
-		if (!Test.TestEqual(TEXT("Initial real GroupFreed"), Observation.GroupFreedCount, 1)
-			|| !Test.TestTrue(TEXT("Occupant reactivates before queued retry consumption"),
-				Scenario.ASC->TryActivateAbility(OccupantHandle))
+		if (!Test.TestEqual(TEXT("Initial real GroupFreed"), Observation.GroupFreedCount, 1)) { return false; }
+		const FGGYGOAbilityActivationRequestResult OccupantReactivation =
+			Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle);
+		if (!Test.TestTrue(TEXT("Occupant reactivates before queued retry consumption"), OccupantReactivation.bNativeAccepted)
+			|| !Test.TestTrue(TEXT("Reactivated occupant is locally active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Exactly one real occupant before old retry"),
 				Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 		Observation.Stage = EIdentityStage::OldRetry;
@@ -243,6 +251,7 @@ namespace
 			|| !Test.TestEqual(TEXT("Old failure publishes one explicit retry deadline"), Observation.OldRetryNotices, 1)
 			|| !Test.TestTrue(TEXT("Original deadline is finite and not expired"),
 				FMath::IsFinite(Observation.OldDeadline) && Observation.OldDeadline > OldPressTime)
+			|| !Test.TestEqual(TEXT("Old retry keeps the exact first deadline"), Observation.OldDeadline, Observation.InitialNoticeDeadline)
 			|| !Test.TestEqual(TEXT("New press has not been consumed in the old retry snapshot"),
 				Original->GetBusinessActivationCountForTest(), 0)
 			|| !Test.TestEqual(TEXT("No unrelated retry notices"), Observation.UnexpectedNotices, 0)) { return false; }

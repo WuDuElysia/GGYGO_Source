@@ -1,5 +1,6 @@
 #include "AI/Boss/Tests/GGYGOBossMeleeLifecycleTestAbility.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
@@ -25,8 +26,155 @@ void UGGYGOBossMeleeLifecycleTestAbility::FinishForTest(const FGGYGOAbilityActiv
 	RequestAbilityEnd(Original, false, false);
 }
 
+bool UGGYGOBossMeleeLifecycleTestAbility::BeginMotionForTest(
+	const FGGYGOAbilityActivationHandle& Original, const UGGYGOActionMotionProfile* Profile)
+{
+	const ACharacter* Character = Cast<ACharacter>(GetAvatarActorFromActorInfo());
+	return BeginOriginalMeleeMotion(Original,
+		Character ? Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()) : nullptr, Profile, 1.0f);
+}
+
 #if WITH_DEV_AUTOMATION_TESTS
+#include "Character/GGYGOCharacterBase.h"
+#include "Character/Components/GGYGOActionCurveRootMotionSource.h"
+#include "Character/Data/GGYGOActionMotionProfile.h"
+#include "Curves/CurveVector.h"
 #include "Misc/AutomationTest.h"
+
+namespace
+{
+	bool VerifyOriginalMotionFailure(FAutomationTestBase& Test)
+	{
+		UWorld::InitializationValues Init;
+		Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(true)
+			.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
+		UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
+		if (!Test.TestNotNull(TEXT("位移失败真实测试 World"), World)) { return false; }
+		struct FCleanup { UWorld* World; ~FCleanup() { World->DestroyWorld(false); } } Cleanup{World};
+		AGGYGOCharacterBase* Owner = World->SpawnActor<AGGYGOCharacterBase>();
+		UGGYGOCharacterMovementComponent* Movement = Owner
+			? Cast<UGGYGOCharacterMovementComponent>(Owner->GetCharacterMovement()) : nullptr;
+		if (!Test.TestNotNull(TEXT("位移失败原 Character"), Owner)
+			|| !Test.TestNotNull(TEXT("位移失败原角色实际 CMC"), Movement)) { return false; }
+		Movement->SetComponentTickEnabled(false);
+		Movement->SetMovementMode(MOVE_Walking);
+		USkeletalMeshComponent* Mesh = Owner->GetMesh();
+		const EVisibilityBasedAnimTickOption OriginalTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+		Mesh->VisibilityBasedAnimTickOption = OriginalTick;
+		Mesh->bEnableUpdateRateOptimizations = true;
+		UGGYGOAbilitySystemComponent* ASC = NewObject<UGGYGOAbilitySystemComponent>(Owner);
+		ASC->RegisterComponent();
+		ASC->InitAbilityActorInfo(Owner, Owner);
+		const FGameplayAbilitySpecHandle SpecHandle = ASC->GiveAbility(
+			FGameplayAbilitySpec(UGGYGOBossMeleeLifecycleTestAbility::StaticClass(), 1));
+		const FGGYGOAbilityActivationRequestResult First = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		if (!Test.TestTrue(TEXT("位移失败原受控激活"), First.bNativeAccepted
+			&& First.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted && First.OriginalActivation.HasActivation())) { return false; }
+		const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(SpecHandle);
+		UGGYGOBossMeleeLifecycleTestAbility* Ability = Spec
+			? Cast<UGGYGOBossMeleeLifecycleTestAbility>(Spec->GetPrimaryInstance()) : nullptr;
+		if (!Test.TestNotNull(TEXT("位移失败原 Ability 实例"), Ability)) { return false; }
+		UGGYGOActionMotionProfile* Profile = NewObject<UGGYGOActionMotionProfile>(Owner);
+		Profile->Duration = 1.0f;
+		Profile->TranslationCurve = NewObject<UCurveVector>(Profile);
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			FRichCurve& Curve = Profile->TranslationCurve->FloatCurves[Axis];
+			Curve.SetKeyInterpMode(Curve.AddKey(0.0f, 0.0f), RCIM_Linear);
+			Curve.SetKeyInterpMode(Curve.AddKey(1.0f, Axis == 0 ? 100.0f : 0.0f), RCIM_Linear);
+		}
+		if (!Test.TestTrue(TEXT("生产入口开始并观察原 Profile motion"),
+			Ability->BeginMotionForTest(First.OriginalActivation, Profile))) { return false; }
+		const TSharedPtr<FRootMotionSource> Source = Movement->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
+		if (!Test.TestTrue(TEXT("原 motion 是实际已安装的 Profile RMS"), Source.IsValid()
+			&& Source->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct())) { return false; }
+		const auto OriginalSource = StaticCastSharedPtr<FRootMotionSource_GGYGOActionCurve>(Source);
+		if (!Test.TestTrue(TEXT("RMS 固定原 CMC/资源/句柄"), OriginalSource->OriginalResource.IsValid()
+			&& OriginalSource->OriginalResource->Owner.Get() == Movement
+			&& OriginalSource->OriginalResource->Handle != INDEX_NONE)) { return false; }
+		// Keep the native pre-failure snapshot and its original resource identity for late preparation.
+		const TSharedPtr<FRootMotionSource> LateOriginalSource(OriginalSource->Clone());
+		if (!Test.TestTrue(TEXT("原生 RMS 副本保留原资源身份"), LateOriginalSource.IsValid()
+			&& LateOriginalSource->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()
+			&& static_cast<const FRootMotionSource_GGYGOActionCurve*>(LateOriginalSource.Get())->OriginalResource
+				== OriginalSource->OriginalResource)) { return false; }
+		TArray<bool> NativeCancelled;
+		TArray<FGGYGOAbilityTerminationCompletedNotice> Completions;
+		bool bRetiredAndRestoredAtNativeEnd = false;
+		const FDelegateHandle NativeEnd = ASC->OnAbilityEnded.AddLambda([&](const FAbilityEndedData& Data)
+		{
+			NativeCancelled.Add(Data.bWasCancelled);
+			if (NativeCancelled.Num() == 1)
+			{
+				bRetiredAndRestoredAtNativeEnd = !Movement->HasActiveActionMotion() && !Ability->HasActiveMeshForTest()
+					&& Mesh->VisibilityBasedAnimTickOption == OriginalTick && Mesh->bEnableUpdateRateOptimizations;
+			}
+		});
+		const FDelegateHandle Completed = ASC->OnAbilityTerminationCompleted().AddLambda(
+			[&](const FGGYGOAbilityTerminationCompletedNotice& Notice) { Completions.Add(Notice); });
+		// Invalidate the accepted original configuration, then run native RMS preparation.
+		// The test never calls an Ability failure/End hook to supply this evidence.
+		Profile->Duration = 0.0f;
+		const FString FailureReason = TEXT("original Profile configuration, owner or playback mapping was retired or changed");
+		Test.AddExpectedMessage(FString::Printf(
+			TEXT("[Movement.ActionMotion] Owner='%s' Profile='%s' Curve='%s' Reason='%s'"),
+			*Owner->GetPathName(), *Profile->GetPathName(), *Profile->TranslationCurve->GetPathName(), *FailureReason),
+			ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+		Test.AddExpectedMessage(FString::Printf(
+			TEXT("BossMelee [%s] 原动作在 [Motion] 失败：Avatar [%s] ASC [%s] Montage [None] Trace [None]；%s"),
+			*Ability->GetPathName(), *GetNameSafe(Owner), *GetNameSafe(ASC), *FailureReason),
+			ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+		Movement->CurrentRootMotion.PrepareRootMotion(0.01f, *Owner, *Movement, true);
+		bool bPassed = Test.TestTrue(TEXT("非法原 Profile 同步取消原 GA 且恢复实际资源"),
+			!Ability->IsActive() && bRetiredAndRestoredAtNativeEnd);
+		bPassed &= Test.TestTrue(TEXT("原 RMS 显式退役且不留下零 Override"),
+			OriginalSource->bExplicitlyCancelled
+			&& OriginalSource->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval)
+			&& OriginalSource->AccumulateMode == ERootMotionAccumulateMode::Additive
+			&& !Movement->CurrentRootMotion.HasOverrideVelocity());
+		bPassed &= Test.TestTrue(TEXT("原 native End 恰一次并保留取消事实"), NativeCancelled.Num() == 1 && NativeCancelled[0]);
+		bPassed &= Test.TestTrue(TEXT("原取消 Completed 恰一次且属于保存的 Original"), Completions.Num() == 1
+			&& Completions[0].GetOriginal().WasCancelled()
+			&& Completions[0].GetOriginal().GetOriginalActivation().HasSameActivation(First.OriginalActivation));
+		if (bPassed)
+		{
+			Profile->Duration = 1.0f;
+			const FGGYGOAbilityActivationRequestResult Next = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+			const bool bNextStarted = Test.TestTrue(TEXT("完整原结束返回后受控后继及 motion 启动"), Next.bNativeAccepted
+				&& Next.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+				&& Next.OriginalActivation.HasActivation()
+				&& !Next.OriginalActivation.HasSameActivation(First.OriginalActivation)
+				&& Ability->BeginMotionForTest(Next.OriginalActivation, Profile));
+			bPassed &= bNextStarted;
+			if (bNextStarted)
+			{
+				Test.AddExpectedMessage(FString::Printf(
+					TEXT("[Movement.ActionMotion] Owner='%s' Profile='%s' Curve='%s' Reason='Profile source no longer belongs to the original active action slot'"),
+					*Owner->GetPathName(), *Profile->GetPathName(), *Profile->TranslationCurve->GetPathName()),
+					ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+				// The native source dispatches its own late failure; CMC rejects its original retired slot.
+				LateOriginalSource->PrepareRootMotion(0.01f, 0.01f, *Owner, *Movement);
+				Movement->EndActionMotion(OriginalSource->OriginalResource->Handle);
+				bPassed &= Test.TestTrue(TEXT("原失败重报/旧句柄清理不得终止后继或清后继资源"),
+					Ability->IsActive() && Ability->HasActiveMeshForTest() && Movement->HasActiveActionMotion()
+					&& Ability->GetInitializedOriginalForTest().HasSameActivation(Next.OriginalActivation)
+					&& NativeCancelled.Num() == 1 && Completions.Num() == 1);
+				Ability->FinishForTest(Next.OriginalActivation);
+				bPassed &= Test.TestTrue(TEXT("后继正常结束恰一次并清自身 motion/Mesh"),
+					NativeCancelled.Num() == 2 && !NativeCancelled[1] && Completions.Num() == 2
+					&& !Completions[1].GetOriginal().WasCancelled()
+					&& Completions[1].GetOriginal().GetOriginalActivation().HasSameActivation(Next.OriginalActivation)
+					&& !Ability->IsActive() && !Ability->HasActiveMeshForTest() && !Movement->HasActiveActionMotion()
+					&& Mesh->VisibilityBasedAnimTickOption == OriginalTick && Mesh->bEnableUpdateRateOptimizations);
+			}
+		}
+		ASC->OnAbilityEnded.Remove(NativeEnd);
+		ASC->OnAbilityTerminationCompleted().Remove(Completed);
+		Test.AddInfo(FString::Printf(TEXT("BossMelee MotionFailure behavior assertions: %s; intentional Error expectations use exact messages/counts."),
+			bPassed ? TEXT("PASS") : TEXT("FAIL")));
+		return bPassed;
+	}
+}
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOBossMeleeEndReentryTest, "GGYGO.BossAI.Melee.EndReentry",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -199,6 +347,11 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 	}
 	ASC->OnAbilityTerminationCompleted().Remove(CompletionHandle);
 	World->DestroyWorld(false);
+	if (bPassed)
+	{
+		AddInfo(TEXT("BossMelee original NormalLifecycle behavior assertions: PASS."));
+		bPassed = VerifyOriginalMotionFailure(*this);
+	}
 	return bPassed;
 }
 #endif
