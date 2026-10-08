@@ -130,6 +130,50 @@ UGGYGOCameraComponent::UGGYGOCameraComponent(const FObjectInitializer& ObjectIni
 	bUsePawnControlRotation = false;
 }
 
+FGGYGOCameraModeObservation UGGYGOCameraComponent::QueryCameraMode(
+	TSubclassOf<UGGYGOCameraMode> ModeClass) const
+{
+	FGGYGOCameraModeObservation Observation;
+	if (!IsInGameThread())
+	{
+		Observation.Diagnostic = TEXT("[Camera.ModeObservation] query requires the game thread.");
+		return Observation;
+	}
+	UClass* OriginalClass = ModeClass.Get();
+	const auto Unavailable = [&Observation, this, OriginalClass](const TCHAR* Reason)
+	{
+		Observation.Diagnostic = FString::Printf(TEXT("[Camera.ModeObservation] Component='%s' Class='%s': %s"),
+			*GetPathName(), *GetPathNameSafe(OriginalClass), Reason);
+		return Observation;
+	};
+	AActor* OriginalOwner = GetOwner();
+	UWorld* OriginalWorld = GetWorld();
+	if (!IsValid(this) || IsBeingDestroyed() || !IsRegistered()
+		|| !IsValid(OriginalOwner) || OriginalOwner->IsActorBeingDestroyed()
+		|| !IsValid(OriginalWorld) || OriginalOwner->GetWorld() != OriginalWorld)
+	{
+		return Unavailable(TEXT("original registered Component/Owner/World is unavailable."));
+	}
+	if (!IsValid(OriginalClass) || !OriginalClass->IsChildOf(UGGYGOCameraMode::StaticClass())
+		|| OriginalClass->HasAnyClassFlags(CLASS_Abstract | CLASS_NewerVersionExists))
+	{
+		return Unavailable(TEXT("requires an explicit valid concrete camera mode class."));
+	}
+	UGGYGOCameraModeStack* OriginalStack = CameraModeStack.Get();
+	if (!IsValid(OriginalStack) || OriginalStack->GetOuter() != this)
+	{
+		return Unavailable(TEXT("current original camera mode stack is unavailable or reparented."));
+	}
+	Observation = OriginalStack->QueryCameraMode(OriginalClass);
+	if (Observation.Status != EGGYGOCameraModeObservationStatus::Unavailable)
+	{
+		Observation.OriginalOwner = OriginalOwner;
+		Observation.OriginalComponent = const_cast<UGGYGOCameraComponent*>(this);
+		Observation.OriginalStack = OriginalStack;
+	}
+	return Observation;
+}
+
 void UGGYGOCameraComponent::OnRegister()
 {
 	InvalidatePreparedCameraViews();

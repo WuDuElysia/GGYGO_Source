@@ -393,6 +393,63 @@ UGGYGOCameraModeStack::UGGYGOCameraModeStack()
 {
 }
 
+FGGYGOCameraModeObservation UGGYGOCameraModeStack::QueryCameraMode(UClass* ModeClass) const
+{
+	FGGYGOCameraModeObservation Observation;
+	const auto Unavailable = [&Observation, this, ModeClass](const TCHAR* Reason)
+	{
+		Observation.Diagnostic = FString::Printf(TEXT("[Camera.ModeObservation] Stack='%s' Class='%s': %s"),
+			*GetPathName(), *ModeClass->GetPathName(), Reason);
+		return Observation;
+	};
+
+	UGGYGOCameraMode* OriginalMode = nullptr;
+	for (const TObjectPtr<UGGYGOCameraMode>& Instance : CameraModeInstances)
+	{
+		if (!IsValid(Instance))
+		{
+			return Unavailable(TEXT("instance pool contains an invalid mode."));
+		}
+		if (Instance->GetClass() == ModeClass)
+		{
+			if (OriginalMode || Instance->GetOuter() != this)
+			{
+				return Unavailable(TEXT("exact-class pool identity is duplicated or reparented."));
+			}
+			OriginalMode = Instance.Get();
+		}
+	}
+
+	bool bActive = false;
+	for (const TObjectPtr<UGGYGOCameraMode>& ActiveMode : CameraModeStack)
+	{
+		if (!IsValid(ActiveMode))
+		{
+			return Unavailable(TEXT("active stack contains an invalid mode."));
+		}
+		if (ActiveMode->GetClass() == ModeClass)
+		{
+			if (ActiveMode != OriginalMode || bActive)
+			{
+				return Unavailable(TEXT("exact-class active mode does not uniquely match its original pooled identity."));
+			}
+			bActive = true;
+		}
+	}
+	if (!OriginalMode)
+	{
+		Observation.Status = EGGYGOCameraModeObservationStatus::NotInstantiated;
+		Observation.Diagnostic = FString::Printf(TEXT("[Camera.ModeObservation] Stack='%s' Class='%s': no existing instance."),
+			*GetPathName(), *ModeClass->GetPathName());
+		return Observation;
+	}
+	Observation.Status = EGGYGOCameraModeObservationStatus::Available;
+	Observation.Mode = OriginalMode;
+	Observation.bInPool = true;
+	Observation.bActive = bActive;
+	return Observation;
+}
+
 void UGGYGOCameraModeStack::ClearStack()
 {
 	for (const TObjectPtr<UGGYGOCameraMode>& Mode : CameraModeStack)

@@ -29,6 +29,47 @@ class AActor;
 class UCanvas;
 class UGGYGOCameraComponent;
 class UGGYGOCameraMode;
+class UGGYGOCameraModeStack;
+
+/** Query outcomes, not camera publication or mode activation state. */
+UENUM(BlueprintType)
+enum class EGGYGOCameraModeObservationStatus : uint8
+{
+	Unavailable,
+	NotInstantiated,
+	Available
+};
+
+/** One GT read of existing objects. References are provenance, not future admission or a POV cache. */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOCameraModeObservation
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	EGGYGOCameraModeObservationStatus Status = EGGYGOCameraModeObservationStatus::Unavailable;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	TObjectPtr<AActor> OriginalOwner = nullptr;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	TObjectPtr<UGGYGOCameraComponent> OriginalComponent = nullptr;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	TObjectPtr<UGGYGOCameraModeStack> OriginalStack = nullptr;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	TObjectPtr<UGGYGOCameraMode> Mode = nullptr;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	bool bInPool = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	bool bActive = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Camera")
+	FString Diagnostic;
+};
 
 /** Native evaluation outcome; consumers must handle Failure before publishing a view. */
 enum class EGGYGOCameraEvaluationStatus : uint8
@@ -320,6 +361,11 @@ public:
 	bool IsStackActivated() const { return CameraModeStack.Num() > 0; }
 
 protected:
+	friend class UGGYGOCameraComponent;
+
+	/** Component admits the GT/context/class; this only reads exact-class pool/active membership. */
+	FGGYGOCameraModeObservation QueryCameraMode(UClass* ModeClass) const;
+
 	/** 取复用实例或创建候选；新候选仅在 Push 完成准入后登记进实例池。 */
 	UGGYGOCameraMode* GetCameraModeInstance(TSubclassOf<UGGYGOCameraMode> CameraModeClass);
 

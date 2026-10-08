@@ -26,10 +26,9 @@ namespace
 	bool ValidateWalkRunLeanTuning(const FZZZWalkRunLeanTuning& Config, FString& OutError)
 	{
 		OutError.Reset();
-		if (!FMath::IsFinite(Config.FullLeanYawRateDegreesPerSecond)
-			|| Config.FullLeanYawRateDegreesPerSecond <= 0.0f)
+		if (!FMath::IsFinite(Config.FullLeanDirectionErrorDegrees) || Config.FullLeanDirectionErrorDegrees < 180.0f)
 		{
-			OutError = TEXT("FullLeanYawRateDegreesPerSecond must be finite and positive");
+			OutError = TEXT("FullLeanDirectionErrorDegrees must be finite and >= 180; author the angle explicitly, legacy yaw rate is not an angle");
 			return false;
 		}
 		if (!FMath::IsFinite(Config.WalkMaxAngleDegrees) || !FMath::IsFinite(Config.RunMaxAngleDegrees)
@@ -39,14 +38,14 @@ namespace
 			OutError = TEXT("Walk/Run maximum angles must be finite with 0 <= Walk <= Run <= 90 degrees");
 			return false;
 		}
-		if (!FMath::IsFinite(Config.EnterResponseSpeed) || Config.EnterResponseSpeed <= 0.0f
-			|| !FMath::IsFinite(Config.RecoveryResponseSpeed) || Config.RecoveryResponseSpeed <= 0.0f)
+		if (!FMath::IsFinite(Config.RecoveryResponseSpeed) || Config.RecoveryResponseSpeed <= 0.0f)
 		{
-			OutError = TEXT("EnterResponseSpeed and RecoveryResponseSpeed must be finite and positive");
+			OutError = TEXT("RecoveryResponseSpeed must be finite and positive for normal exit recovery");
 			return false;
 		}
 		return true;
 	}
+
 }
 
 // ============================================================================
@@ -103,6 +102,31 @@ void UZZZAnimInstance::FailWalkRunLeanPresentation(FName FailureCode, const FStr
 	}
 }
 
+void UZZZAnimInstance::RecoverWalkRunLeanPresentation(float DeltaSeconds, const FZZZWalkRunLeanTuning& Config)
+{
+	if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds < 0.0f)
+	{
+		FailWalkRunLeanPresentation(TEXT("AnimationDelta"), TEXT("normal recovery requires a finite nonnegative native animation delta"));
+		return;
+	}
+	if (!FMath::IsFinite(WalkRunLeanAngleDegrees))
+	{
+		FailWalkRunLeanPresentation(TEXT("PresentationState"), TEXT("the previous normal-recovery pose contains a non-finite angle"));
+		return;
+	}
+
+	WalkRunLeanAngleDegrees = FMath::Clamp(static_cast<float>(WalkRunLeanAngleDegrees
+		* FMath::Exp(-static_cast<double>(Config.RecoveryResponseSpeed) * DeltaSeconds)),
+		-Config.RunMaxAngleDegrees, Config.RunMaxAngleDegrees);
+	if (FMath::IsNearlyZero(WalkRunLeanAngleDegrees))
+	{
+		WalkRunLeanAngleDegrees = 0.0f;
+		bWalkRunLeanPresentationValid = false;
+	}
+	WalkRunLeanFailureReason.Reset();
+	LastWalkRunLeanFailureCode = NAME_None;
+}
+
 void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 {
 	check(IsInGameThread());
@@ -121,12 +145,6 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 		FailWalkRunLeanPresentation(TEXT("Configuration"), ConfigError);
 		return;
 	}
-	if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds < 0.0f)
-	{
-		FailWalkRunLeanPresentation(TEXT("AnimationDelta"), TEXT("native animation delta must be finite and nonnegative"));
-		return;
-	}
-
 	const FGGYGOLocomotionSteeringSnapshot& Steering = Frame.LocomotionSteering;
 	if (Steering.Status == EGGYGOLocomotionSteeringStatus::Invalid)
 	{
@@ -151,7 +169,6 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 		WalkRunLeanSourceEpoch = Steering.SourceEpoch;
 	}
 
-	bool bObservedTrajectory = false;
 	switch (Steering.Status)
 	{
 	case EGGYGOLocomotionSteeringStatus::Initial:
@@ -161,8 +178,9 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 		LastWalkRunLeanFailureCode = NAME_None;
 		return;
 	case EGGYGOLocomotionSteeringStatus::NotApplicable:
-		// Movement owns qualification. No phase, tag, input or direction is reinterpreted here.
-		break;
+		// Movement owns exclusion of Action/TurnBack/no input. This is exit recovery, not a valid zero deviation.
+		RecoverWalkRunLeanPresentation(DeltaSeconds, Config);
+		return;
 	case EGGYGOLocomotionSteeringStatus::Valid:
 		if (Steering.CompletedIntervalSerial == 0 || !FMath::IsFinite(Steering.NativeDeltaSeconds)
 			|| Steering.NativeDeltaSeconds <= 0.0f)
@@ -170,49 +188,26 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 			FailWalkRunLeanPresentation(TEXT("CompletedInterval"), TEXT("Valid steering requires a completed serial and finite positive native delta"));
 			return;
 		}
-		bObservedTrajectory = Steering.bHasVelocityYawRate;
 		break;
 	default:
 		FailWalkRunLeanPresentation(TEXT("SteeringStatus"), TEXT("captured steering status is outside the shared contract"));
 		return;
 	}
 
-	float TargetAngle = 0.0f;
-	float MaxAngle = Config.RunMaxAngleDegrees;
-	if (bObservedTrajectory)
+	if (!FMath::IsFinite(Steering.DesiredDirectionError) || Steering.DesiredDirectionError < -180.0f
+		|| Steering.DesiredDirectionError > 180.0f || !FMath::IsFinite(Frame.WalkRunBlendAlpha)
+		|| Frame.WalkRunBlendAlpha < 0.0f || Frame.WalkRunBlendAlpha > 1.0f)
 	{
-		if (!FMath::IsFinite(Steering.ActualSignedVelocityYawRate)
-			|| !FMath::IsFinite(Frame.WalkRunBlendAlpha)
-			|| Frame.WalkRunBlendAlpha < 0.0f || Frame.WalkRunBlendAlpha > 1.0f)
-		{
-			FailWalkRunLeanPresentation(TEXT("TrajectoryValues"), TEXT("observed velocity yaw rate must be finite and WalkRun alpha must be in [0,1]"));
-			return;
-		}
-		MaxAngle = FMath::Lerp(Config.WalkMaxAngleDegrees, Config.RunMaxAngleDegrees, Frame.WalkRunBlendAlpha);
-		const double NormalizedRate = FMath::Clamp(
-			static_cast<double>(Steering.ActualSignedVelocityYawRate) / Config.FullLeanYawRateDegreesPerSecond, -1.0, 1.0);
-		TargetAngle = static_cast<float>(NormalizedRate * MaxAngle);
-	}
-	if (!FMath::IsFinite(WalkRunLeanAngleDegrees))
-	{
-		FailWalkRunLeanPresentation(TEXT("PresentationState"), TEXT("the original presentation filter contains a non-finite angle"));
+		FailWalkRunLeanPresentation(TEXT("DirectionValues"),
+			TEXT("DesiredDirectionError must be finite in [-180,180] degrees and WalkRun alpha must be in [0,1]"));
 		return;
 	}
 
-	const float Response = !bObservedTrajectory || FMath::Abs(TargetAngle) < FMath::Abs(WalkRunLeanAngleDegrees)
-		? Config.RecoveryResponseSpeed : Config.EnterResponseSpeed;
-	const double Blend = 1.0 - FMath::Exp(-static_cast<double>(Response) * DeltaSeconds);
-	WalkRunLeanAngleDegrees = FMath::Clamp(static_cast<float>(FMath::Lerp(
-		static_cast<double>(WalkRunLeanAngleDegrees), static_cast<double>(TargetAngle), Blend)), -MaxAngle, MaxAngle);
-	if (!bObservedTrajectory && FMath::IsNearlyZero(WalkRunLeanAngleDegrees))
-	{
-		WalkRunLeanAngleDegrees = 0.0f;
-		bWalkRunLeanPresentationValid = false;
-	}
-	else
-	{
-		bWalkRunLeanPresentationValid = bObservedTrajectory || bWalkRunLeanPresentationValid;
-	}
+	// The full native signed-angle domain is linear. No yaw-rate gate, saturation or temporal entry filter.
+	const float MaxAngle = FMath::Lerp(Config.WalkMaxAngleDegrees, Config.RunMaxAngleDegrees, Frame.WalkRunBlendAlpha);
+	WalkRunLeanAngleDegrees = static_cast<float>(static_cast<double>(Steering.DesiredDirectionError)
+		/ Config.FullLeanDirectionErrorDegrees * MaxAngle);
+	bWalkRunLeanPresentationValid = true;
 	WalkRunLeanFailureReason.Reset();
 	LastWalkRunLeanFailureCode = NAME_None;
 }

@@ -18,6 +18,7 @@
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
+#include "UObject/UObjectHash.h"
 
 #include <limits>
 
@@ -368,6 +369,121 @@ namespace
 			GameInstance.Reset();
 		}
 	};
+}
+
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCameraModeObservationTest,
+	"GGYGO.Camera.ModeObservation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOCameraModeObservationTest::RunTest(const FString& Parameters)
+{
+	FGGYGOCameraLifecycleTestWorld TestWorld(GEngine);
+	AGGYGOCameraLifecycleTestPawn* Pawn = SpawnCameraTestPawn(TestWorld.World);
+	if (!TestNotNull(TEXT("observation fixture Pawn"), Pawn)) { return false; }
+	UGGYGOCameraLifecycleTestComponent* Camera = Pawn->GetCameraForTest();
+	if (!TestNotNull(TEXT("observation fixture Camera"), Camera)) { return false; }
+	TestNotNull(TEXT("query has a reflected component entry"),
+		Camera->FindFunction(GET_FUNCTION_NAME_CHECKED(UGGYGOCameraComponent, QueryCameraMode)));
+
+	const FGGYGOCameraModeObservation Pending =
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeA::StaticClass());
+	TestTrue(TEXT("absent exact class is explicitly NotInstantiated"),
+		Pending.Status == EGGYGOCameraModeObservationStatus::NotInstantiated);
+	TestTrue(TEXT("pending query preserves original Component/Owner/Stack provenance"),
+		Pending.OriginalOwner == Pawn && Pending.OriginalComponent == Camera
+		&& IsValid(Pending.OriginalStack) && Pending.OriginalStack->GetOuter() == Camera);
+	TestTrue(TEXT("pending query has no mode or membership"),
+		!Pending.Mode && !Pending.bInPool && !Pending.bActive && !Pending.Diagnostic.IsEmpty());
+	if (!IsValid(Pending.OriginalStack)) { return false; }
+	UGGYGOCameraModeStack* OriginalStack = Pending.OriginalStack.Get();
+
+	// Count direct children only to detect creation; all mode identities come from the query.
+	const auto CountStackChildren = [OriginalStack]()
+	{
+		TArray<UObject*> Children;
+		GetObjectsWithOuter(OriginalStack, Children, EGetObjectsFlags::None);
+		return Children.Num();
+	};
+	const int32 EmptyChildCount = CountStackChildren();
+	TestTrue(TEXT("repeated absent query stays NotInstantiated"),
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeA::StaticClass()).Status
+		== EGGYGOCameraModeObservationStatus::NotInstantiated);
+	TestEqual(TEXT("absent query creates no stack child"), CountStackChildren(), EmptyChildCount);
+
+	const FGGYGOCameraPenetrationRequest NoPenetration;
+	ConfigureTestMode(UGGYGOCameraLifecycleTestModeA::StaticClass(), FVector(20.0f, 0.0f, 0.0f),
+		FRotator::ZeroRotator, 80.0f, NoPenetration, 1.0f);
+	ConfigureTestMode(UGGYGOCameraLifecycleTestModeB::StaticClass(), FVector(100.0f, 0.0f, 0.0f),
+		FRotator(0.0f, 30.0f, 0.0f), 90.0f, NoPenetration, 1.0f);
+	if (!TestTrue(TEXT("push original A"), Camera->PushModeForTest(
+		UGGYGOCameraLifecycleTestModeA::StaticClass()).IsSuccess())
+		|| !TestTrue(TEXT("push original B"), Camera->PushModeForTest(
+			UGGYGOCameraLifecycleTestModeB::StaticClass()).IsSuccess())) { return false; }
+
+	FGGYGOCameraModeObservation Active =
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeB::StaticClass());
+	TestTrue(TEXT("query returns the original active pooled exact-class mode"),
+		Active.Status == EGGYGOCameraModeObservationStatus::Available
+		&& Active.OriginalOwner == Pawn && Active.OriginalComponent == Camera
+		&& Active.OriginalStack == OriginalStack && Active.bInPool && Active.bActive
+		&& IsValid(Active.Mode) && Active.Mode->GetClass() == UGGYGOCameraLifecycleTestModeB::StaticClass());
+	if (!IsValid(Active.Mode)) { return false; }
+	UGGYGOCameraMode* OriginalMode = Active.Mode.Get();
+	TestTrue(TEXT("mode retains the original Stack/Component outer chain"),
+		OriginalMode->GetOuter() == OriginalStack && OriginalMode->GetGGYGOCameraComponent() == Camera);
+	TestEqual(TEXT("first query does not advance blend"), OriginalMode->GetBlendWeight(), 0.0f);
+	TestTrue(TEXT("first query does not evaluate authored view"), OriginalMode->GetCameraModeView().Location.IsZero());
+
+	const int32 PopulatedChildCount = CountStackChildren();
+	const FGGYGOCameraModeView OriginalView = OriginalMode->GetCameraModeView();
+	const float OriginalWeight = OriginalMode->GetBlendWeight();
+	Active.Mode = nullptr;
+	Active.bActive = false;
+	const FGGYGOCameraModeObservation Repeated =
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeB::StaticClass());
+	TestTrue(TEXT("returned value edits cannot change source identity or membership"),
+		Repeated.Mode == OriginalMode && Repeated.OriginalStack == OriginalStack
+		&& Repeated.bInPool && Repeated.bActive);
+	TestEqual(TEXT("active query creates no stack child"), CountStackChildren(), PopulatedChildCount);
+	TestEqual(TEXT("repeated query does not advance blend"), OriginalMode->GetBlendWeight(), OriginalWeight);
+	const FGGYGOCameraModeView& RepeatedView = OriginalMode->GetCameraModeView();
+	TestTrue(TEXT("repeated query preserves location/rotation/control rotation/FOV"),
+		RepeatedView.Location == OriginalView.Location && RepeatedView.Rotation == OriginalView.Rotation
+		&& RepeatedView.ControlRotation == OriginalView.ControlRotation
+		&& RepeatedView.FieldOfView == OriginalView.FieldOfView);
+	const FGGYGOCameraModeObservation ExactBase =
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeBase::StaticClass());
+	TestTrue(TEXT("base-class query never substitutes a derived pooled mode"),
+		ExactBase.Status == EGGYGOCameraModeObservationStatus::NotInstantiated
+		&& ExactBase.OriginalStack == OriginalStack && !ExactBase.Mode
+		&& !ExactBase.bInPool && !ExactBase.bActive);
+
+	const FGGYGOCameraModeObservation Invalid = Camera->QueryCameraMode(nullptr);
+	TestTrue(TEXT("invalid class is explicitly unavailable with empty identities"),
+		Invalid.Status == EGGYGOCameraModeObservationStatus::Unavailable
+		&& !Invalid.OriginalOwner && !Invalid.OriginalComponent && !Invalid.OriginalStack
+		&& !Invalid.Mode && !Invalid.bInPool && !Invalid.bActive && !Invalid.Diagnostic.IsEmpty());
+	TestTrue(TEXT("failed query preserves the original active source"),
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeB::StaticClass()).Mode == OriginalMode
+		&& Camera->IsModeStackActiveForTest());
+	TestEqual(TEXT("failed query creates no stack child"), CountStackChildren(), PopulatedChildCount);
+
+	FGGYGOCameraModeView EvaluatedView;
+	FGGYGOCameraPenetrationRequest EvaluatedRequest;
+	TestTrue(TEXT("explicit evaluator remains the mechanism that advances modes"),
+		Camera->EvaluateStackForTest(0.25f, EvaluatedView, EvaluatedRequest).IsSuccess()
+		&& OriginalMode->GetBlendWeight() > OriginalWeight
+		&& OriginalMode->GetCameraModeView().Location == FVector(100.0f, 0.0f, 0.0f));
+	Camera->ClearCameraModeStack();
+	const FGGYGOCameraModeObservation Inactive =
+		Camera->QueryCameraMode(UGGYGOCameraLifecycleTestModeB::StaticClass());
+	TestTrue(TEXT("deactivated original mode remains pooled but cannot certify active coverage"),
+		Inactive.Status == EGGYGOCameraModeObservationStatus::Available
+		&& Inactive.OriginalStack == OriginalStack && Inactive.Mode == OriginalMode
+		&& Inactive.bInPool && !Inactive.bActive && !Camera->IsModeStackActiveForTest());
+	TestEqual(TEXT("inactive query creates no stack child"), CountStackChildren(), PopulatedChildCount);
+	return true;
 }
 
 

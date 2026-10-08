@@ -163,7 +163,7 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
 	bool bTurnBackRunOut = false;
 
-	/** Filtered presentation angle; positive means lean toward a right turn. AnimBP owns bone axis/sign. */
+	/** Linear signed direction-deviation pose; positive leans toward the right. Only normal exit recovers a previous pose. AnimBP owns bone axis/sign. */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	float WalkRunLeanAngleDegrees = 0.0f;
 
@@ -184,7 +184,7 @@ protected:
 	virtual void ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const override;
 	virtual bool IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const override;
 
-	/** Consume the already captured frame in the existing native update; never queries movement. */
+	/** Map a valid captured direction deviation directly; Movement owns qualification. NotApplicable only recovers this instance's pose. */
 	void UpdateWalkRunLeanPresentation(float DeltaSeconds);
 	/** Retire only this instance's presentation state while preserving authored Tuning. */
 	void ResetWalkRunLeanPresentation();
@@ -197,9 +197,11 @@ private:
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
 	FZZZLocomotionEvents LocomotionEvents;
 
+	/** Normal exit transition, separate from the instantaneous valid linear mapping. */
+	void RecoverWalkRunLeanPresentation(float DeltaSeconds, const FZZZWalkRunLeanTuning& Config);
 	void FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason);
 	FName LastWalkRunLeanFailureCode = NAME_None;
-	/** Borrowed identity for retiring a presentation filter; never authorizes movement. */
+	/** Borrowed identity for retiring the previous pose/recovery; never authorizes movement. */
 	TWeakObjectPtr<UGGYGOCharacterMovementComponent> WalkRunLeanSource;
 	uint64 WalkRunLeanSourceEpoch = 0;
 };

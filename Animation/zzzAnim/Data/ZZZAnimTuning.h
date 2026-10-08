@@ -20,8 +20,12 @@ struct FZZZWalkRunLeanTuning
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean")
 	bool bEnabled = false;
 
-	/** Observed velocity heading yaw rate that reaches the authored maximum, in degrees/second. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled", ClampMin = "0.0"))
+	/** Signed direction deviation reaching the authored maximum, in degrees. At least 180 keeps the full native signed-angle domain linear. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled", ClampMin = "180.0"))
+	float FullLeanDirectionErrorDegrees = 0.0f;
+
+	/** Serialized legacy yaw-rate tuning; never converted into direction degrees or consumed at runtime. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Author FullLeanDirectionErrorDegrees explicitly; yaw rate is not a direction angle."))
 	float FullLeanYawRateDegreesPerSecond = 0.0f;
 
 	/** Maximum presentation angle at WalkRun alpha 0. Bone axis/sign belong to AnimBP. */
@@ -32,11 +36,11 @@ struct FZZZWalkRunLeanTuning
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled", ClampMin = "0.0", ClampMax = "90.0"))
 	float RunMaxAngleDegrees = 0.0f;
 
-	/** Positive exponential presentation response, in 1/seconds. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled", ClampMin = "0.0"))
+	/** Serialized legacy entry filter; valid direction deviations are now mapped directly. */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Valid direction lean is linear and has no entry filter."))
 	float EnterResponseSpeed = 0.0f;
 
-	/** Positive exponential recovery response, in 1/seconds. */
+	/** Positive recovery response in 1/seconds, only after Movement returns NotApplicable. Never filters a valid direction deviation. */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled", ClampMin = "0.0"))
 	float RecoveryResponseSpeed = 0.0f;
 };

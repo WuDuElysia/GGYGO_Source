@@ -27,6 +27,8 @@ AGGYGOAnimationLifecycleTestCharacter::AGGYGOAnimationLifecycleTestCharacter(
 #include "Misc/AutomationTest.h"
 #include "UObject/StrongObjectPtr.h"
 
+#include <limits>
+
 void UGGYGOAnimationLifecycleTestAnimInstance::SeedDirtyRuntimeStateForTest()
 {
 	AnimationState.WorldVelocity = FVector(17.0f, 23.0f, 31.0f);
@@ -41,6 +43,7 @@ void UGGYGOAnimationLifecycleTestAnimInstance::SeedDirtyRuntimeStateForTest()
 	AnimationState.LocomotionSteering.SourceEpoch = 27;
 	AnimationState.LocomotionSteering.CompletedIntervalSerial = 9;
 	AnimationState.LocomotionSteering.ActualSignedVelocityYawRate = 123.0f;
+	AnimationState.LocomotionSteering.DesiredDirectionError = 42.0f;
 	AnimationState.LocomotionSteering.bHasVelocityYawRate = true;
 	AnimationState.LocomotionSteering.Diagnostic = TEXT("previous captured interval");
 	AnimationState.StopMotionType = EGGYGOStopMotionType::RunStop;
@@ -177,6 +180,7 @@ namespace
 		Test.TestEqual(Label(TEXT("Steering.SourceEpoch")), Frame.LocomotionSteering.SourceEpoch, uint64(0));
 		Test.TestEqual(Label(TEXT("Steering.CompletedIntervalSerial")), Frame.LocomotionSteering.CompletedIntervalSerial, uint64(0));
 		Test.TestEqual(Label(TEXT("Steering.ActualSignedVelocityYawRate")), Frame.LocomotionSteering.ActualSignedVelocityYawRate, 0.0f);
+		Test.TestEqual(Label(TEXT("Steering.DesiredDirectionError")), Frame.LocomotionSteering.DesiredDirectionError, 0.0f);
 		Test.TestFalse(Label(TEXT("Steering.bHasVelocityYawRate")), Frame.LocomotionSteering.bHasVelocityYawRate);
 		Test.TestTrue(Label(TEXT("Steering.Diagnostic empty")), Frame.LocomotionSteering.Diagnostic.IsEmpty());
 		Test.TestFalse(Label(TEXT("Steering.OriginalMovement cleared")), Frame.LocomotionSteering.OriginalMovement.IsValid());
@@ -340,6 +344,7 @@ bool FGGYGOAnimationLifecycleResetTest::RunTest(const FString& Parameters)
 	}
 
 	AnimInstance->SetTestPawnOwner(nullptr);
+	AnimInstance->Tuning.WalkRunLean.FullLeanDirectionErrorDegrees = 180.0f;
 	AnimInstance->Tuning.WalkRunLean.FullLeanYawRateDegreesPerSecond = 180.0f;
 	AnimInstance->Tuning.WalkRunLean.WalkMaxAngleDegrees = 2.0f;
 	AnimInstance->Tuning.WalkRunLean.RunMaxAngleDegrees = 6.0f;
@@ -360,7 +365,8 @@ bool FGGYGOAnimationLifecycleResetTest::RunTest(const FString& Parameters)
 	AnimInstance->InvokeNativeUninitializeAnimation();
 	TestClearedLifecycleState(*this, *AnimInstance, TEXT("repeated uninitialize"));
 	TestFalse(TEXT("reset preserves explicit disabled lean mode"), AnimInstance->Tuning.WalkRunLean.bEnabled);
-	TestEqual(TEXT("reset preserves authored full lean rate"), AnimInstance->Tuning.WalkRunLean.FullLeanYawRateDegreesPerSecond, 180.0f);
+	TestEqual(TEXT("reset preserves authored direction reference"), AnimInstance->Tuning.WalkRunLean.FullLeanDirectionErrorDegrees, 180.0f);
+	TestEqual(TEXT("reset preserves serialized legacy rate without converting units"), AnimInstance->Tuning.WalkRunLean.FullLeanYawRateDegreesPerSecond, 180.0f);
 	TestEqual(TEXT("reset preserves authored Run maximum"), AnimInstance->Tuning.WalkRunLean.RunMaxAngleDegrees, 6.0f);
 	return true;
 }
@@ -495,8 +501,8 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(
 
 bool FGGYGOAnimationWalkRunLeanTest::RunTest(const FString& Parameters)
 {
-	// Deliberately test the captured consumer contract. Real CMC qualification and the
-	// production WalkRun graph remain integration smoke gates, not proof from this fixture.
+	// Captured consumer contract only. Real CMC qualification, bone axes and production
+	// Action/WalkRun composition remain integration smoke gates, not proof from this fixture.
 	FScopedAnimationTestWorld TestWorld;
 	if (!TestNotNull(TEXT("World"), TestWorld.World))
 	{
@@ -512,11 +518,13 @@ bool FGGYGOAnimationWalkRunLeanTest::RunTest(const FString& Parameters)
 	TStrongObjectPtr<UGGYGOAnimationLifecycleTestAnimInstance> Anim(NewObject<UGGYGOAnimationLifecycleTestAnimInstance>(Mesh.Get()));
 	FZZZWalkRunLeanTuning& Config = Anim->Tuning.WalkRunLean;
 	Config.bEnabled = true;
-	Config.FullLeanYawRateDegreesPerSecond = 180.0f;
+	Config.FullLeanDirectionErrorDegrees = 180.0f;
 	Config.WalkMaxAngleDegrees = 2.0f;
 	Config.RunMaxAngleDegrees = 6.0f;
-	Config.EnterResponseSpeed = 12.0f;
 	Config.RecoveryResponseSpeed = 8.0f;
+	// Keep a positive serialized legacy configuration to prove it cannot satisfy the new angle contract.
+	Config.FullLeanYawRateDegreesPerSecond = 180.0f;
+	Config.EnterResponseSpeed = 12.0f;
 
 	FGGYGOAnimationStateFrame Frame;
 	Frame.bLocomotionSteeringCaptured = true;
@@ -526,54 +534,113 @@ bool FGGYGOAnimationWalkRunLeanTest::RunTest(const FString& Parameters)
 	Steering.OriginalUpdatedComponent = SourceA->GetCapsuleComponent();
 	Steering.SourceEpoch = 1;
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
-	TestFalse(TEXT("Initial does not manufacture an observed zero rate"), Anim->bWalkRunLeanPresentationValid);
+	TestFalse(TEXT("Initial is not an observed zero direction deviation"), Anim->bWalkRunLeanPresentationValid);
 	TestTrue(TEXT("Initial is a normal wait"), Anim->WalkRunLeanFailureReason.IsEmpty());
 
 	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
 	Steering.CompletedIntervalSerial = 1;
 	Steering.NativeDeltaSeconds = 1.0f / 60.0f;
 	Steering.bHasVelocityYawRate = true;
-	Steering.ActualSignedVelocityYawRate = 180.0f;
+	Steering.ActualSignedVelocityYawRate = -180.0f;
 	Steering.ActualSignedYawRate = -180.0f;
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
-	const float WalkAngle = Anim->WalkRunLeanAngleDegrees;
-	TestTrue(TEXT("right trajectory wins over opposite capsule correction"), WalkAngle > 0.0f);
-	TestTrue(TEXT("Walk stays within its authored limit"), WalkAngle <= Config.WalkMaxAngleDegrees);
-	Anim->InvokeNativeUninitializeAnimation();
-	Frame.WalkRunBlendAlpha = 1.0f;
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
-	const float RunAngle = Anim->WalkRunLeanAngleDegrees;
-	TestTrue(TEXT("same turn has stronger Run presentation"), RunAngle > WalkAngle && RunAngle <= Config.RunMaxAngleDegrees);
+	Steering.DesiredDirectionError = 30.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	const float Walk30 = Anim->WalkRunLeanAngleDegrees;
+	TestTrue(TEXT("right direction deviation wins over opposite velocity and capsule yaw rates"), Walk30 > 0.0f);
+	TestTrue(TEXT("Walk angle is the direct linear proportion even at zero animation delta"), FMath::IsNearlyEqual(Walk30, 1.0f / 3.0f));
+	Steering.DesiredDirectionError = 60.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 2.0f);
+	const float Walk60 = Anim->WalkRunLeanAngleDegrees;
+	TestEqual(TEXT("twice the Walk deviation gives twice the actual angle"), Walk60, 2.0f * Walk30);
+	Steering.DesiredDirectionError = -60.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("left direction is the signed mirror without entry lag"), Anim->WalkRunLeanAngleDegrees, -Walk60);
+	Steering.DesiredDirectionError = 0.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("valid zero deviation immediately clears the angle, not through recovery"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestTrue(TEXT("an admitted zero deviation is a valid pose"), Anim->bWalkRunLeanPresentationValid);
 
+	Frame.WalkRunBlendAlpha = 1.0f;
+	Steering.DesiredDirectionError = 30.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.01f);
+	const float Run30 = Anim->WalkRunLeanAngleDegrees;
+	TestEqual(TEXT("Run maps 30 degrees to one authored lean degree"), Run30, 1.0f);
+	TestTrue(TEXT("same deviation has stronger Run presentation"), Run30 > Walk30);
+	Steering.DesiredDirectionError = 60.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("twice the Run deviation gives twice the actual angle"), Anim->WalkRunLeanAngleDegrees, 2.0f * Run30);
+	Steering.DesiredDirectionError = 30.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("halving the deviation halves the angle in the same update"), Anim->WalkRunLeanAngleDegrees, Run30);
 	Steering.bHasVelocityYawRate = false;
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
-	TestTrue(TEXT("missing trajectory observation recovers without capsule substitution"),
-		Anim->WalkRunLeanAngleDegrees > 0.0f && Anim->WalkRunLeanAngleDegrees < RunAngle);
+	Steering.ActualSignedVelocityYawRate = 0.0f;
+	Steering.ActualSignedYawRate = 720.0f;
+	Steering.NativeDeltaSeconds = 1.0f / 30.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 1.0f);
+	TestEqual(TEXT("valid direction lean does not depend on velocity derivatives or native/animation delta"), Anim->WalkRunLeanAngleDegrees, Run30);
+	Steering.DesiredDirectionError = 90.0f;
+	Frame.WalkRunBlendAlpha = 0.5f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("authoritative gait alpha gives the continuous Walk/Run proportion"), Anim->WalkRunLeanAngleDegrees, 2.0f);
+	Steering.DesiredDirectionError = 180.0f;
+	Frame.WalkRunBlendAlpha = 0.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("full signed-angle domain reaches the Walk maximum without a saturation interval"), Anim->WalkRunLeanAngleDegrees, Config.WalkMaxAngleDegrees);
+	Frame.WalkRunBlendAlpha = 1.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("full signed-angle domain reaches the Run maximum"), Anim->WalkRunLeanAngleDegrees, Config.RunMaxAngleDegrees);
+	Steering.DesiredDirectionError = -180.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("full left deviation is the mirrored Run maximum"), Anim->WalkRunLeanAngleDegrees, -Config.RunMaxAngleDegrees);
+
+	Steering.DesiredDirectionError = 90.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
 	const float BeforeNotApplicable = Anim->WalkRunLeanAngleDegrees;
 	Steering.Status = EGGYGOLocomotionSteeringStatus::NotApplicable;
-	Steering.bHasVelocityYawRate = true;
+	Steering.DesiredDirectionError = 180.0f;
 	Frame.bHasMoveInput = true;
 	Frame.Gait = EGGYGOGait::Run;
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
-	TestTrue(TEXT("NotApplicable overrides otherwise moving Run frame"),
-		Anim->WalkRunLeanAngleDegrees < BeforeNotApplicable);
-
-	++Steering.SourceEpoch;
-	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Frame.TurnBackPhase = EGGYGOTurnBackPhase::Turning;
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
-	TestEqual(TEXT("epoch change retires prior lean immediately"), Anim->WalkRunLeanAngleDegrees, 0.0f);
-	TestTrue(TEXT("new epoch uses only its own completed observation"), Anim->bWalkRunLeanPresentationValid);
-	Steering.ActualSignedVelocityYawRate = -180.0f;
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
-	TestTrue(TEXT("left trajectory produces left lean"), Anim->WalkRunLeanAngleDegrees < 0.0f);
+	TestEqual(TEXT("normal exit starts from its own previous pose, not a fabricated valid zero deviation"), Anim->WalkRunLeanAngleDegrees, BeforeNotApplicable);
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("NotApplicable alone recovers despite otherwise moving Run fields"), Anim->WalkRunLeanAngleDegrees > 0.0f && Anim->WalkRunLeanAngleDegrees < BeforeNotApplicable);
+	TestTrue(TEXT("normal recovery stays usable until its own angle reaches neutral"), Anim->bWalkRunLeanPresentationValid);
+	Anim->InvokeWalkRunLeanForTest(Frame, 3.0f);
+	TestEqual(TEXT("normal recovery finishes at neutral"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestFalse(TEXT("finished recovery is not an active linear observation"), Anim->bWalkRunLeanPresentationValid);
+
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Steering.DesiredDirectionError = 90.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	++Steering.SourceEpoch;
+	Steering.DesiredDirectionError = 0.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("new valid epoch uses its own zero direction, not the old pose"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestTrue(TEXT("new epoch valid zero observation remains usable"), Anim->bWalkRunLeanPresentationValid);
+	Steering.DesiredDirectionError = -90.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	++Steering.SourceEpoch;
+	Steering.Status = EGGYGOLocomotionSteeringStatus::NotApplicable;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("epoch change retires the prior recovery even at zero delta"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestFalse(TEXT("new epoch cannot recover an old source pose"), Anim->bWalkRunLeanPresentationValid);
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Steering.DesiredDirectionError = 90.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
 	Steering.OriginalMovement = Cast<UGGYGOCharacterMovementComponent>(SourceB->GetCharacterMovement());
 	Steering.OriginalCharacter = SourceB;
 	Steering.OriginalUpdatedComponent = SourceB->GetCapsuleComponent();
+	Steering.Status = EGGYGOLocomotionSteeringStatus::NotApplicable;
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
-	TestEqual(TEXT("different CMC with equal epoch cannot inherit lean"), Anim->WalkRunLeanAngleDegrees, 0.0f);
-	Anim->InvokeWalkRunLeanForTest(Frame, 0.25f);
+	TestEqual(TEXT("different CMC with equal epoch cannot inherit recovery"), Anim->WalkRunLeanAngleDegrees, 0.0f);
+	TestFalse(TEXT("different CMC has no observed pose to recover"), Anim->bWalkRunLeanPresentationValid);
+	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
+	Steering.DesiredDirectionError = -45.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.0f);
+	TestEqual(TEXT("new original CMC maps only its own left deviation immediately"), Anim->WalkRunLeanAngleDegrees, -1.5f);
 
-	AddExpectedError(TEXT("[Animation][WalkRunLean]"), EAutomationExpectedErrorFlags::Contains, 2);
+	AddExpectedError(TEXT("[Animation][WalkRunLean]"), EAutomationExpectedErrorFlags::Contains, 3);
 	Steering.Status = EGGYGOLocomotionSteeringStatus::Invalid;
 	Steering.Diagnostic = TEXT("original movement provider retired");
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
@@ -581,15 +648,29 @@ bool FGGYGOAnimationWalkRunLeanTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("Invalid retires the original pose value"), Anim->WalkRunLeanAngleDegrees, 0.0f);
 	TestFalse(TEXT("Invalid is failure rather than a usable neutral pose"), Anim->bWalkRunLeanPresentationValid);
 	TestTrue(TEXT("original provider diagnostic remains visible"), Anim->WalkRunLeanFailureReason.Contains(TEXT("retired")));
-	Config.FullLeanYawRateDegreesPerSecond = 0.0f;
+	Config.FullLeanDirectionErrorDegrees = 0.0f;
 	Steering.Status = EGGYGOLocomotionSteeringStatus::Valid;
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
 	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
-	TestTrue(TEXT("missing enabled tuning fails explicitly"), Anim->WalkRunLeanFailureReason.Contains(TEXT("FullLeanYawRate")));
-	TestEqual(TEXT("failure does not replace required tuning"), Config.FullLeanYawRateDegreesPerSecond, 0.0f);
+	TestTrue(TEXT("enabled legacy-only tuning explicitly requires the new direction angle"), Anim->WalkRunLeanFailureReason.Contains(TEXT("FullLeanDirectionErrorDegrees")));
+	TestEqual(TEXT("legacy yaw rate never fills the missing angle"), Config.FullLeanDirectionErrorDegrees, 0.0f);
+	TestEqual(TEXT("legacy serialized units remain unchanged"), Config.FullLeanYawRateDegreesPerSecond, 180.0f);
+	Config.FullLeanDirectionErrorDegrees = 90.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("a reference that would saturate inside the native domain is rejected"), Anim->WalkRunLeanFailureReason.Contains(TEXT(">= 180")));
+	Config.FullLeanDirectionErrorDegrees = 180.0f;
+	Steering.DesiredDirectionError = std::numeric_limits<float>::quiet_NaN();
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("nonfinite direction fails explicitly without per-frame diagnostic reset"), Anim->WalkRunLeanFailureReason.Contains(TEXT("DesiredDirectionError")));
+	TestFalse(TEXT("illegal direction cannot publish a usable zero pose"), Anim->bWalkRunLeanPresentationValid);
+	Steering.DesiredDirectionError = 181.0f;
+	Anim->InvokeWalkRunLeanForTest(Frame, 0.1f);
+	TestTrue(TEXT("noncanonical captured angle is rejected rather than normalized or clamped"), Anim->WalkRunLeanFailureReason.Contains(TEXT("[-180,180]")));
 	Anim->InvokeNativeUninitializeAnimation();
 	TestClearedLifecycleState(*this, *Anim, TEXT("lean lifecycle uninitialize"));
 	TestTrue(TEXT("lifecycle preserves authored enable mode"), Config.bEnabled);
+	TestEqual(TEXT("lifecycle preserves the authored direction reference"), Config.FullLeanDirectionErrorDegrees, 180.0f);
 
 	Config.bEnabled = false;
 	Anim->SeedDirtyRuntimeStateForTest();

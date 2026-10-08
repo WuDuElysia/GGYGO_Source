@@ -71,7 +71,7 @@ public:
 	void InvokeNativeUpdateAnimation(float DeltaSeconds) { NativeUpdateAnimation(DeltaSeconds); }
 
 	void SeedDirtyRuntimeStateForTest();
-	/** Consumer unit input only; this does not exercise or impersonate the CMC getter. */
+	/** Captured consumer input: Valid maps immediately; DeltaSeconds only drives NotApplicable recovery. Does not exercise or impersonate the CMC getter. */
 	void InvokeWalkRunLeanForTest(const FGGYGOAnimationStateFrame& InFrame, float DeltaSeconds)
 	{
 		AnimationState = InFrame;

@@ -67,6 +67,14 @@ public:
 		return Actor ? Actor->FindComponentByClass<UGGYGOCameraComponent>() : nullptr;
 	}
 
+	/**
+	 * Read existing exact-class mode membership on the GT. No evaluation, mutation or object creation.
+	 * @param ModeClass Explicit original class; no subclass search or default substitution.
+	 * @return Call-local provenance and membership; Unavailable clears identities, NotInstantiated is not success.
+	 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Camera")
+	FGGYGOCameraModeObservation QueryCameraMode(TSubclassOf<UGGYGOCameraMode> ModeClass) const;
+
 	/** 视角跟随的目标。默认是组件拥有者。 */
 	virtual AActor* GetTargetActor() const { return GetOwner(); }
 
