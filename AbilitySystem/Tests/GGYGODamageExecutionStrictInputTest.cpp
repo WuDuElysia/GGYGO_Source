@@ -7,6 +7,8 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "GameFramework/GameplayMessageSubsystem.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
 #include "HAL/CriticalSection.h"
@@ -14,6 +16,7 @@
 #include "Misc/OutputDevice.h"
 #include "Misc/OutputDeviceRedirector.h"
 #include "Misc/ScopeLock.h"
+#include "Misc/ScopeExit.h"
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
@@ -36,6 +39,10 @@ namespace
 		const TCHAR* DamageReason;
 		const TCHAR* PoiseReason;
 		bool bApply = false;
+		TOptional<float> DamageMultiplier;
+		bool bMultiplierMode = false;
+		const TCHAR* ExpectedDamageSource = nullptr;
+		TOptional<float> ExpectedDamageInput;
 	};
 
 	uint32 StrictInputFloatBits(float Value)
@@ -49,6 +56,7 @@ namespace
 	{
 		UEngine* Engine = GEngine;
 		UWorld* World = nullptr;
+		TStrongObjectPtr<UGameInstance> GameInstance;
 		AActor* SourceActor = nullptr;
 		AActor* TargetActor = nullptr;
 		UGGYGOAbilitySystemComponent* SourceASC = nullptr;
@@ -56,8 +64,18 @@ namespace
 		TStrongObjectPtr<UGGYGOCombatSet> CombatSet;
 		TStrongObjectPtr<UGGYGOHealthSet> HealthSet;
 
-		explicit FStrictInputWorld(FName Name)
+		explicit FStrictInputWorld(FName Name, bool bWithMessageRouter = false)
 		{
+			if (bWithMessageRouter)
+			{
+				GameInstance.Reset(NewObject<UGameInstance>(Engine));
+				if (GameInstance.IsValid())
+				{
+					GameInstance->InitializeStandalone(Name);
+					World = GameInstance->GetWorld();
+				}
+				return;
+			}
 			UWorld::InitializationValues Init;
 			Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(false)
 				.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
@@ -75,6 +93,7 @@ namespace
 			{
 				UPackage* Package = World->GetPackage();
 				World->DestroyWorld(false);
+				if (GameInstance.IsValid()) { GameInstance->Shutdown(); }
 				Engine->DestroyWorldContext(World);
 				if (Package) { Package->SetDirtyFlag(false); }
 			}
@@ -97,6 +116,10 @@ namespace
 		{
 			if (!Test.TestNotNull(TEXT("Fixture World"), World)
 				|| !Test.TestNotNull(TEXT("Fixture WorldContext"), Engine->GetWorldContextFromWorld(World))) { return false; }
+			if (Case.bApply && (!Test.TestNotNull(TEXT("实际结算的原生GameInstance"), GameInstance.Get())
+				|| !Test.TestTrue(TEXT("实际结算World由原GameInstance持有"), World->GetGameInstance() == GameInstance.Get())
+				|| !Test.TestNotNull(TEXT("实际结算的原生MessageRouter"),
+					UGameInstance::GetSubsystem<UGameplayMessageSubsystem>(GameInstance.Get())))) { return false; }
 			SourceASC = MakeASC(World, SourceActor);
 			TargetASC = MakeASC(World, TargetActor);
 			if (!Test.TestNotNull(TEXT("Source ASC"), SourceASC)
@@ -225,7 +248,7 @@ namespace
 	{
 		const FString Label = FString::Printf(TEXT("%s/%s"), Case.Name, bPrefilled ? TEXT("Prefilled") : TEXT("Empty"));
 		FStrictInputWorld Fixture(FName(*FString::Printf(TEXT("GGYGOStrictInput_%s_%s"),
-			Case.Name, bPrefilled ? TEXT("Prefilled") : TEXT("Empty"))));
+			Case.Name, bPrefilled ? TEXT("Prefilled") : TEXT("Empty"))), Case.bApply);
 		if (!Fixture.Initialize(Test, Case)) { return false; }
 		const FGameplayEffectContextHandle Context = Fixture.SourceASC->MakeEffectContext();
 		const FGGYGOGameplayEffectContext* ProjectContext = FGGYGOGameplayEffectContext::ExtractEffectContext(Context);
@@ -258,16 +281,25 @@ namespace
 				Spec.SetByCallerTagMagnitudes.IsEmpty() && Spec.SetByCallerNameMagnitudes.IsEmpty())) { return false; }
 		if (Case.DamageOverride.IsSet()) { Spec.SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_Damage, Case.DamageOverride.GetValue()); }
 		if (Case.PoiseOverride.IsSet()) { Spec.SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_PoiseDamage, Case.PoiseOverride.GetValue()); }
+		if (Case.DamageMultiplier.IsSet()) { Spec.SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_DamageMultiplier, Case.DamageMultiplier.GetValue()); }
 		const float* DamageOverride = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_Damage);
 		const float* PoiseOverride = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_PoiseDamage);
+		const float* DamageMultiplier = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_DamageMultiplier);
 		if (!Test.TestTrue(Label + TEXT(" exact override keys and value bits"),
 			(DamageOverride != nullptr) == Case.DamageOverride.IsSet() && (PoiseOverride != nullptr) == Case.PoiseOverride.IsSet()
 			&& (!DamageOverride || StrictInputFloatBits(*DamageOverride) == StrictInputFloatBits(Case.DamageOverride.GetValue()))
 			&& (!PoiseOverride || StrictInputFloatBits(*PoiseOverride) == StrictInputFloatBits(Case.PoiseOverride.GetValue()))
-			&& Spec.SetByCallerTagMagnitudes.Num() == int32(Case.DamageOverride.IsSet()) + int32(Case.PoiseOverride.IsSet()))) { return false; }
+			&& (DamageMultiplier != nullptr) == Case.DamageMultiplier.IsSet()
+			&& (!DamageMultiplier || StrictInputFloatBits(*DamageMultiplier) == StrictInputFloatBits(Case.DamageMultiplier.GetValue()))
+			&& Spec.SetByCallerTagMagnitudes.Num() == int32(Case.DamageOverride.IsSet()) + int32(Case.PoiseOverride.IsSet())
+				+ int32(Case.DamageMultiplier.IsSet()))) { return false; }
 
+		FGameplayTagContainer PassedInTags = Definition->Executions[0].PassedInTags;
+		if (Case.bMultiplierMode) { PassedInTags.AddTag(GGYGOGameplayTags::DamageCalculation_AttackPowerMultiplier); }
 		FGameplayEffectCustomExecutionParameters Params(Spec, Definition->Executions[0].CalculationModifiers,
-			Fixture.TargetASC, Definition->Executions[0].PassedInTags, FPredictionKey());
+			Fixture.TargetASC, PassedInTags, FPredictionKey());
+		if (!Test.TestTrue(Label + TEXT(" 明确的原生 Execution 模式参数"),
+			Params.GetPassedInTags().HasTagExact(GGYGOGameplayTags::DamageCalculation_AttackPowerMultiplier) == Case.bMultiplierMode)) { return false; }
 		const FStrictInputCapture DamageCapture = ReadStrictInputCapture(Params, DamageDefinition);
 		const FStrictInputCapture PoiseCapture = ReadStrictInputCapture(Params, PoiseDefinition);
 		if (!Test.TestTrue(Label + TEXT(" native execution source and target"),
@@ -303,14 +335,16 @@ namespace
 		FString ExpectedRaw;
 		if (Case.bReject)
 		{
-			const FString DamageValue = DamageOverride ? FString::Printf(TEXT("%.9g"), static_cast<double>(*DamageOverride))
-				: (DamageCapture.bSucceeded ? FString::Printf(TEXT("%.9g"), static_cast<double>(DamageCapture.Value)) : TEXT("unavailable"));
+			const FString DamageValue = Case.ExpectedDamageSource
+				? (Case.ExpectedDamageInput.IsSet() ? FString::Printf(TEXT("%.9g"), static_cast<double>(Case.ExpectedDamageInput.GetValue())) : TEXT("unavailable"))
+				: (DamageOverride ? FString::Printf(TEXT("%.9g"), static_cast<double>(*DamageOverride))
+					: (DamageCapture.bSucceeded ? FString::Printf(TEXT("%.9g"), static_cast<double>(DamageCapture.Value)) : TEXT("unavailable")));
 			const FString PoiseValue = PoiseOverride ? FString::Printf(TEXT("%.9g"), static_cast<double>(*PoiseOverride))
 				: (PoiseCapture.bSucceeded ? FString::Printf(TEXT("%.9g"), static_cast<double>(PoiseCapture.Value)) : TEXT("unavailable"));
 			ExpectedRaw = FString::Printf(
 				TEXT("DamageExecution [%s] 拒绝基础输入：GE=%s SourceASC=%s TargetASC=%s BaseDamage{Source=%s Reason=%s Value=%s} BasePoiseDamage{Source=%s Reason=%s Value=%s}；本Execution不新增Modifier。"),
 				*Execution->GetPathName(), *GetPathNameSafe(Definition), *Fixture.SourceASC->GetPathName(), *Fixture.TargetASC->GetPathName(),
-				DamageOverride ? TEXT("SetByCallerTag") : TEXT("CapturedAttribute"), Case.DamageReason, *DamageValue,
+				Case.ExpectedDamageSource ? Case.ExpectedDamageSource : (DamageOverride ? TEXT("SetByCallerTag") : TEXT("CapturedAttribute")), Case.DamageReason, *DamageValue,
 				PoiseOverride ? TEXT("SetByCallerTag") : TEXT("CapturedAttribute"), Case.PoiseReason, *PoiseValue);
 		}
 		TArray<FStrictInputLogMessage> Messages;
@@ -436,7 +470,23 @@ bool FGGYGODamageExecutionStrictInputTest::RunTest(const FString& Parameters)
 		{TEXT("NegativeInfinityDamageCapture"), true, -Infinity, 4, {}, {}, 0, 0, true, TEXT("non-finite"), TEXT("valid")},
 		{TEXT("NaNPoiseCapture"), true, 12, NaN, {}, {}, 0, 0, true, TEXT("valid"), TEXT("non-finite")},
 		{TEXT("PositiveInfinityPoiseCapture"), true, 12, Infinity, {}, {}, 0, 0, true, TEXT("valid"), TEXT("non-finite")},
-		{TEXT("NegativeInfinityPoiseCapture"), true, 12, -Infinity, {}, {}, 0, 0, true, TEXT("valid"), TEXT("non-finite")}
+		{TEXT("NegativeInfinityPoiseCapture"), true, 12, -Infinity, {}, {}, 0, 0, true, TEXT("valid"), TEXT("non-finite")},
+		// 明确倍率模式：合法零值、各段不同倍率、缺键、冲突和非法值均走真实捕获/Execution。
+		{TEXT("HalfMultiplier"), true, 12, 4, {}, {}, 6, 4, false, TEXT("valid"), TEXT("valid"), false, 0.5f, true},
+		{TEXT("DoubleMultiplier"), true, 12, 4, {}, {}, 24, 4, false, TEXT("valid"), TEXT("valid"), false, 2.0f, true},
+		{TEXT("ZeroMultiplier"), true, 12, 4, {}, {}, 0, 4, false, TEXT("valid"), TEXT("valid"), false, 0.0f, true},
+		{TEXT("NegativeCaptureWithMultiplier"), true, -3, 4, {}, {}, 0, 4, false, TEXT("valid"), TEXT("valid"), false, 2.0f, true},
+		{TEXT("MissingRequiredMultiplier"), true, 12, 4, {}, {}, 0, 0, true, TEXT("required-multiplier-missing"), TEXT("valid"), false, {}, true, TEXT("AttackPowerMultiplier"), {}},
+		{TEXT("MultiplierModeNotSelected"), true, 12, 4, {}, {}, 0, 0, true, TEXT("multiplier-mode-not-selected"), TEXT("valid"), false, 2.0f, false, TEXT("AttackPowerMultiplier"), 2.0f},
+		{TEXT("AbsoluteConflictsWithMultiplier"), true, 12, 4, 7.0f, {}, 0, 0, true, TEXT("conflicting-absolute-damage"), TEXT("valid"), false, 2.0f, true, TEXT("AttackPowerMultiplier"), 2.0f},
+		{TEXT("AbsoluteCannotBypassRequiredMultiplier"), true, 12, 4, 7.0f, {}, 0, 0, true, TEXT("conflicting-absolute-damage"), TEXT("valid"), false, {}, true, TEXT("AttackPowerMultiplier"), {}},
+		{TEXT("KeysConflictWithoutMode"), true, 12, 4, 7.0f, {}, 0, 0, true, TEXT("conflicting-absolute-damage"), TEXT("valid"), false, 2.0f, false, TEXT("AttackPowerMultiplier"), 2.0f},
+		{TEXT("NegativeMultiplier"), true, 12, 4, {}, {}, 0, 0, true, TEXT("negative-multiplier"), TEXT("valid"), false, -1.0f, true, TEXT("AttackPowerMultiplier"), -1.0f},
+		{TEXT("NaNMultiplier"), true, 12, 4, {}, {}, 0, 0, true, TEXT("non-finite-multiplier"), TEXT("valid"), false, NaN, true, TEXT("AttackPowerMultiplier"), NaN},
+		{TEXT("PositiveInfinityMultiplier"), true, 12, 4, {}, {}, 0, 0, true, TEXT("non-finite-multiplier"), TEXT("valid"), false, Infinity, true, TEXT("AttackPowerMultiplier"), Infinity},
+		{TEXT("NegativeInfinityMultiplier"), true, 12, 4, {}, {}, 0, 0, true, TEXT("non-finite-multiplier"), TEXT("valid"), false, -Infinity, true, TEXT("AttackPowerMultiplier"), -Infinity},
+		{TEXT("MultiplierProductOverflow"), true, 12, 4, {}, {}, 0, 0, true, TEXT("non-finite-product"), TEXT("valid"), false, std::numeric_limits<float>::max(), true, TEXT("CapturedAttribute*SetByCallerMultiplier"), Infinity},
+		{TEXT("MultiplierRequiresAttackCapture"), false, 0, 0, {}, 2.0f, 0, 0, true, TEXT("capture-failed"), TEXT("valid"), false, 2.0f, true, TEXT("CapturedAttribute*SetByCallerMultiplier"), {}}
 	};
 	bool bPassed = true;
 	for (const FStrictInputCase& Case : Cases)
@@ -450,6 +500,55 @@ bool FGGYGODamageExecutionStrictInputTest::RunTest(const FString& Parameters)
 			bPassed &= bPrefilledPassed;
 			if (!bPrefilledPassed) { return false; }
 		}
+	}
+	FStrictInputWorld BuffFixture(TEXT("GGYGODamageMultiplierBuffSnapshot"));
+	const FStrictInputCase BuffCase{TEXT("BuffSnapshot"), true, 12, 4, {}, {}, 12, 4, false, TEXT("valid"), TEXT("valid")};
+	if (!BuffFixture.Initialize(*this, BuffCase)) { return false; }
+	const FGameplayEffectContextHandle BuffContext = BuffFixture.SourceASC->MakeEffectContext();
+	FGameplayEffectSpecHandle BeforeBuff = BuffFixture.SourceASC->MakeOutgoingSpec(
+		UGGYGOHitDistanceTestEffect::StaticClass(), 1.0f, BuffContext);
+	if (!TestTrue(TEXT("Buff 前创建真实命中 Spec"), BeforeBuff.IsValid())) { return false; }
+	BeforeBuff.Data->SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_DamageMultiplier, 0.5f);
+
+	TStrongObjectPtr<UGameplayEffect> AttackBuff(NewObject<UGameplayEffect>(GetTransientPackage()));
+	AttackBuff->DurationPolicy = EGameplayEffectDurationType::Infinite;
+	FGameplayModifierInfo& BuffModifier = AttackBuff->Modifiers.AddDefaulted_GetRef();
+	BuffModifier.Attribute = UGGYGOCombatSet::GetBaseDamageAttribute();
+	BuffModifier.ModifierOp = EGameplayModOp::Additive;
+	BuffModifier.ModifierMagnitude = FScalableFloat(12.0f);
+	const FActiveGameplayEffectHandle BuffHandle = BuffFixture.SourceASC->ApplyGameplayEffectToSelf(AttackBuff.Get(), 1.0f, BuffContext);
+	ON_SCOPE_EXIT { BuffFixture.SourceASC->RemoveActiveGameplayEffect(BuffHandle); };
+	if (!TestTrue(TEXT("真实持续 Buff 生效，原 Base12 保持且 Current 变为24"), BuffHandle.IsValid()
+		&& BuffFixture.CombatSet->GetBaseDamage() == 24.0f
+		&& BuffFixture.SourceASC->GetNumericAttributeBase(UGGYGOCombatSet::GetBaseDamageAttribute()) == 12.0f)) { return false; }
+
+	const UGGYGODamageExecution* Execution = GetDefault<UGGYGODamageExecution>();
+	const UGameplayEffect* HitDefinition = BeforeBuff.Data->Def.Get();
+	FGameplayTagContainer MultiplierMode = HitDefinition->Executions[0].PassedInTags;
+	MultiplierMode.AddTag(GGYGOGameplayTags::DamageCalculation_AttackPowerMultiplier);
+	FGameplayEffectCustomExecutionParameters BeforeParams(*BeforeBuff.Data.Get(), HitDefinition->Executions[0].CalculationModifiers,
+		BuffFixture.TargetASC, MultiplierMode, FPredictionKey());
+	FGameplayEffectCustomExecutionOutput BeforeOutput;
+	Execution->Execute(BeforeParams, BeforeOutput);
+	if (!TestTrue(TEXT("旧 Spec 保持 Buff 前快照，12×0.5=6"), BeforeOutput.GetOutputModifiers().Num() == 2
+		&& BeforeOutput.GetOutputModifiers()[0].Attribute == UGGYGOHealthSet::GetDamageAttribute()
+		&& BeforeOutput.GetOutputModifiers()[0].Magnitude == 6.0f)) { return false; }
+
+	for (const auto& Segment : {TPair<float, float>(0.5f, 12.0f), TPair<float, float>(1.5f, 36.0f), TPair<float, float>(2.0f, 48.0f)})
+	{
+		FGameplayEffectSpecHandle Hit = BuffFixture.SourceASC->MakeOutgoingSpec(UGGYGOHitDistanceTestEffect::StaticClass(), 1.0f, BuffContext);
+		if (!TestTrue(TEXT("每段重新创建实际 Spec，保留不同段倍率"), Hit.IsValid() && Hit.Data.Get() != BeforeBuff.Data.Get())) { return false; }
+		Hit.Data->SetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_DamageMultiplier, Segment.Key);
+		FGameplayEffectCustomExecutionParameters Params(*Hit.Data.Get(), HitDefinition->Executions[0].CalculationModifiers,
+			BuffFixture.TargetASC, MultiplierMode, FPredictionKey());
+		FGameplayEffectCustomExecutionOutput Output;
+		Execution->Execute(Params, Output);
+		const auto& Modifiers = Output.GetOutputModifiers();
+		bPassed &= TestTrue(TEXT("各段实际捕获 Buff 后攻击力24并应用自身倍率，削韧仍为4"), Modifiers.Num() == 2
+			&& Modifiers[0].Attribute == UGGYGOHealthSet::GetDamageAttribute()
+			&& Modifiers[0].ModifierOp == EGameplayModOp::Additive && Modifiers[0].Magnitude == Segment.Value
+			&& Modifiers[1].Attribute == UGGYGOHealthSet::GetPoiseDamageAttribute()
+			&& Modifiers[1].ModifierOp == EGameplayModOp::Additive && Modifiers[1].Magnitude == 4.0f);
 	}
 	return bPassed;
 }

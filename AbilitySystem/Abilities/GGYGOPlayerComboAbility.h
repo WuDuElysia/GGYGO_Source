@@ -9,19 +9,71 @@
 
 class UGGYGOAbilityTask_PlayMontageAndWaitForEvent;
 class UGGYGOAbilityTask_WaitComboInput;
+class UGGYGOAbilityTask_PlayNiagaraEffect;
 class UGGYGOMeleeTraceComponent;
 class USkeletalMeshComponent;
 class UWorld;
+class APawn;
+class UAnimMontage;
+class UGGYGOPlayerComboAbility;
+class UGGYGOCharacterMovementComponent;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOPlayerComboLifecycleFixture;
 struct FGGYGOMontageSectionFact;
 struct FGGYGOMontageNotifyFact;
+struct FGGYGOMontageWindowFact;
+struct FGGYGOMontageWindowDeclaration;
+struct FGGYGOMontageFXLocalStartReadyFact;
+struct FGGYGOMontageSectionSnapshot;
 enum class EGGYGOActionMotionReleaseReason : uint8;
+
+/** 原 GA 消费者签发的派生事实；不授播放、输入、位移或结束权限。
+ * 原弱对象可退役，Activation 只用于匹配原历史；布尔量分别来自各自的真实边界。 */
+struct GGYGO_API FGGYGOPlayerComboObservationFacts
+{
+	FGGYGOAbilityActivationHandle Activation;
+	TWeakObjectPtr<UGGYGOPlayerComboAbility> Ability;
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	TWeakObjectPtr<APawn> Pawn;
+	TWeakObjectPtr<USkeletalMeshComponent> Mesh;
+	TWeakObjectPtr<UWorld> World;
+	TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> Task;
+	TWeakObjectPtr<UAnimMontage> Montage;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
+	uint64 StepToken = 0;
+	int32 StepIndex = INDEX_NONE;
+	int32 MontageInstanceId = INDEX_NONE;
+	int32 MotionHandle = INDEX_NONE;
+	bool bTaskNaturalEnded = false;
+	bool bConsumerAccepted = false;
+	bool bDrainRequestReturned = false;
+	bool bDrainAccepted = false;
+	bool bSourceCurrentAfterDrainReturn = false;
+	bool bMotionCompleted = false;
+	bool bCleanupObserved = false;
+	bool bCleanupCancelled = false;
+	EGGYGOAbilityTerminationRequestKind CleanupKind = EGGYGOAbilityTerminationRequestKind::None;
+	FString DrainDiagnostic;
+};
+
+/** 只读的原段历史视图。GA 是唯一写入者；不持有资源、Task 或 Actor 的强引用。
+ * 派生记录随原资源退役；调用方可保留原历史，Stop 时 Reset，不得用它重新捕获后继。 */
+class GGYGO_API FGGYGOPlayerComboObservation
+{
+public:
+	bool ReadHistory(FGGYGOPlayerComboObservationFacts& OutFacts) const;
+	void Reset() { History.Reset(); }
+private:
+	struct FState;
+	TSharedPtr<const FState> History;
+	friend class UGGYGOPlayerComboAbility;
+};
 
 UCLASS(Blueprintable)
 class GGYGO_API UGGYGOPlayerComboAbility : public UGGYGOGameplayAbility
 {
 	GENERATED_BODY()
+	struct FAuthorPointGate;
 	struct FStepMotionResources;
 public:
 	UGGYGOPlayerComboAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
@@ -35,9 +87,26 @@ public:
 	bool IsComboWindowOpen() const { return Window.bOpen; }
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
 	bool HasPendingComboRequest() const { return Window.PendingRequestId > 0; }
+	/** 保留的反射查询：当前段攻击接续门是否已开；与 IsAttackContinuationOpen 同一事实，不含移动打断。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
 	bool IsInterruptionOpen() const;
+	/** 当前段攻击接续门是否已由其原实例作者点打开。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
+	bool IsAttackContinuationOpen() const;
+	/** 当前段移动打断门是否已由其原实例作者点及 Main 真实末端打开。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Combo")
+	bool IsMovementInterruptionOpen() const;
 	bool ValidateComboConfiguration(FString& OutError) const;
+	/** 捕获已 Ready 的原自有段及真实 Task 快照；失败清空输出。
+	 * 仅按需创建有来源的派生观察记录，不改变原执行资源或注册回调。 */
+	bool CaptureOriginalStepObservation(FGGYGOPlayerComboObservation& OutObservation,
+		FGGYGOMontageSectionSnapshot& OutSnapshot, FString& OutError);
+	/** 只读同一原段的实时快照；结束、换段、换源及后继均拒绝，失败清空输出。
+	 * 原观察的历史仍可 ReadHistory，不将历史重解释为当前播放。
+	 * @param OutResourceSourceCurrent 可选原 GA 自有资源认证事实；原 Task 退役而 CMC 正在 drain 时可为 true，
+	 * 与实时快照是否可读分开，不代表 CMC 已接受或完成。 */
+	bool ReadOriginalStepObservation(const FGGYGOPlayerComboObservation& Observation,
+		FGGYGOMontageSectionSnapshot& OutSnapshot, FString& OutError, bool* OutResourceSourceCurrent = nullptr) const;
 #if WITH_EDITOR
 	virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
 #endif
@@ -54,8 +123,7 @@ protected:
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	bool IsStepPlayable(int32 Index) const;
 	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f, int32 SourceRequestId = 0);
-	void ReleaseMontageTask(const FGGYGOAbilityActivationHandle& Original);
-	void OpenTraceWindow(const FGGYGOAbilityActivationHandle& Original);
+	void OpenTraceWindow(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageWindowDeclaration& Declaration);
 	void ReleaseTraceWindow(const FGGYGOAbilityActivationHandle& Original);
 	void RejectRequest(const FGGYGOAbilityActivationHandle& Original, int32 RequestId);
 	void SendAuthoritativeStep(const FGGYGOAbilityActivationHandle& Original, int32 RequestId, bool bAccepted);
@@ -67,12 +135,17 @@ protected:
 	bool InitializeStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageSectionFact& Fact);
 	void HandleMontageNotify(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageNotifyFact& Fact);
-	void EnableStepInterruption(const TSharedPtr<FStepMotionResources>& Resource);
+	/** 只开攻击接续门；不查询、订阅或取消 CMC 移动。 */
+	void OpenAttackContinuation(const TSharedPtr<FStepMotionResources>& Resource);
+	/** 以移动点原实例实时快照判定开门；位置未达作者 Main 末端时保留 Pending 并返回。 */
+	void TryOpenMovementInterruption(const TSharedPtr<FStepMotionResources>& Resource);
+	/** 移动门已开后的唯一 CMC 消费：原认证 Intent 重查→Cancel→返栈复核→GA End。 */
+	void BeginMovementInterruption(const TSharedPtr<FStepMotionResources>& Resource);
 	void TryCompleteStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
 	void ReleaseStepMotion(EGGYGOActionMotionReleaseReason Reason);
 	void HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId);
-	void HandleMontageEvent(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
+	void HandleMontageWindow(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageWindowFact& Fact);
 	void HandleMontageCompleted(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
 	void HandleMontageBlendOut(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
@@ -106,9 +179,24 @@ private:
 	/** 验证本次选择的GE依赖，可输出同一次解析的成功结果；成功时空结果仅用于显式无GE模式。
 	 *  不加载、重试、缓存或记录激活状态；失败清空输出。 */
 	bool ValidateDamageEffectDependency(FString& OutError, TSubclassOf<UGameplayEffect>* OutResolvedEffect = nullptr) const;
+	/** 只消费公共 Task 已认证的本段窗口；粒子完成不授予段或能力完成权限。 */
+	void HandleStepFXWindow(const TSharedPtr<FStepMotionResources>& Resource,
+		const FGGYGOMontageWindowFact& Fact);
+	void HandleStepFXLocalStartReady(const TSharedPtr<FStepMotionResources>& Resource,
+		const FGGYGOMontageFXLocalStartReadyFact& Fact);
+	void ReleaseStepFX(const TSharedPtr<FStepMotionResources>& Resource, bool bNormalExit);
+	void FailStepFX(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
+	UFUNCTION()
+	void HandleStepFXFailed(UGGYGOAbilityTask_PlayNiagaraEffect* Sender, const FString& Reason);
 
-	UPROPERTY(Transient)
-	TObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> MontageTask;
+	/** 读本段原 Task 对该门名字的原实例实时点快照，并核对原 Montage/Mesh/实例/触发位置。
+	 *  失败清空输出；只认原 Task 已认证的名字，不自行解析 Montage 声明。 */
+	bool ReadAuthorPointSnapshot(const TSharedPtr<FStepMotionResources>& Resource, const FAuthorPointGate& Gate,
+		FGGYGOMontageNotifyFact& OutFact, float& OutPositionSeconds, FString& OutError) const;
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetMontageTask() const;
+	UGGYGOAbilityTask_PlayNiagaraEffect* GetStepFXTask() const;
+	bool HasMontageCallbackRegistration() const;
+	FTimerHandle GetWatchdogHandle() const;
 	UPROPERTY(Transient)
 	TObjectPtr<UGGYGOAbilityTask_WaitComboInput> InputTask;
 	UPROPERTY(Transient)
@@ -117,15 +205,13 @@ private:
 	TObjectPtr<USkeletalMeshComponent> ActiveMesh;
 	/** Copies of issuer-owned identity and our resources, never another activation/end state machine. */
 	FGGYGOAbilityActivationHandle ResourceActivation;
-	/** 本段持有的原 CMC 资源与来源；不复制 CMC 状态或 Montage 时钟。 */
+	/** 本段原 CMC 资源、来源及 FX 请求/退出事实；不复制引擎运行状态或时钟。 */
 	TSharedPtr<FStepMotionResources> StepMotionResources;
-	FDelegateHandle MontageCallbackRegistration;
 	FDelegateHandle InputCallbackRegistration;
 	FGGYGOMeleeTraceWindowHandle TraceWindow;
 	FDelegateHandle TraceHitSubscription;
 	TWeakObjectPtr<UWorld> OriginalWorld;
 	FGGYGOComboWindowState Window;
-	FTimerHandle WatchdogHandle;
 	int32 CurrentStep = INDEX_NONE;
 	int32 LastRequestId = 0;
 	/** 本段实际起播的原输入请求序号；段号可回接，旧服务器确认按请求顺序隔离。 */

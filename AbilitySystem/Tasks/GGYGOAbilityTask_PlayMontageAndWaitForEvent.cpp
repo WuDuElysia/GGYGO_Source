@@ -4,16 +4,18 @@
  */
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 
-#include "AbilitySystemComponent.h"
-#include "AbilitySystemGlobals.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/Tasks/GGYGORootMotionScaleLease.h"
+#include "Animation/Notifies/GGYGOAnimNotifyState_GameplayEventWindow.h"
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
+#include "AbilitySystemComponent.h"
+#include "AbilitySystemGlobals.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "AnimNotifies/AnimNotify_PlayMontageNotify.h"
-#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "Misc/ScopeExit.h"
 
@@ -37,10 +39,10 @@ struct UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbackRegistration
 namespace
 {
 	bool ResolveNativeMontageNotify(const UAnimMontage* Montage, FName NotifyName,
-		const FAnimNotifyEvent*& OutEvent, float& OutPositionSeconds, FString& OutDiagnostic)
+		const FAnimNotifyEvent*& OutEvent, FGGYGOMontageNotifyDeclaration& OutDeclaration, FString& OutDiagnostic)
 	{
 		OutEvent = nullptr;
-		OutPositionSeconds = 0.0f;
+		OutDeclaration = {};
 		OutDiagnostic.Reset();
 		if (!IsInGameThread() || !IsValid(Montage) || NotifyName.IsNone())
 		{
@@ -77,10 +79,13 @@ namespace
 				OutDiagnostic = TEXT("The configured native Montage Notify point is duplicated.");
 				return false;
 			}
-			const float Position = Event.GetTriggerTime();
-			if (!FMath::IsFinite(Position) || Position < 0.0f || Position > Length)
+			const float AuthoredPosition = Event.GetTime();
+			const float TriggerPosition = Event.GetTriggerTime();
+			if (!FMath::IsFinite(AuthoredPosition) || AuthoredPosition < 0.0f || AuthoredPosition > Length
+				|| !FMath::IsFinite(Event.TriggerTimeOffset)
+				|| !FMath::IsFinite(TriggerPosition) || TriggerPosition < 0.0f || TriggerPosition > Length)
 			{
-				OutDiagnostic = TEXT("The native Montage Notify trigger time is nonfinite or outside the Montage timeline.");
+				OutDiagnostic = FString::Printf(TEXT("原生 Montage Notify '%s' 的作者时间、offset 或触发时间无效。"), *NotifyName.ToString());
 				return false;
 			}
 			Matched = &Event;
@@ -90,9 +95,36 @@ namespace
 			OutDiagnostic = TEXT("The configured stock native Montage Notify point is missing.");
 			return false;
 		}
-		OutEvent = Matched; // Borrowed only by the current call; never retained across asset mutation.
-		OutPositionSeconds = Matched->GetTriggerTime();
+		// UE 按精确 float 时间检测 BranchingPoint Begin/StateEnd 碰撞，碰撞会漏发其中一项。
+		// 只拒绝涉及所选点的碰撞；不修改作者位置，也不把合法 OffsetBefore 改成零。
+		const float TriggerPosition = Matched->GetTriggerTime();
+		for (int32 Index = 0; Index < Montage->Notifies.Num(); ++Index)
+		{
+			const FAnimNotifyEvent& Other = Montage->Notifies[Index];
+			if (!Other.IsBranchingPoint()) { continue; }
+			if ((&Other != Matched && Other.GetTriggerTime() == TriggerPosition)
+				|| (Other.NotifyStateClass && Other.GetEndTriggerTime() == TriggerPosition))
+			{
+				OutDiagnostic = FString::Printf(TEXT("原生 Montage Notify '%s' 在 %.9g 与 BranchingPoint[%d] 的实际触发时间碰撞。"),
+					*NotifyName.ToString(), TriggerPosition, Index);
+				return false;
+			}
+		}
+		OutEvent = Matched; // 数组指针只借用于本调用栈，不跨资产变更保留。
+		OutDeclaration.NotifyName = NotifyName;
+		OutDeclaration.AuthoredPositionSeconds = Matched->GetTime();
+		OutDeclaration.TriggerPositionSeconds = TriggerPosition;
+		OutDeclaration.TriggerTimeOffsetSeconds = Matched->TriggerTimeOffset;
 		return true;
+	}
+
+	bool HasSameGGYGOMontageTaskNotifyTiming(const FGGYGOMontageNotifyDeclaration& First,
+		const FGGYGOMontageNotifyDeclaration& Second)
+	{
+		return First.NotifyName == Second.NotifyName
+			&& First.AuthoredPositionSeconds == Second.AuthoredPositionSeconds
+			&& First.TriggerPositionSeconds == Second.TriggerPositionSeconds
+			&& First.TriggerTimeOffsetSeconds == Second.TriggerTimeOffsetSeconds;
 	}
 
 	bool StopOriginalMontageInstance(const FGGYGOMontagePlayGuardIdentity& Identity,
@@ -181,7 +213,7 @@ FDelegateHandle UGGYGOAbilityTask_PlayMontageAndWaitForEvent::RegisterNativeCall
 	else if (!Callbacks.OnCompleted.IsBound() && !Callbacks.OnBlendOut.IsBound()
 		&& !Callbacks.OnInterrupted.IsBound() && !Callbacks.OnCancelled.IsBound()
 		&& !Callbacks.EventReceived.IsBound() && !Callbacks.SectionReceived.IsBound()
-		&& !Callbacks.NotifyReceived.IsBound() && !Callbacks.OnFailed.IsBound())
+		&& !Callbacks.NotifyReceived.IsBound() && !Callbacks.WindowReceived.IsBound() && !Callbacks.OnFailed.IsBound())
 	{
 		Reason = TEXT("the native callback package has no bound callbacks");
 	}
@@ -343,37 +375,248 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalSectionSnapshot
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotify(
 	const UAnimMontage* Montage, FName NotifyName, float& OutNotifyPositionSeconds, FString& OutDiagnostic)
 {
+	OutNotifyPositionSeconds = 0.0f;
+	FGGYGOMontageNotifyDeclaration Declaration;
+	if (!ResolveOriginalMontageNotifyDeclaration(Montage, NotifyName, Declaration, OutDiagnostic)) { return false; }
+	OutNotifyPositionSeconds = Declaration.TriggerPositionSeconds;
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotifyDeclaration(
+	const UAnimMontage* Montage, FName NotifyName, FGGYGOMontageNotifyDeclaration& OutDeclaration, FString& OutDiagnostic)
+{
 	const FAnimNotifyEvent* Event = nullptr;
-	return ResolveNativeMontageNotify(Montage, NotifyName, Event, OutNotifyPositionSeconds, OutDiagnostic);
+	if (!ResolveNativeMontageNotify(Montage, NotifyName, Event, OutDeclaration, OutDiagnostic)) { return false; }
+	OutDeclaration.NativeNotify = Event->Notify;
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowAtIndex(
+	const UAnimMontage* Montage, int32 NotifyIndex, float RangeStartSeconds, float RangeEndSeconds,
+	FGGYGOMontageWindowDeclaration& OutDeclaration, FString& OutDiagnostic)
+{
+	OutDeclaration = {};
+	OutDiagnostic.Reset();
+	if (!IsValid(Montage) || !Montage->Notifies.IsValidIndex(NotifyIndex)
+		|| !FMath::IsFinite(RangeStartSeconds) || !FMath::IsFinite(RangeEndSeconds)
+		|| RangeStartSeconds < 0.0f || RangeEndSeconds <= RangeStartSeconds)
+	{
+		OutDiagnostic = TEXT("作者窗口需要原 Montage、有效条目及有限正向绑定范围。");
+		return false;
+	}
+	const FAnimNotifyEvent& Event = Montage->Notifies[NotifyIndex];
+	auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Event.NotifyStateClass.Get());
+	const float Begin = Event.GetTime();
+	const float End = Begin + Event.GetDuration();
+	const float TriggerBegin = Event.GetTriggerTime();
+	const float TriggerEnd = Event.GetEndTriggerTime();
+	if (!Notify || !Notify->GetBeginEventTag().IsValid() || !Notify->GetEndEventTag().IsValid()
+		|| Event.GetLinkedMontage() != Montage || !FMath::IsFinite(Begin) || !FMath::IsFinite(End)
+		|| !FMath::IsFinite(TriggerBegin) || !FMath::IsFinite(TriggerEnd)
+		|| Begin < RangeStartSeconds || End <= Begin || End > RangeEndSeconds)
+	{
+		OutDiagnostic = TEXT("原作者窗口的标签、链接或时间范围无效。");
+		return false;
+	}
+	OutDeclaration.Montage = const_cast<UAnimMontage*>(Montage);
+	OutDeclaration.BeginEventTag = Notify->GetBeginEventTag();
+	OutDeclaration.EndEventTag = Notify->GetEndEventTag();
+	OutDeclaration.BeginSeconds = Begin;
+	OutDeclaration.EndSeconds = End;
+	OutDeclaration.BeginTriggerSeconds = TriggerBegin;
+	OutDeclaration.EndTriggerSeconds = TriggerEnd;
+	OutDeclaration.bQueued = Event.MontageTickType == EMontageNotifyTickType::Queued;
+	OutDeclaration.bNoMergeOnConcurrentPlay = (Notify->NotifyStateBehaviorFlags
+		& static_cast<uint8>(EAnimNotifyStateBehaviorFlags::NoMergeOnConcurrentPlay)) != 0;
+	OutDeclaration.NativeNotify = Notify;
+	OutDeclaration.NotifyIndex = NotifyIndex;
+	OutDeclaration.RangeStartSeconds = RangeStartSeconds;
+	OutDeclaration.RangeEndSeconds = RangeEndSeconds;
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowDeclaration(
+	const UAnimMontage* Montage, FGameplayTag BeginEventTag, FGameplayTag EndEventTag,
+	float RangeStartSeconds, float RangeEndSeconds, FGGYGOMontageWindowDeclaration& OutDeclaration,
+	FString& OutDiagnostic)
+{
+	OutDeclaration = {};
+	OutDiagnostic.Reset();
+	if (!IsValid(Montage) || !BeginEventTag.IsValid() || !EndEventTag.IsValid())
+	{
+		OutDiagnostic = TEXT("唯一窗口解析需要原 Montage 和明确 Begin/End 标签。");
+		return false;
+	}
+	int32 Match = INDEX_NONE;
+	for (int32 Index = 0; Index < Montage->Notifies.Num(); ++Index)
+	{
+		const auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Montage->Notifies[Index].NotifyStateClass.Get());
+		if (!Notify) { continue; }
+		const FGameplayTag Begin = Notify->GetBeginEventTag();
+		const FGameplayTag End = Notify->GetEndEventTag();
+		if (Begin != BeginEventTag && Begin != EndEventTag && End != BeginEventTag && End != EndEventTag) { continue; }
+		if (Begin != BeginEventTag || End != EndEventTag || Match != INDEX_NONE)
+		{
+			OutDiagnostic = TEXT("必需唯一窗口存在重复条目或标签配对冲突。");
+			return false;
+		}
+		Match = Index;
+	}
+	if (Match == INDEX_NONE)
+	{
+		OutDiagnostic = TEXT("原 Montage 没有请求的必需窗口。");
+		return false;
+	}
+	return ResolveOriginalMontageWindowAtIndex(Montage, Match, RangeStartSeconds, RangeEndSeconds, OutDeclaration, OutDiagnostic);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
+	const UAnimMontage* Montage, const FGameplayTagContainer& Tags, float RangeStartSeconds, float RangeEndSeconds,
+	TArray<FGGYGOMontageWindowDeclaration>& OutDeclarations, FString& OutDiagnostic)
+{
+	OutDeclarations.Reset();
+	OutDiagnostic.Reset();
+	if (!IsValid(Montage)) { OutDiagnostic = TEXT("窗口解析缺少原 Montage。"); return false; }
+	TArray<FGGYGOMontageWindowDeclaration> Declarations;
+	for (int32 Index = 0; Index < Montage->Notifies.Num(); ++Index)
+	{
+		const auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Montage->Notifies[Index].NotifyStateClass.Get());
+		if (!Notify || (!Notify->GetBeginEventTag().MatchesAny(Tags) && !Notify->GetEndEventTag().MatchesAny(Tags))) { continue; }
+		FGGYGOMontageWindowDeclaration Declaration;
+		if (!ResolveOriginalMontageWindowAtIndex(Montage, Index, RangeStartSeconds, RangeEndSeconds,
+			Declaration, OutDiagnostic)) { return false; }
+		Declarations.Add(MoveTemp(Declaration));
+	}
+	OutDeclarations = MoveTemp(Declarations);
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageWindowDeclarationCurrent(
+	const FGGYGOMontageWindowDeclaration& Declaration) const
+{
+	FGGYGOMontageWindowDeclaration Actual;
+	FString Diagnostic;
+	return Declaration.Montage == MontageToPlay && IsValid(Declaration.NativeNotify)
+		&& ResolveOriginalMontageWindowAtIndex(MontageToPlay, Declaration.NotifyIndex,
+			Declaration.RangeStartSeconds, Declaration.RangeEndSeconds, Actual, Diagnostic)
+		&& Actual.HasSameWindow(Declaration);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ConfigureOriginalMontageWindows(
+	const TArray<FGGYGOMontageWindowDeclaration>& Declarations, FString& OutDiagnostic)
+{
+	OutDiagnostic.Reset();
+	if (!IsInGameThread() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
+		|| bCancellationRequested || bPoseFailureRequested || bMontageWindowsConfigured
+		|| GetState() != EGameplayTaskState::AwaitingActivation)
+	{
+		OutDiagnostic = TEXT("窗口声明只允许在原 Task Ready 前提交一次。");
+		return false;
+	}
+	TSet<int32> Indices;
+	for (const auto& Declaration : Declarations)
+	{
+		if (!IsOriginalMontageWindowDeclarationCurrent(Declaration) || Indices.Contains(Declaration.NotifyIndex))
+		{
+			OutDiagnostic = TEXT("窗口声明与原资产不符，或同次声明集中有重复原条目。");
+			return false;
+		}
+		Indices.Add(Declaration.NotifyIndex);
+	}
+	ConfiguredMontageWindowDeclarations = Declarations;
+	bMontageWindowsConfigured = true;
+	for (const auto& Declaration : Declarations)
+	{
+		EventTags.AddTag(Declaration.BeginEventTag);
+		EventTags.AddTag(Declaration.EndEventTag);
+	}
+	return true;
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageWindowSnapshot(
+	FGameplayTag BeginEventTag, FGameplayTag EndEventTag, FGGYGOMontageWindowDeclaration& OutDeclaration,
+	FGGYGOMontageSectionSnapshot& OutPlayback) const
+{
+	check(IsInGameThread());
+	OutDeclaration = {};
+	OutPlayback = {};
+	const FGGYGOMontageWindowDeclaration* Match = nullptr;
+	for (const auto& Declaration : ConfiguredMontageWindowDeclarations)
+	{
+		if (Declaration.BeginEventTag != BeginEventTag || Declaration.EndEventTag != EndEventTag) { continue; }
+		if (Match) { return false; }
+		Match = &Declaration;
+	}
+	if (!Match || !IsOriginalMontageWindowDeclarationCurrent(*Match)
+		|| !TryGetOriginalSectionSnapshot(OutPlayback)) { return false; }
+	OutDeclaration = *Match;
+	return true;
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ConfigureOriginalMontageNotify(FName InName, FString& OutDiagnostic)
 {
+	return ConfigureOriginalMontageNotifies({InName}, OutDiagnostic);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ConfigureOriginalMontageNotifies(
+	const TArray<FName>& InNames, FString& OutDiagnostic)
+{
 	OutDiagnostic.Reset();
 	if (!IsInGameThread() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || bEndingTask
 		|| bCancellationRequested || bPoseFailureRequested || GetState() != EGameplayTaskState::AwaitingActivation
-		|| !ConfiguredMontageNotifyName.IsNone())
+		|| !ConfiguredMontageNotifyDeclarations.IsEmpty())
 	{
 		OutDiagnostic = TEXT("Native Montage Notify configuration is allowed once, on the original pre-Ready AwaitingActivation task.");
 		return false;
 	}
-	const FAnimNotifyEvent* Event = nullptr;
-	float Position = 0.0f;
-	if (!ResolveNativeMontageNotify(MontageToPlay, InName, Event, Position, OutDiagnostic)) { return false; }
-	ConfiguredMontageNotify = Event->Notify;
-	ConfiguredMontageNotifyName = InName;
-	ConfiguredMontageNotifyPositionSeconds = Position;
+	if (InNames.IsEmpty())
+	{
+		OutDiagnostic = TEXT("原生 Montage Notify 配置需要非空名字集。");
+		return false;
+	}
+	TArray<FGGYGOMontageNotifyDeclaration> Declarations;
+	Declarations.Reserve(InNames.Num());
+	for (FName Name : InNames)
+	{
+		if (Name.IsNone() || Declarations.ContainsByPredicate([Name](const FGGYGOMontageNotifyDeclaration& Item)
+			{ return Item.NotifyName == Name; }))
+		{
+			OutDiagnostic = FString::Printf(TEXT("原生 Montage Notify 配置名字 '%s' 为空或重复。"), *Name.ToString());
+			return false;
+		}
+		FGGYGOMontageNotifyDeclaration Declaration;
+		if (!ResolveOriginalMontageNotifyDeclaration(MontageToPlay, Name, Declaration, OutDiagnostic)) { return false; }
+		Declarations.Add(MoveTemp(Declaration));
+	}
+	// 解析不调用外部代码；全部声明通过后才提交唯一配置集，失败不占用配置机会。
+	ConfiguredMontageNotifyDeclarations = MoveTemp(Declarations);
 	return true;
 }
 
-bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageNotifySourceCurrent() const
+const FGGYGOMontageNotifyDeclaration* UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FindConfiguredMontageNotify(FName NotifyName) const
 {
-	if (ConfiguredMontageNotifyName.IsNone() || !IsValid(ConfiguredMontageNotify)) { return false; }
+	return ConfiguredMontageNotifyDeclarations.FindByPredicate([NotifyName](const FGGYGOMontageNotifyDeclaration& Item)
+		{ return Item.NotifyName == NotifyName; });
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageNotifySourceCurrent(
+	const FGGYGOMontageNotifyDeclaration& Declaration) const
+{
+	if (!IsValid(Declaration.NativeNotify)) { return false; }
 	const FAnimNotifyEvent* Event = nullptr;
-	float Position = 0.0f;
+	FGGYGOMontageNotifyDeclaration Actual;
 	FString Diagnostic;
-	return ResolveNativeMontageNotify(MontageToPlay, ConfiguredMontageNotifyName, Event, Position, Diagnostic)
-		&& Event->Notify == ConfiguredMontageNotify && Position == ConfiguredMontageNotifyPositionSeconds;
+	return ResolveNativeMontageNotify(MontageToPlay, Declaration.NotifyName, Event, Actual, Diagnostic)
+		&& Event->Notify == Declaration.NativeNotify && HasSameGGYGOMontageTaskNotifyTiming(Actual, Declaration);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::AreOriginalMontageNotifySourcesCurrent() const
+{
+	for (const FGGYGOMontageNotifyDeclaration& Declaration : ConfiguredMontageNotifyDeclarations)
+	{
+		if (!IsOriginalMontageNotifySourceCurrent(Declaration)) { return false; }
+	}
+	return !ConfiguredMontageNotifyDeclarations.IsEmpty();
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySnapshot(
@@ -382,14 +625,28 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySn
 	check(IsInGameThread());
 	OutFact = {};
 	OutPositionSeconds = 0.0f;
-	if (!CanDispatchOriginalInstanceFact(OriginalGuardIdentity) || !IsOriginalMontageNotifySourceCurrent()) { return false; }
+	if (ConfiguredMontageNotifyDeclarations.Num() != 1) { return false; }
+	return TryGetOriginalMontageNotifySnapshotByName(ConfiguredMontageNotifyDeclarations[0].NotifyName, OutFact, OutPositionSeconds);
+}
+
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySnapshotByName(
+	FName NotifyName, FGGYGOMontageNotifyFact& OutFact, float& OutPositionSeconds) const
+{
+	check(IsInGameThread());
+	OutFact = {};
+	OutPositionSeconds = 0.0f;
+	const FGGYGOMontageNotifyDeclaration* Declaration = FindConfiguredMontageNotify(NotifyName);
+	if (!Declaration || !CanDispatchOriginalInstanceFact(OriginalGuardIdentity)
+		|| !IsOriginalMontageNotifySourceCurrent(*Declaration)) { return false; }
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
 	if (!Instance || !FMath::IsFinite(Instance->GetPosition())) { return false; }
 	OutFact.Montage = MontageToPlay;
 	OutFact.Mesh = ActivatedMesh.Get();
 	OutFact.MontageInstanceId = Instance->GetInstanceID();
-	OutFact.NotifyName = ConfiguredMontageNotifyName;
-	OutFact.NotifyPositionSeconds = ConfiguredMontageNotifyPositionSeconds;
+	OutFact.NotifyName = Declaration->NotifyName;
+	OutFact.NotifyPositionSeconds = Declaration->TriggerPositionSeconds;
+	OutFact.NotifyAuthoredPositionSeconds = Declaration->AuthoredPositionSeconds;
+	OutFact.NotifyTriggerTimeOffsetSeconds = Declaration->TriggerTimeOffsetSeconds;
 	OutPositionSeconds = Instance->GetPosition();
 	return true;
 }
@@ -397,10 +654,13 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySn
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalMontageNotifyFact(
 	const FGGYGOMontageNotifyFact& Fact, const FGGYGOMontagePlayGuardIdentity& Original) const
 {
-	return CanDispatchOriginalInstanceFact(Original) && IsOriginalMontageNotifySourceCurrent()
+	const FGGYGOMontageNotifyDeclaration* Declaration = FindConfiguredMontageNotify(Fact.NotifyName);
+	return Declaration && CanDispatchOriginalInstanceFact(Original) && IsOriginalMontageNotifySourceCurrent(*Declaration)
 		&& GetTaskMontageInstance() && Fact.Montage == MontageToPlay && Fact.Mesh == ActivatedMesh.Get()
-		&& Fact.MontageInstanceId == Original.CreatedInstanceId && Fact.NotifyName == ConfiguredMontageNotifyName
-		&& Fact.NotifyPositionSeconds == ConfiguredMontageNotifyPositionSeconds;
+		&& Fact.MontageInstanceId == Original.CreatedInstanceId
+		&& Fact.NotifyPositionSeconds == Declaration->TriggerPositionSeconds
+		&& Fact.NotifyAuthoredPositionSeconds == Declaration->AuthoredPositionSeconds
+		&& Fact.NotifyTriggerTimeOffsetSeconds == Declaration->TriggerTimeOffsetSeconds;
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchValidatedOriginalMontageNotifyFact(
@@ -426,16 +686,17 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchValidatedOriginalMont
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
 	FName NotifyName, const FBranchingPointNotifyPayload& Payload)
 {
-	if (NotifyName != ConfiguredMontageNotifyName || !IsValid(ConfiguredMontageNotify)
+	const FGGYGOMontageNotifyDeclaration* Declaration = FindConfiguredMontageNotify(NotifyName);
+	if (!Declaration || !IsValid(Declaration->NativeNotify)
 		|| Payload.MontageInstanceID == INDEX_NONE
 		|| Payload.MontageInstanceID != MontageInstanceId || Payload.SkelMeshComponent != ActivatedMesh.Get()
 		|| Payload.SequenceAsset != MontageToPlay || !Payload.NotifyEvent) { return; }
 	const FAnimNotifyEvent* Event = nullptr;
-	float Position = 0.0f;
+	FGGYGOMontageNotifyDeclaration Actual;
 	FString Diagnostic;
-	if (!ResolveNativeMontageNotify(MontageToPlay, NotifyName, Event, Position, Diagnostic)
-		|| Event != Payload.NotifyEvent || Event->Notify != ConfiguredMontageNotify
-		|| Position != ConfiguredMontageNotifyPositionSeconds) { return; }
+	if (!ResolveNativeMontageNotify(MontageToPlay, NotifyName, Event, Actual, Diagnostic)
+		|| Event != Payload.NotifyEvent || Event->Notify != Declaration->NativeNotify
+		|| !HasSameGGYGOMontageTaskNotifyTiming(Actual, *Declaration)) { return; }
 	const FGGYGOMontagePlayGuardIdentity Original = OriginalGuardIdentity;
 	if (!CanDispatchOriginalInstanceFact(Original)) { return; }
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
@@ -446,8 +707,10 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
 	Fact.Montage = MontageToPlay;
 	Fact.Mesh = ActivatedMesh.Get();
 	Fact.MontageInstanceId = Instance->GetInstanceID();
-	Fact.NotifyName = ConfiguredMontageNotifyName;
-	Fact.NotifyPositionSeconds = ConfiguredMontageNotifyPositionSeconds;
+	Fact.NotifyName = Declaration->NotifyName;
+	Fact.NotifyPositionSeconds = Declaration->TriggerPositionSeconds;
+	Fact.NotifyAuthoredPositionSeconds = Declaration->AuthoredPositionSeconds;
+	Fact.NotifyTriggerTimeOffsetSeconds = Declaration->TriggerTimeOffsetSeconds;
 	DispatchValidatedOriginalMontageNotifyFact(Fact, Original);
 }
 
@@ -515,11 +778,25 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		FailAndEndTask(TEXT("Montage、播放速率或 RootMotion 缩放配置无效"));
 		return;
 	}
-	if (!ConfiguredMontageNotifyName.IsNone())
+	for (const auto& Declaration : ConfiguredMontageWindowDeclarations)
 	{
-		if (!IsOriginalMontageNotifySourceCurrent())
+		if (!IsOriginalMontageWindowDeclarationCurrent(Declaration))
 		{
-			FailAndEndTask(TEXT("配置的原生 Montage Notify 单点声明在 Ready 前已失效"));
+			FailAndEndTask(TEXT("配置的原作者窗口在 Ready 前已失效"));
+			return;
+		}
+	}
+	if (!ConfiguredMontageWindowDeclarations.IsEmpty() && !WindowReceived.IsBound()
+		&& !(NativeCallbackRegistration.IsValid() && NativeCallbackRegistration->Callbacks.WindowReceived.IsBound()))
+	{
+		FailAndEndTask(TEXT("已配置原作者窗口但没有 Ready 前安装的 typed 消费者"));
+		return;
+	}
+	if (!ConfiguredMontageNotifyDeclarations.IsEmpty())
+	{
+		if (!AreOriginalMontageNotifySourcesCurrent())
+		{
+			FailAndEndTask(TEXT("配置的原生 Montage Notify 声明在 Ready 前已失效"));
 			return;
 		}
 		if (!NotifyReceived.IsBound() && !(NativeCallbackRegistration.IsValid()
@@ -700,13 +977,13 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		if (Task && !Task->bEndingTask) { Task->FailAndEndTask(TEXT("原 Guard 实例已失效，无法安装任务委托"), &Result); }
 		return;
 	}
-	if (!Task->ConfiguredMontageNotifyName.IsNone() && !Task->IsOriginalMontageNotifySourceCurrent())
+	if (!Task->ConfiguredMontageNotifyDeclarations.IsEmpty() && !Task->AreOriginalMontageNotifySourcesCurrent())
 	{
 		Task->StopPlayingMontage();
 		Task = OriginalTask.Get();
 		if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished)
 		{
-			Task->FailAndEndTask(TEXT("原生播放外调返回后配置的 Montage Notify 单点声明已改变"));
+			Task->FailAndEndTask(TEXT("原生播放外调返回后配置的 Montage Notify 声明已改变"));
 		}
 		return;
 	}
@@ -722,7 +999,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	Instance->OnMontageEnded = Task->MontageEndedDelegate;
 	Task->MontageSectionChangedDelegate.BindUObject(Task, &ThisClass::OnMontageSectionChangedForInstance, Result.Guard.Identity);
 	Instance->OnMontageSectionChanged = Task->MontageSectionChangedDelegate;
-	if (!Task->ConfiguredMontageNotifyName.IsNone())
+	if (!Task->ConfiguredMontageNotifyDeclarations.IsEmpty())
 	{
 		// This engine multicast has no handle: detach only the original AnimInstance/task/function pair.
 		AnimInstance->OnPlayMontageNotifyBegin.AddDynamic(Task, &ThisClass::OnOriginalMontageNotifyBegin);
@@ -808,6 +1085,10 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 {
 	if (bEndingTask) { return; }
 	bEndingTask = true;
+	bWindowFactDispatching = false;
+	DispatchingWindowFact = {};
+	ConsumedWindowSourceDispatches.Reset();
+	ConfiguredMontageWindowDeclarations.Reset();
 	// Close the subscription before any cleanup. Its captures stay stack-owned until all old
 	// cleanup and Super have returned, so their destructors cannot interrupt a member-write tail.
 	TSharedPtr<FNativeCallbackRegistration> DetachedNativeCallbacks = MoveTemp(NativeCallbackRegistration);
@@ -815,6 +1096,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 	{
 		OriginalAnimInstance->OnPlayMontageNotifyBegin.RemoveDynamic(this, &ThisClass::OnOriginalMontageNotifyBegin);
 	}
+	ConfiguredMontageNotifyDeclarations.Reset();
 	ActionPoseContractTicket.Reset();
 	// Keep bTickingTask until native deactivation removes this task from TickingTasks.
 	if (AbilityEnded && bStopWhenAbilityEnds) { RequestInFlightMontageStop(); }
@@ -1132,18 +1414,124 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageEnded(UAnimMontage* 
 	}
 }
 
+bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageWindowFact(
+	const FGGYGOMontageWindowFact& Fact) const
+{
+	if (!bWindowFactDispatching || Fact.Issuer.Get() != this || Fact.DispatchSerial == 0
+		|| Fact.DispatchSerial != DispatchingWindowFact.DispatchSerial
+		|| Fact.Montage != DispatchingWindowFact.Montage || Fact.Mesh != DispatchingWindowFact.Mesh
+		|| Fact.MontageInstanceId != DispatchingWindowFact.MontageInstanceId
+		|| Fact.Phase != DispatchingWindowFact.Phase
+		|| Fact.DispatchWorldTimeSeconds != DispatchingWindowFact.DispatchWorldTimeSeconds
+		|| !Fact.Declaration.HasSameWindow(DispatchingWindowFact.Declaration)
+		|| !IsOriginalMontageWindowDeclarationCurrent(Fact.Declaration)) { return false; }
+	return Fact.Phase == EGGYGOMontageWindowPhase::Begin
+		? IsNotifyValid() : CanDispatchOriginalInstanceFact(OriginalGuardIdentity);
+}
+
+void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageWindowFact(
+	FGameplayTag EventTag, const FGameplayEventData& Payload)
+{
+	FGGYGOMontageWindowSourceData Source;
+	if (!UGGYGOAnimNotifyState_GameplayEventWindow::TryReadWindowDispatch(&Payload, Source)
+		|| !Source.DispatchIdentity.IsValid()
+		|| Source.EventTag != EventTag || !Source.bHasMontageInstanceContext
+		|| Source.MontageInstanceId != MontageInstanceId || MontageInstanceId == INDEX_NONE
+		|| Source.Animation.Get() != MontageToPlay.Get() || Source.Mesh != ActivatedMesh
+		|| Source.AnimInstance != ActivatedAnimInstance || !Source.Notify.IsValid()) { return; }
+	ConsumedWindowSourceDispatches.RemoveAll([](const TWeakPtr<const void>& Identity) { return !Identity.IsValid(); });
+	if (ConsumedWindowSourceDispatches.ContainsByPredicate([&Source](const TWeakPtr<const void>& Identity)
+		{ return Identity.Pin() == Source.DispatchIdentity; })) { return; }
+	if ((Source.Phase != EGGYGOMontageWindowPhase::Begin && Source.Phase != EGGYGOMontageWindowPhase::End)
+		|| (Source.Phase == EGGYGOMontageWindowPhase::Begin
+			? !IsNotifyValid() : !CanDispatchOriginalInstanceFact(OriginalGuardIdentity))) { return; }
+	const FGGYGOMontageWindowDeclaration* Match = nullptr;
+	for (const auto& Declaration : ConfiguredMontageWindowDeclarations)
+	{
+		if (Declaration.NativeNotify.Get() != Source.Notify.Get()
+			|| Declaration.BeginSeconds != Source.BeginSeconds || Declaration.EndSeconds != Source.EndSeconds
+			|| Declaration.BeginTriggerSeconds != Source.BeginTriggerSeconds
+			|| Declaration.EndTriggerSeconds != Source.EndTriggerSeconds
+			|| Declaration.bQueued != Source.bQueued
+			|| Declaration.bNoMergeOnConcurrentPlay != Source.bNoMergeOnConcurrentPlay
+			|| (Source.Phase == EGGYGOMontageWindowPhase::Begin
+				? Declaration.BeginEventTag : Declaration.EndEventTag) != EventTag) { continue; }
+		if (Match)
+		{
+			FailAndEndTask(TEXT("原窗口来源与多个相同作者条目相符，不能猜测声明。"));
+			return;
+		}
+		Match = &Declaration;
+	}
+	if (!Match) { return; }
+	if (!IsOriginalMontageWindowDeclarationCurrent(*Match))
+	{
+		FailAndEndTask(TEXT("已配置原窗口的作者来源发生变化。"));
+		return;
+	}
+	UWorld* World = Source.Mesh->GetWorld();
+	if (!World || World->bIsTearingDown || !FMath::IsFinite(World->GetTimeSeconds())) { return; }
+	if (LastWindowDispatchSerial == MAX_uint64)
+	{
+		FailAndEndTask(TEXT("原窗口同步派发身份已耗尽。"));
+		return;
+	}
+	FGGYGOMontageWindowFact Fact;
+	Fact.Montage = MontageToPlay;
+	Fact.Mesh = Source.Mesh.Get();
+	Fact.MontageInstanceId = MontageInstanceId;
+	Fact.Declaration = *Match;
+	Fact.Phase = Source.Phase;
+	Fact.DispatchWorldTimeSeconds = World->GetTimeSeconds();
+	Fact.Issuer = this;
+	Fact.DispatchSerial = ++LastWindowDispatchSerial;
+	ConsumedWindowSourceDispatches.Add(Source.DispatchIdentity);
+	const FGGYGOMontageWindowFact PreviousFact = DispatchingWindowFact;
+	const bool bPreviousDispatching = bWindowFactDispatching;
+	DispatchingWindowFact = Fact;
+	bWindowFactDispatching = true;
+	const TWeakObjectPtr<ThisClass> OriginalTask(this);
+	const auto Registration = NativeCallbackRegistration;
+	if (Registration.IsValid() && Registration->Callbacks.WindowReceived.IsBound())
+	{
+		Registration->Callbacks.WindowReceived.Execute(Fact);
+	}
+	ThisClass* Task = OriginalTask.Get();
+	if (Task && Task->NativeCallbackRegistration == Registration && Task->IsOriginalMontageWindowFact(Fact))
+	{
+		Task->WindowReceived.Broadcast(Fact);
+	}
+	Task = OriginalTask.Get();
+	if (Task && Task->bWindowFactDispatching && Task->DispatchingWindowFact.DispatchSerial == Fact.DispatchSerial)
+	{
+		// 嵌套派发只归还本帧的槽位；结束或后继改写后不恢复旧值。
+		Task->DispatchingWindowFact = PreviousFact;
+		Task->bWindowFactDispatching = bPreviousDispatching;
+		if (!bPreviousDispatching || !Task->IsOriginalMontageWindowFact(PreviousFact))
+		{
+			Task->bWindowFactDispatching = false;
+			Task->DispatchingWindowFact = {};
+		}
+	}
+}
+
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnGameplayEvent(FGameplayTag EventTag, const FGameplayEventData* Payload)
 {
-	if (!Payload || !ShouldBroadcastAbilityTaskDelegates() || !IsNotifyValid())
+	if (!Payload) { return; }
+	const TWeakObjectPtr<ThisClass> OriginalTask(this);
+	DispatchOriginalMontageWindowFact(EventTag, *Payload);
+	ThisClass* Task = OriginalTask.Get();
+	if (!Task) { return; }
+	if (!Task->ShouldBroadcastAbilityTaskDelegates() || !Task->IsNotifyValid())
 	{
 		return;
 	}
 	if (const UAnimMontage* Source = Cast<UAnimMontage>(Payload->OptionalObject))
 	{
-		if (Source != MontageToPlay) { return; }
+		if (Source != Task->MontageToPlay) { return; }
 		// GameplayEventWindow 把本地播放实例 ID+1 放入 Magnitude；0 表示无上下文。
-		if (Payload->EventMagnitude > 0.0f && MontageInstanceId != INDEX_NONE
-			&& FMath::RoundToInt(Payload->EventMagnitude) - 1 != MontageInstanceId) { return; }
+		if (Payload->EventMagnitude > 0.0f && Task->MontageInstanceId != INDEX_NONE
+			&& FMath::RoundToInt(Payload->EventMagnitude) - 1 != Task->MontageInstanceId) { return; }
 	}
 
 	// 拷一份负载再广播：原始指针指向 ASC 内部的临时对象，
@@ -1151,7 +1539,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnGameplayEvent(FGameplayTag 
 	FGameplayEventData TempData = *Payload;
 	TempData.EventTag = EventTag;
 
-	DispatchOriginalCallback(ENativeCallback::EventReceived, EventTag, MoveTemp(TempData));
+	Task->DispatchOriginalCallback(ENativeCallback::EventReceived, EventTag, MoveTemp(TempData));
 }
 
 FString UGGYGOAbilityTask_PlayMontageAndWaitForEvent::GetDebugString() const

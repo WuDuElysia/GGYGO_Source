@@ -5,7 +5,7 @@
  * ## 本类刻意不做的事
  * 不含移动逻辑、不含输入处理、不含战斗逻辑、不含动画驱动。
  * 它只做四件事：创建组件、实现 `IAbilitySystemInterface`、
- * 把引擎的生命周期回调转给 `UGGYGOPawnExtensionComponent`、把死亡事件接到表现上。
+ * 把引擎生命周期接到初始化及原生通知、把死亡事件接到表现上。
  *
  * 原因是这些职责的生命周期与复用边界各不相同：
  * 移动逻辑属于 CMC（要参与网络预测），输入属于本地控制端（模拟代理没有），
@@ -28,6 +28,7 @@
 #pragma once
 
 #include "AbilitySystemInterface.h"
+#include "Delegates/Delegate.h"
 #include "GameFramework/Character.h"
 #include "Templates/SharedPointer.h"
 
@@ -52,6 +53,14 @@ class GGYGO_API AGGYGOCharacterBase : public ACharacter, public IAbilitySystemIn
 
 public:
 	AGGYGOCharacterBase(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+
+	DECLARE_EVENT_OneParam(AGGYGOCharacterBase, FReplicatedLocalRoleChanged, AGGYGOCharacterBase*);
+
+	/**
+	 * 本角色接收复制且 LocalRole 变化后的原生通知；Controller 复制可能尚未完成。
+	 * 订阅者持有并归还 FDelegateHandle，绑定后自行读取当前状态；本事件不重放初始快照。
+	 */
+	FReplicatedLocalRoleChanged& OnReplicatedLocalRoleChanged() { return ReplicatedLocalRoleChanged; }
 
 	//~IAbilitySystemInterface
 	/** 返回本角色作为 Avatar 所属的那个 ASC。注入完成前为 nullptr。 */
@@ -98,6 +107,9 @@ protected:
 	/** 服务器上失去 Controller。 */
 	virtual void UnPossessed() override;
 
+	/** 接收复制后的 LocalRole 变化，保留引擎回调并通知本地订阅者。 */
+	virtual void PostNetReceiveRole() override;
+
 	/** 客户端收到 Controller 复制。 */
 	virtual void OnRep_Controller() override;
 
@@ -131,6 +143,8 @@ protected:
 	void UninitAndDestroy();
 
 private:
+	FReplicatedLocalRoleChanged ReplicatedLocalRoleChanged;
+
 	/** 只拥有原对象身份和一个通知 token；Health 独占实际资源。 */
 	struct FHealthAbilitySystemSubscription;
 	bool RegisterHealthAbilitySystemSubscription(FString& OutError);

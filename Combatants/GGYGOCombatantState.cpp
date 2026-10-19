@@ -257,11 +257,12 @@ void AGGYGOCombatantState::CloseAvatarBindingLifecycle(const TCHAR* EntryPoint)
 	}
 	EGGYGOAvatarBindingReason RetirementReason = EGGYGOAvatarBindingReason::InvalidASC;
 	bool bRetiredOriginalContext = false;
+	TArray<FGGYGOMontageFXCloseObligation> MontageFXRetirements;
 	if (UGGYGOAbilitySystemComponent* ASC = OriginalASC.Get())
 	{
-		// Metadata revocation is separate from physical Clear, even when cleanup failed or was Busy.
+		// 元数据撤销与物理 Clear 分别记录；这里只携出原表现关闭义务，诊断完成后再派发。
 		bRetiredOriginalContext = ASC->InvalidateAvatarBinding(
-			RetirementContext, EGGYGOAvatarBindingReason::LifecycleClosed, RetirementReason);
+			RetirementContext, EGGYGOAvatarBindingReason::LifecycleClosed, RetirementReason, &MontageFXRetirements);
 	}
 	if (History.Outcome != EOutcome::Succeeded || !bRetiredOriginalContext)
 	{
@@ -277,6 +278,8 @@ void AGGYGOCombatantState::CloseAvatarBindingLifecycle(const TCHAR* EntryPoint)
 			static_cast<unsigned long long>(RetirementContext.LastActorInfoWrite.Serial),
 			bRetiredOriginalContext ? 1 : 0, static_cast<uint32>(RetirementReason));
 	}
+	// 自有成员与关闭历史均已收尾；派发可能重入，本函数在此之后不再访问 Host 成员。
+	UGGYGOAbilitySystemComponent::DispatchMontageFXRetirements(MontageFXRetirements);
 }
 
 void AGGYGOCombatantState::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -533,7 +536,9 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 
 	const TWeakObjectPtr<AGGYGOCombatantState> OriginalHost(this);
 	const TWeakObjectPtr<APawn> OriginalSelection(AvatarPawn);
-	const auto OriginalScope = [&]()
+	// 初始化请求仍成立：宿主允许绑定、所选 Pawn 未变且存活、Host 与 Extension 都还没有本地资源。
+	// 由 ASC 在原生写入前后调用；外调返回后才有可能变 false。
+	const auto IsInitializeRequestCurrent = [&]()
 	{
 		AGGYGOCombatantState* Host = OriginalHost.Get();
 		UGGYGOPawnExtensionComponent* LiveExtension = Request.ExpectedExtension.Get();
@@ -548,7 +553,7 @@ FHostResult AGGYGOCombatantState::InitializeAvatarBinding(const FHostRequest& Re
 	Native.ExpectedContext = Request.ExpectedContext;
 	Native.OwnerActor = this;
 	Native.AvatarActor = Pawn;
-	Native.IsRequestContextCurrent = OriginalScope;
+	Native.IsRequestContextCurrent = IsInitializeRequestCurrent;
 	FGGYGOAvatarBindingPublicationReceipt Publication;
 	const FGGYGOAvatarBindingResult Initialized = ExecuteHostActorInfo(ASC, Native, Publication);
 	AppendASCStep(History, EHostStep::ActorInfoInit, Initialized);
@@ -791,7 +796,9 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 		SetLocalFailure(History, Withdrawn);
 		return History;
 	}
-	const auto OriginalScope = [&]()
+	// 释放请求仍针对原资源：Host 仍持原 H／Context，ASC 仍归本 Host，Extension 槽位已撤回或仍是原 H。
+	// 它只限定原资源清理范围，不表示新的工作准入；Cancel／Cue／Clear 各自在原生窗口内调用。
+	const auto IsReleaseRequestCurrent = [&]()
 	{
 		AGGYGOCombatantState* Host = OriginalHost.Get();
 		UGGYGOPawnExtensionComponent* LiveExtension = Request.ExpectedExtension.Get();
@@ -818,16 +825,18 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 			History.Reason = EHostReason::InvalidExtension;
 			return;
 		}
-		if (!Host || !OriginalScope())
+		if (!Host || !IsReleaseRequestCurrent())
 		{
 			History.Outcome = EOutcome::Stale;
 			History.Reason = EHostReason::CallerInvalidated;
 			return;
 		}
+		TArray<FGGYGOMontageFXCloseObligation> MontageFXRetirements;
 		if (UGGYGOAbilitySystemComponent* ASC = Request.ExpectedASC.Get())
 		{
 			EGGYGOAvatarBindingReason Reason;
-			ASC->InvalidateAvatarBinding(Request.ExpectedContext, EGGYGOAvatarBindingReason::OperationInvalidated, Reason);
+			ASC->InvalidateAvatarBinding(Request.ExpectedContext, EGGYGOAvatarBindingReason::OperationInvalidated,
+				Reason, &MontageFXRetirements);
 		}
 		Host->RetireHostAvatarResource(Request.ExpectedResource);
 		if (UGGYGOPawnExtensionComponent* LiveExtension = Request.ExpectedExtension.Get())
@@ -835,6 +844,9 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 			const FGGYGOPawnASCLocalResult Local = LiveExtension->NotifyLocalResourcesReleased(Request.ExpectedResource);
 			AppendLocalStep(History, EHostStep::NotifyLocalReleased, Local);
 		}
+		// 原 H 与本地通知历史已收尾；即使 Released 销毁了 ASC，也须派发已携出的原关闭义务。
+		UGGYGOAbilitySystemComponent::DispatchMontageFXRetirements(MontageFXRetirements);
+		// Released 和表现派发均可重入；返栈只重取原 Host 修正返回历史，不再清理后继成员。
 		if (AGGYGOCombatantState* CurrentHost = OriginalHost.Get();
 			!CurrentHost || CurrentHost->AvatarResource.HasResource())
 		{
@@ -855,7 +867,7 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 	FGameplayTagContainer IgnoredAbilities;
 	IgnoredAbilities.AddTag(GGYGOGameplayTags::Ability_Behavior_SurvivesDeath);
 	const FGGYGOAvatarBindingResult Canceled = ASC->TryCancelAvatarBindingAbilities(
-		Request.ExpectedContext, nullptr, &IgnoredAbilities, OriginalScope);
+		Request.ExpectedContext, nullptr, &IgnoredAbilities, IsReleaseRequestCurrent);
 	AppendASCStep(History, EHostStep::CancelAbilities, Canceled);
 	if (Canceled.Outcome != EOutcome::Succeeded)
 	{
@@ -865,7 +877,7 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 	}
 	EGGYGOAvatarBindingReason Reason;
 	ASC = Request.ExpectedASC.Get();
-	if (!ASC || !OriginalScope()
+	if (!ASC || !IsReleaseRequestCurrent()
 		|| ASC->CheckAvatarBindingCleanupContext(Request.ExpectedContext, Reason) != EOutcome::Succeeded)
 	{
 		History.Outcome = EOutcome::Stale;
@@ -873,6 +885,8 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 		FinishLocalFailure();
 		return History;
 	}
+	// ClearAbilityInput 只清 ASC 输入缓存，本地只追加历史；发布范围谓词不读这两项，
+	// 下方 Cue 移除会在其原生窗口内再次调用同一谓词，这里不重复核验。
 	ASC->ClearAbilityInput();
 	FGGYGOAvatarBindingHostStepResult InputStep;
 	InputStep.Step = EHostStep::ClearAbilityInput;
@@ -881,15 +895,8 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 	InputHistory.OriginalResource = Request.ExpectedResource;
 	InputStep.InputClear = InputHistory;
 	History.Steps.Add(MoveTemp(InputStep));
-	if (!OriginalScope())
-	{
-		History.Outcome = EOutcome::Stale;
-		History.Reason = EHostReason::CallerInvalidated;
-		FinishLocalFailure();
-		return History;
-	}
 	const FGGYGOAvatarBindingResult Cues = ASC->TryRemoveAvatarBindingGameplayCues(
-		Request.ExpectedContext, OriginalScope);
+		Request.ExpectedContext, IsReleaseRequestCurrent);
 	AppendASCStep(History, EHostStep::RemoveGameplayCues, Cues);
 	if (Cues.Outcome != EOutcome::Succeeded)
 	{
@@ -904,7 +911,7 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 	const bool bClosingOriginalHost = !bAvatarBindingPermitted || IsActorBeingDestroyed();
 	Clear.ClearMode = bClosingOriginalHost || (OriginalOwner && OriginalOwner->IsActorBeingDestroyed())
 		? EGGYGOAvatarBindingClearMode::ClearActorInfo : EGGYGOAvatarBindingClearMode::PreserveOwner;
-	Clear.IsRequestContextCurrent = OriginalScope;
+	Clear.IsRequestContextCurrent = IsReleaseRequestCurrent;
 	FGGYGOAvatarBindingPublicationReceipt Publication;
 	const FGGYGOAvatarBindingResult Cleared = ASC->TryExecuteAvatarActorInfoTransaction(Clear, Publication);
 	AppendASCStep(History, EHostStep::ActorInfoClear, Cleared);
@@ -915,7 +922,7 @@ FHostResult AGGYGOCombatantState::ReleaseAvatarBinding(const FHostRequest& Reque
 		return History;
 	}
 	AGGYGOCombatantState* Host = OriginalHost.Get();
-	if (!Host || !OriginalScope())
+	if (!Host || !IsReleaseRequestCurrent())
 	{
 		History.Outcome = EOutcome::Stale;
 		History.Reason = EHostReason::CallerInvalidated;
@@ -955,7 +962,8 @@ FHostResult AGGYGOCombatantState::RefreshAvatarBinding(const FHostRequest& Reque
 		return HostResult(EOutcome::Stale, EHostReason::ReadyNotEstablished);
 	}
 	const TWeakObjectPtr<AGGYGOCombatantState> OriginalHost(this);
-	const auto OriginalScope = [&]()
+	// 刷新请求仍针对原 Ready 资源：Host、ASC、Pawn、Extension 端点及本地槽位都未换成后继。
+	const auto IsRefreshRequestCurrent = [&]()
 	{
 		AGGYGOCombatantState* Host = OriginalHost.Get();
 		UGGYGOAbilitySystemComponent* LiveASC = Request.ExpectedASC.Get();
@@ -971,7 +979,7 @@ FHostResult AGGYGOCombatantState::RefreshAvatarBinding(const FHostRequest& Reque
 	FGGYGOAvatarBindingRequest Native;
 	Native.Kind = EGGYGOAvatarBindingKind::Refresh;
 	Native.ExpectedContext = Request.ExpectedContext;
-	Native.IsRequestContextCurrent = OriginalScope;
+	Native.IsRequestContextCurrent = IsRefreshRequestCurrent;
 	FGGYGOAvatarBindingPublicationReceipt Publication;
 	const FGGYGOAvatarBindingResult Refreshed = ASC->TryExecuteAvatarActorInfoTransaction(Native, Publication);
 	AppendASCStep(History, EHostStep::ActorInfoRefresh, Refreshed);
@@ -981,7 +989,7 @@ FHostResult AGGYGOCombatantState::RefreshAvatarBinding(const FHostRequest& Reque
 		return History;
 	}
 	AGGYGOCombatantState* Host = OriginalHost.Get();
-	if (!Host || !OriginalScope())
+	if (!Host || !IsRefreshRequestCurrent())
 	{
 		History.Outcome = EOutcome::Stale;
 		History.Reason = EHostReason::CallerInvalidated;
@@ -1233,15 +1241,6 @@ void AGGYGOCombatantState::SynchronizeAvatarBinding()
 			TEXT("[Combatants] SynchronizeAvatarBinding stopped: Host=%s ASC=%s Outcome=%u Reason=%u."),
 			*GetPathNameSafe(this), *GetPathNameSafe(AbilitySystemComponent),
 			static_cast<uint32>(Result.Outcome), static_cast<uint32>(Result.Reason));
-	}
-}
-
-void AGGYGOCombatantState::ClearLocalAvatarBinding(APawn* AvatarToClean)
-{
-	if (AvatarResource.HasResource()
-		&& AvatarResource.GetIdentity().Pawn.HasSameIndexAndSerialNumber(TWeakObjectPtr<APawn>(AvatarToClean)))
-	{
-		RequestAvatarBinding(MakeAvatarResourceRequest(EHostOperation::Release));
 	}
 }
 

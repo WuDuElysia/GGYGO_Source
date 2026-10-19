@@ -70,6 +70,12 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Attack_Light);
 	/** 重攻击。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Attack_Heavy);
+	/** Special 攻击动作输入。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Attack_Special);
+	/** ExSpecial 攻击动作输入。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Attack_ExSpecial);
+	/** Rush 攻击动作输入。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Attack_Rush);
 	/** 闪避。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Dodge);
 	/** 技能。 */
@@ -300,6 +306,9 @@ namespace GGYGOGameplayTags
 	/** 削韧来源标记。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Gameplay_PoiseDamage);
 
+	/** GE 的 Execution.PassedInTags 显式选择攻击力乘倍率模式，要求独立的 DamageMultiplier 键。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(DamageCalculation_AttackPowerMultiplier);
+
 	// ============================================================
 	// 八、Cooldown —— 冷却
 	// ============================================================
@@ -337,6 +346,10 @@ namespace GGYGOGameplayTags
 	/** 普攻连段允许切换区间的开始与结束。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_ComboWindowBegin);
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_ComboWindowEnd);
+	/** 通用 FX 表现窗口开启。由 Montage 的事件窗口发出。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_FXWindowBegin);
+	/** 通用 FX 表现窗口关闭。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_FXWindowEnd);
 	/** 可取消点，此后允许被其他动作打断。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_CancelPoint);
 	/** 命中确认。由命中判定组件发出。 */
@@ -402,8 +415,10 @@ namespace GGYGOGameplayTags
 	// 十三、SetByCaller —— GE 幅度键
 	// ============================================================
 
-	/** 伤害数值。 */
+	/** 绝对伤害数值；自毁保留该语义，与攻击力倍率输入互斥。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(SetByCaller_Damage);
+	/** 各段独立的有限非负伤害倍率；零为显式零伤害，缺键不代表一倍。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(SetByCaller_DamageMultiplier);
 	/** 治疗数值。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(SetByCaller_Heal);
 	/** 削韧数值。 */

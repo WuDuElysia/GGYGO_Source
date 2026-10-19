@@ -34,6 +34,8 @@ public class GGYGO : ModuleRules
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
+			// 整身倾身复用原生两骨 IK；只处理输入姿态，不执行角色位移。
+			"AnimationCore",
 			"Json",
 			// Native输入测试夹具直接使用Slate窗口/控件，须显式声明所属模块链接依赖。
 			"Slate",
@@ -42,6 +44,8 @@ public class GGYGO : ModuleRules
 			"Projects",
 			// 解耦的 Gameplay 消息广播；模块来自 Plugins/GameplayMessageRouter。
 			"GameplayMessageRuntime",
+			// 远端姿态记录的 FVector_NetQuantize100 序列化在本模块实例化，直接链接 NetCore 导出的量化向量函数。
+			"NetCore",
 		});
 
 		// 头文件与实现文件按职责子目录并列，模块根是唯一 include 根。
@@ -57,6 +61,8 @@ public class GGYGO : ModuleRules
 			PrivateDependencyModuleNames.Add("AutomationController");
 			// 原生首按测试的自有PIE作用域；调用按WITH_EDITOR保护。
 			PrivateDependencyModuleNames.Add("UnrealEd");
+			// 渲染预览测试夹具构造原生骨骼 LOD 数据，资源类型直接依赖这两个模块。
+			PrivateDependencyModuleNames.AddRange(new string[] { "RHI", "RenderCore" });
 		}
 
 		// Iris 网络序列化支持。

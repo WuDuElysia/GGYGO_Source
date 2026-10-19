@@ -79,6 +79,9 @@ FGGYGOSquadPresetLoadResult UGGYGOSquadPresets::TryLoadForLocalPlayer(const ULoc
 		return Reject(TEXT("The original primary local player has no valid platform user or user index."));
 	}
 
+	// 原主玩家、GI 与平台用户关联。上面已逐项直接核对并记录，下面只在真实外调返回后重新核对：
+	// 平台模块获取（可能加载模块）、存储后端查询与读取、反序列化（会执行 Serialize／HandlePostLoad）
+	// 以及 InitializeSaveGame。中间仅有本函数局部写入或未被重写的引擎 getter 时不重复调用。
 	const auto CheckOriginalContext = [&Result]() -> FString
 	{
 		const ULocalPlayer* const CurrentPlayer = Result.OriginalLocalPlayer.Get();
@@ -88,29 +91,18 @@ FGGYGOSquadPresetLoadResult UGGYGOSquadPresets::TryLoadForLocalPlayer(const ULoc
 		{
 			return TEXT("The original local player or game instance became unavailable.");
 		}
-
-		const int32 CurrentUserIndex = CurrentPlayer->GetPlatformUserIndex();
-		if (Result.OriginalLocalPlayer.Get() != CurrentPlayer
-			|| !IsValid(CurrentPlayer) || CurrentPlayer->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			|| Result.OriginalGameInstance.Get() != CurrentGameInstance
-			|| !IsValid(CurrentGameInstance) || CurrentGameInstance->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			|| CurrentPlayer->GetGameInstance() != CurrentGameInstance
+		if (CurrentPlayer->GetGameInstance() != CurrentGameInstance
 			|| CurrentGameInstance->GetFirstGamePlayer() != CurrentPlayer
 			|| CurrentPlayer->GetPlatformUserId() != Result.OriginalPlatformUserId
-			|| CurrentUserIndex != Result.OriginalPlatformUserIndex)
+			|| CurrentPlayer->GetPlatformUserIndex() != Result.OriginalPlatformUserIndex)
 		{
 			return TEXT("The original local player/game instance/primary player/platform user/index identity changed.");
 		}
 		return FString();
 	};
-	FString ContextError = CheckOriginalContext();
-	if (!ContextError.IsEmpty())
-	{
-		return Reject(ContextError);
-	}
 
 	ISaveGameSystem* const SaveSystem = IPlatformFeaturesModule::Get().GetSaveGameSystem();
-	ContextError = CheckOriginalContext();
+	FString ContextError = CheckOriginalContext();
 	if (!ContextError.IsEmpty())
 	{
 		return Reject(ContextError);
@@ -223,16 +215,8 @@ FGGYGOSquadPresetLoadResult UGGYGOSquadPresets::TryLoadForLocalPlayer(const ULoc
 		&& Presets->GetSaveSlotName() == Result.SlotName
 		&& Presets->GetPlatformUserId() == Result.OriginalPlatformUserId
 		&& Presets->GetPlatformUserIndex() == Result.OriginalPlatformUserIndex;
-	ContextError = CheckOriginalContext();
-	if (!ContextError.IsEmpty())
-	{
-		return Reject(ContextError);
-	}
-	CandidateError = CheckCandidateData();
-	if (!CandidateError.IsEmpty())
-	{
-		return Reject(CandidateError);
-	}
+	// 上面四个 getter 是未被本类重写的引擎读取，不改变原上下文或候选数据；
+	// InitializeSaveGame 返回后的核对结果在此仍然成立。
 	if (!bCandidateHasOriginalIdentity)
 	{
 		return Reject(TEXT("Native initialization did not preserve the original candidate's local player/user/slot association."));

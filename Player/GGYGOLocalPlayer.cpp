@@ -124,7 +124,9 @@ bool UGGYGOLocalPlayer::GetProjectionData(FViewport* Viewport, FSceneViewProject
 	{
 		return RejectAssociation(TEXT("AfterSuper"), Reason);
 	}
-	if (!CameraManager->HasConfirmedNativeCameraView() || !bProjected)
+	// 确认位只增不减，准入 PC／World 只在 InitializeFor 写入且已准入后拒绝重置；Super 前已核确认，
+	// 上面的返栈关联核验又确认原 PC／World／Manager 未变，因此确认结论在此仍成立，只需传播原生投影结果。
+	if (!bProjected)
 	{
 		return false;
 	}
@@ -166,69 +168,38 @@ bool UGGYGOLocalPlayer::TryGetSquadPresets(UGGYGOSquadPresets*& OutPresets, FStr
 	// Keep the host alive until its scope guard has restored Busy, including destruction callbacks.
 	const TStrongObjectPtr<const UGGYGOLocalPlayer> HostLifetime(this);
 	const TGuardValue<bool> AccessScope(bSquadPresetsAccessBusy, true);
+	// 一次同步核对原发布来源与缓存对象的关联。核对内只有本类未重写的引擎 getter，没有外调，
+	// 因此每项只查一次；缓存路径整体无外调，加载路径的外调都在 TryLoadForLocalPlayer 内并已在其中复核。
 	const auto CheckSourceAndObject = [this](const TWeakObjectPtr<const ULocalPlayer>& OriginalPlayer,
 		const TWeakObjectPtr<UGameInstance>& OriginalGameInstance, FPlatformUserId OriginalUserId,
 		int32 OriginalUserIndex, const FString& OriginalSlotName, UGGYGOSquadPresets* OriginalPresets) -> FString
 	{
-		const auto CheckHostContext = [&]() -> FString
+		UGameInstance* const GameInstance = OriginalGameInstance.Get();
+		if (OriginalPlayer.Get() != this || !IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			|| !IsValid(GameInstance) || GameInstance->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
 		{
-			UGameInstance* const GameInstance = OriginalGameInstance.Get();
-			if (OriginalPlayer.Get() != this || !IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-				|| !IsValid(GameInstance) || GameInstance->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
-			{
-				return TEXT("The original local player or game instance became unavailable.");
-			}
-			if (!OriginalUserId.IsValid() || OriginalUserIndex < 0
-				|| OriginalSlotName != UGGYGOSquadPresets::SaveSlotName)
-			{
-				return TEXT("The original publication has an invalid platform user/index or does not identify the retained save slot.");
-			}
-			if (GetGameInstance() != GameInstance || GameInstance->GetFirstGamePlayer() != this)
-			{
-				return TEXT("The host is no longer the original game instance's primary local player.");
-			}
-
-			const int32 CurrentUserIndex = GetPlatformUserIndex();
-			if (OriginalPlayer.Get() != this || !IsValid(this) || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-				|| OriginalGameInstance.Get() != GameInstance
-				|| !IsValid(GameInstance) || GameInstance->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-				|| GetGameInstance() != GameInstance || GameInstance->GetFirstGamePlayer() != this
-				|| GetPlatformUserId() != OriginalUserId || CurrentUserIndex != OriginalUserIndex)
-			{
-				return TEXT("The original primary local player/game instance/platform user/index identity changed.");
-			}
-			return FString();
-		};
-
-		FString Error = CheckHostContext();
-		if (!Error.IsEmpty())
+			return TEXT("The original local player or game instance became unavailable.");
+		}
+		if (!OriginalUserId.IsValid() || OriginalUserIndex < 0
+			|| OriginalSlotName != UGGYGOSquadPresets::SaveSlotName)
 		{
-			return Error;
+			return TEXT("The original publication has an invalid platform user/index or does not identify the retained save slot.");
+		}
+		if (GetGameInstance() != GameInstance || GameInstance->GetFirstGamePlayer() != this)
+		{
+			return TEXT("The host is no longer the original game instance's primary local player.");
+		}
+		if (GetPlatformUserId() != OriginalUserId || GetPlatformUserIndex() != OriginalUserIndex)
+		{
+			return TEXT("The original primary local player/game instance/platform user/index identity changed.");
 		}
 		if (!IsValid(OriginalPresets) || OriginalPresets->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
 		{
 			return TEXT("The original presets object is unavailable or being destroyed.");
 		}
-
-		const TWeakObjectPtr<UGGYGOSquadPresets> OriginalObject(OriginalPresets);
-		const ULocalPlayer* const AssociatedPlayer = OriginalPresets->GetLocalPlayer();
-		const FString AssociatedSlot = OriginalPresets->GetSaveSlotName();
-		const FPlatformUserId AssociatedUserId = OriginalPresets->GetPlatformUserId();
-		const int32 AssociatedUserIndex = OriginalPresets->GetPlatformUserIndex();
-		Error = CheckHostContext();
-		if (!Error.IsEmpty())
-		{
-			return Error;
-		}
-		if (OriginalObject.Get() != OriginalPresets || !IsValid(OriginalPresets)
-			|| OriginalPresets->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
-		{
-			return TEXT("The original presets object became unavailable during association validation.");
-		}
-		if (AssociatedPlayer != this || AssociatedSlot != OriginalSlotName
-			|| AssociatedUserId != OriginalUserId || AssociatedUserIndex != OriginalUserIndex
-			|| OriginalPresets->ULocalPlayerSaveGame::GetLocalPlayer() != this
-			|| OriginalPresets->ULocalPlayerSaveGame::GetSaveSlotName() != OriginalSlotName)
+		if (OriginalPresets->GetLocalPlayer() != this || OriginalPresets->GetSaveSlotName() != OriginalSlotName
+			|| OriginalPresets->GetPlatformUserId() != OriginalUserId
+			|| OriginalPresets->GetPlatformUserIndex() != OriginalUserIndex)
 		{
 			return TEXT("The original presets object's local player/user/slot association no longer matches its publication.");
 		}
@@ -244,16 +215,11 @@ bool UGGYGOLocalPlayer::TryGetSquadPresets(UGGYGOSquadPresets*& OutPresets, FStr
 		{
 			return Reject(TEXT("The original cache is invalid, lost or mismatched; it is retained and no replacement load is attempted."));
 		}
-		const TStrongObjectPtr<UGGYGOSquadPresets> CachedLifetime(CachedPresets);
 		const FString Error = CheckSourceAndObject(SquadPresetsSourceLocalPlayer, SquadPresetsSourceGameInstance,
 			SquadPresetsSourcePlatformUserId, SquadPresetsSourcePlatformUserIndex, SquadPresetsSourceSlotName, CachedPresets);
 		if (!Error.IsEmpty())
 		{
 			return Reject(Error);
-		}
-		if (SquadPresets.Get() != CachedPresets || SquadPresetsSourceObject.Get() != CachedPresets)
-		{
-			return Reject(TEXT("The original cache identity changed during validation; no new source was adopted."));
 		}
 		OutPresets = CachedPresets;
 		return true;

@@ -1086,8 +1086,9 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 		const FGGYGOMovementOwnerSyncNotice OriginalReady = Scope->OwnerSyncNotice;
 		FGGYGOMovementInputRequestIdentity Request;
 		FString AdmissionError;
-		// False includes ordinary real release/no request. It never authorizes admission.
-		if (!Source->GetMovementInputRequest(Session, Request, AdmissionError)) { return; }
+		// 只有已证明的 Held 请求可申请首次准入；NotHeld／Awaiting／Unavailable 都不授权，也不在此诊断。
+		if (Source->QueryMovementInputRequest(Session, Request, AdmissionError)
+			!= EGGYGOMovementInputRequestQueryResult::Held) { return; }
 		if (!IsOriginalAssemblyCurrent()
 			|| Scope->OwnerSyncObserver.GetScope() != OriginalObserver.GetScope()
 			|| Scope->OwnerSyncObserver.GetObserverSerial() != OriginalObserver.GetObserverSerial()
@@ -1273,9 +1274,16 @@ void UGGYGOHeroComponent::Input_Move(const FInputActionInstance& Instance,
 	}
 	FGGYGOMovementInputRequestIdentity Request;
 	FString Error;
-	if (!OriginalScope->Source->GetMovementInputRequest(Session, Request, Error))
+	const EGGYGOMovementInputRequestQueryResult Query =
+		OriginalScope->Source->QueryMovementInputRequest(Session, Request, Error);
+	if (Query != EGGYGOMovementInputRequestQueryResult::Held)
 	{
-		GGYGOHeroMovementInput::Report(OriginalScope, TEXT("MovementRequestUnavailable"), Error);
+		// NotHeld 是 Source 确认的正常中立，Query 不附错误；非零 Action 值与之矛盾，单独说明后拒绝投影。
+		// Unavailable／AwaitingPhysicalProof 直接沿用 Query 的原错误。
+		GGYGOHeroMovementInput::Report(OriginalScope, TEXT("MovementRequestUnavailable"),
+			Query == EGGYGOMovementInputRequestQueryResult::NotHeld
+				? FString(TEXT("原 Source 查询为 NotHeld（已确认中立且没有活动请求）；拒绝本次非零 Move Action 值的移动投影。"))
+				: Error);
 		return;
 	}
 	if (Request.Session != Session || Request.RequestSerial == 0)

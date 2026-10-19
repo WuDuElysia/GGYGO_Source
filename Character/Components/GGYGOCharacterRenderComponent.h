@@ -1,3 +1,4 @@
+/** @file 通用角色表现配置、材质资源所有权和场景主光输入。 */
 #pragma once
 
 #include "Components/ActorComponent.h"
@@ -46,7 +47,9 @@ class GGYGO_API UGGYGOCharacterRenderComponent : public UActorComponent
 public:
 	UGGYGOCharacterRenderComponent();
 
-	/** Apply explicit bindings. Call ReleaseMaterials before replacing the mesh or cosmetics. */
+	/** Apply validated Unlit bindings. Call ReleaseMaterials before replacing the mesh or cosmetics.
+	 * Failed configuration releases our resources and requires an explicit refresh after correction.
+	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Rendering")
 	void RefreshMaterials();
 
@@ -64,7 +67,7 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GGYGO|Rendering", meta = (ClampMin = "0.01"))
 	float LightingUpdateInterval = 0.1f;
 
-	/** Directional-light intensity that produces the authored material brightness. */
+	/** Directional-light intensity that produces the authored material brightness. Used when intensity response > 0. */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GGYGO|Rendering|Light Response", meta = (ClampMin = "0.01"))
 	float ReferenceKeyLightIntensity = 1.0f;
 
@@ -90,6 +93,10 @@ public:
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GGYGO|Rendering")
 	bool bTraceKeyLightOcclusion = true;
 
+	/** 非 PIE 关卡使用瞬态图元数据和描边壳预览同一配置；不修改 Mesh 的材质覆盖或序列化默认。 */
+	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GGYGO|Rendering|Editor")
+	bool bPreviewSceneLighting = false;
+
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "GGYGO|Rendering")
 	bool bEnableOutline = false;
 
@@ -107,21 +114,42 @@ protected:
 	virtual void BeginPlay() override;
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
+#if WITH_EDITOR
+	virtual void PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent) override;
+#endif
 
 private:
 	friend class FGGYGOCharacterRenderOwnershipTest;
 	friend class FGGYGOCharacterRenderLightTest;
+	friend class FGGYGOCharacterRenderContractTest;
+	friend class FGGYGOCharacterRenderPreviewTest;
 	ADirectionalLight* ResolveKeyLight();
 	bool IsEligibleKeyLight(const ADirectionalLight* Light) const;
 	bool HasCurrentMesh() const;
+	bool ValidateLightSettings(FString& OutError) const;
+	bool ValidateMaterialBindings(const USkeletalMeshComponent* Mesh, FString& OutError) const;
+	void FailRendering(const FString& Error);
 	void UpdateLighting();
-	void UpdateOutline();
-	UMaterialInterface* FindMaterialForSlot(FName SlotName) const;
+	bool SampleLighting(FVector& OutDirection, FLinearColor& OutColor, float& OutStrength, float& OutVisibility);
+	bool UsesEditorSceneLighting() const;
+	void RefreshEditorLighting();
+	bool ValidatePreviewBindings(const USkeletalMeshComponent* Mesh, FString& OutError) const;
+	bool WritePreviewLighting(TConstArrayView<float> Values);
+	void ReleasePreviewLighting();
+	bool UpdateOutline(USkeletalMeshComponent* Mesh);
+	void ReleaseOutline();
+
+	// 仅记录本组件租用的九个预览槽；不缓存光照事实或其它系统的数据。
+	static constexpr int32 PreviewDataCount = 9;
+	UPROPERTY(Transient, DuplicateTransient) TWeakObjectPtr<USkeletalMeshComponent> PreviewMesh;
+	UPROPERTY(Transient, DuplicateTransient) TWeakObjectPtr<USkeletalMesh> PreviewMeshAsset;
+	TArray<float> PreviewOriginalData;
+	TArray<float> PreviewWrittenData;
 
 	UPROPERTY(Transient)
 	TObjectPtr<USkeletalMeshComponent> TargetMesh;
 
-	UPROPERTY(Transient)
+	UPROPERTY(Transient, DuplicateTransient)
 	TObjectPtr<USkeletalMeshComponent> OutlineMesh;
 
 	UPROPERTY(Transient)

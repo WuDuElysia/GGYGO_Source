@@ -416,8 +416,10 @@ void UGGYGOPlayerInput::RetireOriginalQualification(FName Reason, bool bEstablis
 			// The resource authenticates this exact producer, even during producer destruction.
 			Resource->RetireInitialQualification(this, Reason);
 		}
-		else if (!OriginalResource.IsExplicitlyNull())
+		else if (!OriginalResource.IsExplicitlyNull()
+			&& (!bEndingInput || CurrentSession.SessionSerial != 0))
 		{
+			// 无会话的 BeginDestroy 允许原 Origin 随宿主销毁；运行期及活会话失效仍须诊断。
 			ReportOnce(TEXT("OriginalOriginLostDuringRetirement"), TEXT("The captured resource expired; its own lifecycle cleanup owns retirement, no replacement is queried."));
 		}
 	}
@@ -972,18 +974,6 @@ void UGGYGOPlayerInput::EndMovementInputSession(const FGGYGOMovementInputSession
 		Pending.Fact = Fact;
 		DeliverPendingFacts();
 	}
-}
-
-bool UGGYGOPlayerInput::GetMovementInputRequest(const FGGYGOMovementInputSessionIdentity& Session,
-	FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const
-{
-	const EGGYGOMovementInputRequestQueryResult Result = QueryMovementInputRequest(Session, OutRequest, OutError);
-	if (Result == EGGYGOMovementInputRequestQueryResult::NotHeld)
-	{
-		// The typed query treats real Neutral as normal; this legacy entry retains its false diagnostic.
-		OutError = MakeError(TEXT("No attached, proven physical movement request is held in this session.") + DescribeSourceProof());
-	}
-	return Result == EGGYGOMovementInputRequestQueryResult::Held;
 }
 
 EGGYGOMovementInputRequestQueryResult UGGYGOPlayerInput::QueryMovementInputRequest(

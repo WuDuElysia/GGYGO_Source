@@ -1,21 +1,17 @@
 /**
  * @file GGYGODamageExecution.h
- * @brief 伤害结算
+ * @brief 按显式输入模式计算伤害与削韧，输出 HealthSet 元属性。
  *
- * 把攻击方的输出属性与防御方的承受属性合成为最终伤害，写入
- * `UGGYGOHealthSet` 的 `Damage` 与 `PoiseDamage` 元属性。
+ * GE 的 Executions[].PassedInTags 含 DamageCalculation.AttackPowerMultiplier 时，
+ * 必须提供有限非负的 SetByCaller.DamageMultiplier，伤害为源 CombatSet.BaseDamage
+ * 的原生 Spec 快照乘该倍率，再应用能力来源衰减。该模式拒绝绝对伤害键。
  *
- * ## 为什么用 Execution 而不是普通 Modifier
- * 普通 Modifier 只能做"属性 A 加减一个数"，无法同时读取源与目标的多个属性
- * 再按公式合成。伤害需要 `攻击方输出 × 倍率 - 防御方减免`，
- * 而且倍率与减免各自还要看 Tag（弱点部位、无敌帧、属性克制），
- * 这些只能在 Execution 里做。
+ * 未选择倍率模式时，保留 SetByCaller.Damage 绝对伤害或缺键时的源属性捕获；
+ * 自毁继续使用绝对值。倍率键出现在未选择的模式、与绝对键冲突、缺失或非法时，
+ * 本 Execution 明确诊断且不新增输出。原生 Execute 不提供 GE 应用失败返回值。
  *
- * ## 为什么伤害要经元属性
- * Execution 不直接扣 `Health`，而是写入 `Damage` 元属性，由 HealthSet 的
- * `PostGameplayEffectExecute` 转成扣血。这样免疫判定、钳制、死亡边沿检测
- * 全部集中在 HealthSet 一处 —— 若各个 Execution 各自扣血，
- * 每加一种伤害来源就要重复实现一遍那些规则。
+ * 削韧继续使用独立的 SetByCaller.PoiseDamage 或源属性捕获。
+ * Execution 只输出 Damage / PoiseDamage 元属性，HealthSet 负责业务边界与结算。
  */
 #pragma once
 

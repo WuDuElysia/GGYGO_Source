@@ -64,9 +64,6 @@ public:
 	EGGYGOMovementInputRequestQueryResult QueryMovementInputRequest(
 		const FGGYGOMovementInputSessionIdentity& OriginalSession,
 		FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const;
-	/** Legacy Held-only lookup; preserves its original false diagnostics. */
-	bool GetMovementInputRequest(const FGGYGOMovementInputSessionIdentity& Session,
-		FGGYGOMovementInputRequestIdentity& OutRequest, FString& OutError) const;
 
 	/** Records this construction only inside the original resource's explicit native scope. */
 	virtual void PostInitProperties() override;

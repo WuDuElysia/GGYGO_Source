@@ -14,6 +14,9 @@ class UGGYGOActionMotionProfile;
 class UGGYGOCharacterMovementComponent;
 struct FHitResult;
 struct FGGYGOMeleeTraceWindowHandle;
+struct FGGYGOActionMotionSourceBinding;
+struct FGGYGOMontageTaskFailureFact;
+struct FGGYGOMontageWindowFact;
 
 /**
  * 一条完整的近战执行链：Montage Event 开/关 Trace，命中后应用 Damage GE 并发 Cue。
@@ -26,6 +29,9 @@ class GGYGO_API UGGYGOBossMeleeAbility : public UGGYGOCombatActionAbility
 
 public:
 	UGGYGOBossMeleeAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
+	/** Validate the configured attack source and explicit motion mode without starting resources.
+	 * @param OutError Empty on success; diagnostic identifying invalid required configuration on failure.
+	 * @return Whether this ability's asset configuration is valid; runtime receivers are checked on activation. */
 	bool ValidateMeleeConfiguration(FString& OutError) const;
 #if WITH_EDITOR
 	virtual EDataValidationResult IsDataValid(FDataValidationContext& Context) const override;
@@ -52,6 +58,16 @@ protected:
 	/** 可空；GA 持有动作期句柄，CMC 采样位移。仅支持从零开始、固定速率且不跳 Section 的线性 Montage。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee")
 	TObjectPtr<const UGGYGOActionMotionProfile> ActionMotionProfile;
+	/** Explicit original-Montage XYZ mode; incompatible with ActionMotionProfile.
+	 * False retains the optional Profile contract, including deliberately absent motion. */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee|Motion")
+	bool bUseMontageSourceMotion = false;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee|Motion", meta = (EditCondition = "bUseMontageSourceMotion"))
+	FName MotionSlot = TEXT("DefaultSlot");
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee|Motion", meta = (EditCondition = "bUseMontageSourceMotion"))
+	FName MotionSection = TEXT("Main");
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee|Motion", meta = (EditCondition = "bUseMontageSourceMotion", ClampMin = "0.0"))
+	float MotionTranslationScale = 1.0f;
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Boss Melee")
 	TSubclassOf<UGameplayEffect> DamageEffect;
@@ -82,7 +98,14 @@ private:
 	struct FOriginalMeleeResources;
 	// Resources and issued provenance only; GA/ASC remain the lifecycle authorities.
 	TSharedPtr<FOriginalMeleeResources> OriginalResources;
-	enum class EMontageCallback : uint8 { Completed, Interrupted, BlendOut, Event };
+	enum class EMontageCallback : uint8 { Completed, Interrupted, BlendOut };
+	bool ResolveMeleeConfiguration(FString& OutError,
+		TSharedPtr<const FGGYGOActionMotionSourceBinding, ESPMode::ThreadSafe>& OutSource) const;
+	bool BeginOriginalMontageMotion(const TSharedPtr<FOriginalMeleeResources>& Resources);
+	void TryCompleteOriginalMontageMotion(const TSharedPtr<FOriginalMeleeResources>& Resources);
+	void HandleOriginalTaskFailure(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask,
+		const FGGYGOMontageTaskFailureFact& Fact);
 
 	bool OwnsOriginalResources(const TSharedPtr<FOriginalMeleeResources>& Resources,
 		const FGGYGOAbilityActivationHandle& Original) const;
@@ -100,7 +123,11 @@ private:
 	void HandleOriginalMontageCallback(const TSharedPtr<FOriginalMeleeResources>& Resources,
 		const FGGYGOAbilityActivationHandle& Original,
 		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask,
-		EMontageCallback Kind, FGameplayTag EventTag, const FGameplayEventData& EventData);
+		EMontageCallback Kind);
+	void HandleOriginalHitWindow(const TSharedPtr<FOriginalMeleeResources>& Resources,
+		const FGGYGOAbilityActivationHandle& Original,
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask,
+		const FGGYGOMontageWindowFact& Fact);
 	void HandleOriginalMontageTimeout(const TSharedPtr<FOriginalMeleeResources>& Resources,
 		const FGGYGOAbilityActivationHandle& Original,
 		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask);

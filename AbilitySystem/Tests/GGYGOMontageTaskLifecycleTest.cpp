@@ -4,17 +4,25 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "AbilitySystem/Tasks/GGYGORootMotionScaleLease.h"
+#include "Animation/Notifies/GGYGOAnimNotifyState_GameplayEventWindow.h"
+#include "System/GGYGOGameplayTags.h"
+
+#include "Animation/ActiveMontageInstanceScope.h"
+#include "Animation/AnimNotifyQueue.h"
 #include "Animation/AnimComposite.h"
 #include "Animation/AnimInstance.h"
 #include "Animation/AnimMontage.h"
 #include "Animation/Skeleton.h"
+#include "AnimNotifies/AnimNotify_PlayMontageNotify.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/Engine.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
 #include "Rendering/SkeletalMeshRenderData.h"
+#include "Misc/ScopeExit.h"
 #include "UObject/Package.h"
+#include "UObject/UnrealType.h"
 
 #include <limits>
 
@@ -532,6 +540,216 @@ namespace
 	}
 }
 
+namespace
+{
+	bool RunGGYGOMontageWindowProducerContract(FAutomationTestBase& Test)
+	{
+		FScopedMontageTaskTestWorld TestWorld(GEngine);
+		FGGYGOMontageTaskTestFixture Fixture;
+		if (!Test.TestTrue(TEXT("窗口原实例夹具"), Fixture.Initialize(TestWorld.World))) { return false; }
+		FScopedActiveMontageTestAbility AbilityCleanup{ Fixture.Ability };
+		const FGameplayTag BeginTag = GGYGOGameplayTags::Event_Montage_HitWindowBegin;
+		const FGameplayTag EndTag = GGYGOGameplayTags::Event_Montage_HitWindowEnd;
+		FGameplayTagContainer Tags;
+		Tags.AddTag(BeginTag);
+		Tags.AddTag(EndTag);
+		auto AddWindow = [&](float Begin, float Duration, bool bQueued)
+		{
+			auto* Notify = NewObject<UGGYGOAnimNotifyState_GameplayEventWindow>(Fixture.Montage);
+			Notify->InitializeEventTags(BeginTag, EndTag);
+			Notify->NotifyStateBehaviorFlags = 0;
+			FAnimNotifyEvent& Event = Fixture.Montage->Notifies.AddDefaulted_GetRef();
+			Event.NotifyStateClass = Notify;
+			Event.MontageTickType = bQueued ? EMontageNotifyTickType::Queued : EMontageNotifyTickType::BranchingPoint;
+			Event.Link(Fixture.Montage, Begin);
+			Event.SetDuration(Duration);
+		};
+		AddWindow(0.1f, 0.2f, true);
+		FGGYGOMontageWindowDeclaration Unique;
+		FString Diagnostic;
+		if (!Test.TestTrue(TEXT("通用唯一窗口允许原 NoMerge=0"),
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowDeclaration(
+				Fixture.Montage, BeginTag, EndTag, 0.0f, 1.0f, Unique, Diagnostic))) { return false; }
+		Test.TestFalse(TEXT("声明保留实际 NoMerge=0"), Unique.bNoMergeOnConcurrentPlay);
+		AddWindow(0.5f, 0.2f, false);
+		TArray<FGGYGOMontageWindowDeclaration> Declarations;
+		if (!Test.TestTrue(TEXT("同 Tag 对的顺序窗口返回完整集合"),
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
+				Fixture.Montage, Tags, 0.0f, 1.0f, Declarations, Diagnostic))
+			|| !Test.TestEqual(TEXT("两个真实作者窗口"), Declarations.Num(), 2)) { return false; }
+		Test.TestFalse(TEXT("顺序条目具有不同本地声明身份"), Declarations[0].HasSameWindow(Declarations[1]));
+		Test.TestFalse(TEXT("通用声明保留 BranchingPoint"), Declarations[1].bQueued);
+		Test.TestFalse(TEXT("必需唯一入口拒绝同 Tag 多窗"),
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowDeclaration(
+				Fixture.Montage, BeginTag, EndTag, 0.0f, 1.0f, Unique, Diagnostic));
+		Test.TestNull(TEXT("唯一解析失败不发布部分声明"), Unique.Montage.Get());
+		TArray<FGGYGOMontageWindowDeclaration> Empty;
+		FGameplayTagContainer Unused(GGYGOGameplayTags::Event_Montage_ComboWindowBegin);
+		Test.TestTrue(TEXT("没有匹配作者窗是明确空集"),
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
+				Fixture.Montage, Unused, 0.0f, 1.0f, Empty, Diagnostic));
+		Test.TestTrue(TEXT("未猜造订阅词汇对应的窗口"), Empty.IsEmpty());
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = nullptr;
+		TArray<FGGYGOMontageWindowFact> Facts;
+		bool bNestedReplayCase = false;
+		bool bEndTaskInNestedWindow = false;
+		TFunction<void(const FGGYGOMontageWindowFact&)> NestedProducerAndReplay;
+		bool bPublicPayloadUnchanged = true;
+		TOptional<float> ExpectedPublicMagnitude;
+		int32 PublicEventCount = 0;
+		const FDelegateHandle PublicObserver = Fixture.ASC->AddGameplayEventTagContainerDelegate(Tags,
+			FGameplayEventTagMulticastDelegate::FDelegate::CreateLambda([&](FGameplayTag, const FGameplayEventData* Payload)
+			{
+				++PublicEventCount;
+				bPublicPayloadUnchanged &= Payload && Payload->TargetData.Num() == 0
+					&& Payload->OptionalObject == Fixture.Montage && Payload->OptionalObject2 == Fixture.OriginalMesh
+					&& (!ExpectedPublicMagnitude.IsSet() || Payload->EventMagnitude == ExpectedPublicMagnitude.GetValue());
+			}));
+		ON_SCOPE_EXIT
+		{
+			Fixture.ASC->RemoveGameplayEventTagContainerDelegate(Tags, PublicObserver);
+			Fixture.Ability->SetK2ActivateActionForTest({});
+		};
+		Fixture.Ability->SetK2ActivateActionForTest([&]()
+		{
+			auto* EmptyTask = CreateMontageTask(Fixture.Ability, Fixture.Montage, TEXT("ExplicitEmptyWindows"));
+			if (Test.TestNotNull(TEXT("显式空集的 Ready 前 Task"), EmptyTask))
+			{
+				Test.TestTrue(TEXT("Ready 前可明确配置无作者窗口"), EmptyTask->ConfigureOriginalMontageWindows(Empty, Diagnostic));
+				Test.TestFalse(TEXT("显式空集也已消费单次配置"), EmptyTask->ConfigureOriginalMontageWindows(Declarations, Diagnostic));
+				EmptyTask->EndTask();
+			}
+			Task = CreateMontageTask(Fixture.Ability, Fixture.Montage, TEXT("TypedWindowProducer"));
+			if (!Task) { return; }
+			Test.TestTrue(TEXT("Ready 前一次完整窗口配置"), Task->ConfigureOriginalMontageWindows(Declarations, Diagnostic));
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks;
+			Callbacks.WindowReceived.BindLambda([&](const FGGYGOMontageWindowFact& Fact)
+			{
+				Test.TestTrue(TEXT("同步原窗口事实通过签发 Task 认证"), Task->IsOriginalMontageWindowFact(Fact));
+				Facts.Add(Fact);
+				if (bEndTaskInNestedWindow && Fact.Declaration.HasSameWindow(Declarations[1]))
+				{
+					Task->EndTask();
+					return;
+				}
+				if (bNestedReplayCase && Fact.Declaration.HasSameWindow(Declarations[0]))
+				{
+					bNestedReplayCase = false;
+					NestedProducerAndReplay(Fact);
+				}
+			});
+			Test.TestTrue(TEXT("仅 WindowReceived 的 native 包可注册"), Task->RegisterNativeCallbacks(MoveTemp(Callbacks)).IsValid());
+			Task->ReadyForActivation();
+		});
+		if (!Test.TestTrue(TEXT("真实原能力激活窗口 Task"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle))
+			|| !Test.TestNotNull(TEXT("真实窗口 Task"), Task)) { return false; }
+		FGGYGOMontageSectionSnapshot Playback;
+		if (!Test.TestTrue(TEXT("原固定实例快照"), Task->TryGetOriginalSectionSnapshot(Playback))) { return false; }
+		FGameplayEventData Forged;
+		Forged.EventTag = BeginTag;
+		Forged.Instigator = Fixture.OriginalAvatar;
+		Forged.Target = Fixture.OriginalAvatar;
+		Forged.OptionalObject = Fixture.Montage;
+		Forged.OptionalObject2 = Fixture.OriginalMesh;
+		Forged.EventMagnitude = static_cast<float>(Playback.MontageInstanceId + 1);
+		Fixture.ASC->HandleGameplayEvent(BeginTag, &Forged);
+		Test.TestTrue(TEXT("普通 GameplayEvent 不能伪造 typed 作者事实"), Facts.IsEmpty());
+		auto Emit = [&](int32 Index, bool bBegin, bool bCopyEnd, int32 InstanceId)
+		{
+			FAnimNotifyEvent Copy = Fixture.Montage->Notifies[Index];
+			FAnimNotifyEvent* Event = bCopyEnd ? &Copy : &Fixture.Montage->Notifies[Index];
+			auto* Notify = CastChecked<UGGYGOAnimNotifyState_GameplayEventWindow>(Event->NotifyStateClass.Get());
+			const TOptional<float> PreviousMagnitude = ExpectedPublicMagnitude;
+			if (Event->MontageTickType == EMontageNotifyTickType::BranchingPoint)
+			{
+				// 原生 BranchingPoint 的 EventReference 不含作者条目或整数实例上下文。
+				// 真实身份由原 Payload 承接；公开事件保留旧空引用路径的 Magnitude=0。
+				ExpectedPublicMagnitude = 0.0f;
+				FBranchingPointNotifyPayload BranchingPayload(Fixture.OriginalMesh, Fixture.Montage,
+					Event, InstanceId, !bBegin);
+				if (bBegin) { Notify->BranchingPointNotifyBegin(BranchingPayload); }
+				else { Notify->BranchingPointNotifyEnd(BranchingPayload); }
+			}
+			else
+			{
+				ExpectedPublicMagnitude = static_cast<float>(static_cast<int64>(InstanceId) + 1);
+				FAnimNotifyEventReference Reference(Event, Fixture.Montage);
+				Reference.AddContextData<UE::Anim::FAnimNotifyMontageInstanceContext>(InstanceId);
+				if (bBegin) { Notify->NotifyBegin(Fixture.OriginalMesh, Fixture.Montage, Event->GetDuration(), Reference); }
+				else { Notify->NotifyEnd(Fixture.OriginalMesh, Fixture.Montage, Reference); }
+			}
+			ExpectedPublicMagnitude = PreviousMagnitude;
+		};
+		Emit(0, true, false, Playback.MontageInstanceId == 0 ? 1 : 0);
+		Test.TestTrue(TEXT("错误整数实例不能取得 typed 许可"), Facts.IsEmpty());
+		Emit(1, true, false, Playback.MontageInstanceId == 0 ? 1 : 0);
+		Test.TestTrue(TEXT("真实 BranchingPoint 错误 Payload 整数实例不能取得 typed 许可"), Facts.IsEmpty());
+		Emit(0, true, false, Playback.MontageInstanceId);
+		Emit(0, false, true, Playback.MontageInstanceId);
+		if (!Test.TestEqual(TEXT("Queued 原引用单独产生 Begin/End"), Facts.Num(), 2)) { return false; }
+		const int32 BeforeBranchingPublicEvents = PublicEventCount;
+		Emit(1, true, false, Playback.MontageInstanceId);
+		Emit(1, false, true, Playback.MontageInstanceId);
+		if (!Test.TestEqual(TEXT("真实 BranchingPoint Payload 补齐第二组 Begin/End"), Facts.Num(), 4)) { return false; }
+		Test.TestEqual(TEXT("BranchingPoint 每个入口仍只发送一次公开事件"), PublicEventCount, BeforeBranchingPublicEvents + 2);
+		Test.TestTrue(TEXT("BranchingPoint 原 int32 实例与实际作者模式被保留"),
+			Facts[2].MontageInstanceId == Playback.MontageInstanceId
+			&& Facts[3].MontageInstanceId == Playback.MontageInstanceId
+			&& !Facts[2].Declaration.bQueued && !Facts[3].Declaration.bQueued);
+		Test.TestTrue(TEXT("End 的活动通知副本仍关联原声明"), Facts[0].Declaration.HasSameWindow(Facts[1].Declaration));
+		Test.TestFalse(TEXT("下一作者窗不冒认上个声明"), Facts[1].Declaration.HasSameWindow(Facts[2].Declaration));
+		Test.TestTrue(TEXT("两组 End phase 明确"), Facts[1].Phase == EGGYGOMontageWindowPhase::End
+			&& Facts[3].Phase == EGGYGOMontageWindowPhase::End);
+		Test.TestFalse(TEXT("派发后的历史副本不再授权工作"), Task->IsOriginalMontageWindowFact(Facts[0]));
+		Test.TestTrue(TEXT("Queued/BranchingPoint 公开 Payload 的原对象、Magnitude 与空 TargetData 保持"), bPublicPayloadUnchanged);
+		NestedProducerAndReplay = [&](const FGGYGOMontageWindowFact& OuterFact)
+		{
+			const int32 BeforeInner = Facts.Num();
+			Emit(1, true, false, Playback.MontageInstanceId);
+			if (!Test.TestEqual(TEXT("嵌套 B 交付一个新事实"), Facts.Num(), BeforeInner + 1)) { return; }
+			const FGGYGOMontageWindowFact InnerFact = Facts.Last();
+			Test.TestTrue(TEXT("B 返回后仍在 A 同步回调中，A 资格恢复"), Task->IsOriginalMontageWindowFact(OuterFact));
+			Test.TestFalse(TEXT("B 返回后 B 历史副本已失效"), Task->IsOriginalMontageWindowFact(InnerFact));
+			// B 已实际退出，A 的原发送 scope 仍存活；公开重发不得再次消费 A。
+			Fixture.ASC->HandleGameplayEvent(BeginTag, &Forged);
+			Test.TestEqual(TEXT("恢复 A 资格不重新消费其 producer token"), Facts.Num(), BeforeInner + 1);
+			Test.TestTrue(TEXT("拒绝重发后 A 仍保有原同步资格"), Task->IsOriginalMontageWindowFact(OuterFact));
+		};
+		const int32 BeforeNested = Facts.Num();
+		bNestedReplayCase = true;
+		Emit(0, true, false, Playback.MontageInstanceId);
+		if (!Test.TestEqual(TEXT("A→真实 B→公开重发 A 只产生 A/B 两个事实"), Facts.Num(), BeforeNested + 2)) { return false; }
+		Test.TestFalse(TEXT("A 完整返回后 A 历史副本失效"), Task->IsOriginalMontageWindowFact(Facts[BeforeNested]));
+		Test.TestFalse(TEXT("A 完整返回后 B 历史副本仍失效"), Task->IsOriginalMontageWindowFact(Facts[BeforeNested + 1]));
+		Test.TestTrue(TEXT("嵌套 BranchingPoint 返回后仍保持各自公开 Payload"), bPublicPayloadUnchanged);
+		FGGYGOMontageWindowDeclaration Ambiguous;
+		FGGYGOMontageSectionSnapshot AmbiguousPlayback;
+		Test.TestFalse(TEXT("多窗口快照不猜首个同 Tag 条目"),
+			Task->TryGetOriginalMontageWindowSnapshot(BeginTag, EndTag, Ambiguous, AmbiguousPlayback));
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(Task);
+		NestedProducerAndReplay = [&](const FGGYGOMontageWindowFact& OuterFact)
+		{
+			Emit(1, true, false, Playback.MontageInstanceId);
+			const auto* ClosingTask = OriginalTask.GetEvenIfUnreachable();
+			Test.TestFalse(TEXT("B 内 EndTask 返回后不得恢复 A 资格"),
+				ClosingTask && ClosingTask->IsOriginalMontageWindowFact(OuterFact));
+		};
+		const int32 BeforeNestedEnd = Facts.Num();
+		bEndTaskInNestedWindow = true;
+		bNestedReplayCase = true;
+		Emit(0, true, false, Playback.MontageInstanceId);
+		const auto* ClosingTask = OriginalTask.GetEvenIfUnreachable();
+		if (!Test.TestEqual(TEXT("B 内结束仍只交付原 A/B 两个事实"), Facts.Num(), BeforeNestedEnd + 2)) { return false; }
+		Test.TestFalse(TEXT("结束后的旧 A 栈不能重新安装 A 资格"),
+			ClosingTask && ClosingTask->IsOriginalMontageWindowFact(Facts[BeforeNestedEnd]));
+		Test.TestFalse(TEXT("结束后 B 资格也保持失效"),
+			ClosingTask && ClosingTask->IsOriginalMontageWindowFact(Facts[BeforeNestedEnd + 1]));
+		if (auto* LiveTask = OriginalTask.Get()) { LiveTask->EndTask(); }
+		Fixture.Ability->FinishForTest();
+		return true;
+	}
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOMontageTaskLifecycleTest,
 	"GGYGO.AbilitySystem.MontageTask.RateLeaseAndLifecycle",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -703,7 +921,15 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	Ability->SetK2ActivateActionForTest([&]
 	{
 		OuterReentrantTask = CreateMontageTask(Ability, Montage, TEXT("OuterReentrant"));
-		if (OuterReentrantTask) { OuterReentrantTask->ReadyForActivation(); }
+		if (OuterReentrantTask)
+		{
+			AddExpectedError(FString::Printf(
+				TEXT("MontageTask \\[%s\\].*ASC 未签发成功的原播放资源；Outcome=%d Reason=%d Guard=%d Stage=%d"),
+				*OuterReentrantTask->GetName(), int32(EGGYGOAbilityMontagePlaybackOutcome::Stale),
+				int32(EGGYGOAbilityMontagePlaybackReason::GuardSuperseded), int32(EGGYGOMontagePlayGuardOutcome::Superseded),
+				int32(EGGYGOMontagePlayGuardNativeStage::Returned)), EAutomationExpectedErrorFlags::Contains, 1);
+			OuterReentrantTask->ReadyForActivation();
+		}
 	});
 	bool bReactivatedDuringOuterPlay = false;
 	StartedObserver->ArmForTest(AnimInstance, Montage, [&]
@@ -719,6 +945,7 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	const int32 PlayCountBeforeNestedReactivation = NativeCreatedPlayCount;
 	ASC->TryActivateAbility(Fixture.AbilityHandle);
 	TestTrue(TEXT("Montage_PlayInternal 回调同步 End 并重激活成功"), bReactivatedDuringOuterPlay);
+	TestTrue(TEXT("被合法后继取代的旧 Task 已明确结束"), OuterReentrantTask && OuterReentrantTask->IsFinished());
 	TestEqual(TEXT("外层与嵌套任务均通过真实 Montage_PlayInternal"),
 		NativeCreatedPlayCount, PlayCountBeforeNestedReactivation + 2);
 	TestNotNull(TEXT("嵌套 successor task 建立"), NestedSuccessorTask);
@@ -834,8 +1061,185 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 	AnimInstance->TickMontageOnly(0.5f / NaturalEndTask->GetEffectivePlayRate());
 	TestTrue(TEXT("自然结束结束 Task"), NaturalEndTask->IsFinished());
 	TestEqual(TEXT("自然结束重复释放安全"), OriginalAvatar->GetAnimRootMotionTranslationScale(), 2.375f);
-	return true;
+	return RunGGYGOMontageWindowProducerContract(*this);
 }
+
+#if WITH_EDITOR
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOMontageTaskNamedNotifyTest,
+	"GGYGO.AbilitySystem.MontageTask.NamedNotifyContract",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOMontageTaskNamedNotifyTest::RunTest(const FString& Parameters)
+{
+	if (!TestNotNull(TEXT("GEngine"), GEngine)) { return false; }
+	FScopedMontageTaskTestWorld TestWorld(GEngine);
+	FGGYGOMontageTaskTestFixture Fixture;
+	if (!TestTrue(TEXT("具名通知原生夹具初始化"), Fixture.Initialize(TestWorld.World))) { return false; }
+	FScopedActiveMontageTestAbility Cleanup{Fixture.Ability};
+	UAnimMontage* Montage = Fixture.Montage;
+	FNameProperty* NameProperty = FindFProperty<FNameProperty>(UAnimNotify_PlayMontageNotify::StaticClass(), TEXT("NotifyName"));
+	if (!TestNotNull(TEXT("stock NotifyName 属性"), NameProperty)) { return false; }
+	const FName FirstName(TEXT("OriginalPointA"));
+	const FName SecondName(TEXT("OriginalPointB"));
+	const FName MissingName(TEXT("UnconfiguredPoint"));
+	const float FirstPosition = 0.25f;
+	const float SecondPosition = Montage->GetAnimCompositeSection(Montage->GetSectionIndex(TEXT("End"))).GetTime();
+	const float SecondOffset = -UE_KINDA_SMALL_NUMBER;
+	auto AddPoint = [&](FName Name, float Position, float Offset)
+	{
+		UAnimNotify_PlayMontageNotify* Notify = NewObject<UAnimNotify_PlayMontageNotify>(Montage);
+		NameProperty->SetPropertyValue_InContainer(Notify, Name);
+		FAnimNotifyEvent& Event = Montage->Notifies.AddDefaulted_GetRef();
+		Event.Notify = Notify;
+		Event.NotifyName = Name;
+		Event.MontageTickType = EMontageNotifyTickType::BranchingPoint;
+		Event.Link(Montage, Position);
+		Event.TriggerTimeOffset = Offset;
+	};
+	AddPoint(FirstName, FirstPosition, 0.0f);
+	AddPoint(SecondName, SecondPosition, SecondOffset);
+	FGGYGOMontageNotifyDeclaration SecondDeclaration;
+	FString Diagnostic;
+	if (!TestTrue(TEXT("合法 OffsetBefore 原声明可解析"),
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotifyDeclaration(
+			Montage, SecondName, SecondDeclaration, Diagnostic))) { return false; }
+	TestEqual(TEXT("声明保留作者位置"), SecondDeclaration.AuthoredPositionSeconds, SecondPosition, 0.0f);
+	TestEqual(TEXT("声明保留原 offset"), SecondDeclaration.TriggerTimeOffsetSeconds, SecondOffset, 0.0f);
+	TestEqual(TEXT("声明保留实际触发时间"), SecondDeclaration.TriggerPositionSeconds, SecondPosition + SecondOffset, 0.0f);
+	TestTrue(TEXT("提前触发时刻不是作者位置"), SecondDeclaration.TriggerPositionSeconds < SecondDeclaration.AuthoredPositionSeconds);
+	float LegacyTime = 9.0f;
+	TestTrue(TEXT("旧静态接口保持 trigger 语义"),
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotify(Montage, SecondName, LegacyTime, Diagnostic));
+	TestEqual(TEXT("旧输出含 offset"), LegacyTime, SecondDeclaration.TriggerPositionSeconds, 0.0f);
+
+	// 不依赖缓存或告警：真实 marker 碰撞即拒绝，包括未被请求的第三个名字。
+	AddPoint(TEXT("OtherPoint"), SecondDeclaration.TriggerPositionSeconds, 0.0f);
+	TestFalse(TEXT("不同名字的精确 trigger 碰撞拒绝"),
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotifyDeclaration(
+			Montage, SecondName, SecondDeclaration, Diagnostic));
+	TestTrue(TEXT("碰撞诊断定位所选名字"), Diagnostic.Contains(SecondName.ToString()));
+	TestTrue(TEXT("声明失败清输出"), SecondDeclaration.NotifyName.IsNone());
+	Montage->Notifies.Pop();
+	Montage->Notifies[1].MontageTickType = EMontageNotifyTickType::Queued;
+	// stock 点由 native 标志成为 BranchingPoint，不能仅凭 Queued 枚举判成普通点。
+	TestTrue(TEXT("stock Queued 设置仍按原生 BranchingPoint 认证"),
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotifyDeclaration(
+			Montage, SecondName, SecondDeclaration, Diagnostic));
+	UAnimNotify* SecondNotify = Montage->Notifies[1].Notify.Get();
+	const bool bOriginalNativeBranchingPoint = SecondNotify->bIsNativeBranchingPoint;
+	SecondNotify->bIsNativeBranchingPoint = false;
+	TestFalse(TEXT("真正不具 BranchingPoint 资格的点被拒绝"),
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageNotifyDeclaration(
+			Montage, SecondName, SecondDeclaration, Diagnostic));
+	SecondNotify->bIsNativeBranchingPoint = bOriginalNativeBranchingPoint;
+	Montage->Notifies[1].MontageTickType = EMontageNotifyTickType::BranchingPoint;
+	Montage->RefreshCacheData();
+	Montage->BlendIn.SetBlendTime(0.0f);
+	Montage->BlendOut.SetBlendTime(0.1f);
+	if (!TestTrue(TEXT("配置夹具原能力激活"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle))) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ConfigurationTask = CreateMontageTask(Fixture.Ability, Montage, TEXT("NamedConfiguration"));
+	if (!TestNotNull(TEXT("pre-Ready Task"), ConfigurationTask)) { return false; }
+	TestFalse(TEXT("空集合拒绝"), ConfigurationTask->ConfigureOriginalMontageNotifies({}, Diagnostic));
+	TestFalse(TEXT("None 名字拒绝"), ConfigurationTask->ConfigureOriginalMontageNotifies({FirstName, NAME_None}, Diagnostic));
+	TestFalse(TEXT("重复名字拒绝"), ConfigurationTask->ConfigureOriginalMontageNotifies({FirstName, FirstName}, Diagnostic));
+	TestFalse(TEXT("缺第二点不部分提交"), ConfigurationTask->ConfigureOriginalMontageNotifies({FirstName, MissingName}, Diagnostic));
+	TestTrue(TEXT("失败后可一次提交完整两点"), ConfigurationTask->ConfigureOriginalMontageNotifies({FirstName, SecondName}, Diagnostic));
+	TestFalse(TEXT("原集合不能被追加或替换"), ConfigurationTask->ConfigureOriginalMontageNotify(FirstName, Diagnostic));
+	ConfigurationTask->EndTask();
+
+	TArray<FGGYGOMontageNotifyFact> Received;
+	auto StartTask = [&](FName TaskName, float StartTime, bool bSingle)
+	{
+		Fixture.Ability->FinishForTest();
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Started = nullptr;
+		Fixture.Ability->SetK2ActivateActionForTest([&, TaskName, StartTime, bSingle]()
+		{
+			Started = CreateMontageTask(Fixture.Ability, Montage, TaskName);
+			if (!Started) { return; }
+			const bool bConfigured = bSingle ? Started->ConfigureOriginalMontageNotify(FirstName, Diagnostic)
+				: Started->ConfigureOriginalMontageNotifies({FirstName, SecondName}, Diagnostic);
+			TestTrue(TEXT("Ready 前配置原通知集"), bConfigured);
+			if (!bConfigured) { Started->EndTask(); return; }
+			UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks;
+			Callbacks.NotifyReceived.BindLambda([&](const FGGYGOMontageNotifyFact& Fact) { Received.Add(Fact); });
+			TestTrue(TEXT("一次 native Notify 包注册"), Started->RegisterNativeCallbacks(MoveTemp(Callbacks)).IsValid());
+			Started->SetStartTimeSeconds(StartTime);
+			Started->ReadyForActivation();
+		});
+		TestTrue(TEXT("原能力真实 Try 激活"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle));
+		return Started;
+	};
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = StartTask(TEXT("NamedNativePoints"), 0.0f, false);
+	if (!TestTrue(TEXT("两点 Task 真实 Ready 播放"), Task && Task->IsActive())) { return false; }
+	FGGYGOMontageNotifyFact FirstFact, SecondFact;
+	float Position = 9.0f;
+	if (!TestTrue(TEXT("第一名字原快照可读"), Task->TryGetOriginalMontageNotifySnapshotByName(FirstName, FirstFact, Position))
+		|| !TestTrue(TEXT("第二名字原快照可读"), Task->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position))) { return false; }
+	const int32 OriginalId = FirstFact.MontageInstanceId;
+	TestTrue(TEXT("两点绑定同一原实例而非第二播放器"), OriginalId != INDEX_NONE && SecondFact.MontageInstanceId == OriginalId);
+	TestEqual(TEXT("两点快照保留原 Mesh"), SecondFact.Mesh.Get(), Fixture.OriginalMesh);
+	TestEqual(TEXT("第二点保留作者时间"), SecondFact.NotifyAuthoredPositionSeconds, SecondPosition, 0.0f);
+	TestEqual(TEXT("第二点保留实际 trigger"), SecondFact.NotifyPositionSeconds, SecondPosition + SecondOffset, 0.0f);
+	TestFalse(TEXT("多点旧无名快照不猜第一点"), Task->TryGetOriginalMontageNotifySnapshot(FirstFact, Position));
+	TestTrue(TEXT("旧入口失败清 fact"), FirstFact.NotifyName.IsNone() && FirstFact.MontageInstanceId == INDEX_NONE);
+	TestEqual(TEXT("旧入口失败清 position"), Position, 0.0f, 0.0f);
+	TestFalse(TEXT("未配置名字不能借其它点快照"), Task->TryGetOriginalMontageNotifySnapshotByName(MissingName, FirstFact, Position));
+	TestFalse(TEXT("Ready 后不能重新配置"), Task->ConfigureOriginalMontageNotifies({FirstName, SecondName}, Diagnostic));
+	Fixture.AnimInstance->TickMontageOnly(0.3f / Task->GetEffectivePlayRate());
+	if (!TestEqual(TEXT("真实 native 第一个点仅发一次"), Received.Num(), 1)) { return false; }
+	TestEqual(TEXT("第一 native 点名字"), Received[0].NotifyName, FirstName);
+	TestEqual(TEXT("第一 native 点精确原 ID"), Received[0].MontageInstanceId, OriginalId);
+	if (!Task->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position)) { return false; }
+	// 原生步进越过 trigger、仍停在作者边界之前，避免恰落 float 端点掩盖契约。
+	const float BeforeAuthoredPosition = (SecondFact.NotifyPositionSeconds + SecondFact.NotifyAuthoredPositionSeconds) * 0.5f;
+	Fixture.AnimInstance->TickMontageOnly((BeforeAuthoredPosition - Position) / Task->GetEffectivePlayRate());
+	if (!TestEqual(TEXT("真实 native 第二个独立点送达"), Received.Num(), 2)) { return false; }
+	TestEqual(TEXT("第二 native 点名字"), Received[1].NotifyName, SecondName);
+	TestTrue(TEXT("OffsetBefore 通知送达时仍未到作者边界"),
+		Task->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position) && Position < SecondPosition);
+	Fixture.AnimInstance->TickMontageOnly(0.002f / Task->GetEffectivePlayRate());
+	TestTrue(TEXT("同名字 live 快照随后见证真实边界"),
+		Task->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position) && Position >= SecondPosition);
+	TestEqual(TEXT("跨作者边界不合成或重发 Notify"), Received.Num(), 2);
+
+	Received.Reset();
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* NonzeroTask = StartTask(TEXT("NamedNonzeroStart"), 0.65f, false);
+	if (!TestTrue(TEXT("非零起点 Task Ready"), NonzeroTask && NonzeroTask->IsActive())) { return false; }
+	TestEqual(TEXT("跳过原生点不补发通知"), Received.Num(), 0);
+	TestTrue(TEXT("非零起点各名字原实例快照可读"),
+		NonzeroTask->TryGetOriginalMontageNotifySnapshotByName(FirstName, FirstFact, Position)
+		&& NonzeroTask->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position) && Position >= 0.65f);
+	// 保持 trigger 不变仍不能偷换作者时间与 offset；另一名字的独立来源仍可认证。
+	Montage->Notifies[0].Link(Montage, FirstPosition + 0.015625f);
+	Montage->Notifies[0].TriggerTimeOffset = -0.015625f;
+	TestEqual(TEXT("来源探针保持原 trigger"), Montage->Notifies[0].GetTriggerTime(), FirstPosition, 0.0f);
+	TestFalse(TEXT("作者时间/offset 改变使该原声明失效"),
+		NonzeroTask->TryGetOriginalMontageNotifySnapshotByName(FirstName, FirstFact, Position));
+	TestTrue(TEXT("独立第二名字不借或依赖第一名字授权"),
+		NonzeroTask->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position));
+	Montage->Notifies[0].Link(Montage, FirstPosition);
+	Montage->Notifies[0].TriggerTimeOffset = 0.0f;
+	const int32 NonzeroId = SecondFact.MontageInstanceId;
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Successor = StartTask(TEXT("NamedSameAssetSuccessor"), 0.0f, false);
+	if (!TestTrue(TEXT("同资产后继 Ready"), Successor && Successor->IsActive())) { return false; }
+	TestFalse(TEXT("旧 Task 不借后继读取任一名字"), NonzeroTask->TryGetOriginalMontageNotifySnapshotByName(SecondName, SecondFact, Position));
+	TestTrue(TEXT("后继原名字及新 ID 可读"), Successor->TryGetOriginalMontageNotifySnapshotByName(FirstName, FirstFact, Position)
+		&& FirstFact.MontageInstanceId != NonzeroId);
+	FBranchingPointNotifyPayload OldPayload(Fixture.OriginalMesh, Montage, &Montage->Notifies[0], NonzeroId);
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(FirstName, OldPayload);
+	TestEqual(TEXT("晚到旧 ID 不交付给同资产后继"), Received.Num(), 0);
+	Successor->EndTask();
+	TestFalse(TEXT("退休 Task 的具名快照关闭"), Successor->TryGetOriginalMontageNotifySnapshotByName(FirstName, FirstFact, Position));
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(FirstName, OldPayload);
+	TestEqual(TEXT("清理后原订阅不再派发"), Received.Num(), 0);
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* SingleTask = StartTask(TEXT("NamedLegacySingle"), 0.0f, true);
+	if (!TestTrue(TEXT("原单点 Ready"), SingleTask && SingleTask->IsActive())) { return false; }
+	TestTrue(TEXT("旧单点无名快照仍可读"), SingleTask->TryGetOriginalMontageNotifySnapshot(FirstFact, Position));
+	TestEqual(TEXT("旧单点快照原名字"), FirstFact.NotifyName, FirstName);
+	Fixture.Ability->FinishForTest();
+	return !HasAnyErrors();
+}
+#endif
 
 namespace
 {

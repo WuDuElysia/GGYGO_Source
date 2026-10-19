@@ -84,9 +84,6 @@ protected:
 	/** Capture the selected/replicated target once and use the same request chain. */
 	void SynchronizeAvatarBinding();
 
-	/** Release only the original Host-held resource for this Pawn. */
-	void ClearLocalAvatarBinding(APawn* AvatarToClean);
-
 	/** 本宿主的 ASC。派生类只配置复制模式，不替换实例。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Combatant", meta = (AllowPrivateAccess = "true"))
 	TObjectPtr<UGGYGOAbilitySystemComponent> AbilitySystemComponent;

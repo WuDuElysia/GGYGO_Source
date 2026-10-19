@@ -6,6 +6,7 @@
 #include "Engine/GameInstance.h"
 #include "Engine/GameViewportClient.h"
 #include "GameFramework/Character.h"
+#include "GameFramework/GameModeBase.h"
 #include "InputMappingContext.h"
 #include "InputTriggers.h"
 #include "Player/GGYGOPlayerController.h"
@@ -58,6 +59,16 @@ public:
 
 private:
 	bool bUseNativeInputInitialization = false;
+};
+
+/** 原生 PIE 宿主使用项目 PC 的输入出生链及 CameraManager 配置。 */
+UCLASS(Transient)
+class AGGYGOInputTestGameMode : public AGameModeBase
+{
+	GENERATED_BODY()
+
+public:
+	AGGYGOInputTestGameMode(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 };
 
 /** Configures the test component's own IMC list; no private session state is exposed. */
@@ -140,6 +151,8 @@ public:
 	UGGYGOAbilitySystemComponent* GetASCForTest() const;
 	UGGYGOInputComponent* GetInputComponentForTest() const;
 	void SetAbilitySystemHostForTest(AGGYGOCombatantState* Host);
+	/** 首次输入安装前选择 Source 探针；普通夹具仍由完整 Hero 持有输入会话。 */
+	bool EnableSourceMovementProbeForTest();
 
 protected:
 	virtual UInputComponent* CreatePlayerInputComponent() override;
@@ -151,6 +164,7 @@ private:
 	UPROPERTY()
 	TObjectPtr<UGGYGOInputTestHeroComponent> Hero;
 	TWeakObjectPtr<AGGYGOCombatantState> AbilitySystemHost;
+	bool bSourceMovementProbe = false;
 };
 
 #if WITH_DEV_AUTOMATION_TESTS

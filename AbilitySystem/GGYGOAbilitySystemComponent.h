@@ -43,6 +43,7 @@
 #include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
 #include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
+#include "FX/GGYGOMontageFXPublication.h"
 #include "NativeGameplayTags.h"
 #include "Templates/SharedPointer.h"
 #include "Templates/UniquePtr.h"
@@ -109,7 +110,7 @@ struct GGYGO_API FGGYGOAvatarSwitchAbilityExitResult
 
 /**
  * Subscriber-only view of immutable original termination history.
- * As with K4, private inheritance prevents callers from reaching native Broadcast/Clear;
+ * Private inheritance prevents callers from reaching native Broadcast/Clear;
  * only ASC may dispatch. Subscription/removal does not grant completion or restart authority.
  */
 class FGGYGOAbilityTerminationCompletedEvent : private TMulticastDelegate<
@@ -220,11 +221,25 @@ DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOAbilityInputRetryable,
 	const FGGYGOAbilityInputRetryRequest& /*OriginalRequest*/);
 
 UCLASS()
-class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent
+class GGYGO_API UGGYGOAbilitySystemComponent : public UAbilitySystemComponent, public IGGYGOMontageFXHost
 {
 	GENERATED_BODY()
 
 public:
+	virtual UGGYGOMontageFXPublicationOwner* GetMontageFXPublicationOwner() override { return MontageFXPublicationOwner; }
+	/** 原 GA/Task 的同步 Begin 事实经过 GAS 来源认证后，才发布派生表现记录。 */
+	bool TryPublishMontageFX(UGGYGOGameplayAbility* OriginalAbility,
+		const FGGYGOAbilityActivationHandle& OriginalActivation,
+		class UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask,
+		const struct FGGYGOMontageWindowFact& BeginFact, const FGGYGOMontageFXRecord& Request,
+		FGGYGOMontageFXLease& OutLease, FString& OutDiagnostic);
+	/** 纯数据退休；不执行本地表现、RPC 或 GA/BP 回调。 */
+	void PrepareMontageFXRetirements(const TArray<FGGYGOAbilityActivationHandle>& Originals,
+		TArray<FGGYGOMontageFXCloseObligation>& OutObligations);
+	/** 调用方须已完成原成员写入及 scope 归还；发送后不能继续借原成员写入。 */
+	static void DispatchMontageFXRetirements(TArray<FGGYGOMontageFXCloseObligation>& Obligations);
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void OnRegister() override;
 	UGGYGOAbilitySystemComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	virtual ~UGGYGOAbilitySystemComponent() override;
 	/** Actual GAS destruction supplies a synchronous native cleanup source. */
@@ -262,12 +277,14 @@ public:
 	EGGYGOAvatarBindingOutcome CheckAvatarBindingCleanupContext(
 		const FGGYGOAvatarBindingContext& Expected, EGGYGOAvatarBindingReason& OutReason) const;
 	/**
-	 * Revoke only the exact committed context; never revoke an operation which refers to it.
-	 * LifecycleClosed/ActorInfoMismatch/OperationInvalidated/RequestContextExpired are valid reasons.
-	 * Repeated matching revocation is idempotent. No ActorInfo writes, callbacks or native cleanup.
+	 * 撤销精确原提交 Context；不撤销引用该 Context 的 Operation，不写 ActorInfo 或执行外部回调。
+	 * Reason 支持 LifecycleClosed/ActorInfoMismatch/OperationInvalidated/RequestContextExpired；匹配的重复撤销幂等。
+	 * 原表现资源的关闭义务追加到 OutRetirements，调用方完成自身写入及 native scope 后须显式 Dispatch。
+	 * 未传输出时只借用当前同步 native 调用栈的输出；无可用输出且仍有表现资源则拒绝为 MissingRetirementOutput。
 	 */
 	bool InvalidateAvatarBinding(const FGGYGOAvatarBindingContext& Expected,
-		EGGYGOAvatarBindingReason Reason, EGGYGOAvatarBindingReason& OutRejectionReason);
+		EGGYGOAvatarBindingReason Reason, EGGYGOAvatarBindingReason& OutRejectionReason,
+		TArray<FGGYGOMontageFXCloseObligation>* OutRetirements = nullptr);
 
 	/**
 	 * ActorInfo transactions; game thread only. Reset the independent caller-stack
@@ -419,9 +436,6 @@ public:
 	 */
 	void CancelAbilitiesByFunc(TShouldCancelAbilityFunc ShouldCancelFunc, bool bReplicateCancelAbility);
 
-	/** 取消所有由输入激活的能力（`OnInputTriggered` 与 `WhileInputActive`）。 */
-	void CancelInputActivatedAbilities(bool bReplicateCancelAbility);
-
 	/** 服务器纠正拥有者本次激活的能力状态；目标数据解释由具体能力负责。 */
 	UFUNCTION(Client, Reliable)
 	void ClientCorrectAbilityState(FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey ActivationKey,
@@ -448,7 +462,14 @@ public:
 	/** 每帧消费输入缓存。需要外部驱动，见文件头说明。 */
 	void ProcessAbilityInput(float DeltaTime, bool bGamePaused);
 
-	/** 清空全部输入缓存（含 held 与 retry），并使正在消费的旧快照失效。 */
+	/**
+	 * 清空全部输入缓存（含 held 与 retry），并使正在消费的旧快照失效。
+	 *
+	 * 同步纯容器写入：只改本 ASC 的输入请求、边沿、retry、held、输入修订号、
+	 * 激活尝试来源及 Spec.InputPressed；不广播、不调用 GA／BP、不写 ActorInfo。
+	 * 调用方的后置核验是否需要，取决于其谓词是否读取上述状态，而不是本调用会外调。
+	 * 若以后在此加入原生事件或委托派发，须同步恢复各调用方的返栈核验。
+	 */
 	void ClearAbilityInput();
 
 	/**
@@ -879,6 +900,8 @@ private:
 		// References to GA's one original record; no ASC execution state or deferred queue.
 		TArray<TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>> TerminationExitDependencies;
 		TSharedPtr<FGGYGOAbilityTerminationCompletedNotice> OriginalTerminationCompleted;
+		TArray<FGGYGOAbilityActivationHandle>* RetiredActivationsOutput = nullptr;
+		TArray<FGGYGOMontageFXCloseObligation>* FXCloseOutput = nullptr;
 	};
 
 	class FScopedControlledAbilityActivationCall
@@ -902,11 +925,13 @@ private:
 	bool CompleteControlledAbilityActivationEvaluation(uint64 EvaluationSerial, bool bNativeRulesPassed);
 	/** Native notification issues GA history regardless of a controlled Try; only an exact
 	 * admitted Try receives an outer-return witness. Raw history never fabricates that witness. */
-	void ObserveControlledAbilityActivation(FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability);
+	void ObserveControlledAbilityActivation(FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability,
+		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
 	void RegisterOriginalTerminationTryDependencies(
 		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record);
 	void TryPublishOriginalTerminationCompleted(
-		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record);
+		const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record,
+		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
 	FControlledAbilityActivationCall* ControlledAbilityActivationCall = nullptr;
 	FGGYGOAbilityTerminationCompletedEvent AbilityTerminationCompletedEvent;
 
@@ -1055,6 +1080,50 @@ private:
 		EGGYGOAvatarBindingReason Reason) const;
 
 	FGGYGOAvatarBindingNoticeEvent AvatarBindingNoticeEvent;
+
+	/** 当前实际注册的强别名；跨重注册的稳定资源拥有者由 State.LocalOwner 保持。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UGGYGOMontageFXPublicationOwner> MontageFXPublicationOwner;
+	UPROPERTY(ReplicatedUsing = OnRep_MontageFXState)
+	FGGYGOMontageFXState MontageFXState;
+	UFUNCTION()
+	void OnRep_MontageFXState();
+	UFUNCTION(NetMulticast, Reliable)
+	void MulticastMontageFXTerminal(const FGGYGOMontageFXTerminal& Terminal);
+	void SendMontageFXTerminal(const FGGYGOMontageFXTerminal& Terminal);
+	void PrepareInvalidMontageFXSources(TArray<FGGYGOMontageFXCloseObligation>& OutObligations);
+
+	/** 当前 native 调用栈的显式输出通道；析构仅恢复栈链接。 */
+	class FScopedMontageFXRetirementOutput
+	{
+	public:
+		FScopedMontageFXRetirementOutput(UGGYGOAbilitySystemComponent* InASC,
+			TArray<FGGYGOAbilityActivationHandle>& InActivations, TArray<FGGYGOMontageFXCloseObligation>& InObligations);
+		~FScopedMontageFXRetirementOutput();
+	private:
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+		FScopedMontageFXRetirementOutput* Previous = nullptr;
+		TArray<FGGYGOAbilityActivationHandle>& Activations;
+		TArray<FGGYGOMontageFXCloseObligation>& Obligations;
+		friend class UGGYGOAbilitySystemComponent;
+	};
+	FScopedMontageFXRetirementOutput* MontageFXRetirementOutput = nullptr;
+	TArray<FGGYGOAbilityActivationHandle>* GetMontageFXRetirementOutput();
+	TArray<FGGYGOMontageFXCloseObligation>* GetMontageFXCloseOutput();
+	void ExecuteWithMontageFXRetirement(TFunctionRef<void()> Action);
+	void DestroyActiveStateWithRetirementOutput();
+	void RemoveAbilityWithRetirementOutput(FGameplayAbilitySpec& AbilitySpec);
+	void InitActorInfoWithRetirementOutput(AActor* InOwnerActor, AActor* InAvatarActor);
+	void ClearActorInfoWithRetirementOutput();
+	void RefreshActorInfoWithRetirementOutput();
+	FGGYGOAvatarBindingResult CleanupFailedInitWithRetirementOutput(const FGGYGOAvatarBindingOperationIdentity& OriginalOperation, TFunction<bool()> IsOriginalCallerCurrent);
+	FGGYGOAvatarBindingResult ExecuteActorInfoTransactionWithRetirementOutput(const FGGYGOAvatarBindingRequest& Request, EAvatarBindingIdentityAdmission Admission, FGGYGOAvatarBindingPublicationReceipt& OutPublication);
+	FGGYGOAvatarBindingResult CancelAvatarAbilitiesWithRetirementOutput(const FGGYGOAvatarBindingContext& Expected, const FGameplayTagContainer* WithTags, const FGameplayTagContainer* WithoutTags, TFunction<bool()> IsOriginalCallerCurrent);
+	FGGYGOAvatarBindingResult RemoveAvatarCuesWithRetirementOutput(const FGGYGOAvatarBindingContext& Expected, TFunction<bool()> IsOriginalCallerCurrent);
+	FGGYGOAbilityActivationRequestResult ActivateAbilityWithRetirementOutput(FGameplayAbilitySpecHandle Handle, bool bAllowRemoteActivation);
+	void NotifyAbilityActivatedWithRetirementOutput(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability);
+	void NotifyAbilityEndedWithRetirementOutput(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled);
+
 
 	/** Single ASC-owned protocol resource; native execution and external callback bridges stay here. */
 	TUniquePtr<FGGYGOAvatarBindingProtocol> AvatarBindingProtocol;

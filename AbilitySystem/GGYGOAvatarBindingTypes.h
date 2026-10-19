@@ -46,7 +46,9 @@ enum class EGGYGOAvatarBindingReason : uint8
 	/** Publication admission only; these do not authorize binding invalidation. */
 	InvalidPublication,
 	PublicationInProgress,
-	PublicationAlreadyConsumed
+	PublicationAlreadyConsumed,
+	/** 原绑定仍有表现资源，但当前调用栈未提供关闭义务输出。 */
+	MissingRetirementOutput
 };
 
 enum class EGGYGOAvatarBindingNoticeKind : uint8
@@ -140,6 +142,20 @@ struct FGGYGOAvatarBindingContext
 			&& Binding.HasSameIdentity(Other.Binding)
 			&& LastActorInfoWrite.HasSameIdentity(
 				Other.LastActorInfoWrite);
+	}
+
+	/**
+	 * 四字段原值比较：Binding／LastActorInfoWrite 各自的 Serial 与弱 Issuer 槽位。
+	 * 默认未发放值、已失效弱身份也按原值比较；不判断发放、存活或有效性，不解引用 Issuer。
+	 * 需要“双方均已发放”语义时使用 HasSameContext。
+	 */
+	bool HasSameValue(const FGGYGOAvatarBindingContext& Other) const
+	{
+		return Binding.Serial == Other.Binding.Serial
+			&& Binding.Issuer.HasSameIndexAndSerialNumber(Other.Binding.Issuer)
+			&& LastActorInfoWrite.Serial == Other.LastActorInfoWrite.Serial
+			&& LastActorInfoWrite.Issuer.HasSameIndexAndSerialNumber(
+				Other.LastActorInfoWrite.Issuer);
 	}
 };
 

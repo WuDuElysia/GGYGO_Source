@@ -1,9 +1,12 @@
+/** @file GGYGOBossMeleeEndReentryTest.cpp @brief 严格原生命周期、真实 Boss Host XYZ 及正式 Kevin Ice01 生产冒烟。 */
 #include "AI/Boss/Tests/GGYGOBossMeleeLifecycleTestAbility.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
+#include "GameplayEffect.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOBossMeleeLifecycleTestAbility)
 
@@ -12,6 +15,11 @@ void UGGYGOBossMeleeLifecycleTestAbility::ActivateAbilityBody(const FGGYGOAbilit
 	const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
 	const FGameplayEventData* TriggerEventData)
 {
+	if (AttackMontage)
+	{
+		Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
+		return;
+	}
 	UGGYGOCombatActionAbility::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (!CaptureCurrentActivation().HasSameActivation(Original)) { return; }
 	ACharacter* Character = ActorInfo ? Cast<ACharacter>(ActorInfo->AvatarActor.Get()) : nullptr;
@@ -19,6 +27,17 @@ void UGGYGOBossMeleeLifecycleTestAbility::ActivateAbilityBody(const FGGYGOAbilit
 	{
 		RequestAbilityEnd(Original, false, true);
 	}
+}
+
+void UGGYGOBossMeleeLifecycleTestAbility::ConfigureMontageForTest(UAnimMontage* Montage, FName StartBone, FName EndBone)
+{
+	AttackMontage = Montage;
+	bUseMontageSourceMotion = true;
+	ActionMotionProfile = nullptr;
+	TraceStartSocket = StartBone;
+	TraceEndSocket = EndBone;
+	DamageEffect = UGameplayEffect::StaticClass(); // No hit is fabricated by this playback/resource fixture.
+	HitCueTag = FGameplayTag();
 }
 
 void UGGYGOBossMeleeLifecycleTestAbility::FinishForTest(const FGGYGOAbilityActivationHandle& Original)
@@ -39,7 +58,43 @@ bool UGGYGOBossMeleeLifecycleTestAbility::BeginMotionForTest(
 #include "Character/Components/GGYGOActionCurveRootMotionSource.h"
 #include "Character/Data/GGYGOActionMotionProfile.h"
 #include "Curves/CurveVector.h"
+#include "Animation/AnimMontage.h"
+#include "Animation/AnimSequence.h"
+#include "Animation/Notifies/GGYGOAnimNotifyState_GameplayEventWindow.h"
+#include "Animation/Skeleton.h"
+#include "Animation/AnimData/IAnimationDataController.h"
+#include "AI/Boss/Tests/GGYGOBossEncounterLifecycleTestTypes.h"
+#include "AI/Boss/GGYGOBossAIController.h"
+#include "AI/Boss/GGYGOBossState.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "Character/Data/GGYGOMovementSet.h"
+#include "Character/Data/GGYGOPawnData.h"
+#include "Engine/Engine.h"
+#include "Engine/SkeletalMesh.h"
+#include "System/GGYGOGameplayTags.h"
 #include "Misc/AutomationTest.h"
+#if WITH_EDITOR
+#include "AbilitySystem/GGYGOAbilitySet.h"
+#include "AbilitySystem/Attributes/GGYGOHealthSet.h"
+#include "Animation/AnimData/IAnimationDataModel.h"
+#include "Components/CapsuleComponent.h"
+#include "Components/SphereComponent.h"
+#include "Dom/JsonObject.h"
+#include "Editor.h"
+#include "Editor/EditorEngine.h"
+#include "GameFramework/GameModeBase.h"
+#include "GameFramework/PlayerStart.h"
+#include "EngineUtils.h"
+#include "Misc/FileHelper.h"
+#include "Misc/PackageName.h"
+#include "Misc/Paths.h"
+#include "PlayInEditorDataTypes.h"
+#include "Serialization/JsonReader.h"
+#include "Serialization/JsonSerializer.h"
+#include "Settings/LevelEditorPlaySettings.h"
+#include "UObject/Package.h"
+#endif
 
 namespace
 {
@@ -209,7 +264,7 @@ bool FGGYGOBossMeleeEndReentryTest::RunTest(const FString& Parameters)
 	{
 		bRestoredBeforeBroadcast = Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered
 			&& Mesh->bEnableUpdateRateOptimizations && !Ability->HasActiveMeshForTest();
-		// Retain the strict native entry from the original reproduction, including its Busy boundary.
+		// 保留真实 OnAbilityEnded 内的原生重入入口，核旧 End 栈不会破坏后继资源。
 		bReactivated = ASC->TryActivateAbility(Handle);
 		ReentryOriginal = Ability->GetInitializedOriginalForTest();
 	});
@@ -217,14 +272,35 @@ bool FGGYGOBossMeleeEndReentryTest::RunTest(const FString& Parameters)
 	AddInfo(FString::Printf(TEXT("原生 End 回调内同 Spec 原生尝试：NativeAccepted=%d InitializedOriginal=%d；旧重入成功期待保留。"),
 		bReactivated ? 1 : 0, ReentryOriginal.HasActivation() ? 1 : 0));
 	TestTrue(TEXT("广播前恢复 Mesh 并清引用"), bRestoredBeforeBroadcast);
-	// Preserve the original expectations below. The approved Busy policy rejects this native-End
-	// reentry until original Completed; these expectations remain a visible policy mismatch.
+	// 旧 proof 的完整返回义务不阻止原生退役后新 proof 准入；旧结束只能收口自身资源。
 	TestTrue(TEXT("结束回调内重新激活同一 Spec"), bReactivated);
 	TestTrue(TEXT("旧结束不得清空新动作 Mesh"), Ability->HasActiveMeshForTest());
 	TestTrue(TEXT("旧结束不得覆盖新动作 Tick 设置"), Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::AlwaysTickPoseAndRefreshBones);
 	TestFalse(TEXT("新动作仍关闭 URO"), Mesh->bEnableUpdateRateOptimizations);
 	ASC->OnAbilityEnded.Remove(EndHandle);
-	if (bReactivated) { Ability->FinishForTest(ReentryOriginal); }
+	if (bReactivated)
+	{
+		int32 RawSuccessorCompletions = 0;
+		const FDelegateHandle CompletionObserver = ASC->OnAbilityTerminationCompleted().AddLambda(
+			[&RawSuccessorCompletions, ReentryOriginal](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+			{
+				if (Notice.HasCompletion()
+					&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(ReentryOriginal))
+				{
+					++RawSuccessorCompletions;
+				}
+			});
+		TestTrue(TEXT("已登记原生后继最终清理的完成观察"), CompletionObserver.IsValid());
+		// 后继通过 raw Try 启动；显式请求清理必须诊断缺少受控完成证明，不能伪造 Completed。
+		AddExpectedMessage(FString::Printf(
+			TEXT("AbilitySystem original termination Ability [%s] ASC [%s] Spec [%s] failed: reason=%d."),
+			*GetPathNameSafe(Ability), *GetPathNameSafe(ASC), *Handle.ToString(),
+			static_cast<int32>(EGGYGOAbilityTerminationReason::UnsupportedEntry)),
+			ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+		Ability->FinishForTest(ReentryOriginal);
+		ASC->OnAbilityTerminationCompleted().Remove(CompletionObserver);
+		TestEqual(TEXT("无受控完成证明的原生后继不发布业务 Completed"), RawSuccessorCompletions, 0);
+	}
 	TestTrue(TEXT("新动作最终恢复最初设置"), Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered && Mesh->bEnableUpdateRateOptimizations);
 	World->DestroyWorld(false);
 	return true;
@@ -354,4 +430,756 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 	}
 	return bPassed;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOBossMeleeOriginalMontageTest, "GGYGO.BossAI.Melee.OriginalMontageXYZ",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
+{
+#if WITH_EDITOR
+	UWorld::InitializationValues Init;
+	Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(true)
+		.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
+	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
+	if (!TestNotNull(TEXT("XYZ consumer real World"), World)) { return false; }
+	if (!TestNotNull(TEXT("XYZ native Engine"), GEngine)) { World->DestroyWorld(false); return false; }
+	GEngine->CreateNewWorldContext(EWorldType::Game).SetCurrentWorld(World);
+	struct FBossXYZWorldCleanup
+	{
+		UWorld* World;
+		AGGYGOEncounterLifecycleTestEncounter* Encounter = nullptr;
+		~FBossXYZWorldCleanup()
+		{
+			if (IsValid(Encounter)) { Encounter->CleanupForTest(); }
+			World->DestroyWorld(false);
+			GEngine->DestroyWorldContext(World);
+		}
+	} Cleanup{World};
+	World->InitializeActorsForPlay(FURL());
+	UGGYGOMovementSet* MovementSet = NewObject<UGGYGOMovementSet>(World);
+	MovementSet->bUseCurveDrivenSpeed = false; // Explicit isolated locomotion fixture; action must still supply XYZ.
+	UGGYGOPawnData* PawnData = NewObject<UGGYGOPawnData>(World);
+	PawnData->PawnClass = AGGYGOBossCharacter::StaticClass();
+	PawnData->MovementSet = MovementSet;
+	UGGYGOBossDefinition* Definition = NewObject<UGGYGOBossDefinition>(World);
+	Definition->InitialFormTag = GGYGOGameplayTags::State_Boss_Form_Default;
+	Definition->InitialPhaseTag = GGYGOGameplayTags::State_Boss_Phase_One;
+	FGGYGOBossFormDefinition& Form = Definition->Forms.AddDefaulted_GetRef();
+	Form.FormTag = Definition->InitialFormTag;
+	Form.AvatarPawnData = PawnData;
+	FGGYGOBossPhaseDefinition& Phase = Definition->Phases.AddDefaulted_GetRef();
+	Phase.PhaseTag = Definition->InitialPhaseTag;
+	AGGYGOEncounterLifecycleTestEncounter* Encounter = World->SpawnActor<AGGYGOEncounterLifecycleTestEncounter>();
+	if (!TestNotNull(TEXT("XYZ actual Encounter"), Encounter)) { return false; }
+	Cleanup.Encounter = Encounter;
+	Encounter->ConfigureForTest(Definition);
+	if (!TestTrue(TEXT("XYZ production assembly-only SpawnBoss"), Encounter->SpawnBoss())) { return false; }
+	AGGYGOBossCharacter* Character = Encounter->GetBossAvatar();
+	AGGYGOBossState* State = Encounter->GetBossState();
+	UGGYGOAbilitySystemComponent* ASC = State ? State->GetGGYGOAbilitySystemComponent() : nullptr;
+	UGGYGOCharacterMovementComponent* Movement = Character ? Character->GetGGYGOMovementComponent() : nullptr;
+	USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+	if (!TestNotNull(TEXT("XYZ original Character"), Character) || !TestNotNull(TEXT("XYZ original CMC"), Movement)
+		|| !TestNotNull(TEXT("XYZ original Mesh"), Mesh)) { return false; }
+	AGGYGOBossAIController* Controller = Encounter->GetBossController();
+	UGGYGOPawnExtensionComponent* Extension = Character->GetPawnExtensionComponent();
+	if (!TestNotNull(TEXT("XYZ original external Host"), State)
+		|| !TestNotNull(TEXT("XYZ original Host ASC"), ASC)
+		|| !TestNotNull(TEXT("XYZ original Controller"), Controller)
+		|| !TestNotNull(TEXT("XYZ original PawnExtension"), Extension)) { return false; }
+	const FGGYGOAvatarBindingContext InitialContext = ASC->GetAvatarBindingContext();
+	const FGGYGOPawnASCResourceHandle InitialResource = Extension->GetCurrentLocalAbilitySystemResource();
+	EGGYGOAvatarBindingReason BindingReason;
+	if (!TestTrue(TEXT("XYZ initial production assembly has real published Host Ready"),
+		Character->GetGGYGOAbilitySystemComponent() == ASC && State->GetAvatarPawn() == Character
+		&& State->GetGGYGOAbilitySystemComponent() == ASC && ASC->AbilityActorInfo.IsValid()
+		&& ASC->AbilityActorInfo->OwnerActor.Get() == State && ASC->AbilityActorInfo->AvatarActor.Get() == Character
+		&& InitialContext.HasIssuedContext() && InitialResource.HasResource()
+		&& InitialResource.GetIdentity().Binding.HasSameIdentity(InitialContext.Binding)
+		&& Extension->IsLocalAbilitySystemResourceReady(InitialResource)
+		&& ASC->CheckAvatarBindingContext(InitialContext, BindingReason) == EGGYGOAvatarBindingOutcome::Succeeded
+		&& Character->GetController() == Controller && Controller->GetPawn() == Character
+		&& !Character->FindComponentByClass<UGGYGOAbilitySystemComponent>())) { return false; }
+	// Mesh/AnimInstance are part of the committed native binding source. Release its
+	// real Host resource before configuring the fixture, then publish a new binding.
+	State->DetachAvatar(Character);
+	if (!TestTrue(TEXT("XYZ real Host Release retires the original resource before source configuration"),
+		State->GetGGYGOAbilitySystemComponent() == ASC && !State->GetAvatarPawn()
+		&& ASC->GetOwnerActor() == State && !ASC->GetAvatarActor()
+		&& !Character->GetGGYGOAbilitySystemComponent()
+		&& !Extension->GetCurrentLocalAbilitySystemResource().HasResource()
+		&& !Extension->IsLocalAbilitySystemResourceInstalled(InitialResource)
+		&& !Extension->IsLocalAbilitySystemResourceReady(InitialResource)
+		&& ASC->CheckAvatarBindingContext(InitialContext, BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded
+		&& Character->GetController() == Controller && Controller->GetPawn() == Character)) { return false; }
+	USkeletalMesh* Cube = LoadObject<USkeletalMesh>(nullptr, TEXT("/Engine/EngineMeshes/SkeletalCube.SkeletalCube"));
+	USkeleton* Skeleton = Cube && Cube->GetSkeleton() ? DuplicateObject<USkeleton>(Cube->GetSkeleton(), Character) : nullptr;
+	if (!TestNotNull(TEXT("XYZ real engine Mesh"), Cube) || !TestNotNull(TEXT("XYZ owned Skeleton"), Skeleton)
+		|| !TestTrue(TEXT("XYZ real Mesh compatible bones"), Skeleton->IsCompatibleMesh(Cube) && Cube->GetRefSkeleton().GetNum() >= 2)) { return false; }
+	Skeleton->RegisterSlotNode(TEXT("DefaultSlot"));
+	Mesh->USkinnedMeshComponent::SetSkinnedAssetAndUpdate(Cube);
+	Mesh->SetAnimInstanceClass(UGGYGOBossMeleeLifecycleTestAnimInstance::StaticClass());
+	Mesh->SetRelativeRotation(FRotator::ZeroRotator);
+	Mesh->SetRelativeScale3D(FVector::OneVector);
+	Mesh->SetComponentTickEnabled(false);
+	Mesh->SetVisibility(false);
+	Mesh->SetCastShadow(false);
+	Mesh->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+	Mesh->bEnableUpdateRateOptimizations = true;
+	UAnimInstance* Anim = Mesh->GetAnimInstance();
+	if (!TestNotNull(TEXT("XYZ concrete Guard instance"), Anim)) { return false; }
+	UGGYGOBossMeleeLifecycleTestAnimInstance* Guard = Cast<UGGYGOBossMeleeLifecycleTestAnimInstance>(Anim);
+	if (!TestNotNull(TEXT("XYZ original concrete Guard receiver"), Guard)) { return false; }
+	State->AttachAvatar(Character);
+	const FGGYGOAvatarBindingContext ReboundContext = ASC->GetAvatarBindingContext();
+	const FGGYGOPawnASCResourceHandle ReboundResource = Extension->GetCurrentLocalAbilitySystemResource();
+	if (!TestTrue(TEXT("XYZ same Host publishes a new real binding to the configured native source"),
+		State->GetGGYGOAbilitySystemComponent() == ASC && State->GetAvatarPawn() == Character
+		&& Character->GetGGYGOAbilitySystemComponent() == ASC
+		&& ReboundContext.HasIssuedContext() && !ReboundContext.Binding.HasSameIdentity(InitialContext.Binding)
+		&& ReboundResource.HasResource() && !ReboundResource.HasSameResource(InitialResource)
+		&& ReboundResource.GetIdentity().Binding.HasSameIdentity(ReboundContext.Binding)
+		&& Extension->IsLocalAbilitySystemResourceReady(ReboundResource)
+		&& !Extension->IsLocalAbilitySystemResourceInstalled(InitialResource)
+		&& ASC->CheckAvatarBindingContext(ReboundContext, BindingReason) == EGGYGOAvatarBindingOutcome::Succeeded
+		&& ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->OwnerActor.Get() == State
+		&& ASC->AbilityActorInfo->AvatarActor.Get() == Character
+		&& ASC->AbilityActorInfo->SkeletalMeshComponent.Get() == Mesh && ASC->AbilityActorInfo->GetAnimInstance() == Guard
+		&& Character->GetController() == Controller && Controller->GetPawn() == Character)) { return false; }
+	Movement->SetComponentTickEnabled(false);
+	Movement->bRunPhysicsWithNoController = true;
+	if (!TestTrue(TEXT("XYZ fixture valid MovementSet"), Movement->SetMovementSet(MovementSet))) { return false; }
+	Character->SetActorLocation(FVector(0.0, 0.0, 1000.0));
+	Movement->SetMovementMode(MOVE_Falling);
+	UGGYGOMeleeTraceComponent* Trace = Character->FindComponentByClass<UGGYGOMeleeTraceComponent>();
+	if (!TestNotNull(TEXT("XYZ Boss original Trace component"), Trace)) { return false; }
+	Trace->SetComponentTickEnabled(false);
+	if (!TestTrue(TEXT("XYZ real external Host owns the ready original Avatar ASC"), ASC && State
+		&& Character->GetGGYGOAbilitySystemComponent() == ASC && State->GetAvatarPawn() == Character
+		&& ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->OwnerActor.Get() == State
+		&& ASC->AbilityActorInfo->AvatarActor.Get() == Character)) { return false; }
+	UAnimSequence* Sequence = NewObject<UAnimSequence>(Character);
+	Sequence->SetSkeleton(Skeleton);
+	IAnimationDataController& Data = Sequence->GetController();
+	Data.InitializeModel();
+	{
+		IAnimationDataController::FScopedBracket Bracket(Data, FText::FromString(TEXT("Boss original XYZ fixture")), false);
+		Data.SetFrameRate(FFrameRate(32, 1), false);
+		Data.SetNumberOfFrames(FFrameNumber(32), false);
+		const FName Names[] = {TEXT("RootMotion_PosX"), TEXT("RootMotion_PosY"), TEXT("RootMotion_PosZ")};
+		const float Ends[] = {100.0f, 30.0f, 50.0f};
+		for (int32 Axis = 0; Axis < 3; ++Axis)
+		{
+			const FAnimationCurveIdentifier Id(Names[Axis], ERawCurveTrackTypes::RCT_Float);
+			FRichCurveKey First(0.0f, 0.0f), Last(1.0f, Ends[Axis]);
+			First.InterpMode = RCIM_Linear;
+			if (!TestTrue(TEXT("XYZ authored cumulative axis installed"), Data.AddCurve(Id, 4, false)
+				&& Data.SetCurveKeys(Id, {First, Last}, false))) { return false; }
+		}
+		Data.NotifyPopulated();
+	}
+	UAnimMontage* Montage = NewObject<UAnimMontage>(Character);
+	Montage->SetSkeleton(Skeleton);
+	Montage->SetCompositeLength(1.0f);
+	Montage->BlendIn.SetBlendTime(0.0f);
+	Montage->BlendOut.SetBlendTime(0.125f);
+	Montage->BlendOutTriggerTime = 0.125f;
+	Montage->SlotAnimTracks.SetNum(1);
+	Montage->SlotAnimTracks[0].SlotName = TEXT("DefaultSlot");
+	FAnimSegment Segment;
+	Segment.SetAnimReference(Sequence, true);
+	Montage->SlotAnimTracks[0].AnimTrack.AnimSegments.Add(Segment);
+	if (!TestTrue(TEXT("XYZ one complete Main section"), Montage->AddAnimCompositeSection(TEXT("Main"), 0.0f) != INDEX_NONE)) { return false; }
+	UGGYGOAnimNotifyState_GameplayEventWindow* HitWindow = NewObject<UGGYGOAnimNotifyState_GameplayEventWindow>(Montage);
+	HitWindow->NotifyStateBehaviorFlags |= static_cast<uint8>(EAnimNotifyStateBehaviorFlags::NoMergeOnConcurrentPlay);
+	HitWindow->InitializeEventTags(GGYGOGameplayTags::Event_Montage_HitWindowBegin,
+		GGYGOGameplayTags::Event_Montage_HitWindowEnd);
+	FAnimNotifyEvent& WindowEvent = Montage->Notifies.AddDefaulted_GetRef();
+	WindowEvent.NotifyStateClass = HitWindow;
+	WindowEvent.MontageTickType = EMontageNotifyTickType::Queued;
+	WindowEvent.Link(Montage, 0.125f);
+	WindowEvent.SetDuration(0.5f);
+	WindowEvent.EndLink.Link(Montage, 0.625f);
+	const FGameplayAbilitySpecHandle SpecHandle = ASC->GiveAbility(FGameplayAbilitySpec(UGGYGOBossMeleeLifecycleTestAbility::StaticClass(), 1));
+	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(SpecHandle);
+	UGGYGOBossMeleeLifecycleTestAbility* Ability = Spec ? Cast<UGGYGOBossMeleeLifecycleTestAbility>(Spec->GetPrimaryInstance()) : nullptr;
+	if (!TestNotNull(TEXT("XYZ actual GA instance"), Ability)) { return false; }
+	Ability->ConfigureMontageForTest(Montage, Cube->GetRefSkeleton().GetBoneName(0), Cube->GetRefSkeleton().GetBoneName(1));
+	FString Error;
+	Ability->SetProfileForTest(NewObject<UGGYGOActionMotionProfile>(Character));
+	bool bPassed = TestFalse(TEXT("XYZ and Profile are mutually exclusive"), Ability->ValidateMeleeConfiguration(Error));
+	bPassed &= TestTrue(TEXT("Mutual exclusion has explicit diagnostic"), Error.Contains(TEXT("互斥")));
+	Ability->SetProfileForTest(nullptr);
+	if (!TestTrue(TEXT("XYZ complete configuration valid"), Ability->ValidateMeleeConfiguration(Error))) { return false; }
+	TArray<FGGYGOAbilityTerminationCompletedNotice> Completed;
+	const FDelegateHandle Completion = ASC->OnAbilityTerminationCompleted().AddLambda(
+		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice) { Completed.Add(Notice); });
+	const FVector Entry = Character->GetActorLocation();
+	const auto Request = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+	if (!TestTrue(TEXT("XYZ production GA starts original native Task and CMC"), Request.bNativeAccepted
+		&& Request.OriginalActivation.HasActivation() && Ability->IsActive() && Movement->HasActiveActionMotion()))
+	{
+		ASC->OnAbilityTerminationCompleted().Remove(Completion);
+		return false;
+	}
+	FAnimMontageInstance* Instance = Anim->GetActiveInstanceForMontage(Montage);
+	if (!TestNotNull(TEXT("XYZ original native instance"), Instance)) { ASC->OnAbilityTerminationCompleted().Remove(Completion); return false; }
+	const int32 OriginalInstanceId = Instance->GetInstanceID();
+	const TSharedPtr<FRootMotionSource> OriginalSource = Movement->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
+	if (!TestTrue(TEXT("XYZ activation owns its original native curve source"), OriginalSource.IsValid()
+		&& OriginalSource->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()))
+	{
+		ASC->OnAbilityTerminationCompleted().Remove(Completion);
+		return false;
+	}
+	const auto& OriginalCurveSource = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*OriginalSource);
+	bool bSawPlaybackEndBeforeFinalMove = false;
+	for (int32 Step = 0; Step < 8; ++Step)
+	{
+		if (FAnimMontageInstance* OriginalInstance = Anim->GetMontageInstanceForID(OriginalInstanceId))
+		{
+			OriginalInstance->UpdateWeight(0.125f);
+			OriginalInstance->Advance(0.125f, nullptr, false);
+		}
+		Anim->DispatchQueuedAnimEvents();
+		// Task Completed retires the active handle; the same finite native RMS retains
+		// its unconsumed tail. Observe that original source rather than active admission.
+		if (Ability->GetActiveTaskCountForTest() == 0 && OriginalCurveSource.GetTime() < OriginalCurveSource.Duration)
+		{
+			bSawPlaybackEndBeforeFinalMove = TestTrue(TEXT("Native playback end retains original GA until CMC final contribution"),
+				Ability->IsActive() && Completed.IsEmpty() && !Movement->HasActiveActionMotion()
+				&& Movement->GetRootMotionSourceByID(OriginalSource->LocalID) == OriginalSource
+				&& OriginalCurveSource.bCompletionRequested && !OriginalCurveSource.bExplicitlyCancelled
+				&& OriginalCurveSource.SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage
+				&& OriginalCurveSource.OriginalBinding.IsValid() && OriginalCurveSource.OriginalBinding->Montage.Get() == Montage
+				&& (Character->GetActorLocation() - Entry).Equals(FVector(100.0, 30.0, 50.0) * OriginalCurveSource.GetTime(), 0.1));
+			bPassed &= bSawPlaybackEndBeforeFinalMove;
+		}
+		Movement->MoveAutonomous(0.0f, 0.125f, 0, FVector::ZeroVector);
+	}
+	bPassed &= TestTrue(TEXT("Real capsule consumes full authored XYZ once"), (Character->GetActorLocation() - Entry).Equals(FVector(100.0, 30.0, 50.0), 0.1));
+	bPassed &= TestTrue(TEXT("Original Task ended before its final native move was consumed"), bSawPlaybackEndBeforeFinalMove);
+	bPassed &= TestTrue(TEXT("The same original RMS final interval was actually consumed by native movement"),
+		OriginalCurveSource.bPreparedNaturalEnd && OriginalCurveSource.bPreparedContributionConsumed
+		&& OriginalCurveSource.GetTime() >= OriginalCurveSource.Duration && !OriginalCurveSource.bExplicitlyCancelled);
+	bPassed &= TestTrue(TEXT("XYZ normal End occurs once after both original facts"), Completed.Num() == 1
+		&& !Completed[0].GetOriginal().WasCancelled() && !Ability->IsActive() && !Movement->HasActiveActionMotion()
+		&& !Ability->HasActiveMeshForTest() && Mesh->bEnableUpdateRateOptimizations
+		&& Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+	if (bPassed)
+	{
+		Movement->SetMovementMode(MOVE_Falling);
+		const auto Cancelled = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		bPassed &= TestTrue(TEXT("XYZ next real activation starts"), Cancelled.bNativeAccepted && Ability->IsActive() && Movement->HasActiveActionMotion());
+		Ability->RequestAbilityCancel(Cancelled.OriginalActivation, true);
+		bPassed &= TestTrue(TEXT("XYZ cancellation releases only its original resources"), Completed.Num() == 2
+			&& Completed[1].GetOriginal().WasCancelled() && !Movement->HasActiveActionMotion() && !Ability->HasActiveMeshForTest());
+	}
+	if (bPassed)
+	{
+		// Required-role mode without its compiled producer fails in the actual pre-Ready
+		// Task. Its N0 failure arrives after EndTask, before a CMC resource can be issued.
+		Guard->RequiredPoseCorrectionSlot = TEXT("DefaultSlot");
+		AddExpectedMessage(TEXT("[AbilitySystem.MontageTask.Pose]"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1, false);
+		AddExpectedMessage(TEXT("原动作在 [Montage Task] 失败"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1, false);
+		const auto StartupFailed = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		bPassed &= TestTrue(TEXT("Original required Task startup failure ends once without issuing CMC motion"),
+			StartupFailed.bNativeAccepted && StartupFailed.OriginalActivation.HasActivation() && Completed.Num() == 3
+			&& Completed[2].GetOriginal().WasCancelled()
+			&& Completed[2].GetOriginal().GetOriginalActivation().HasSameActivation(StartupFailed.OriginalActivation)
+			&& !Ability->IsActive() && Ability->GetActiveTaskCountForTest() == 0
+			&& !Movement->HasActiveActionMotion() && !Ability->HasActiveMeshForTest()
+			&& Mesh->bEnableUpdateRateOptimizations
+			&& Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered);
+		Guard->RequiredPoseCorrectionSlot = NAME_None;
+	}
+	if (bPassed)
+	{
+		Movement->SetMovementMode(MOVE_Falling);
+		const auto Failed = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		bPassed &= TestTrue(TEXT("XYZ failure probe starts through real GA"), Failed.bNativeAccepted && Ability->IsActive());
+		const FAnimationCurveIdentifier ZId(TEXT("RootMotion_PosZ"), ERawCurveTrackTypes::RCT_Float);
+		bPassed &= TestTrue(TEXT("Invalidate accepted original required Z source"), Data.RemoveCurve(ZId, false));
+		AddExpectedMessage(TEXT("RootMotion_PosZ"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 2, false);
+		Movement->CurrentRootMotion.PrepareRootMotion(0.01f, *Character, *Movement, true);
+		bPassed &= TestTrue(TEXT("CMC source failure ends original GA as cancelled and restores Mesh"), Completed.Num() == 4
+			&& Completed[3].GetOriginal().WasCancelled()
+			&& Completed[3].GetOriginal().GetOriginalActivation().HasSameActivation(Failed.OriginalActivation)
+			&& !Ability->IsActive() && !Movement->HasActiveActionMotion() && !Ability->HasActiveMeshForTest()
+			&& Mesh->bEnableUpdateRateOptimizations);
+		bPassed &= TestFalse(TEXT("Missing Z rejects configuration rather than no-motion success"), Ability->ValidateMeleeConfiguration(Error));
+	}
+	ASC->OnAbilityTerminationCompleted().Remove(Completion);
+	return bPassed;
+#else
+	AddError(TEXT("Original Montage fixture requires editor animation data model."));
+	return false;
+#endif
+}
+
+#if WITH_EDITOR
+namespace
+{
+	/** 正式资产的有限观察叶；自有原生 PIE 的动画／CMC／查询帧均由 UE 驱动。 */
+	class FKevinIce01ProductionCommand : public IAutomationLatentCommand
+	{
+	public:
+		explicit FKevinIce01ProductionCommand(FAutomationTestBase& InTest) : Test(InTest) {}
+		virtual ~FKevinIce01ProductionCommand() override
+		{
+			Cleanup();
+			FEditorDelegates::PostPIEStarted.Remove(PIEStartedObserver);
+			// 自动化被中止时也只能收尾本次请求，不能接管原用户或替换会话。
+			if (OwnsPIE() && CountPIEWorlds() == 1) GEditor->EndPlayMap();
+			CancelOwnQueuedPIE();
+		}
+
+		virtual bool Update() override
+		{
+			if (bEnding) return UpdateEnding();
+			if (!bStarted)
+			{
+				bStarted = true;
+				if (!RequestHost()) { Cleanup(); return true; }
+				return false;
+			}
+			if (bFailed) return BeginEnding();
+			if (!bAssetsStarted)
+			{
+				if (!bPIEStarted)
+				{
+					if (FPlatformTime::Seconds() < HostDeadline) return false;
+					Check(false, TEXT("自有 PIE 启动超时")); return BeginEnding();
+				}
+				bAssetsStarted = true;
+				if (!Start()) return BeginEnding();
+			}
+			const FWorldContext* Context = GEditor && World.IsValid() ? GEditor->GetWorldContextFromWorld(World.Get()) : nullptr;
+			if (!Check(OwnsPIE() && CountPIEWorlds() == 1 && Context && GEditor->PlayWorld == World.Get() && Context->ContextHandle == WorldContext
+				&& !GEditor->ShouldEndPlayMap() && Source.IsValid() && Target.IsValid() && ASC.IsValid()
+				&& TargetASC.IsValid() && Movement.IsValid() && Mesh.IsValid() && Anim.IsValid() && Trace.IsValid() && Ability.IsValid()
+				&& ASC->GetAvatarBindingContext().HasSameContext(SourceBinding) && TargetASC->GetAvatarBindingContext().HasSameContext(TargetBinding)
+				&& ASC->GetAvatarActor() == Source.Get() && TargetASC->GetAvatarActor() == Target.Get()
+				&& Mesh->GetAnimInstance() == Anim.Get(),
+				TEXT("原 PIE 或正式动作接收者已失效／被替换"))) return BeginEnding();
+			if (!Check(FPlatformTime::Seconds() < Deadline, TEXT("正式 Ice01 未在有限期限内结束"))) return BeginEnding();
+			if (Trace->IsTracing())
+			{
+				++OpenSamples;
+				if (Probe.IsValid() && FMath::PointDistToSegment(Probe->GetComponentLocation(), Mesh->GetSocketLocation(TraceStart),
+					Mesh->GetSocketLocation(TraceEnd)) <= Probe->GetScaledSphereRadius()) ++ContactSamples;
+			}
+			bSawCapsuleMove |= (Source->GetActorLocation() - Entry).SizeSquared() > 1.0;
+			if (CompletionCount == 0) { return false; }
+			// 结束通知捕获最后胶囊提交；再观察原生 RMS 从实际组件退役，避免尾部惯性冒充曲线位移。
+			if (Movement->GetRootMotionSource(TEXT("GGYGO.ActionCurve")).IsValid()) { return false; }
+			bool bPassed = Check(CompletionCount == 1 && !bCancelled && !Ability->IsActive()
+				&& !Ability->CaptureCurrentActivation().HasActivation(), TEXT("原 GA 未自然且唯一结束"));
+			bPassed &= Check(CurveSource.IsValid() && CurveSource->bPreparedNaturalEnd
+				&& CurveSource->bPreparedContributionConsumed && !CurveSource->bExplicitlyCancelled
+				&& CurveSource->GetTime() >= CurveSource->Duration, TEXT("原生 RMS 完整末区间未实际消费"));
+			bPassed &= Check(bSawCapsuleMove && (FinalLocation - Entry).Equals(ExpectedDelta, 1.0),
+				FString::Printf(TEXT("正式胶囊 XYZ 不符：实际 %s，资产期望 %s"),
+					*(FinalLocation - Entry).ToString(), *ExpectedDelta.ToString()));
+			bPassed &= Check(BeginCount == 1 && EndCount == 1 && OpenSamples >= 2 && ContactSamples >= 2 && EffectCount == 1,
+				FString::Printf(TEXT("实际窗口／重复接触去重不符：Begin=%d End=%d OpenSamples=%d ContactSamples=%d GE=%d"),
+					BeginCount, EndCount, OpenSamples, ContactSamples, EffectCount));
+			bPassed &= Check(FMath::IsNearlyEqual(InitialHealth - TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetHealthAttribute()), Damage, 0.01f)
+				&& FMath::IsNearlyEqual(InitialPoise - TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetPoiseAttribute()), PoiseDamage, 0.01f),
+				TEXT("正式 GE／Execution／AttributeSet 的生命或韧性结算不符"));
+			bPassed &= Check(!Movement->HasActiveActionMotion() && !Trace->IsTracing() && !Trace->IsComponentTickEnabled()
+				&& !Anim->Montage_IsPlaying(Montage.Get()) && ASC->GetTickingTasksDescription().IsEmpty()
+				&& Mesh->VisibilityBasedAnimTickOption == OriginalTick && Mesh->bEnableUpdateRateOptimizations == bOriginalURO,
+				TEXT("自然结束后的 CMC／Trace／Montage／Mesh 资源未恢复"));
+			for (const TWeakObjectPtr<UPackage>& Package : InputPackages)
+				bPassed &= Check(Package.IsValid() && !Package->IsDirty(), TEXT("正式输入资产变脏，拒绝保存／通过"));
+			bBehaviorVerified = bPassed;
+			return BeginEnding();
+		}
+
+	private:
+		bool Check(bool bCondition, const FString& Reason)
+		{
+			if (!bCondition) Test.AddError(TEXT("[BossAI.KevinIce01.ProductionSmoke] ") + Reason);
+			bFailed |= !bCondition;
+			return bCondition;
+		}
+
+		int32 CountPIEWorlds() const
+		{
+			int32 Count = 0;
+			if (GEditor) for (const FWorldContext& Context : GEditor->GetWorldContexts())
+				if (Context.WorldType == EWorldType::PIE) ++Count;
+			return Count;
+		}
+
+		bool OwnsPIE() const
+		{
+			if (!GEditor || !RequestSettings.IsValid()) return false;
+			const TOptional<FPlayInEditorSessionInfo> Info = GEditor->GetPlayInEditorSessionInfo();
+			return Info.IsSet() && Info->OriginalRequestParams.EditorPlaySettings == RequestSettings.Get()
+				&& Info->OriginalRequestParams.SessionDestination == EPlaySessionDestinationType::InProcess
+				&& !Info->OriginalRequestParams.GameModeOverride;
+		}
+
+		bool RequestHost()
+		{
+			if (!Check(GEditor && !GEditor->IsPlaySessionInProgress() && !GEditor->IsSettingUpPlayWorld()
+				&& !GEditor->PlayWorld && !GEditor->ShouldEndPlayMap() && !GEditor->GetPlaySessionRequest().IsSet()
+				&& CountPIEWorlds() == 0, TEXT("需要空闲 Native Editor；拒绝接管已有或排队中的用户 PIE"))) return false;
+			EditorWorld = GEditor->GetEditorWorldContext().World();
+			if (!Check(EditorWorld.IsValid() && EditorWorld->GetPackage()->GetName() == TEXT("/Game/Map/L_Movement_Test"),
+				TEXT("请以 L_Movement_Test 启动 Native Editor；本叶不换地图"))) return false;
+			bEditorMapDirty = EditorWorld->GetPackage()->IsDirty();
+			OuterWorld = GWorld; OuterViewport = GEngine->GameViewport.Get();
+			RequestSettings.Reset(NewObject<ULevelEditorPlaySettings>(GetTransientPackage()));
+			RequestSettings->SetPlayNetMode(EPlayNetMode::PIE_Standalone);
+			RequestSettings->SetRunUnderOneProcess(true); RequestSettings->SetPlayNumberOfClients(1);
+			RequestSettings->bLaunchSeparateServer = false; RequestSettings->GameGetsMouseControl = false;
+			RequestSettings->bShouldMinimizeEditorOnNonVRPIE = false;
+			FRequestPlaySessionParams Params;
+			Params.EditorPlaySettings = RequestSettings.Get(); Params.bAllowOnlineSubsystem = false;
+			PIEStartedObserver = FEditorDelegates::PostPIEStarted.AddLambda([this](bool bSimulating)
+			{
+				bPIEStarted = Check(!bSimulating && OwnsPIE() && CountPIEWorlds() == 1,
+					TEXT("PostPIEStarted 未确认本叶唯一原生请求"));
+			});
+			HostDeadline = FPlatformTime::Seconds() + 30.0;
+			GEditor->RequestPlaySession(Params);
+			const TOptional<FRequestPlaySessionParams> Queued = GEditor->GetPlaySessionRequest();
+			if (!Check(Queued.IsSet() && Queued->EditorPlaySettings
+				&& Queued->SessionDestination == EPlaySessionDestinationType::InProcess && !Queued->GameModeOverride
+				&& !Queued->bAllowOnlineSubsystem, TEXT("原生 PIE 未保留本叶请求"))) return false;
+			// RequestPlaySession 同步复制设置；持有实际排队副本，后续会话归属仅认这个原生身份。
+			RequestSettings.Reset(Queued->EditorPlaySettings.Get());
+			return true;
+		}
+
+		void CancelOwnQueuedPIE()
+		{
+			if (!GEditor || !RequestSettings.IsValid()) return;
+			const TOptional<FRequestPlaySessionParams> Queued = GEditor->GetPlaySessionRequest();
+			if (Queued.IsSet() && Queued->EditorPlaySettings == RequestSettings.Get()) GEditor->CancelRequestPlaySession();
+		}
+
+		bool BeginEnding()
+		{
+			Cleanup();
+			FEditorDelegates::PostPIEStarted.Remove(PIEStartedObserver);
+			bEnding = true; EndDeadline = FPlatformTime::Seconds() + 10.0;
+			if (OwnsPIE())
+			{
+				if (Check(CountPIEWorlds() == 1, TEXT("出现外来 PIE Context，拒绝批量结束"))) GEditor->RequestEndPlayMap();
+			}
+			else CancelOwnQueuedPIE();
+			return false;
+		}
+
+		bool UpdateEnding()
+		{
+			if (OwnsPIE())
+			{
+				if (FPlatformTime::Seconds() < EndDeadline) return false;
+				Check(false, TEXT("自有 PIE 收尾超时"));
+				if (CountPIEWorlds() == 1) GEditor->EndPlayMap();
+			}
+			Check(!OwnsPIE() && CountPIEWorlds() == 0, TEXT("自有 PIE Context 未释放或被外来会话替换"));
+			Check(EditorWorld.IsValid() && GWorld == OuterWorld && GEngine->GameViewport.Get() == OuterViewport
+				&& EditorWorld->GetPackage()->IsDirty() == bEditorMapDirty, TEXT("原 Editor World／Viewport／地图脏状态未恢复"));
+			if (!bFailed && bBehaviorVerified)
+				Test.AddInfo(TEXT("[BossAI.KevinIce01.ProductionSmoke] PASS：正式配置授予／实际 XYZ 胶囊／原生窗口 GE 去重结算／资源、自建 Actor 及自有 PIE 清理。仅 L_Movement_Test 受控 Falling 查询夹具，无地面实战／P3／原作命中框／联机声明。"));
+			return true;
+		}
+
+		bool IsReady(AGGYGOEncounterLifecycleTestEncounter* Encounter)
+		{
+			AGGYGOBossCharacter* Avatar = Encounter ? Encounter->GetBossAvatar() : nullptr;
+			AGGYGOBossState* State = Encounter ? Encounter->GetBossState() : nullptr;
+			UGGYGOAbilitySystemComponent* HostASC = State ? State->GetGGYGOAbilitySystemComponent() : nullptr;
+			UGGYGOPawnExtensionComponent* Extension = Avatar ? Avatar->GetPawnExtensionComponent() : nullptr;
+			if (!Avatar || !HostASC || !Extension) return false;
+			const FGGYGOAvatarBindingContext Binding = HostASC->GetAvatarBindingContext();
+			const FGGYGOPawnASCResourceHandle Resource = Extension->GetCurrentLocalAbilitySystemResource();
+			EGGYGOAvatarBindingReason Reason;
+			return Avatar->HasAuthority() && Avatar->GetGGYGOAbilitySystemComponent() == HostASC && State->GetAvatarPawn() == Avatar
+				&& HostASC->AbilityActorInfo.IsValid() && HostASC->GetOwnerActor() == State && HostASC->GetAvatarActor() == Avatar
+				&& Binding.HasIssuedContext() && Resource.HasResource() && Resource.GetIdentity().Binding.HasSameIdentity(Binding.Binding)
+				&& Extension->IsLocalAbilitySystemResourceReady(Resource)
+				&& HostASC->CheckAvatarBindingContext(Binding, Reason) == EGGYGOAvatarBindingOutcome::Succeeded
+				&& Encounter->GetBossController() && Avatar->GetController() == Encounter->GetBossController()
+				&& Encounter->GetBossController()->GetPawn() == Avatar && !Avatar->FindComponentByClass<UGGYGOAbilitySystemComponent>();
+		}
+
+		AGGYGOEncounterLifecycleTestEncounter* SpawnEncounter(const FTransform& Transform)
+		{
+			FActorSpawnParameters Params;
+			Params.ObjectFlags |= RF_Transient;
+			Params.bDeferConstruction = true;
+			Params.SpawnCollisionHandlingOverride = ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+			AGGYGOEncounterLifecycleTestEncounter* Encounter = World->SpawnActor<AGGYGOEncounterLifecycleTestEncounter>(
+				AGGYGOEncounterLifecycleTestEncounter::StaticClass(), Transform, Params);
+			if (!Encounter) return nullptr;
+			Encounters.Add(Encounter);
+			Encounter->ConfigureForTest(Definition.Get());
+			Encounter->FinishSpawning(Transform);
+			if (!Encounter->SpawnBoss() || !IsReady(Encounter)) return nullptr;
+			CreatedActors.Add(Encounter->GetBossState()); CreatedActors.Add(Encounter->GetBossController());
+			CreatedActors.Add(Encounter->GetBossAvatar()); CreatedActors.Add(Encounter);
+			return Encounter;
+		}
+
+		bool Start()
+		{
+			World = GEditor ? GEditor->PlayWorld : nullptr;
+			if (!Check(World.IsValid() && World->HasBegunPlay() && World->GetNetMode() == NM_Standalone
+				&& World->GetGameInstance() && UWorld::RemovePIEPrefix(World->GetPackage()->GetName()) == TEXT("/Game/Map/L_Movement_Test"),
+				TEXT("本叶原生 Standalone PIE 未就绪或改变了 L_Movement_Test 宿主"))) return false;
+			const FWorldContext* Context = GEditor->GetWorldContextFromWorld(World.Get());
+			if (!Check(Context && Context->WorldType == EWorldType::PIE, TEXT("缺少真实 PIE Context"))) return false;
+			WorldContext = Context->ContextHandle;
+			Deadline = FPlatformTime::Seconds() + 15.0;
+			FString ConfigText;
+			TSharedPtr<FJsonObject> Config;
+			const FString ConfigPath = FPaths::ProjectDir() / TEXT("AAADocs/Assets/BH3/KevinDemonBattle/BH3_Kevin_Combat_Wiring_Config.json");
+			if (!Check(FFileHelper::LoadFileToString(ConfigText, *ConfigPath)
+				&& FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(ConfigText), Config) && Config.IsValid(),
+				TEXT("正式 Wiring_Config 无效：") + ConfigPath)) return false;
+			const TSharedPtr<FJsonObject>* Assets = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* Actions = nullptr;
+			FString Trigger, DefinitionPath, AbilityPath, MontagePath, EffectPath, StartSocket, EndSocket, MeshPath;
+			if (!Check(Config->TryGetStringField(TEXT("attack_trigger"), Trigger) && Trigger == TEXT("automation_only")
+				&& Config->TryGetObjectField(TEXT("assets"), Assets) && (*Assets)->TryGetStringField(TEXT("definition"), DefinitionPath)
+				&& Config->TryGetArrayField(TEXT("actions"), Actions) && Actions->Num() == 1
+				&& Config->TryGetStringField(TEXT("damage_effect"), EffectPath)
+				&& Config->TryGetStringField(TEXT("mesh"), MeshPath)
+				&& Config->TryGetStringField(TEXT("trace_start_socket"), StartSocket)
+				&& Config->TryGetStringField(TEXT("trace_end_socket"), EndSocket), TEXT("正式配置必需字段缺失"))) return false;
+			const TSharedPtr<FJsonObject> Action = (*Actions)[0]->AsObject();
+			FString ActionId;
+			double ConfigDamage = 0.0, ConfigPoise = 0.0, ConfigRadius = 0.0;
+			if (!Check(Action.IsValid() && Action->TryGetStringField(TEXT("id"), ActionId) && ActionId == TEXT("Ice01")
+				&& Action->TryGetStringField(TEXT("ability"), AbilityPath) && Action->TryGetStringField(TEXT("montage"), MontagePath)
+				&& Action->TryGetNumberField(TEXT("damage"), ConfigDamage) && Action->TryGetNumberField(TEXT("poise_damage"), ConfigPoise)
+				&& Action->TryGetNumberField(TEXT("trace_radius"), ConfigRadius)
+				&& FMath::IsFinite(ConfigDamage) && ConfigDamage > 0 && FMath::IsFinite(ConfigPoise) && ConfigPoise > 0
+				&& FMath::IsFinite(ConfigRadius) && ConfigRadius >= 1, TEXT("正式 Ice01 路径或测试数值无效"))) return false;
+			Damage = static_cast<float>(ConfigDamage); PoiseDamage = static_cast<float>(ConfigPoise);
+			const auto ObjectPath = [](const FString& Package) { return Package + TEXT(".") + FPackageName::GetLongPackageAssetName(Package); };
+			Definition.Reset(LoadObject<UGGYGOBossDefinition>(nullptr, *ObjectPath(DefinitionPath)));
+			Montage.Reset(LoadObject<UAnimMontage>(nullptr, *ObjectPath(MontagePath)));
+			AbilityClass.Reset(LoadClass<UGGYGOBossMeleeAbility>(nullptr, *(ObjectPath(AbilityPath) + TEXT("_C"))));
+			EffectClass.Reset(LoadClass<UGameplayEffect>(nullptr, *EffectPath));
+			MeshAsset.Reset(LoadObject<USkeletalMesh>(nullptr, *ObjectPath(MeshPath)));
+			if (!Check(Definition.IsValid() && Montage.IsValid() && AbilityClass.IsValid() && EffectClass.IsValid() && MeshAsset.IsValid(),
+				TEXT("正式落盘 Definition／GA／Montage／GE／Mesh 缺失，拒绝替换资产"))) return false;
+			const FGGYGOBossFormDefinition* Form = Definition->FindForm(Definition->InitialFormTag);
+			if (!Check(Form && Form->AvatarPawnData && Form->AvatarPawnData->AbilitySets.Num() == 1
+			&& Form->AvatarPawnData->MovementSet && Form->AvatarPawnData->MovementSet->bUseCurveDrivenSpeed
+				&& !Definition->BehaviorTree && Montage->GetNumSections() == 1 && Montage->GetSectionName(0) == TEXT("Main")
+				&& Montage->GetAnimCompositeSection(0).GetTime() == 0 && Montage->GetAnimCompositeSection(0).NextSectionName.IsNone()
+				&& Montage->SlotAnimTracks.Num() == 1 && Montage->SlotAnimTracks[0].AnimTrack.AnimSegments.Num() == 1,
+				TEXT("正式挂接／动画单段或正常曲线模式不符"))) return false;
+			Sequence.Reset(Cast<UAnimSequence>(Montage->SlotAnimTracks[0].AnimTrack.AnimSegments[0].GetAnimReference()));
+			if (!Check(Sequence.IsValid() && Sequence->GetDataModel(), TEXT("正式派生 Sequence 无原生曲线模型"))) return false;
+			const FName CurveNames[] = {TEXT("RootMotion_PosX"), TEXT("RootMotion_PosY"), TEXT("RootMotion_PosZ")};
+			FVector CurveDelta;
+			for (int32 Axis = 0; Axis < 3; ++Axis)
+			{
+				const FFloatCurve* Curve = Sequence->GetDataModel()->FindFloatCurve(FAnimationCurveIdentifier(CurveNames[Axis], ERawCurveTrackTypes::RCT_Float));
+				if (!Check(Curve && !Curve->FloatCurve.GetConstRefOfKeys().IsEmpty(), TEXT("正式完整 XYZ 曲线缺失"))) return false;
+				CurveDelta[Axis] = Curve->FloatCurve.Eval(Sequence->GetPlayLength()) - Curve->FloatCurve.Eval(0.0f);
+			}
+			if (!Check(!CurveDelta.ContainsNaN(), TEXT("正式 XYZ 末值非法"))) return false;
+			for (const UObject* Input : {static_cast<const UObject*>(Definition.Get()), static_cast<const UObject*>(Montage.Get()),
+				static_cast<const UObject*>(Sequence.Get()), static_cast<const UObject*>(AbilityClass.Get()), static_cast<const UObject*>(EffectClass.Get()),
+				static_cast<const UObject*>(MeshAsset.Get()), static_cast<const UObject*>(MeshAsset->GetSkeleton()), static_cast<const UObject*>(Form->AvatarPawnData.Get()),
+				static_cast<const UObject*>(Form->AvatarPawnData->MovementSet.Get()), static_cast<const UObject*>(Form->AvatarPawnData->AbilitySets[0].Get())})
+			{
+				if (!Check(Input && !Input->GetPackage()->IsDirty(), TEXT("正式输入资产须由原作者保存冻结"))) return false;
+				InputPackages.AddUnique(Input->GetPackage());
+			}
+			APlayerStart* Anchor = nullptr;
+			for (TActorIterator<APlayerStart> It(World.Get()); It; ++It) { Anchor = *It; break; }
+			if (!Check(Anchor != nullptr, TEXT("L_Movement_Test 无真实 PlayerStart，拒绝猜测测试锚点"))) return false;
+			if (!Check(Form->AvatarPawnData->PawnClass && Form->AvatarPawnData->PawnClass->IsChildOf(AGGYGOBossCharacter::StaticClass()),
+				TEXT("正式 PawnClass 缺失或不属于 Boss Avatar"))) return false;
+			const ACharacter* PawnCDO = Form->AvatarPawnData->PawnClass->GetDefaultObject<ACharacter>();
+			if (!Check(PawnCDO && PawnCDO->GetCapsuleComponent(), TEXT("正式 PawnClass 胶囊无效"))) return false;
+			// 使用 CMC 原生准入的 Falling 夹具；仅临时 Source 实例关闭重力以核对三轴贡献，不代表地面实战。
+			FTransform FixtureTransform(FRotator::ZeroRotator, Anchor->GetActorLocation()
+				+ FVector(0, 0, PawnCDO->GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight() * 4.0));
+			AGGYGOEncounterLifecycleTestEncounter* SourceEncounter = SpawnEncounter(FixtureTransform);
+			if (!Check(SourceEncounter != nullptr, TEXT("正式 Source Encounter 装配／Ready 失败"))) return false;
+			Source = SourceEncounter->GetBossAvatar(); ASC = SourceEncounter->GetBossState()->GetGGYGOAbilitySystemComponent();
+			Mesh = Source->GetMesh(); Movement = Source->GetGGYGOMovementComponent(); Trace = Source->FindComponentByClass<UGGYGOMeleeTraceComponent>();
+			if (!Check(Mesh.IsValid() && Movement.IsValid() && Trace.IsValid() && Mesh->GetSkeletalMeshAsset() == MeshAsset.Get()
+				&& Mesh->DoesSocketExist(FName(*StartSocket)) && Mesh->DoesSocketExist(FName(*EndSocket)), TEXT("正式 Mesh／CMC／Socket 接收者不符"))) return false;
+			Anim = Mesh->GetAnimInstance(); SourceBinding = ASC->GetAvatarBindingContext();
+			if (!Check(Anim.IsValid(), TEXT("正式动画实例缺失"))) return false;
+			if (!Check(!Anim->GetClass()->GetPackage()->IsDirty(), TEXT("正式 ABP 输入变脏"))) return false;
+			InputPackages.AddUnique(Anim->GetClass()->GetPackage());
+			TraceStart = FName(*StartSocket); TraceEnd = FName(*EndSocket);
+			Movement->GravityScale = 0.0f;
+			Movement->SetMovementMode(MOVE_Falling);
+			if (!Check(Movement->IsFalling() && FMath::IsNearlyZero(Movement->GetGravityZ()),
+				TEXT("受控 Falling 夹具未进入合法模式或实例重力未关闭"))) return false;
+			Source->GetCapsuleComponent()->SetCollisionResponseToChannel(ECC_Pawn, ECR_Ignore);
+			FixtureTransform.AddToTranslation(FVector(0, 0, PawnCDO->GetCapsuleComponent()->GetUnscaledCapsuleHalfHeight() * 8.0));
+			AGGYGOEncounterLifecycleTestEncounter* TargetEncounter = SpawnEncounter(FixtureTransform);
+			if (!Check(TargetEncounter != nullptr, TEXT("正式 Target Encounter 装配／Ready 失败"))) return false;
+			Target = TargetEncounter->GetBossAvatar(); TargetASC = TargetEncounter->GetBossState()->GetGGYGOAbilitySystemComponent();
+			TargetBinding = TargetASC->GetAvatarBindingContext();
+			Target->GetCharacterMovement()->SetComponentTickEnabled(false);
+			Target->GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			Target->GetMesh()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+			Probe = NewObject<USphereComponent>(Target.Get(), NAME_None, RF_Transient);
+			Probe->SetupAttachment(Target->GetRootComponent());
+			Probe->SetCollisionObjectType(ECC_Pawn); Probe->SetCollisionEnabled(ECollisionEnabled::QueryOnly);
+			Probe->SetCollisionResponseToAllChannels(ECR_Ignore); Probe->SetCollisionResponseToChannel(ECC_Pawn, ECR_Overlap);
+			Probe->RegisterComponent();
+			InitialHealth = TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetHealthAttribute());
+			InitialPoise = TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetPoiseAttribute());
+			if (!Check(InitialHealth > Damage && InitialPoise > PoiseDamage, TEXT("真实目标属性未初始化或不足以验去重"))) return false;
+			const FGameplayAbilitySpec* Selected = nullptr;
+			int32 SpecCount = 0;
+			for (const FGameplayAbilitySpec& Granted : ASC->GetActivatableAbilities())
+				if (Granted.Ability && Granted.Ability->GetClass() == AbilityClass.Get()) { Selected = &Granted; ++SpecCount; }
+			if (!Check(SpecCount == 1 && Selected && Selected->SourceObject.Get() == Definition.Get(),
+				TEXT("正式 State 配置授予的唯一 Spec／来源不符；不手工补授予"))) return false;
+			Ability = Cast<UGGYGOBossMeleeAbility>(Selected->GetPrimaryInstance());
+			FString AbilityError;
+			if (!Check(Ability.IsValid() && Ability->ValidateMeleeConfiguration(AbilityError), TEXT("正式 GA 配置失败：") + AbilityError)) return false;
+			OriginalTick = Mesh->VisibilityBasedAnimTickOption; bOriginalURO = Mesh->bEnableUpdateRateOptimizations;
+			Entry = Source->GetActorLocation(); ExpectedDelta = Source->GetActorQuat().RotateVector(CurveDelta * Mesh->GetComponentScale());
+			WindowEventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowBegin);
+			WindowEventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowEnd);
+			WindowObserver = ASC->AddGameplayEventTagContainerDelegate(WindowEventTags,
+				FGameplayEventTagMulticastDelegate::FDelegate::CreateLambda(
+				[this, ConfigRadius](FGameplayTag Tag, const FGameplayEventData* Payload)
+				{
+					if (bCleaned) return;
+					FGGYGOMontageWindowSourceData WindowSource;
+					// 只观察真实 producer 的同次来源；窗口准入仍由正式 Task 及下游 Trace／GE 证明。
+					if (!Check(UGGYGOAnimNotifyState_GameplayEventWindow::TryReadWindowDispatch(Payload, WindowSource)
+						&& WindowSource.EventTag == Tag && WindowSource.Animation.Get() == Montage.Get()
+						&& WindowSource.Mesh.Get() == Mesh.Get() && WindowSource.AnimInstance.Get() == Anim.Get()
+						&& WindowSource.Notify.IsValid() && WindowSource.bHasMontageInstanceContext
+						&& WindowSource.MontageInstanceId != INDEX_NONE, TEXT("正式窗口不是原 Notify 的真实发送来源"))) return;
+					if (WindowSource.Phase == EGGYGOMontageWindowPhase::End)
+					{
+						if (Tag == GGYGOGameplayTags::Event_Montage_HitWindowEnd) { ++EndCount; }
+						return;
+					}
+					if (Tag != GGYGOGameplayTags::Event_Montage_HitWindowBegin) return;
+					++BeginCount;
+					if (!Check(BeginCount == 1 && Mesh.IsValid() && Target.IsValid() && Probe.IsValid(), TEXT("窗口或目标夹具身份失效"))) return;
+					const FVector A = Mesh->GetSocketLocation(TraceStart), B = Mesh->GetSocketLocation(TraceEnd);
+					if (!Check(!A.ContainsNaN() && !B.ContainsNaN() && (B - A).Size() > 1, TEXT("真实武器 Socket 帧无效"))) return;
+					Probe->SetSphereRadius(static_cast<float>((B - A).Size() * 0.5 + ConfigRadius));
+					Target->SetActorLocation((A + B) * 0.5, false, nullptr, ETeleportType::TeleportPhysics);
+				}));
+			if (!Check(WindowObserver.IsValid(), TEXT("真实窗口 producer 观察登记失败"))) return false;
+			EffectObserver = ASC->OnGameplayEffectAppliedDelegateToTarget.AddLambda(
+				[this](UAbilitySystemComponent* Receiver, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle)
+				{
+					++EffectCount;
+					if (!Check(ASC.IsValid() && TargetASC.IsValid() && Ability.IsValid() && Trace.IsValid(), TEXT("GE 回执时原接收者已失效"))) return;
+					const FGameplayEffectContextHandle& HitContext = Spec.GetContext();
+					const FHitResult* Hit = HitContext.GetHitResult();
+					Check(Receiver == TargetASC.Get() && Spec.Def && Spec.Def->GetClass() == EffectClass.Get()
+						&& HitContext.GetAbilityInstance_NotReplicated() == Ability.Get() && HitContext.GetInstigator() == ASC->GetOwnerActor()
+						&& Hit && Hit->GetActor() == Target.Get() && Trace->IsTracing() && BeginCount == 1 && EndCount == 0
+						&& FMath::IsNearlyEqual(Spec.GetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_Damage, false), Damage)
+						&& FMath::IsNearlyEqual(Spec.GetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_PoiseDamage, false), PoiseDamage),
+						TEXT("原生 GE 回执的真实目标／正式 GA／GE／命中上下文／窗口／数值不符"));
+				});
+			CompletionObserver = ASC->OnAbilityTerminationCompleted().AddLambda([this](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+			{
+				if (!Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Original)) return;
+				++CompletionCount; bCancelled = Notice.GetOriginal().WasCancelled();
+				if (Source.IsValid()) FinalLocation = Source->GetActorLocation();
+			});
+			const FGGYGOAbilityActivationRequestResult Request = ASC->TryActivateAbilityWithTerminationBoundary(Selected->Handle);
+			Original = Request.OriginalActivation;
+			if (!Check(Request.bNativeAccepted && Original.HasActivation() && Ability->IsActive() && Movement->HasActiveActionMotion(),
+				TEXT("正式已授予 GA 未建立原始播放／CMC"))) return false;
+			const TSharedPtr<FRootMotionSource> NativeSource = Movement->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
+			if (!Check(NativeSource.IsValid() && NativeSource->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct(),
+				TEXT("实际 CMC 未持有正式原生 Action RMS"))) return false;
+			CurveSource = StaticCastSharedPtr<FRootMotionSource_GGYGOActionCurve>(NativeSource);
+			if (!Check(CurveSource->SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage && CurveSource->OriginalBinding.IsValid()
+				&& CurveSource->OriginalBinding->Montage.Get() == Montage.Get() && CurveSource->OriginalBinding->Segments.Num() == 1
+				&& CurveSource->OriginalBinding->Segments[0].Sequence.Get() == Sequence.Get(), TEXT("实际 RMS 没有消费正式 paired XYZ"))) return false;
+			Test.AddInfo(TEXT("[BossAI.KevinIce01.ProductionSmoke] 已由真实 Encounter／State 配置授予并激活正式 GA；等待 UE 自然帧，不推进 Task／CMC 私有时钟。"));
+			return true;
+		}
+
+		bool Cleanup()
+		{
+			if (bCleaned) return !bFailed;
+			bCleaned = true;
+			if (ASC.IsValid())
+			{
+				ASC->RemoveGameplayEventTagContainerDelegate(WindowEventTags, WindowObserver);
+				ASC->OnGameplayEffectAppliedDelegateToTarget.Remove(EffectObserver);
+				ASC->OnAbilityTerminationCompleted().Remove(CompletionObserver);
+			}
+			WindowObserver.Reset();
+			if (Ability.IsValid() && Ability->IsActive() && Original.HasActivation()) Ability->RequestAbilityCancel(Original, true);
+			for (const TWeakObjectPtr<AGGYGOEncounterLifecycleTestEncounter>& Encounter : Encounters)
+				if (Encounter.IsValid()) { Encounter->CleanupForTest(); Encounter->Destroy(); }
+			for (const TWeakObjectPtr<AActor>& Created : CreatedActors)
+				Check(!Created.IsValid() || Created->IsActorBeingDestroyed(), TEXT("Encounter 自建 Actor 未回收：") + GetPathNameSafe(Created.Get()));
+			CurveSource.Reset();
+			return !bFailed;
+		}
+
+		FAutomationTestBase& Test;
+		TWeakObjectPtr<UWorld> World;
+		TWeakObjectPtr<UWorld> EditorWorld;
+		TStrongObjectPtr<ULevelEditorPlaySettings> RequestSettings;
+		FDelegateHandle PIEStartedObserver;
+		UWorld* OuterWorld = nullptr;
+		UGameViewportClient* OuterViewport = nullptr;
+		FName WorldContext;
+		TStrongObjectPtr<UGGYGOBossDefinition> Definition;
+		TStrongObjectPtr<UAnimMontage> Montage;
+		TStrongObjectPtr<UAnimSequence> Sequence;
+		TStrongObjectPtr<UClass> AbilityClass, EffectClass;
+		TStrongObjectPtr<USkeletalMesh> MeshAsset;
+		TArray<TWeakObjectPtr<UPackage>> InputPackages;
+		TArray<TWeakObjectPtr<AGGYGOEncounterLifecycleTestEncounter>> Encounters;
+		TArray<TWeakObjectPtr<AActor>> CreatedActors;
+		TWeakObjectPtr<AGGYGOBossCharacter> Source, Target;
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC, TargetASC;
+		TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
+		TWeakObjectPtr<USkeletalMeshComponent> Mesh;
+		TWeakObjectPtr<UAnimInstance> Anim;
+		TWeakObjectPtr<UGGYGOMeleeTraceComponent> Trace;
+		TWeakObjectPtr<UGGYGOBossMeleeAbility> Ability;
+		TWeakObjectPtr<USphereComponent> Probe;
+		TSharedPtr<FRootMotionSource_GGYGOActionCurve> CurveSource;
+		FGGYGOAbilityActivationHandle Original;
+		FGGYGOAvatarBindingContext SourceBinding, TargetBinding;
+		FGameplayTagContainer WindowEventTags;
+		FDelegateHandle WindowObserver, EffectObserver, CompletionObserver;
+		FName TraceStart, TraceEnd;
+		FVector Entry, FinalLocation, ExpectedDelta;
+		EVisibilityBasedAnimTickOption OriginalTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
+		float Damage = 0.0f, PoiseDamage = 0.0f, InitialHealth = 0.0f, InitialPoise = 0.0f;
+		double Deadline = 0.0, HostDeadline = 0.0, EndDeadline = 0.0;
+		int32 BeginCount = 0, EndCount = 0, OpenSamples = 0, ContactSamples = 0, EffectCount = 0, CompletionCount = 0;
+		bool bStarted = false, bFailed = false, bCleaned = false, bCancelled = false, bSawCapsuleMove = false, bOriginalURO = false;
+		bool bAssetsStarted = false, bPIEStarted = false, bEnding = false, bBehaviorVerified = false, bEditorMapDirty = false;
+	};
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOKevinIce01ProductionTest, "GGYGO.BossAI.Melee.KevinIce01ProductionSmoke",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOKevinIce01ProductionTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FKevinIce01ProductionCommand(*this));
+	return true;
+}
+#endif
 #endif

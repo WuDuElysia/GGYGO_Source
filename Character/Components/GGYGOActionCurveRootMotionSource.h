@@ -2,6 +2,7 @@
 
 #include "GameFramework/RootMotionSource.h"
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
+#include "Character/Data/GGYGOMotionExecutionTypes.h"
 #include "GGYGOActionCurveRootMotionSource.generated.h"
 
 class UCurveVector;
@@ -12,7 +13,7 @@ enum class EGGYGOActionCurveSourceMode : uint8
 	Profile, OriginalMontage
 };
 
-/** Original Montage XYZ trajectory or explicit ground Profile, using native RMS time and ownership. */
+/** 原 Montage XYZ／可选完整 Yaw 合同或显式地面 Profile，共用原 native RMS 时间与所有权。 */
 USTRUCT()
 struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 {
@@ -26,6 +27,7 @@ struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 	/** Explicit source modes; missing montage data never selects the profile branch. */
 	EGGYGOActionCurveSourceMode SourceMode = EGGYGOActionCurveSourceMode::Profile;
 	FGGYGOActionMotionSourceBindingPtr OriginalBinding;
+	EGGYGOMotionRotationMode RotationMode = EGGYGOMotionRotationMode::TranslationOnly;
 	TSharedPtr<const FGGYGOActionMotionResource> OriginalResource;
 	/** Original Montage UE-local XYZ is transformed once by the captured Actor basis. */
 	FQuat EntryActorRotation = FQuat::Identity;
@@ -36,6 +38,14 @@ struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 	bool bNativeImported = false;
 	/** Derived native application evidence, copied with the original SavedMove source. */
 	bool bPreparedContributionConsumed = false;
+	/** 原 native 获选源在真实旋转之后认证，不由平移 Prepared 标志代替。 */
+	bool bPreparedRotationConsumed = false;
+	float PreparedNativeStartSeconds = 0.0f;
+	float PreparedNativeEndSeconds = 0.0f;
+	float PreparedMontageStartSeconds = 0.0f;
+	float PreparedMontageEndSeconds = 0.0f;
+	float PreparedYawDeltaDegrees = 0.0f;
+	TArray<FGGYGOActionMotionSourceInterval> PreparedSourceIntervals;
 	/** Derived from successful original final-range evaluation; native application still has to consume it. */
 	bool bPreparedNaturalEnd = false;
 

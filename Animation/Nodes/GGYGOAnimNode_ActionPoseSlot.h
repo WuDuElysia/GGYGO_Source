@@ -1,3 +1,4 @@
+/** @file GGYGOAnimNode_ActionPoseSlot.h @brief 原生 Slot 混合后的基础对齐与动作身体/轨迹分离。 */
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #pragma once
@@ -12,9 +13,9 @@ class USkeletalMesh;
 class UGGYGOMontageGuardAnimInstance;
 
 /**
- * Native Slot playback with component alignment and body/trajectory translation separation.
- * The native slot remains the only pose mixer. No montage position or pose survives Evaluate.
- * This contract supports nonadditive, uniform slot blending and fixed reference ancestors.
+ * 原生 Slot 是唯一混合器；Source 的身体偏移随原生权重保留，动作部分分离身体/轨迹。
+ * 不跨 Evaluate 保存姿态或 Montage 时间，不写 CMC；仅支持非 additive、均匀 Slot
+ * 混合和固定参考祖先。Source 必须已将执行轨迹与身体姿态分离。
  */
 USTRUCT(BlueprintInternalUseOnly)
 struct GGYGO_API FGGYGOAnimNode_ActionPoseSlot : public FAnimNode_Slot
@@ -27,7 +28,7 @@ struct GGYGO_API FGGYGOAnimNode_ActionPoseSlot : public FAnimNode_Slot
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Action Pose", meta = (NeverAsPin))
 	FName TrajectoryBoneName = NAME_None;
 
-	/** Component alignment plus the action's authored body/trajectory offset from mesh reference. */
+	/** 基础对齐；保留 Source 的身体偏移及动作相对轨迹的身体偏移。 */
 	UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Action Pose", meta = (NeverAsPin))
 	FVector ComponentAlignment = FVector::ZeroVector;
 
@@ -72,6 +73,7 @@ private:
 		FTransform BodyParent;
 		FTransform TrajectoryParent;
 		TArray<FReferenceAncestor> Ancestors;
+		FVector ReferenceBodyTranslation = FVector::ZeroVector;
 		FVector ReferenceResidual = FVector::ZeroVector;
 	};
 
@@ -113,7 +115,7 @@ private:
 
 	// Borrowed from the native hook during this one Evaluate call; cleared at both boundaries.
 	bool bInEvaluation = false;
-	bool bSourceResidualReady = false;
-	FVector SourceResidual = FVector::ZeroVector;
+	bool bSourceTranslationContributionReady = false;
+	FVector SourceTranslationContribution = FVector::ZeroVector;
 	FString EvaluationFailure;
 };

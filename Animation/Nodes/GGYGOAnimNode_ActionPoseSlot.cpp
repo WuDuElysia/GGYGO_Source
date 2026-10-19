@@ -1,3 +1,4 @@
+/** @file GGYGOAnimNode_ActionPoseSlot.cpp @brief 保留原生 Source 身体偏移，校正动作轨迹与基础对齐。 */
 // Copyright Epic Games, Inc. All Rights Reserved.
 
 #include "Animation/Nodes/GGYGOAnimNode_ActionPoseSlot.h"
@@ -36,8 +37,8 @@ namespace GGYGOActionPosePrivate
 void FGGYGOAnimNode_ActionPoseSlot::ClearEvaluationScratch()
 {
 	bInEvaluation = false;
-	bSourceResidualReady = false;
-	SourceResidual = FVector::ZeroVector;
+	bSourceTranslationContributionReady = false;
+	SourceTranslationContribution = FVector::ZeroVector;
 	EvaluationFailure.Reset();
 }
 
@@ -155,7 +156,8 @@ bool FGGYGOAnimNode_ActionPoseSlot::BuildReferenceCache(const FBoneContainer& Bo
 		}
 		return false;
 	}
-	OutCache.ReferenceResidual = OutCache.BodyParent.TransformVector(OutCache.BodyLocal.GetTranslation())
+	OutCache.ReferenceBodyTranslation = OutCache.BodyParent.TransformVector(OutCache.BodyLocal.GetTranslation());
+	OutCache.ReferenceResidual = OutCache.ReferenceBodyTranslation
 		- OutCache.TrajectoryParent.TransformVector(OutCache.TrajectoryLocal.GetTranslation());
 	if (OutCache.ReferenceResidual.ContainsNaN())
 	{
@@ -426,11 +428,14 @@ void FGGYGOAnimNode_ActionPoseSlot::PostEvaluateSourcePose(FPoseContext& SourceC
 	{
 		return;
 	}
-	SourceResidual = ReadResidualTranslation(SourceContext.Pose);
-	bSourceResidualReady = !SourceResidual.ContainsNaN();
-	if (!bSourceResidualReady)
+	// 仅扣除 Source 的基础对齐和轨迹项。身体相对参考姿态的起伏、骨盆调整
+	// 已参与原生 Slot 混合，必须按同一 Source 权重保留，不能重新压回固定位置。
+	SourceTranslationContribution = Reference.ReferenceBodyTranslation
+		- Reference.TrajectoryParent.TransformVector(SourceContext.Pose[Reference.Trajectory].GetTranslation());
+	bSourceTranslationContributionReady = !SourceTranslationContribution.ContainsNaN();
+	if (!bSourceTranslationContributionReady)
 	{
-		EvaluationFailure = TEXT("The participating native Source body/trajectory residual is nonfinite.");
+		EvaluationFailure = TEXT("The participating native Source alignment/trajectory contribution is nonfinite.");
 	}
 }
 
@@ -528,16 +533,27 @@ void FGGYGOAnimNode_ActionPoseSlot::Evaluate_AnyThread(FPoseContext& Output)
 			? WeightData.TotalNodeWeight : 1.;
 		const double ActionCoefficient = WeightData.TotalNodeWeight / NativeDivisor;
 		FString Diagnostic;
-		if ((SourceCoefficient > 0. && !bSourceResidualReady)
+		if ((SourceCoefficient > 0. && !bSourceTranslationContributionReady)
 			|| !ValidateAncestors(Output.Pose, SourceCoefficient + ActionCoefficient, Diagnostic))
 		{
-			FailEvaluation(Diagnostic.IsEmpty() ? TEXT("The participating native Source residual was not produced in this Evaluate call.") : Diagnostic);
+			FailEvaluation(Diagnostic.IsEmpty() ? TEXT("The participating native Source translation contribution was not produced in this Evaluate call.") : Diagnostic);
 			return;
 		}
-		// Remove only the action trajectory and reference alignment contribution.
-		// The authored body offset survives on every axis through native Slot mixing.
-		TargetTranslation += ReadResidualTranslation(Output.Pose) - SourceCoefficient * SourceResidual
+		// 原生权重同时保留 Source 身体偏移和动作身体/轨迹差；零动作权重
+		// 使用相同 Source 偏移定义，避免 Montage 开始、结束时切换平移规则。
+		TargetTranslation += ReadResidualTranslation(Output.Pose) - SourceCoefficient * SourceTranslationContribution
 			- ActionCoefficient * Reference.ReferenceResidual;
+	}
+	else
+	{
+		FString Diagnostic;
+		if (!ValidateAncestors(Output.Pose, 1., Diagnostic))
+		{
+			FailEvaluation(Diagnostic);
+			return;
+		}
+		TargetTranslation += Reference.BodyParent.TransformVector(Output.Pose[Reference.Body].GetTranslation())
+			- Reference.ReferenceBodyTranslation;
 	}
 	FTransform BodyParent;
 	if (TargetTranslation.ContainsNaN() || !GetBodyParentTransform(Output.Pose, BodyParent))

@@ -42,7 +42,10 @@ public:
 		float FirstPlayRate = 1.0f);
 	static FName GetK2ActivateAbilityFunctionName();
 	void SetFirstPlayRateForTest(float PlayRate);
+	void ConfigureDamageMultiplierForTest(float Multiplier);
 	void SetK2ActivateActionForTest(TFunction<void()> Action) { K2ActivateAction = MoveTemp(Action); }
+	/** 在真实原 cleanup 入口执行一次夹具动作；不改公共 GA／CMC 生命周期入口。 */
+	void SetBeforeCleanupActionForTest(TFunction<void()> Action) { BeforeCleanupAction = MoveTemp(Action); }
 	bool EndAndReactivateForTest();
 	bool EndAndReactivateAfterDeferredEndForTest(bool& bDeferredEndWasCoalesced);
 	void FinishForTest();
@@ -57,14 +60,25 @@ public:
 	virtual void ProcessEvent(UFunction* Function, void* Parms) override;
 
 protected:
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	virtual void ApplyAbilityTagsToGameplayEffectSpec(FGameplayEffectSpec& Spec,
 		FGameplayAbilitySpec* AbilitySpec) const override;
 
 private:
 	TFunction<void()> K2ActivateAction;
+	TFunction<void()> BeforeCleanupAction;
 	mutable bool bInvalidateNextRequiredSpec = false;
 	mutable int32 SpecExtensionCount = 0;
 	mutable int32 InvalidatedSpecCount = 0;
+};
+
+/** 使用真实DamageExecution及显式倍率模式的瞬态测试载体。 */
+UCLASS(Transient)
+class UGGYGOPlayerComboLifecycleMultiplierEffect : public UGameplayEffect
+{
+	GENERATED_BODY()
+public:
+	UGGYGOPlayerComboLifecycleMultiplierEffect();
 };
 
 /** A real invalid required-class selection, assigned only after successful fixture activation. */
@@ -74,15 +88,14 @@ class UGGYGOPlayerComboLifecycleInvalidDamageEffect : public UGameplayEffect
 	GENERATED_BODY()
 };
 
-/** Executes a test callback only after Unreal's real Montage_PlayInternal has run. */
+/** 保留正常播放与拒播叶的 Guard 正返回计数；重入创建事实另由真实 Started 观察者提供。 */
 UCLASS(Transient)
 class UGGYGOPlayerComboLifecycleTestAnimInstance : public UGGYGOMontageGuardAnimInstance
 {
 	GENERATED_BODY()
 
 public:
-	void SetAfterSuperMontagePlayActionForTest(TFunction<void()> Action) { AfterSuperMontagePlayAction = MoveTemp(Action); }
-	int32 GetSuccessfulSuperMontagePlayCountForTest() const { return SuccessfulSuperMontagePlayCount; }
+	int32 GetSuccessfulGuardReturnCountForTest() const { return SuccessfulGuardReturnCount; }
 
 protected:
 	virtual float Montage_PlayInternal(UAnimMontage* MontageToPlay, const FMontageBlendSettings& BlendInSettings,
@@ -90,6 +103,5 @@ protected:
 		float InTimeToStartMontageAt = 0.f, bool bStopAllMontages = true) override;
 
 private:
-	TFunction<void()> AfterSuperMontagePlayAction;
-	int32 SuccessfulSuperMontagePlayCount = 0;
+	int32 SuccessfulGuardReturnCount = 0;
 };

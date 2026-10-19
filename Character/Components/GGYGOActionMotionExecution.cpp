@@ -96,8 +96,11 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	if (HasActiveActionMotion() || NextActionMotionHandle <= 0 || NextActionMotionHandle == MAX_int32)
 		return Reject(TEXT("action execution slot is occupied or original token allocator is exhausted"));
 	FString Error;
-	if (!OriginalSource.IsValid() || !GGYGOActionMotionEvaluation::ValidateSource(*OriginalSource, Error))
+	EGGYGOMotionRotationMode RotationMode;
+	if (!OriginalSource.IsValid() || !GGYGOActionMotionEvaluation::ValidateSource(*OriginalSource, RotationMode, Error))
 		return Reject(Error.IsEmpty() ? TEXT("original source binding is missing") : Error);
+	if (RotationMode == EGGYGOMotionRotationMode::SourceYaw && Movement.CharacterOwner->bUseControllerRotationYaw)
+		return Reject(TEXT("source Yaw requires bUseControllerRotationYaw=false on the original Character; Controller cannot overwrite CMC rotation"));
 	if (!FMath::IsFinite(MontagePositionSeconds) || MontagePositionSeconds < OriginalSource->MontageStartSeconds
 		|| MontagePositionSeconds >= OriginalSource->MontageEndSeconds
 		|| !FMath::IsFinite(EffectiveMontagePlayRate) || EffectiveMontagePlayRate <= 0.0f
@@ -129,6 +132,7 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	Resource->Mesh = Mesh;
 	Resource->AnimInstance = Anim;
 	Resource->Source = OriginalSource;
+	Resource->RotationMode = RotationMode;
 	Resource->MontageInstanceId = OriginalMontageInstanceId;
 	Resource->InstancePlayRate = Instance->GetPlayRate();
 	Resource->Handle = NextActionMotionHandle;
@@ -139,6 +143,7 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	Source->Settings.UnSetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
 	Source->Settings.SetFlag(ERootMotionSourceSettingsFlags::UseSensitiveLiftoffCheck);
 	Source->OriginalBinding = OriginalSource;
+	Source->RotationMode = RotationMode;
 	Source->OriginalResource = Resource;
 	Source->MontageStartSeconds = MontagePositionSeconds;
 	Source->EntryActorRotation = Rotation;
@@ -177,6 +182,11 @@ bool FGGYGOActionMotionExecution::ValidateMontageActionRuntime(
 		OutError = TEXT("original XYZ action source must override Z and use native sensitive liftoff");
 		return false;
 	}
+	if (Source.RotationMode == EGGYGOMotionRotationMode::SourceYaw && Movement.CharacterOwner->bUseControllerRotationYaw)
+	{
+		OutError = TEXT("source Yaw lost sole CMC rotation ownership: original Character enables Controller Yaw");
+		return false;
+	}
 	const auto Resource = Source.OriginalResource;
 	if (!Resource.IsValid())
 	{
@@ -186,7 +196,7 @@ bool FGGYGOActionMotionExecution::ValidateMontageActionRuntime(
 		return false;
 	}
 	if (Resource->Owner.Get() != &Movement || Resource->Character.Get() != Movement.CharacterOwner
-		|| Resource->Source != Source.OriginalBinding)
+		|| Resource->Source != Source.OriginalBinding || Resource->RotationMode != Source.RotationMode)
 	{
 		OutError = TEXT("source does not belong to its original CMC, Character and immutable binding");
 		return false;
@@ -305,7 +315,8 @@ void FGGYGOActionMotionExecution::PublishMontageActionMotionCompletion()
 		const auto& Source = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*Base);
 		const auto Resource = Source.OriginalResource;
 		if (Source.SourceMode != EGGYGOActionCurveSourceMode::OriginalMontage || Source.bExplicitlyCancelled
-			|| !Source.bPreparedNaturalEnd || !Source.bPreparedContributionConsumed || !Resource.IsValid()
+			|| !Source.bPreparedNaturalEnd || !Source.bPreparedContributionConsumed
+			|| !Source.bPreparedRotationConsumed || !Resource.IsValid()
 			|| Resource->Owner.Get() != &Movement || Resource->Character.Get() != Movement.CharacterOwner
 			|| (ActiveMontageActionResource != Resource && CompletedMontageActionResource != Resource)
 			|| (CompletedMontageActionResource == Resource && bCompletedMontageActionNativeContributionConsumed)) continue;
@@ -317,7 +328,7 @@ void FGGYGOActionMotionExecution::PublishMontageActionMotionCompletion()
 			ActiveActionMotionHandle = INDEX_NONE;
 			ActionMotionSourceID = static_cast<uint16>(ERootMotionSourceID::Invalid);
 		}
-		// All native physics for this move has completed. Detach before external cleanup/reentry.
+		// 平移与原生旋转均已结束，先解绑再外调；回调不能吞掉同一区间的最后转角。
 		if (ActionMotionCompletionResource == Resource)
 		{
 			FGGYGOActionMotionCompletionDelegate Callback = MoveTemp(ActionMotionCompletionCallback);
@@ -566,7 +577,7 @@ bool FGGYGOActionMotionExecution::CancelMontageActionMotionForMovement(
 			if (!Base.IsValid() || Base->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()) return false;
 			const auto& Source = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*Base);
 			return OriginalResource.IsValid() && Source.OriginalResource == OriginalResource
-				&& !Source.bExplicitlyCancelled && !Source.bPreparedContributionConsumed;
+				&& !Source.bExplicitlyCancelled && (!Source.bPreparedContributionConsumed || !Source.bPreparedRotationConsumed);
 		});
 	};
 	const bool bHadUnconsumedTail = HasUnconsumedTail(Movement.CurrentRootMotion.RootMotionSources)
@@ -724,6 +735,27 @@ void FGGYGOActionMotionExecution::EndActionMotion(int32 Handle)
 
 void FGGYGOActionMotionExecution::CleanupFinishedActionMotion()
 {
+	const auto Draining = ActiveMontageActionResource.IsValid() ? ActiveMontageActionResource : CompletedMontageActionResource;
+	if (Draining.IsValid() && !(CompletedMontageActionResource == Draining && bCompletedMontageActionNativeContributionConsumed))
+	{
+		const auto HasOriginalSource = [&Draining](const auto& Sources)
+		{
+			return Sources.ContainsByPredicate([&Draining](const auto& Base)
+			{
+				return Base.IsValid() && Base->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()
+					&& static_cast<const FRootMotionSource_GGYGOActionCurve&>(*Base).OriginalResource == Draining;
+			});
+		};
+		if (!HasOriginalSource(Movement.CurrentRootMotion.RootMotionSources)
+			&& !HasOriginalSource(Movement.CurrentRootMotion.PendingAddRootMotionSources))
+		{
+			const FString Error = FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' token=%d: original native source retired before final translation/rotation consumption"),
+				*Movement.GetPathName(), *GetPathNameSafe(Draining->Source->Montage.Get()), Draining->Handle);
+			UE_LOG(LogGGYGOActionMotion, Error, TEXT("%s"), *Error);
+			FailMontageActionMotion(Draining, Error);
+			return;
+		}
+	}
 	if (ActiveMontageActionResource.IsValid())
 	{
 		const auto Resource = ActiveMontageActionResource;

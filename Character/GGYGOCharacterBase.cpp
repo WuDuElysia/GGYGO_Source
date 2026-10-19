@@ -190,6 +190,15 @@ void AGGYGOCharacterBase::UnPossessed()
 	}
 }
 
+void AGGYGOCharacterBase::PostNetReceiveRole()
+{
+	Super::PostNetReceiveRole();
+
+	// Controller 的 RepNotify 可能仍在后续；订阅者按当前状态重评。
+	// 广播可重入或销毁本角色，之后不再访问成员。
+	ReplicatedLocalRoleChanged.Broadcast(this);
+}
+
 void AGGYGOCharacterBase::OnRep_Controller()
 {
 	Super::OnRep_Controller();

@@ -1,9 +1,11 @@
+/** @file GGYGOBossMeleeLifecycleTestAbility.h @brief Test access to original melee resources and native playback. */
 #pragma once
 
 #include "AI/Boss/Abilities/GGYGOBossMeleeAbility.h"
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "GGYGOBossMeleeLifecycleTestAbility.generated.h"
 
-/** 隔离 Montage 业务，复用生产 Mesh/Motion/Cleanup 与原 GAS 请求。 */
+/** 可隔离 Mesh/Profile 生命周期，或通过完整生产 Montage Body 验证真实 XYZ 链。 */
 UCLASS(Transient)
 class UGGYGOBossMeleeLifecycleTestAbility : public UGGYGOBossMeleeAbility
 {
@@ -11,10 +13,20 @@ class UGGYGOBossMeleeLifecycleTestAbility : public UGGYGOBossMeleeAbility
 public:
 	void FinishForTest(const FGGYGOAbilityActivationHandle& Original);
 	bool BeginMotionForTest(const FGGYGOAbilityActivationHandle& Original, const UGGYGOActionMotionProfile* Profile);
+	void ConfigureMontageForTest(UAnimMontage* Montage, FName StartBone, FName EndBone);
+	void SetProfileForTest(const UGGYGOActionMotionProfile* Profile) { ActionMotionProfile = Profile; }
+	int32 GetActiveTaskCountForTest() const { return ActiveTasks.Num(); }
 	bool HasActiveMeshForTest() const { return HasOriginalMeleeMeshResource(); }
 	FGGYGOAbilityActivationHandle GetInitializedOriginalForTest() const { return GetOriginalMeleeResourceActivation(); }
 protected:
 	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+};
+
+/** Concrete ordinary-slot Guard; native playback and original-instance callbacks remain real. */
+UCLASS(Transient)
+class UGGYGOBossMeleeLifecycleTestAnimInstance : public UGGYGOMontageGuardAnimInstance
+{
+	GENERATED_BODY()
 };

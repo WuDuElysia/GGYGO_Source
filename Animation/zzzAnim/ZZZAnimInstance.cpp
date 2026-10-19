@@ -26,17 +26,30 @@ namespace
 	bool ValidateWalkRunLeanTuning(const FZZZWalkRunLeanTuning& Config, FString& OutError)
 	{
 		OutError.Reset();
-		if (!FMath::IsFinite(Config.FullLeanDirectionErrorDegrees) || Config.FullLeanDirectionErrorDegrees < 180.0f)
+		const FRichCurve* Response = Config.DirectionErrorToLeanDegrees.GetRichCurveConst();
+		if (!Response || Response->GetNumKeys() < 2)
 		{
-			OutError = TEXT("FullLeanDirectionErrorDegrees must be finite and >= 180; author the angle explicitly, legacy yaw rate is not an angle");
+			OutError = TEXT("DirectionErrorToLeanDegrees must contain an authored response covering [0,180] direction degrees");
 			return false;
 		}
-		if (!FMath::IsFinite(Config.WalkMaxAngleDegrees) || !FMath::IsFinite(Config.RunMaxAngleDegrees)
-			|| Config.WalkMaxAngleDegrees < 0.0f || Config.RunMaxAngleDegrees < Config.WalkMaxAngleDegrees
-			|| Config.RunMaxAngleDegrees > 90.0f)
+		float FirstInput = 0.0f;
+		float LastInput = 0.0f;
+		Response->GetTimeRange(FirstInput, LastInput);
+		if (FirstInput != 0.0f || LastInput != 180.0f || Response->Eval(0.0f) != 0.0f)
 		{
-			OutError = TEXT("Walk/Run maximum angles must be finite with 0 <= Walk <= Run <= 90 degrees");
+			OutError = TEXT("DirectionErrorToLeanDegrees must cover [0,180] exactly and map zero deviation to zero lean");
 			return false;
+		}
+		for (const FRichCurveKey& Key : Response->GetConstRefOfKeys())
+		{
+			if (!FMath::IsFinite(Key.Time) || !FMath::IsFinite(Key.Value)
+				|| Key.Value < 0.0f || Key.Value >= 90.0f
+				|| !FMath::IsFinite(Key.ArriveTangent) || !FMath::IsFinite(Key.LeaveTangent)
+				|| !FMath::IsFinite(Key.ArriveTangentWeight) || !FMath::IsFinite(Key.LeaveTangentWeight))
+			{
+				OutError = TEXT("DirectionErrorToLeanDegrees keys/tangents must be finite with lean in [0,90) degrees");
+				return false;
+			}
 		}
 		if (!FMath::IsFinite(Config.RecoveryResponseSpeed) || Config.RecoveryResponseSpeed <= 0.0f)
 		{
@@ -81,6 +94,8 @@ void UZZZAnimInstance::OnAnimationLifecycleReset()
 void UZZZAnimInstance::ResetWalkRunLeanPresentation()
 {
 	WalkRunLeanAngleDegrees = 0.0f;
+	WalkRunLeanAxisCS = FVector::ZeroVector;
+	WalkRunLeanUpCS = FVector::ZeroVector;
 	bWalkRunLeanPresentationValid = false;
 	WalkRunLeanFailureReason.Reset();
 	LastWalkRunLeanFailureCode = NAME_None;
@@ -91,6 +106,8 @@ void UZZZAnimInstance::ResetWalkRunLeanPresentation()
 void UZZZAnimInstance::FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason)
 {
 	WalkRunLeanAngleDegrees = 0.0f;
+	WalkRunLeanAxisCS = FVector::ZeroVector;
+	WalkRunLeanUpCS = FVector::ZeroVector;
 	bWalkRunLeanPresentationValid = false;
 	WalkRunLeanFailureReason = Reason;
 	if (LastWalkRunLeanFailureCode != FailureCode)
@@ -115,9 +132,8 @@ void UZZZAnimInstance::RecoverWalkRunLeanPresentation(float DeltaSeconds, const 
 		return;
 	}
 
-	WalkRunLeanAngleDegrees = FMath::Clamp(static_cast<float>(WalkRunLeanAngleDegrees
-		* FMath::Exp(-static_cast<double>(Config.RecoveryResponseSpeed) * DeltaSeconds)),
-		-Config.RunMaxAngleDegrees, Config.RunMaxAngleDegrees);
+	WalkRunLeanAngleDegrees = static_cast<float>(WalkRunLeanAngleDegrees
+		* FMath::Exp(-static_cast<double>(Config.RecoveryResponseSpeed) * DeltaSeconds));
 	if (FMath::IsNearlyZero(WalkRunLeanAngleDegrees))
 	{
 		WalkRunLeanAngleDegrees = 0.0f;
@@ -168,6 +184,13 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 		WalkRunLeanSource = Steering.OriginalMovement;
 		WalkRunLeanSourceEpoch = Steering.SourceEpoch;
 	}
+	if (!Frame.bCapsuleMeshBasisValid || Frame.LeanAxisCS.ContainsNaN() || Frame.CapsuleUpCS.ContainsNaN())
+	{
+		FailWalkRunLeanPresentation(TEXT("PoseBasis"), TEXT("the original capsule and mesh have no valid captured pose basis"));
+		return;
+	}
+	WalkRunLeanAxisCS = Frame.LeanAxisCS;
+	WalkRunLeanUpCS = Frame.CapsuleUpCS;
 
 	switch (Steering.Status)
 	{
@@ -195,18 +218,20 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 	}
 
 	if (!FMath::IsFinite(Steering.DesiredDirectionError) || Steering.DesiredDirectionError < -180.0f
-		|| Steering.DesiredDirectionError > 180.0f || !FMath::IsFinite(Frame.WalkRunBlendAlpha)
-		|| Frame.WalkRunBlendAlpha < 0.0f || Frame.WalkRunBlendAlpha > 1.0f)
+		|| Steering.DesiredDirectionError > 180.0f)
 	{
 		FailWalkRunLeanPresentation(TEXT("DirectionValues"),
-			TEXT("DesiredDirectionError must be finite in [-180,180] degrees and WalkRun alpha must be in [0,1]"));
+			TEXT("DesiredDirectionError must be finite in [-180,180] degrees"));
 		return;
 	}
 
-	// The full native signed-angle domain is linear. No yaw-rate gate, saturation or temporal entry filter.
-	const float MaxAngle = FMath::Lerp(Config.WalkMaxAngleDegrees, Config.RunMaxAngleDegrees, Frame.WalkRunBlendAlpha);
-	WalkRunLeanAngleDegrees = static_cast<float>(static_cast<double>(Steering.DesiredDirectionError)
-		/ Config.FullLeanDirectionErrorDegrees * MaxAngle);
+	const float Magnitude = Config.DirectionErrorToLeanDegrees.GetRichCurveConst()->Eval(FMath::Abs(Steering.DesiredDirectionError));
+	if (!FMath::IsFinite(Magnitude) || Magnitude < 0.0f || Magnitude >= 90.0f)
+	{
+		FailWalkRunLeanPresentation(TEXT("ResponseValue"), TEXT("the authored response must evaluate to a finite lean in [0,90) degrees"));
+		return;
+	}
+	WalkRunLeanAngleDegrees = Steering.DesiredDirectionError < 0.0f ? -Magnitude : Magnitude;
 	bWalkRunLeanPresentationValid = true;
 	WalkRunLeanFailureReason.Reset();
 	LastWalkRunLeanFailureCode = NAME_None;

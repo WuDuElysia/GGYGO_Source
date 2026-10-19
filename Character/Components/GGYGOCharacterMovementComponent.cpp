@@ -188,6 +188,10 @@ UGGYGOCharacterMovementComponent::UGGYGOCharacterMovementComponent(const FObject
 	// 这里需要属性复制，因为转身状态要发给模拟代理，而那条信息
 	// 不属于移动预测数据。
 	SetIsReplicatedByDefault(true);
+
+	// 远端姿态记录以原生 ServerLastTransformUpdateTimeStamp 作样本键。原生只在 Linear 下复制它；
+	// 这个原生开关让任意平滑模式都复制同一键，不改变平滑模式本身。实例覆盖为 false 时发布端明确报 Invalid。
+	bNetworkAlwaysReplicateTransformUpdateTimestamp = true;
 }
 
 void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
@@ -195,11 +199,12 @@ void UGGYGOCharacterMovementComponent::GetLifetimeReplicatedProps(TArray<FLifeti
 	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
 
 	// SkipOwner：拥有者自己是权威解算方，收到服务器的回传只会与本地预测打架。
-	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, bReplicatedTurnBackCurveDriven, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, ResolvedGait, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, LocomotionMotionType, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, StopMotionType, COND_SkipOwner);
 	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, WalkRunBlendAlpha, COND_SkipOwner);
+	// 拥有者走原预测/校正协议，只有模拟代理消费远端姿态。
+	DOREPLIFETIME_CONDITION(UGGYGOCharacterMovementComponent, RemoteMotionPoseRecord, COND_SimulatedOnly);
 }
 
 bool UGGYGOCharacterMovementComponent::EnsureMovementOwnerSyncLifetime()
@@ -230,6 +235,8 @@ void UGGYGOCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewU
 	Super::SetUpdatedComponent(NewUpdatedComponent);
 	if (UpdatedComponent != OriginalComponent)
 	{
+		CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
+		ResetRemoteMotionPoseConsumer();
 		ResetLocomotionSteeringObservation();
 		NativeMovementVelocityResult.Reset();
 		NativeVelocityBeforeRootMotion.Reset();
@@ -252,6 +259,11 @@ void UGGYGOCharacterMovementComponent::BeginPlay()
 
 void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
+	CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
+	bRemoteMotionPosePublicationClosed = true;
+	RemoteMotionPoseCandidate.Reset();
+	RemoteMotionPoseSegment.Reset();
+	ResetRemoteMotionPoseConsumer();
 	ResetLocomotionSteeringObservation();
 	bMovementOwnerSyncClosed = true;
 	NativeMovementVelocityResult.Reset();
@@ -1861,6 +1873,11 @@ void UGGYGOCharacterMovementComponent::TickComponent(float DeltaTime, ELevelTick
 	Self = WeakSelf.Get();
 	if (!Self || Self->IsBeingDestroyed() || Self->bMovementOwnerSyncClosed) return;
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+	Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->bMovementOwnerSyncClosed) return;
+	// 原生 Tick（含 ServerAutonomousProxyTick、listen 平滑、代理 SimulatedTick）已返回；只在这里补键与重试接受。
+	FinalizeRemoteMotionPosePublication();
+	RefreshRemoteMotionPoseConsumer();
 }
 
 float UGGYGOCharacterMovementComponent::GetScaledCurveSpeed() const
@@ -1988,6 +2005,7 @@ bool UGGYGOCharacterMovementComponent::PublishLocomotionSourceBinding(
 		return false;
 	}
 	// Publication is independent of MovementSet/input readiness. A rejected source replaces only its own publication.
+	CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
 	RetireLocomotionCurveRootMotion();
 	CompletedLocomotionCurveOrigin.Reset();
 	CurveMotion.Reset();
@@ -2006,6 +2024,7 @@ void UGGYGOCharacterMovementComponent::RetireLocomotionSourceBinding(
 	if (!IsInGameThread() || !LocomotionSourceBinding.IsValid()
 		|| LocomotionSourceBinding->Identity.Producer.Get() != OriginalProducer
 		|| LocomotionSourceBinding->Identity.ConfigurationGeneration != OriginalConfigurationGeneration) return;
+	CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
 	RetireLocomotionCurveRootMotion();
 	CompletedLocomotionCurveOrigin.Reset();
 	CurveMotion.Reset();
@@ -2046,6 +2065,7 @@ bool UGGYGOCharacterMovementComponent::GetLocomotionSourceBinding(
 
 void UGGYGOCharacterMovementComponent::ResetLocomotionState()
 {
+	CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
 	ResetLocomotionSteeringObservation();
 	RetireLocomotionCurveRootMotion();
 	CompletedLocomotionCurveOrigin.Reset();
@@ -2065,7 +2085,6 @@ void UGGYGOCharacterMovementComponent::ResetLocomotionState()
 	CurveMotion.Reset();
 	ResetTurnBack();
 	bTurnBackInputLatched = false;
-	bReplicatedTurnBackCurveDriven = false;
 	RemoveRootMotionSource(GGYGOMovementConstants::CurveBrakeSourceName);
 	RemoveRootMotionSource(GGYGOMovementConstants::CurveTurnBackSourceName);
 }
@@ -2462,7 +2481,6 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateAfterMovement(float D
 	bNativeVelocityIntervalCanRetain = false;
 	NativeVelocityIntervalCharacter.Reset();
 	NativeVelocityIntervalComponent.Reset();
-	PublishMontageActionMotionCompletion();
 }
 
 bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const
@@ -2503,7 +2521,10 @@ void UGGYGOCharacterMovementComponent::RequestRunOnNextMove()
 
 void UGGYGOCharacterMovementComponent::UpdateCharacterStateBeforeMovement(float DeltaSeconds)
 {
+	// 原生 PerformMovement 在每次写 ServerLastTransformUpdateTimeStamp 之前都经过这里；只作远端发布的入口身份。
+	if (IsRemoteMotionPosePublisher()) ++RemoteMotionPoseMoveEntrySerial;
 	BeginLocomotionSteeringInterval();
+	BeginMotionExecutionInterval();
 	BeginNativeMovementVelocityInterval();
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> VelocityIntervalSelf(this);
 	ON_SCOPE_EXIT
@@ -2675,16 +2696,6 @@ void UGGYGOCharacterMovementComponent::CommitLocomotionCandidate(const FLocomoti
 	TurnBackEntryYaw = Candidate.TurnEntryYaw;
 	bTurnBackInputLatched = Candidate.bTurnInputLatched;
 	CurveMotion = Candidate.Motion;
-	PublishCommittedTurnBackState();
-}
-
-void UGGYGOCharacterMovementComponent::PublishCommittedTurnBackState()
-{
-	if (CharacterOwner && CharacterOwner->HasAuthority())
-	{
-		bReplicatedTurnBackCurveDriven = HasAcceptedMovementSet() && MovementSet->bUseCurveDrivenSpeed
-			&& (TurnBackPhase == EGGYGOTurnBackPhase::Turning || TurnBackPhase == EGGYGOTurnBackPhase::Braking);
-	}
 }
 
 bool UGGYGOCharacterMovementComponent::HasCurrentLocomotionCurveOrigin(
@@ -2702,10 +2713,51 @@ bool UGGYGOCharacterMovementComponent::HasCurrentLocomotionCurveOrigin(
 		&& IsMovementInputBindingCurrent(Origin->Binding);
 }
 
+bool UGGYGOCharacterMovementComponent::HasPendingLocomotionCurveSource() const
+{
+	const auto Input = PendingLocomotionCurveInput;
+	if (!IsValid(CharacterOwner) || CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy
+		|| CharacterOwner->bClientUpdating || CharacterOwner->bServerMoveIgnoreRootMotion
+		|| CharacterOwner->bUseControllerRotationYaw
+		|| !IsMovingOnGround() || !Input.IsValid()
+		|| !HasCurrentLocomotionCurveOrigin(Input->Origin)
+		|| Input->NativeSource != MovementInputNativeSource)
+	{
+		return false;
+	}
+	const auto Origin = Input->Origin;
+	if (Origin->MovementSet.Get() != MovementSet.Get() || Origin->SourceBinding != LocomotionSourceBinding)
+	{
+		return false;
+	}
+	for (const auto* Sources : {&CurrentRootMotion.RootMotionSources, &CurrentRootMotion.PendingAddRootMotionSources})
+	{
+		for (const TSharedPtr<FRootMotionSource>& Source : *Sources)
+		{
+			if (!Source.IsValid() || Source->GetScriptStruct() != FRootMotionSource_GGYGOCurve::StaticStruct()
+				|| Source->Status.HasFlag(ERootMotionSourceStatusFlags::Finished)
+				|| Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval))
+			{
+				continue;
+			}
+			if (static_cast<const FRootMotionSource_GGYGOCurve&>(*Source).Origin == Origin)
+			{
+				return true;
+			}
+		}
+	}
+	return false;
+}
+
 bool UGGYGOCharacterMovementComponent::ReportLocomotionCurveRootMotionFailure(
 	const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin, const FString& Reason)
 {
-	if (!HasCurrentLocomotionCurveOrigin(Origin) || Reason.IsEmpty()) return false;
+	if (Reason.IsEmpty()) return false;
+	// 位移 RMS 已退役的原尾段仍须能失败；精确原请求匹配，不能伤及后继。
+	const bool bCompletedSourceCurrent = Origin.IsValid() && Origin == CompletedLocomotionCurveOrigin
+		&& !IsMovementInputRequestBlocked()
+		&& IsLocomotionCurveOriginForCandidate(Origin, CaptureLocomotionCandidate(), LocomotionSourceBinding);
+	if (!HasCurrentLocomotionCurveOrigin(Origin) && !bCompletedSourceCurrent) return false;
 	return FailLocomotionRequest(Origin->ExecutionRequestSerial, FString::Printf(
 		TEXT("CurveRMS Motion=%d Sequence=%u: %s"), static_cast<int32>(Origin->MotionType),
 		Origin->MotionSequence, *Reason));
@@ -2732,10 +2784,27 @@ void UGGYGOCharacterMovementComponent::RetireLocomotionCurveRootMotion()
 	PendingLocomotionCurveInput.Reset();
 }
 
+bool UGGYGOCharacterMovementComponent::IsLocomotionCurveOriginForCandidate(
+	const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin,
+	const FLocomotionUpdateCandidate& Candidate, const FGGYGOLocomotionSourceBindingPtr& SourceBinding) const
+{
+	return Origin.IsValid() && Origin->Owner.Get() == this
+		&& Origin->ExecutionRequestSerial != 0 && Origin->ExecutionRequestSerial == LocomotionRequestSerial
+		&& Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
+		&& Origin->MovementSet.Get() == MovementSet.Get() && Origin->MotionType == Candidate.MotionType
+		&& Origin->SourceBinding == SourceBinding
+		&& Origin->MotionSequence == Candidate.MotionSequence;
+}
+
 bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 	float MovementTickTime, const FLocomotionUpdateCandidate& Candidate, FString& OutError)
 {
 	OutError.Reset();
+	if (CharacterOwner && CharacterOwner->bUseControllerRotationYaw)
+	{
+		OutError = TEXT("CurveRMS source Yaw requires bUseControllerRotationYaw=false on the original Character");
+		return false;
+	}
 	if (!FMath::IsFinite(MovementTickTime) || MovementTickTime <= 0.0f
 		|| !HasAcceptedMovementSet() || !MovementSet->bUseCurveDrivenSpeed || !UpdatedComponent
 		|| LocomotionRequestSerial == 0 || IsMovementInputRequestBlocked())
@@ -2745,16 +2814,7 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 	}
 	FGGYGOLocomotionSourceBindingPtr SourceBinding;
 	if (!GetLocomotionSourceBinding(SourceBinding, OutError)) return false;
-	const auto SameSegment = [this, &Candidate, &SourceBinding](const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin)
-	{
-		return Origin.IsValid() && Origin->Owner.Get() == this
-			&& Origin->ExecutionRequestSerial == LocomotionRequestSerial
-			&& Origin->Binding == MovementInputBinding && Origin->InputRequest == MovementInputRequest
-			&& Origin->MovementSet.Get() == MovementSet.Get() && Origin->MotionType == Candidate.MotionType
-			&& Origin->SourceBinding == SourceBinding
-			&& Origin->MotionSequence == Candidate.MotionSequence;
-	};
-	if (SameSegment(CompletedLocomotionCurveOrigin))
+	if (IsLocomotionCurveOriginForCandidate(CompletedLocomotionCurveOrigin, Candidate, SourceBinding))
 	{
 		// Native completion closes this resource. The remaining clip semantics use the ordinary
 		// CMC path, and cannot remount the same physical execution even if a later speed is positive.
@@ -2763,7 +2823,7 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 		CommitLocomotionCandidate(Remaining);
 		return true;
 	}
-	if (!SameSegment(LocomotionCurveOrigin))
+	if (!IsLocomotionCurveOriginForCandidate(LocomotionCurveOrigin, Candidate, SourceBinding))
 	{
 		RetireLocomotionCurveRootMotion();
 		CompletedLocomotionCurveOrigin.Reset();
@@ -2776,6 +2836,8 @@ bool UGGYGOCharacterMovementComponent::StageLocomotionCurveRootMotion(
 		Origin->MotionSequence = Candidate.MotionSequence;
 		Origin->MovementSet = MovementSet.Get();
 		Origin->SourceBinding = SourceBinding;
+		// 此执行入口消费原完整曲线 Yaw；合同归原 Origin，不随 RunOut 或零增量改变。
+		Origin->RotationMode = EGGYGOMotionRotationMode::SourceYaw;
 		Origin->MotionTimeOrigin = Candidate.MotionTime;
 		Origin->BaseYaw = Candidate.MotionType == EGGYGOLocomotionMotionType::TurnBack
 			? Candidate.TurnEntryYaw : UpdatedComponent->GetComponentRotation().Yaw;
@@ -3080,6 +3142,8 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 	else
 	{
 		const UGGYGOMovementSet* OriginalSet = Origin->MovementSet.Get();
+		if (CharacterOwner && CharacterOwner->bUseControllerRotationYaw)
+			return Reject(TEXT("CurveRMS lost sole CMC Yaw ownership; original Character enables Controller Yaw."));
 		if (!OriginalSet || OriginalSet != MovementSet.Get() || !HasAcceptedMovementSet()
 			|| Candidate.MotionType != Origin->MotionType || Candidate.MotionSequence != Origin->MotionSequence
 			|| !FMath::IsFinite(Source.BaseYaw) || Source.BaseYaw != Origin->BaseYaw
@@ -3113,6 +3177,9 @@ EGGYGOCurveRootMotionPrepareResult UGGYGOCharacterMovementComponent::PrepareLoco
 				return Reject(TEXT("CurveRMS actual turn elapsed interval is non-finite or negative."));
 			}
 			AdvanceTurnBackPhase(SimulationTime, Candidate, true);
+			if (Candidate.TurnPhase == EGGYGOTurnBackPhase::None
+				&& static_cast<double>(Prepared->MotionEndTime) * AnimationSource->SequenceRateScale < AnimationSource->PlayLength)
+				return Reject(TEXT("TurnBack duration expired before the original source ended; remaining Yaw cannot be reported Finished."));
 		}
 		if (!Evaluation.Sample.bHasCurveSource || !FMath::IsFinite(Candidate.TurnElapsed))
 		{
@@ -3345,8 +3412,9 @@ bool UGGYGOCharacterMovementComponent::IsCurrentMotionFinished(
 }
 
 bool UGGYGOCharacterMovementComponent::EvaluateWalkRunSource(
-	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const
+	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError)
 {
+	const float StartCycle = Candidate.CyclePhase;
 	FGGYGOWalkRunEvaluationResult Result;
 	FGGYGOLocomotionSourceBindingPtr Binding;
 	// The public interval evaluator validates the full configuration in this same call.
@@ -3366,18 +3434,22 @@ bool UGGYGOCharacterMovementComponent::EvaluateWalkRunSource(
 	}
 	Candidate.Motion = Result.Motion.Sample;
 	Candidate.CyclePhase = EndPhase;
+	PrepareOrdinaryMotionExecution(Candidate, Binding, Candidate.MotionTime, Candidate.MotionTime,
+		StartCycle, Result.EndCyclePosition);
 	return true;
 }
 
 bool UGGYGOCharacterMovementComponent::EvaluateLocomotionSource(
-	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const
+	float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError)
 {
 	if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds < 0.0f)
 	{
 		OutError = FString::Printf(TEXT("Locomotion DeltaSeconds=%.9g must be finite and non-negative."), DeltaSeconds);
 		return false;
 	}
-	const float AcceptedDelta = FMath::Min(DeltaSeconds, GGYGOMovementConstants::MaxClampedDelta);
+	// 曲线消费采用这个真实 native 区间，不能把动画源时钟静默截短。
+	const float AcceptedDelta = MovementSet->bUseCurveDrivenSpeed
+		? DeltaSeconds : FMath::Min(DeltaSeconds, GGYGOMovementConstants::MaxClampedDelta);
 	if (Candidate.MotionType == EGGYGOLocomotionMotionType::None)
 	{
 		Candidate.Motion.Reset();
@@ -3415,6 +3487,7 @@ bool UGGYGOCharacterMovementComponent::EvaluateLocomotionSource(
 		return false;
 	}
 	FGGYGOLocomotionEvaluationResult Result;
+	const float StartTime = Candidate.MotionTime;
 	const float EndTime = Candidate.MotionTime + AcceptedDelta;
 	if (!GGYGOLocomotionEvaluation::EvaluateSingleInterval(*Source, Candidate.MotionTime, EndTime,
 		MovementSet->RootMotionScale, Result, &OutError))
@@ -3423,6 +3496,7 @@ bool UGGYGOCharacterMovementComponent::EvaluateLocomotionSource(
 	}
 	Candidate.Motion = Result.Sample;
 	Candidate.MotionTime = EndTime;
+	PrepareOrdinaryMotionExecution(Candidate, Binding, StartTime, EndTime);
 	return true;
 }
 
@@ -3536,7 +3610,20 @@ bool UGGYGOCharacterMovementComponent::TryUpdateLocomotion(
 		}
 		else
 		{
-			SetLocomotionMotion(EGGYGOLocomotionMotionType::WalkRun, Candidate);
+			bool bFinished = false;
+			if (!IsCurrentMotionFinished(Candidate, bFinished, Error)) return Reject();
+			if (bFinished)
+			{
+				ResetTurnBack(Candidate);
+				SetLocomotionMotion(EGGYGOLocomotionMotionType::WalkRun, Candidate);
+			}
+			else
+			{
+				// 输入与轨迹已交还；原源时间继续到末端，残余 Yaw 由同一 CMC 区间消费。
+				if (!EvaluateLocomotionSource(DeltaSeconds, Candidate, Error)) return Reject();
+				CommitLocomotionCandidate(Candidate);
+				return true;
+			}
 		}
 	}
 	if (Candidate.TurnPhase == EGGYGOTurnBackPhase::None
@@ -3686,6 +3773,8 @@ void UGGYGOCharacterMovementComponent::UpdateFromCompressedFlags(uint8 Flags)
 
 void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 {
+	// RMS 已准备的同一区间由引擎在此函数之后旋转；包含 Finished 的最后贡献。
+	if (PrepareNativeMotionExecutionRotation()) return;
 	// The final PrepareRootMotion can mark Finished before this call. Retain the entry rotation for that tick.
 	if (ActionMotionExecution.HasOwnedSlot() || (IsMovingOnGround() && HasRegisteredActionCurveSource()))
 	{
@@ -3698,36 +3787,13 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 		EnforceGroundLocomotionAdmission(TEXT("PhysicsRotation"));
 		return;
 	}
-	// 转身的曲线接管段（Turning / Braking）朝向由 `RootMotion_Yaw` 曲线驱动。
-	//
-	// 在这里接管而不是在外部调 AddActorWorldRotation，是为了不与 CMC 的
-	// 自动朝向对齐（bOrientRotationToMovement）互相争夺 Yaw ——
-	// 绕过 Super 就等于这一帧只有曲线在转角色，不需要临时关掉那些开关再恢复。
-	//
-	// 累加增量而不是直接设成 `EntryYaw + YawTotal`：增量对入口朝向的误差不敏感，
-	// 模拟代理那边的入口朝向是个近似值，用绝对值会让它一进入转身就跳一下。
-	// 曲线的累计转角已解 ±180 折叠，所以差分不会出现一帧 358 度的假增量。
-	const bool bCanApplyLocalCurveYaw = CharacterOwner
-		&& CharacterOwner->GetLocalRole() != ROLE_SimulatedProxy;
-	if (bCanApplyLocalCurveYaw && IsTurnBackCurveDriven() && UpdatedComponent)
+	// 新源可能晚于引擎本帧的 RMS 快照挂接；等待原生 Prepare，不让普通转向改变其进入朝向。
+	if (HasPendingLocomotionCurveSource())
 	{
 		bLocomotionSteeringIntervalExcluded = true;
-		const float YawDelta = FMath::IsFinite(CurveMotion.YawDeltaDegrees)
-			? CurveMotion.YawDeltaDegrees
-			: 0.0f;
-
-		if (!FMath::IsNearlyZero(YawDelta))
-		{
-			FRotator NewRotation = UpdatedComponent->GetComponentRotation();
-			NewRotation.Yaw += YawDelta;
-
-			// 走 MoveUpdatedComponent 而不是直接设置变换：它会处理碰撞扫掠，
-			// 也让这次旋转进入 CMC 的移动更新记录，回放时结果一致。
-			MoveUpdatedComponent(FVector::ZeroVector, NewRotation.Quaternion(), /*bSweep=*/true);
-		}
-
 		return;
 	}
+	if (ApplyOrdinaryMotionCurveYaw()) return;
 
 	LocomotionSteeringRotationBudget.Reset();
 	if (CanExecuteOrdinaryLocomotionSteering() && Velocity.SizeSquared2D() > UE_KINDA_SMALL_NUMBER)
@@ -3748,6 +3814,10 @@ void UGGYGOCharacterMovementComponent::PhysicsRotation(float DeltaTime)
 
 void UGGYGOCharacterMovementComponent::ResetLocomotionSteeringObservation()
 {
+	MotionExecutionSnapshot = {};
+	PendingMotionExecution = {};
+	bMotionExecutionIntervalOpen = false;
+	bHasPendingMotionExecution = false;
 	if (LocomotionSteeringSourceEpoch != MAX_uint64) ++LocomotionSteeringSourceEpoch;
 	LocomotionSteeringSnapshot = {};
 	LocomotionSteeringSnapshot.OriginalMovement = this;
@@ -3788,6 +3858,7 @@ bool UGGYGOCharacterMovementComponent::CanExecuteOrdinaryLocomotionSteering() co
 		&& CharacterOwner->GetLocalRole() != ROLE_SimulatedProxy && HasMoveInput()
 		&& !ShouldRejectMovementInputGroundLocomotion() && !ShouldRejectUnownedCurveGroundLocomotion()
 		&& !HasActiveActionMotion() && !HasIndependentGroundRootMotion() && !IsTurnBackCurveDriven()
+		&& !HasPendingLocomotionCurveSource()
 		&& !CurrentRootMotion.HasOverrideVelocity() && !CurrentRootMotion.HasAdditiveVelocity()
 		&& !GetUnsupportedGroundRootMotionSource();
 }
@@ -3822,6 +3893,19 @@ void UGGYGOCharacterMovementComponent::OnMovementUpdated(
 	float DeltaSeconds, const FVector& OldLocation, const FVector& OldVelocity)
 {
 	Super::OnMovementUpdated(DeltaSeconds, OldLocation, OldVelocity);
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> CompletionSelf(this);
+	const TWeakObjectPtr<ACharacter> CompletionCharacter(CharacterOwner);
+	const TWeakObjectPtr<USceneComponent> CompletionComponent(UpdatedComponent.Get());
+	const bool bCompletedInterval = bMotionExecutionIntervalOpen;
+	CompleteMotionExecutionInterval(DeltaSeconds, OldLocation);
+	if (!CompletionSelf.IsValid() || IsBeingDestroyed() || CharacterOwner != CompletionCharacter.Get()
+		|| UpdatedComponent != CompletionComponent.Get()) return;
+	if (bCompletedInterval) CaptureRemoteMotionPoseCandidate();
+	ON_SCOPE_EXIT
+	{
+		if (UGGYGOCharacterMovementComponent* Self = CompletionSelf.Get())
+			if (!Self->IsBeingDestroyed()) Self->PublishMontageActionMotionCompletion();
+	};
 	// Historical prediction/correction never certifies a new live presentation sample.
 	if (!bLocomotionSteeringIntervalOpen || !CharacterOwner || CharacterOwner->bClientUpdating) return;
 	bLocomotionSteeringIntervalOpen = false;
@@ -3948,11 +4032,17 @@ FGGYGOLocomotionSteeringSnapshot UGGYGOCharacterMovementComponent::GetLocomotion
 
 EGGYGOTurnBackPhase UGGYGOCharacterMovementComponent::GetTurnBackPhase() const
 {
-	// 模拟代理没有本地解算的相位，只有复制来的一个 bool。
-	// 映射成 Turning 是因为动画层只判断 `!= None`，具体是哪一段它不关心。
+	// 模拟代理没有本地解算的相位；与姿态同出一条已接受的权威完成区间记录，避免独立 bool 与姿态错帧。
+	// 只有已认证的同条记录给出相位；未知或未认证不当作结束，也不当作转身。
 	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
 	{
-		return bReplicatedTurnBackCurveDriven ? EGGYGOTurnBackPhase::Turning : EGGYGOTurnBackPhase::None;
+		// Current/Held，以及本端动画源资格合法等待时保留的同段已认证相位（bSegmentFactsRetained），与快照一致；
+		// 它只是表现事实，不授予入场、新时间或执行。listen server 远端角色仍返回本 CMC 权威相位。
+		const FGGYGORemoteMotionPoseSnapshot Remote = GetRemoteMotionPoseSnapshot();
+		const bool bCertifiedSegment = Remote.Status == EGGYGORemoteMotionPoseStatus::Current
+			|| Remote.Status == EGGYGORemoteMotionPoseStatus::Held
+			|| (Remote.Status == EGGYGORemoteMotionPoseStatus::Awaiting && Remote.bSegmentFactsRetained);
+		return bCertifiedSegment ? Remote.TurnBackPhase : EGGYGOTurnBackPhase::None;
 	}
 
 	return TurnBackPhase;
@@ -3960,20 +4050,13 @@ EGGYGOTurnBackPhase UGGYGOCharacterMovementComponent::GetTurnBackPhase() const
 
 bool UGGYGOCharacterMovementComponent::IsTurnBackRunOut() const
 {
-	// 模拟代理恒为 false：复制过来的 bool 只表达"曲线是否在接管"，
-	// 而 RunOut 段的移动与普通移动一致，那一端不需要区分。
 	return GetTurnBackPhase() == EGGYGOTurnBackPhase::RunOut;
 }
 
 bool UGGYGOCharacterMovementComponent::IsTurnBackCurveDriven() const
 {
-	if (CharacterOwner && CharacterOwner->GetLocalRole() == ROLE_SimulatedProxy)
-	{
-		return bReplicatedTurnBackCurveDriven;
-	}
-
-	return TurnBackPhase == EGGYGOTurnBackPhase::Turning
-		|| TurnBackPhase == EGGYGOTurnBackPhase::Braking;
+	const EGGYGOTurnBackPhase Phase = GetTurnBackPhase();
+	return Phase == EGGYGOTurnBackPhase::Turning || Phase == EGGYGOTurnBackPhase::Braking;
 }
 
 void UGGYGOCharacterMovementComponent::ResetTurnBack()
@@ -3981,7 +4064,6 @@ void UGGYGOCharacterMovementComponent::ResetTurnBack()
 	TurnBackPhase = EGGYGOTurnBackPhase::None;
 	TurnBackElapsed = 0.0f;
 	TurnBackEntryYaw = 0.0f;
-	PublishCommittedTurnBackState();
 
 	// 不清 bTurnBackInputLatched：它的解闩条件是"输入离开反向阈值"，
 	// 而转身刚结束时玩家往往还按着同一个方向键。在这里清掉会让那个方向键

@@ -21,6 +21,9 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_ForceWalk, "InputTag.ForceWalk");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Attack_Light, "InputTag.Attack.Light");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Attack_Heavy, "InputTag.Attack.Heavy");
+	UE_DEFINE_GAMEPLAY_TAG(InputTag_Attack_Special, "InputTag.Attack.Special");
+	UE_DEFINE_GAMEPLAY_TAG(InputTag_Attack_ExSpecial, "InputTag.Attack.ExSpecial");
+	UE_DEFINE_GAMEPLAY_TAG(InputTag_Attack_Rush, "InputTag.Attack.Rush");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Dodge, "InputTag.Dodge");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Skill, "InputTag.Skill");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Ultimate, "InputTag.Ultimate");
@@ -109,6 +112,7 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage_SelfDestruct, "Gameplay.Damage.SelfDestruct");
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_Damage_FellOutOfWorld, "Gameplay.Damage.FellOutOfWorld");
 	UE_DEFINE_GAMEPLAY_TAG(Gameplay_PoiseDamage, "Gameplay.PoiseDamage");
+	UE_DEFINE_GAMEPLAY_TAG(DamageCalculation_AttackPowerMultiplier, "DamageCalculation.AttackPowerMultiplier");
 
 	// ===== 八、Cooldown =====
 	UE_DEFINE_GAMEPLAY_TAG(Cooldown_Evade, "Cooldown.Evade");
@@ -126,6 +130,8 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindow, "Event.Montage.ComboWindow");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindowBegin, "Event.Montage.ComboWindowBegin");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_ComboWindowEnd, "Event.Montage.ComboWindowEnd");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_FXWindowBegin, "Event.Montage.FXWindowBegin");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_FXWindowEnd, "Event.Montage.FXWindowEnd");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_CancelPoint, "Event.Montage.CancelPoint");
 	UE_DEFINE_GAMEPLAY_TAG(Event_HitConfirm, "Event.HitConfirm");
 
@@ -153,6 +159,7 @@ namespace GGYGOGameplayTags
 
 	// ===== 十三、SetByCaller =====
 	UE_DEFINE_GAMEPLAY_TAG(SetByCaller_Damage, "SetByCaller.Damage");
+	UE_DEFINE_GAMEPLAY_TAG(SetByCaller_DamageMultiplier, "SetByCaller.DamageMultiplier");
 	UE_DEFINE_GAMEPLAY_TAG(SetByCaller_Heal, "SetByCaller.Heal");
 	UE_DEFINE_GAMEPLAY_TAG(SetByCaller_PoiseDamage, "SetByCaller.PoiseDamage");
 	UE_DEFINE_GAMEPLAY_TAG(SetByCaller_StunDuration, "SetByCaller.StunDuration");

@@ -14,6 +14,8 @@
 
 #include "Character/Data/GGYGOMovementTypes.h"
 #include "Character/Data/GGYGOLocomotionSteeringTypes.h"
+#include "Character/Data/GGYGOMotionExecutionTypes.h"
+#include "Character/Data/GGYGORemoteMotionPoseTypes.h"
 #include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 #include "Character/Components/GGYGOActionMotionExecution.h"
 #include "Input/GGYGOMovementInputTypes.h"
@@ -100,6 +102,8 @@ struct FGGYGOCurveRootMotionOrigin
 	uint16 MotionSequence = 0;
 	TWeakObjectPtr<const UGGYGOMovementSet> MovementSet;
 	FGGYGOLocomotionSourceBindingPtr SourceBinding;
+	/** 原源准入时声明，RMS 位移结束不退休旋转合同；未准入值不提供 SourceYaw 权限。 */
+	EGGYGOMotionRotationMode RotationMode = EGGYGOMotionRotationMode::TranslationOnly;
 	float SourceTimeOrigin = 0.0f;
 	float MotionTimeOrigin = 0.0f;
 	float BaseYaw = 0.0f;
@@ -189,6 +193,8 @@ public:
 	virtual void OnMovementUpdated(float DeltaSeconds, const FVector& OldLocation, const FVector& OldVelocity) override;
 	virtual void ClientHandleMoveResponse(const FCharacterMoveResponseDataContainer& MoveResponse) override;
 	virtual bool ClientUpdatePositionAfterServerUpdate() override;
+	/** 原生样本呈现入口；先执行原生平滑，再只读记录该次样本键与变换供远端姿态配对。 */
+	virtual void SmoothCorrection(const FVector& OldLocation, const FQuat& OldRotation, const FVector& NewLocation, const FQuat& NewRotation) override;
 	virtual void ServerMove_PerformMovement(const FCharacterNetworkMoveData& MoveData) override;
 	virtual void MoveAutonomous(float ClientTimeStamp, float DeltaTime, uint8 CompressedFlags, const FVector& NewAccel) override;
 
@@ -302,6 +308,16 @@ public:
 
 	/** GT-only, original native interval qualification and lifecycle validation owned here. */
 	FGGYGOLocomotionSteeringSnapshot GetLocomotionSteeringSnapshot() const;
+	/** GT-only，原生平移／旋转结束后的完成区间；不是当前 pose 或执行许可。 */
+	FGGYGOMotionExecutionSnapshot GetMotionExecutionSnapshot() const;
+	/**
+	 * GT-only，远端观察端的权威完成区间姿态：SimulatedProxy，或 listen server 上由远端客户端控制的角色。
+	 * 其它角色返回 NotRemote，调用方继续使用 GetMotionExecutionSnapshot。
+	 * Current：可进入段并使用 SequenceSeconds；Held：只可保持已进入同段的 CertifiedSequenceSeconds；
+	 * bEnded 只来自原片自然末端，终点姿态不授予播放许可。listen server 调用方须取快照相位，
+	 * 本 CMC 的实时相位 getter 仍是权威执行值。不执行位移或 Yaw，不推进时间。
+	 */
+	FGGYGORemoteMotionPoseSnapshot GetRemoteMotionPoseSnapshot() const;
 
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	EGGYGOStopMotionType GetStopMotionType() const { return StopMotionType; }
@@ -329,19 +345,13 @@ public:
 	/**
 	 * 当前转身相位。
 	 *
-	 * 模拟代理上只区分"曲线是否正在接管移动"：相位的精确取值在本地控制端解算，
-	 * 复制给其它客户端的只有一个 bool，所以那里只能返回 `Turning` 或 `None`。
-	 * 动画层只判断是否 `None`，不区分具体相位，这个精度足够。
+	 * 本地执行端返回本 CMC 解算的相位。模拟代理返回已接受远端姿态记录中的权威完成区间相位，
+	 * 与 GetRemoteMotionPoseSnapshot 的姿态出自同一条记录；尚无记录或不在单 Sequence 段时为 `None`。
 	 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
 	EGGYGOTurnBackPhase GetTurnBackPhase() const;
 
-	/**
-	 * 转身是否已进入交还输入的 `RunOut` 段。
-	 *
-	 * 模拟代理恒为 false：那一端只知道"曲线是否在接管"，而 `RunOut` 段的移动
-	 * 与普通移动无异，模拟代理按普通移动表现即可，不需要这个标记。
-	 */
+	/** 转身是否已进入交还输入的 `RunOut` 段；模拟代理同样读取已接受远端记录的相位。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
 	bool IsTurnBackRunOut() const;
 
@@ -582,8 +592,15 @@ private:
 		bool bOnGround, bool bMoveInputRising, bool bBlockReleased, float DeltaSeconds, float& Timer) const;
 	void SetLocomotionMotion(EGGYGOLocomotionMotionType NewType, FLocomotionUpdateCandidate& Candidate) const;
 	bool UpdateWalkRunBlend(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
-	bool EvaluateLocomotionSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
-	bool EvaluateWalkRunSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError) const;
+	bool EvaluateLocomotionSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError);
+	bool EvaluateWalkRunSource(float DeltaSeconds, FLocomotionUpdateCandidate& Candidate, FString& OutError);
+	void BeginMotionExecutionInterval();
+	void PrepareOrdinaryMotionExecution(const FLocomotionUpdateCandidate& Candidate,
+		const FGGYGOLocomotionSourceBindingPtr& Binding, float StartTime, float EndTime,
+		float StartCycle = 0.0f, float EndCycle = 0.0f);
+	bool PrepareNativeMotionExecutionRotation();
+	bool ApplyOrdinaryMotionCurveYaw();
+	void CompleteMotionExecutionInterval(float DeltaSeconds, const FVector& OldLocation);
 	bool GetLocomotionSourceBinding(FGGYGOLocomotionSourceBindingPtr& OutBinding, FString& OutError,
 		bool bValidateSourceConfiguration = true) const;
 	bool IsLocomotionSourceBindingCurrent(const FGGYGOLocomotionSourceBindingPtr& Binding, FString& OutError,
@@ -603,8 +620,11 @@ private:
 	void RetireLocomotionCurveRootMotion();
 	/** Returns true only when this original interval was consumed, including an idempotent repeat. */
 	bool ConsumeLocomotionCurvePrepared(const TSharedPtr<const FGGYGOCurveRootMotionPrepared>& Prepared);
-	void PublishCommittedTurnBackState();
 	bool HasCurrentLocomotionCurveOrigin(const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin) const;
+	bool IsLocomotionCurveOriginForCandidate(const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin,
+		const FLocomotionUpdateCandidate& Candidate, const FGGYGOLocomotionSourceBindingPtr& SourceBinding) const;
+	/** 当前地面原源已挂接但未消费，只保留其旋转权，不代表已执行。 */
+	bool HasPendingLocomotionCurveSource() const;
 
 	/** Actual local resource ownership and bounded saved-move context; no held/FAILED/time authority. */
 	TSharedPtr<const FGGYGOCurveRootMotionOrigin> LocomotionCurveOrigin;
@@ -684,8 +704,120 @@ private:
 	void MarkNativeMovementVelocityResult();
 	void StoreNativeMovementVelocityResult();
 
+	/**
+	 * 远端姿态发布（authority，非 standalone）。候选只来自 OnMovementUpdated 内原完成区间；
+	 * 键在本 CMC 原生 Tick 返回后补上，仅当其后没有新的 PerformMovement 入口（入口序号相同）
+	 * 且胶囊仍等于原生写时间戳时的 LastUpdate 变换。不另建 Tick、计时器或时钟。
+	 */
+	struct FRemoteMotionPoseCandidate
+	{
+		FGGYGOMotionExecutionSnapshot Snapshot;
+		uint64 MoveEntrySerial = 0;
+		uint32 PublisherEpoch = 0;
+		bool bFinalized = false;
+	};
+	/** 决定原生时间戳来源与样本归属的发布端身份；任一变化即开启新 Epoch 并关闭旧段。 */
+	struct FRemoteMotionPoseOwnerIdentity
+	{
+		TWeakObjectPtr<ACharacter> Character;
+		TWeakObjectPtr<USceneComponent> Component;
+		TWeakObjectPtr<AController> Controller;
+		ENetRole LocalRole = ROLE_None;
+		ENetRole RemoteRole = ROLE_None;
+		bool operator==(const FRemoteMotionPoseOwnerIdentity& Other) const;
+	};
+	FRemoteMotionPoseOwnerIdentity CaptureRemoteMotionPoseOwnerIdentity() const;
+	TOptional<FRemoteMotionPoseOwnerIdentity> RemoteMotionPosePublisherIdentity;
+	uint32 RemoteMotionPosePublisherEpoch = 0;
+	/** 发布端身份变化时开启新 Epoch；返回 false 表示发布已关闭。 */
+	bool RefreshRemoteMotionPosePublisherIdentity();
+	struct FRemoteMotionPoseSegmentKey
+	{
+		uint64 ExecutionRequestSerial = 0;
+		uint16 MotionSequence = 0;
+		EGGYGOLocomotionMotionType MotionType = EGGYGOLocomotionMotionType::None;
+		FGGYGOLocomotionSourceBindingPtr Binding;
+		bool Matches(const FGGYGOMotionExecutionSnapshot& Snapshot) const;
+	};
+	TOptional<FRemoteMotionPoseCandidate> RemoteMotionPoseCandidate;
+	TOptional<FRemoteMotionPoseSegmentKey> RemoteMotionPoseSegment;
+	uint64 RemoteMotionPoseMoveEntrySerial = 0;
+	uint32 RemoteMotionPoseLastSegmentSerial = 0;
+	bool bRemoteMotionPosePublicationClosed = false;
+	bool bRemoteMotionPosePublisherDiagnosticReported = false;
+	bool IsRemoteMotionPosePublisher() const;
+	void CaptureRemoteMotionPoseCandidate();
+	void FinalizeRemoteMotionPosePublication();
+	void PublishRemoteMotionPoseRecord(FGGYGORemoteMotionPoseRecord Content);
+	/** 段资源在 move 之外退役（重置、换绑、组件替换、EndPlay）；只关闭未自然结束的已发布段。 */
+	void CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason Reason);
+	/** 本地 getter 与远端发布共用的原 Locomotion 请求/段/绑定成员资格；不含帧窗口与角色判断。 */
+	EGGYGOMotionExecutionStatus QualifyLocomotionExecutionMembership(
+		const FGGYGOMotionExecutionSnapshot& Snapshot, FString& OutError) const;
+
+	/**
+	 * 远端姿态观察端（SimulatedProxy 或 listen server 远端控制角色）。原生呈现样本只在
+	 * SmoothCorrection 实参被证明正是当前原生复制字段的呈现时可认证；不合成样本、不排序样本键。
+	 */
+	struct FRemoteMotionPoseNativeSample
+	{
+		uint64 EventSerial = 0;
+		float Key = 0.0f;
+		bool bCertifiable = false;
+		bool bRelativeTransform = false;
+		FVector Location = FVector::ZeroVector;
+		FRotator Rotation = FRotator::ZeroRotator;
+		float LocationTolerance = 0.0f;
+		float RotationTolerance = 0.0f;
+		FString Diagnostic;
+	};
+	struct FRemoteMotionPoseAccepted
+	{
+		FGGYGORemoteMotionPoseRecord Record;
+		/** 该记录配对到的原生呈现事件；与最新事件相同才是 Current。 */
+		uint64 MatchedEventSerial = 0;
+		EGGYGORemoteMotionPoseIdentity Identity = EGGYGORemoteMotionPoseIdentity::None;
+		FGGYGOLocomotionSourceBindingPtr Binding;
+		uint64 AcceptedFrame = 0;
+	};
+	enum class ERemoteMotionPoseSourceCheck : uint8 { Verified, Awaiting, Invalid };
+	TOptional<FGGYGORemoteMotionPoseRecord> RemoteMotionPosePending;
+	TOptional<FRemoteMotionPoseAccepted> RemoteMotionPoseAccepted;
+	/** 同 Epoch 同段、键不同的上一已配对样本，仅供原生 Linear 显示坐标插值。 */
+	TOptional<FRemoteMotionPoseAccepted> RemoteMotionPosePrevious;
+	FRemoteMotionPoseNativeSample RemoteMotionPoseNativeSample;
+	uint64 RemoteMotionPoseNativeEventSerial = 0;
+	TOptional<FRemoteMotionPoseOwnerIdentity> RemoteMotionPoseConsumerIdentity;
+	EGGYGORemoteMotionPoseWaitReason RemoteMotionPoseWaitReason = EGGYGORemoteMotionPoseWaitReason::None;
+	FString RemoteMotionPoseDiagnostic;
+	uint32 RemoteMotionPoseLastSeenSerial = 0;
+	bool bRemoteMotionPoseSeen = false;
+	bool IsRemoteMotionPoseConsumer() const;
+	/** 角色/组件/控制者/网络角色任一变化都清空观察端状态；返回 false 表示当前不是观察端。 */
+	bool EnsureRemoteMotionPoseConsumerIdentity();
+	void ResetRemoteMotionPoseConsumer();
+	void ReceiveRemoteMotionPoseRecord(const FGGYGORemoteMotionPoseRecord& Record);
+	void CaptureRemoteMotionPoseNativeSample(const FVector& NewLocation, const FQuat& NewRotation);
+	bool DoesRemoteMotionPoseMatchNativeSample(const FGGYGORemoteMotionPoseRecord& Record) const;
+	void TryAcceptRemoteMotionPose();
+	void RefreshRemoteMotionPoseConsumer();
+	/** 本端当前动画源与记录源身份比对；内容摘要重算，区分合法未就绪与已证明失败。 */
+	ERemoteMotionPoseSourceCheck VerifyRemoteMotionPoseSource(const FGGYGORemoteMotionPoseRecord& Record,
+		FGGYGOLocomotionSourceBindingPtr& OutBinding, EGGYGORemoteMotionPoseIdentity& OutIdentity,
+		EGGYGORemoteMotionPoseWaitReason& OutWait, FString& OutError) const;
+	/** 查询时的轻量资格：同一不可变发布、原生生命周期仍当前、配置未变；内容摘要由原生 Tick 重验。 */
+	ERemoteMotionPoseSourceCheck CheckRemoteMotionPoseBindingCurrent(const FRemoteMotionPoseAccepted& Accepted,
+		const FGGYGOLocomotionSequenceSource*& OutSource, EGGYGORemoteMotionPoseWaitReason& OutWait, FString& OutError) const;
+	UFUNCTION()
+	void OnRep_RemoteMotionPoseRecord();
+
 	/** Derived observation/scratch for the original native interval; never saved-move authority. */
 	FGGYGOLocomotionSteeringSnapshot LocomotionSteeringSnapshot;
+	mutable FGGYGOMotionExecutionSnapshot MotionExecutionSnapshot;
+	FGGYGOMotionExecutionSnapshot PendingMotionExecution;
+	uint64 MotionExecutionIntervalSerial = 0;
+	bool bMotionExecutionIntervalOpen = false;
+	bool bHasPendingMotionExecution = false;
 	TWeakObjectPtr<const UGGYGOMovementSet> LocomotionSteeringOriginalSet;
 	FGGYGOLocomotionSourceBindingPtr LocomotionSteeringOriginalSource;
 	uint64 LocomotionSteeringSourceEpoch = 1;
@@ -800,7 +932,7 @@ protected:
 	 *
 	 * 这两段合成一个判定是因为它们的移动行为完全一致：方向都取曲线在入口坐标系里的
 	 * 值，朝向都由转角增量累加。区别只在转角还在不在变，而那是表现层的事。
-	 * 网络侧也只需要同步这一个事实，所以压缩标志位只发一个 bit。
+	 * 模拟代理经 GetTurnBackPhase 读取已认证远端姿态记录的相位。
 	 */
 	bool IsTurnBackCurveDriven() const;
 
@@ -866,17 +998,11 @@ protected:
 	float TurnBackEntryYaw = 0.0f;
 
 	/**
-	 * "曲线正在接管转身"的复制标志。
-	 *
-	 * SavedMove / MoveData 只在"客户端→服务器"方向传递，不会转发给其它客户端，
-	 * 所以模拟代理无法从那条路径得知转身状态。服务器按自身动画源解算后写入本属性，
-	 * 再由属性复制发给其它客户端。
-	 *
-	 * 只复制这一个 bool 而不是完整相位：`Turning` 与 `Braking` 的移动行为一致，
-	 * `RunOut` 的移动与普通移动一致，所以三个相位对接收端只有两种含义。
+	 * 权威完成区间的远端姿态记录（COND_SimulatedOnly）。只由 authority 在原生 Tick 返回后写入；
+	 * 观察端只在同键原生样本到达后接受，listen server 远端控制角色在本地直接走同一接受路径。
 	 */
-	UPROPERTY(Replicated)
-	bool bReplicatedTurnBackCurveDriven = false;
+	UPROPERTY(ReplicatedUsing = OnRep_RemoteMotionPoseRecord)
+	FGGYGORemoteMotionPoseRecord RemoteMotionPoseRecord;
 
 	/**
 	 * 本帧的曲线运动量。

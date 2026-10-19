@@ -4,7 +4,8 @@
 //
 // root motion 曲线不在这里烘焙。那部分由 AAADocs/Scripts 下的 Python 管线完成：
 // 逐帧数据从各动作 FBX 的外部 Root 节点提取，标量设置来自 AnimeStudio 导出的 per-clip JSON。
-// 曲线名的运行时唯一定义在 GGYGOAnimCurveSampler.cpp 的 GGYGOAnimCurveNames 里。
+// 运行时按名读取这些曲线的位置：走跑／起停／转身见 Character/Data/GGYGOLocomotionEvaluation.cpp，
+// 动作位移见 Character/Data/GGYGOActionMotionEvaluation.cpp。
 #pragma once
 
 #include "CoreMinimal.h"

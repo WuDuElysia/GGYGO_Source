@@ -69,9 +69,10 @@ public:
 	/**
 	 * 伤害的载体 GE。
 	 *
-	 * 需要配一个用 `SetByCaller.Damage` 传数值、Execution 为
-	 * `GGYGODamageExecution` 的即时 GE。选择共享配置的伤害来源
-	 * 通过 SetByCaller 与源角色的 CombatSet 表达差异。
+	 * 需要配置使用 `GGYGODamageExecution` 的即时 GE。攻击力乘各段倍率时，
+	 * 在 Executions[].PassedInTags 显式配置 `DamageCalculation.AttackPowerMultiplier`，
+	 * 调用方写独立的 `SetByCaller.DamageMultiplier`；攻击力来自命中 Spec 的 CombatSet 捕获。
+	 * 绝对伤害键 `SetByCaller.Damage` 与该模式互斥；自毁使用独立载体配置。
 	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Damage")
 	TSoftClassPtr<UGameplayEffect> DamageGameplayEffect_SetByCaller;

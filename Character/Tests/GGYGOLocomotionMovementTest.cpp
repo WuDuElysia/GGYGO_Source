@@ -19,6 +19,8 @@ AGGYGOLocomotionTestCharacter::AGGYGOLocomotionTestCharacter(const FObjectInitia
 	: Super(ObjectInitializer.SetDefaultSubobjectClass<UGGYGOLocomotionTestMovementComponent>(
 		ACharacter::CharacterMovementComponentName))
 {
+	// 测试角色遵守原曲线由 CMC 独占 Yaw 的入口前置。
+	bUseControllerRotationYaw = false;
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -553,15 +555,15 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	CommitMove->SetTestAcceleration(-CommitCharacter->GetActorForwardVector());
 	CommitMove->SetTestGait(EGGYGOGait::Run);
 	CommitMove->StageTestMotion(0.016f, true, EGGYGOGait::Run);
-	if (!TestTrue(TEXT("Stage preserves the uncommitted phase and published flag"),
-		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None && !CommitMove->GetPublishedTurnBackForTest())) return false;
+	if (!TestTrue(TEXT("Stage preserves the uncommitted phase"),
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None)) return false;
 	CommitMove->CurrentRootMotion.PrepareRootMotion(0.016f, *CommitCharacter, *CommitMove, true);
 	if (!TestTrue(TEXT("Actual native TurnBack commit publishes the authority phase"),
-		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::Turning && CommitMove->GetPublishedTurnBackForTest())) return false;
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::Turning)) return false;
 	CommitMove->SetMovementMode(MOVE_Falling);
 	CommitMove->UpdateCharacterStateBeforeMovement(0.016f);
-	if (!TestTrue(TEXT("Normal ground exit clears the committed TurnBack publication"),
-		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None && !CommitMove->GetPublishedTurnBackForTest())) return false;
+	if (!TestTrue(TEXT("Normal ground exit clears the committed TurnBack phase"),
+		CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None)) return false;
 
 	// Invalidate the exact input at a real curve-read boundary, after Prepare's initial admission checks.
 	CommitMove->SetMovementMode(MOVE_Walking);
@@ -583,8 +585,193 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	if (!TestTrue(TEXT("Consumer rejection cannot publish sampled output as success"),
 		bClosedAtRead && RejectedResult == EGGYGOCurveRootMotionPrepareResult::Stale
 			&& !RejectedPrepared.IsValid() && !CommitError.IsEmpty()
-			&& CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None
-			&& !CommitMove->GetPublishedTurnBackForTest())) return false;
+			&& CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None)) return false;
+
+	// 原 pending 已失效时，旧组中的退役源不能阻挡后继请求的普通转向。
+	FLocomotionMovementConsumerFixture SuccessorSource(*this, CommitMove, TEXT("pending 退役后的后继"));
+	if (!SuccessorSource.Bind() || !SuccessorSource.StartFreshRequest(TEXT("后继普通转向"))) return false;
+	CommitMove->bRunPhysicsWithNoController = true;
+	CommitMove->SetTestAcceleration(FVector(0.0, 2048.0, 0.0));
+	const float SuccessorEntryYaw = CommitCharacter->GetActorRotation().Yaw;
+	CommitMove->PhysicsRotation(0.152633f);
+	if (!TestTrue(TEXT("退役 pending 不占后继的普通旋转权"),
+		FMath::Abs(FMath::FindDeltaAngleDegrees(SuccessorEntryYaw, CommitCharacter->GetActorRotation().Yaw)) > 1.0f
+			&& CommitMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None)) return false;
+	if (!SuccessorSource.Close()) return false;
+
+	// 复用原消费者夹具，但执行真实 PerformMovement；不手动 Prepare 来掩盖首次挂接的等待区间。
+	AActor* PendingFloorOwner = World->SpawnActor<AActor>();
+	AGGYGOLocomotionTestCharacter* PendingCharacter = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
+	if (!TestNotNull(TEXT("pending 原生地面"), PendingFloorOwner)
+		|| !TestNotNull(TEXT("pending 原生角色"), PendingCharacter)) return false;
+	UBoxComponent* PendingFloor = NewObject<UBoxComponent>(PendingFloorOwner);
+	PendingFloorOwner->SetRootComponent(PendingFloor);
+	PendingFloor->SetBoxExtent(FVector(10000.0, 10000.0, 20.0));
+	PendingFloor->SetCollisionProfileName(TEXT("BlockAll"));
+	PendingFloor->RegisterComponent();
+	const FVector PendingFloorOrigin(20000.0, 0.0, 0.0);
+	PendingFloor->SetWorldLocation(PendingFloorOrigin - FVector(0.0, 0.0, 20.0));
+	PendingCharacter->SetActorLocation(PendingFloorOrigin + FVector(0.0, 0.0,
+		PendingCharacter->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() + 2.15));
+	auto* PendingMove = CastChecked<UGGYGOLocomotionTestMovementComponent>(PendingCharacter->GetCharacterMovement());
+	PendingMove->SetComponentTickEnabled(false);
+	PendingMove->SetUpdatedComponent(PendingCharacter->GetCapsuleComponent());
+	PendingMove->SetMovementMode(MOVE_Falling);
+	PendingMove->SetMovementMode(MOVE_Walking);
+	PendingMove->bRunPhysicsWithNoController = true;
+	UGGYGOMovementSet* PendingSet = DuplicateObject<UGGYGOMovementSet>(FirstSet, PendingCharacter);
+	PendingSet->WalkToRunHoldSeconds = 0.1f; // 使用合法阈值，先经原生持续输入再升 Run。
+	PendingSet->WalkRunBlendInterpSpeed = 0.0f;
+	PendingSet->bEnableLocomotionSteering = true;
+	FRichCurve* PendingResponse = PendingSet->SteeringAngleResponse.GetRichCurve();
+	PendingResponse->SetKeyInterpMode(PendingResponse->AddKey(0.0f, 0.0f), RCIM_Linear);
+	PendingResponse->SetKeyInterpMode(PendingResponse->AddKey(180.0f, 1.0f), RCIM_Linear);
+	if (!TestTrue(TEXT("pending 原生配置真实绑定"), BindMovementFixture(PendingMove, PendingSet))) return false;
+	FLocomotionMovementConsumerFixture PendingSource(*this, PendingMove, TEXT("低帧率 pending 原源"));
+	if (!PendingSource.Bind() || !PendingSource.StartFreshRequest(TEXT("原生直行起步"))) return false;
+	PendingMove->MoveAutonomous(0.0f, 0.4f, 0, FVector(2048.0, 0.0, 0.0));
+	// 首帧输入沿会清零计时；再经一次原生移动跨过合法 Hold 阈值。
+	PendingMove->MoveAutonomous(0.4f, 0.4f, 0, FVector(2048.0, 0.0, 0.0));
+	if (!TestTrue(TEXT("原生起步已有真实 Run 与速度"),
+		PendingMove->IsMovingOnGround() && PendingMove->GetResolvedGait() == EGGYGOGait::Run
+			&& PendingMove->Velocity.X > 0.0)) return false;
+	const FQuat PendingEntryRotation = PendingCharacter->GetActorQuat();
+	const FVector ReverseAcceleration = -PendingCharacter->GetActorForwardVector() * 2048.0;
+	PendingMove->MoveAutonomous(0.8f, 0.152633f, 0, ReverseAcceleration);
+	const auto PendingNativeSource = PendingMove->GetRootMotionSource(TEXT("GGYGO.CurveTurnBack"));
+	if (!TestTrue(TEXT("首次反向已挂原源但尚未准备，不发布相位或额外转向"),
+		PendingNativeSource.IsValid()
+			&& PendingNativeSource->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct()
+			&& !PendingNativeSource->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared)
+			&& PendingMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None
+			&& PendingCharacter->GetActorQuat().Equals(PendingEntryRotation, 0.001)
+			&& PendingMove->GetLocomotionSteeringSnapshot().Status != EGGYGOLocomotionSteeringStatus::Valid
+			&& (PendingMove->GetMotionExecutionSnapshot().Status != EGGYGOMotionExecutionStatus::Valid
+				|| PendingMove->GetMotionExecutionSnapshot().MotionType != EGGYGOLocomotionMotionType::TurnBack))) return false;
+	const auto PendingOrigin = static_cast<const FRootMotionSource_GGYGOCurve&>(*PendingNativeSource).Origin;
+	if (!TestTrue(TEXT("首次挂接源保留真实 Origin"), PendingOrigin.IsValid())) return false;
+	float NativeTime = 0.952633f;
+	float LastMotionEnd = 0.0f;
+	float TotalNativeYaw = 0.0f;
+	uint64 LastInterval = 0;
+	int32 NativeTurnIntervals = 0;
+	bool bSourceCompleted = false;
+	for (int32 Step = 0; Step < 6 && !bSourceCompleted; ++Step)
+	{
+		PendingMove->MoveAutonomous(NativeTime, 0.4f, 0, ReverseAcceleration);
+		NativeTime += 0.4f;
+		const auto Completed = PendingMove->GetMotionExecutionSnapshot();
+		if (!TestTrue(TEXT("后续只能消费原源真实 Prepare 区间"),
+			Completed.Status == EGGYGOMotionExecutionStatus::Valid
+				&& Completed.SourceKind == EGGYGOMotionExecutionSource::Locomotion
+				&& Completed.MotionType == EGGYGOLocomotionMotionType::TurnBack
+				&& Completed.OriginalLocomotionOrigin == PendingOrigin
+				&& Completed.ExecutionRequestSerial == PendingOrigin->ExecutionRequestSerial
+				&& Completed.CompletedIntervalSerial > LastInterval
+				&& FMath::IsNearlyEqual(Completed.MotionStartSeconds, LastMotionEnd, 0.0001f))) return false;
+		LastInterval = Completed.CompletedIntervalSerial;
+		LastMotionEnd = Completed.MotionEndSeconds;
+		TotalNativeYaw += Completed.RequestedYawDeltaDegrees;
+		++NativeTurnIntervals;
+		bSourceCompleted = Completed.bEnded;
+		if (bSourceCompleted && !TestEqual(TEXT("原动画源完成理由"),
+			Completed.EndReason, EGGYGOMotionExecutionEndReason::Completed)) return false;
+	}
+	if (!TestTrue(TEXT("原 D0 从零、后续区间完整执行一次全部 Yaw 并保留末朝向"),
+		bSourceCompleted && NativeTurnIntervals >= 2 && FMath::IsNearlyEqual(TotalNativeYaw, 180.0f, 0.01f)
+			&& PendingCharacter->GetActorQuat().Equals(
+				FRotator(0.0f, TotalNativeYaw, 0.0f).Quaternion() * PendingEntryRotation, 0.001))) return false;
+	if (!PendingSource.Close()) return false;
+
+	// 复现真实交接：原 Yaw 已转完而原 Sequence 仍有零 Yaw 尾段，RMS 先结束位移。
+	AGGYGOLocomotionTestCharacter* HandoffCharacter = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
+	if (!TestNotNull(TEXT("RunOut 交接原角色"), HandoffCharacter)) return false;
+	HandoffCharacter->SetActorLocation(PendingFloorOrigin + FVector(0.0, 1000.0,
+		HandoffCharacter->GetCapsuleComponent()->GetScaledCapsuleHalfHeight() + 2.15));
+	auto* HandoffMove = CastChecked<UGGYGOLocomotionTestMovementComponent>(HandoffCharacter->GetCharacterMovement());
+	HandoffMove->SetComponentTickEnabled(false);
+	HandoffMove->SetUpdatedComponent(HandoffCharacter->GetCapsuleComponent());
+	HandoffMove->SetMovementMode(MOVE_Falling);
+	HandoffMove->SetMovementMode(MOVE_Walking);
+	HandoffMove->bRunPhysicsWithNoController = true;
+	UGGYGOMovementSet* HandoffSet = DuplicateObject<UGGYGOMovementSet>(PendingSet, HandoffCharacter);
+	UGGYGOLocomotionMotionProfile* HandoffProfile = DuplicateObject<UGGYGOLocomotionMotionProfile>(
+		PendingSet->TurnBackProfile, HandoffSet);
+	HandoffSet->TurnBackProfile = HandoffProfile;
+	HandoffProfile->SpeedCurve.GetRichCurve()->Reset();
+	HandoffProfile->DirectionXCurve.GetRichCurve()->Reset();
+	HandoffProfile->YawCurve.GetRichCurve()->Reset();
+	const FKeyHandle SlowSpeed = HandoffProfile->SpeedCurve.GetRichCurve()->AddKey(0.0f, 10.0f);
+	HandoffProfile->SpeedCurve.GetRichCurve()->SetKeyInterpMode(SlowSpeed, RCIM_Constant);
+	HandoffProfile->SpeedCurve.GetRichCurve()->AddKey(0.55f, 200.0f);
+	HandoffProfile->SpeedCurve.GetRichCurve()->AddKey(1.0f, 200.0f);
+	const FKeyHandle ForwardDirection = HandoffProfile->DirectionXCurve.GetRichCurve()->AddKey(0.0f, 1.0f);
+	HandoffProfile->DirectionXCurve.GetRichCurve()->SetKeyInterpMode(ForwardDirection, RCIM_Constant);
+	HandoffProfile->DirectionXCurve.GetRichCurve()->AddKey(0.55f, -1.0f);
+	HandoffProfile->DirectionXCurve.GetRichCurve()->AddKey(1.0f, -1.0f);
+	FRichCurve* HandoffYaw = HandoffProfile->YawCurve.GetRichCurve();
+	HandoffYaw->SetKeyInterpMode(HandoffYaw->AddKey(0.0f, 0.0f), RCIM_Linear);
+	HandoffYaw->SetKeyInterpMode(HandoffYaw->AddKey(0.3f, 180.0f), RCIM_Linear);
+	HandoffYaw->AddKey(1.0f, 180.0f);
+	if (!TestTrue(TEXT("RunOut 交接合法原配置"), BindMovementFixture(HandoffMove, HandoffSet))) return false;
+	FLocomotionMovementConsumerFixture HandoffSource(*this, HandoffMove, TEXT("RunOut 原源交接"));
+	if (!HandoffSource.Bind() || !HandoffSource.StartFreshRequest(TEXT("RunOut 原生直行准备"))) return false;
+	HandoffMove->MoveAutonomous(0.0f, 0.4f, 0, FVector(2048.0, 0.0, 0.0));
+	HandoffMove->MoveAutonomous(0.4f, 0.4f, 0, FVector(2048.0, 0.0, 0.0));
+	if (!TestTrue(TEXT("RunOut 交接前真实 Run"), HandoffMove->IsMovingOnGround()
+		&& HandoffMove->GetResolvedGait() == EGGYGOGait::Run && HandoffMove->Velocity.X > 0.0)) return false;
+	const FVector HandoffReverse = -HandoffCharacter->GetActorForwardVector() * 2048.0;
+	constexpr float HandoffDelta = 0.0217521f;
+	float HandoffTime = 0.8f;
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, HandoffReverse);
+	HandoffTime += HandoffDelta;
+	const auto HandoffNative = HandoffMove->GetRootMotionSource(TEXT("GGYGO.CurveTurnBack"));
+	if (!TestTrue(TEXT("RunOut 挂接原原生源"), HandoffNative.IsValid()
+		&& HandoffNative->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct())) return false;
+	const auto HandoffOrigin = static_cast<const FRootMotionSource_GGYGOCurve&>(*HandoffNative).Origin;
+	bool bSawNativeExit = false, bSawOwnedZeroTail = false, bSawFreeTrajectory = false, bSawSourceEnd = false;
+	float HandoffTotalYaw = 0.0f;
+	for (int32 Step = 0; Step < 64 && !bSawSourceEnd; ++Step)
+	{
+		HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, HandoffReverse);
+		HandoffTime += HandoffDelta;
+		const auto Completed = HandoffMove->GetMotionExecutionSnapshot();
+		if (!TestTrue(TEXT("RunOut 原源区间完整旋转合同"), Completed.Status == EGGYGOMotionExecutionStatus::Valid
+			&& Completed.OriginalLocomotionOrigin == HandoffOrigin
+			&& Completed.RotationMode == EGGYGOMotionRotationMode::SourceYaw && Completed.bCurveYawApplied
+			&& Completed.RotationAfter.Equals(FRotator(0.0f, Completed.RequestedYawDeltaDegrees, 0.0f).Quaternion()
+				* Completed.RotationBefore, 1.e-4))) return false;
+		HandoffTotalYaw += Completed.RequestedYawDeltaDegrees;
+		if (Completed.bNativeSourceFinished && !Completed.bEnded)
+		{
+			bSawNativeExit = true;
+			if (!TestTrue(TEXT("RMS 退出保原正向小动量，未伪造反向速度"), HandoffMove->Velocity.X > 0.0
+				&& HandoffMove->Velocity.Size2D() < 20.0)) return false;
+		}
+		if (bSawNativeExit && !Completed.bHasNativeSourceInterval && !Completed.bEnded)
+		{
+			bSawOwnedZeroTail = true;
+			if (!TestTrue(TEXT("原源零 Yaw 尾段不让普通朝向改写"), Completed.RequestedYawDeltaDegrees == 0.0f
+				&& Completed.RotationAfter.Equals(Completed.RotationBefore, 1.e-4))) return false;
+			bSawFreeTrajectory |= FMath::Abs(HandoffMove->Velocity.Y) > 1.0;
+		}
+		bSawSourceEnd = Completed.bEnded;
+		if (bSawSourceEnd && !TestEqual(TEXT("完整原源终点仍为 Completed"),
+			Completed.EndReason, EGGYGOMotionExecutionEndReason::Completed)) return false;
+	}
+	if (!TestTrue(TEXT("RMS 与整源寿命分开、RunOut 轨迹仍自由且原 Yaw 完整"),
+		bSawNativeExit && bSawOwnedZeroTail && bSawFreeTrajectory && bSawSourceEnd
+			&& FMath::IsNearlyEqual(HandoffTotalYaw, 180.0f, 0.01f))) return false;
+	const float HandoffEndYaw = HandoffCharacter->GetActorRotation().Yaw;
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, FVector(0.0, 2048.0, 0.0));
+	const auto Successor = HandoffMove->GetMotionExecutionSnapshot();
+	if (!TestTrue(TEXT("原源结束后才由已准入普通转向接回"),
+		Successor.Status == EGGYGOMotionExecutionStatus::Valid
+			&& Successor.RotationMode == EGGYGOMotionRotationMode::TranslationOnly
+			&& !Successor.OriginalLocomotionOrigin.IsValid() && !Successor.bCurveYawApplied
+			&& HandoffMove->GetLocomotionSteeringSnapshot().Status == EGGYGOLocomotionSteeringStatus::Valid
+			&& FMath::Abs(FMath::FindDeltaAngleDegrees(HandoffEndYaw, HandoffCharacter->GetActorRotation().Yaw)) > 1.0f)) return false;
+	if (!HandoffSource.Close()) return false;
 
 	return true;
 }

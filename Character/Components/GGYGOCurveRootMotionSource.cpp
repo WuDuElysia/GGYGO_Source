@@ -96,7 +96,8 @@ void FRootMotionSource_GGYGOCurve::PrepareRootMotion(
 	{
 		check(Result.IsValid());
 		Prepared = Result;
-		RootMotionParams.Set(FTransform(Result->OverrideVelocity));
+		// 同一个 Prepared 同时携带平移与 Yaw；原生 CMC 在一次区间末执行旋转。
+		RootMotionParams.Set(FTransform(FRotator(0.0f, Result->Sample.YawDeltaDegrees, 0.0f).Quaternion(), Result->OverrideVelocity));
 		SetTime(Result->NativeEndTime);
 		if (Disposition == EGGYGOCurveRootMotionPrepareResult::Finished)
 		{

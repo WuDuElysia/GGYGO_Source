@@ -24,7 +24,7 @@
  */
 struct FGGYGODamageStatics
 {
-	/** 攻击方的基础伤害输出。Snapshot=true：取施加 GE 那一刻的值。 */
+	/** 攻击方的伤害输出；Snapshot=true，在创建本次 Spec 时捕获。 */
 	FGameplayEffectAttributeCaptureDefinition BaseDamageDef;
 
 	/** 攻击方的基础削韧输出。 */
@@ -32,12 +32,8 @@ struct FGGYGODamageStatics
 
 	FGGYGODamageStatics()
 	{
-		// Source + bSnapshot=true 的含义：在 GE **创建**时就把攻击力记下来。
-		//
-		// 这一点对动作游戏很关键：攻击判定与伤害落地之间有若干帧
-		// （动画的判定窗口），期间攻击方的 Buff 可能已经结束。
-		// 用快照保证"挥刀那一刻的攻击力"决定这次伤害，
-		// 而不是"命中那一刻"—— 后者会让玩家感觉 Buff 白吃了。
+		// Source + Snapshot 在创建 Spec 时冻结攻击力及当时生效的 Buff。
+		// 共享命中 Builder 在每次命中回调内创建新 Spec，各段消费各自命中时的捕获值。
 		BaseDamageDef = FGameplayEffectAttributeCaptureDefinition(
 			UGGYGOCombatSet::GetBaseDamageAttribute(),
 			EGameplayEffectAttributeCaptureSource::Source,
@@ -58,6 +54,8 @@ static const FGGYGODamageStatics& DamageStatics()
 
 UGGYGODamageExecution::UGGYGODamageExecution()
 {
+	// 由 GE 的原生 Execution 配置显式选择伤害输入模式。
+	bRequiresPassedInTags = true;
 	RelevantAttributesToCapture.Add(DamageStatics().BaseDamageDef);
 	RelevantAttributesToCapture.Add(DamageStatics().BasePoiseDamageDef);
 }
@@ -118,7 +116,55 @@ void UGGYGODamageExecution::Execute_Implementation(const FGameplayEffectCustomEx
 		Result.bValid = true;
 		return Result;
 	};
-	const FBaseInputResult DamageInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_Damage, DamageStatics().BaseDamageDef);
+	const bool bMultiplierMode = ExecutionParams.GetPassedInTags().HasTagExact(
+		GGYGOGameplayTags::DamageCalculation_AttackPowerMultiplier);
+	const float* DamageMultiplier = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_DamageMultiplier);
+	FBaseInputResult DamageInput;
+	if (!bMultiplierMode && !DamageMultiplier)
+	{
+		DamageInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_Damage, DamageStatics().BaseDamageDef);
+	}
+	else
+	{
+		DamageInput.Source = TEXT("AttackPowerMultiplier");
+		DamageInput.bHasValue = DamageMultiplier != nullptr;
+		if (DamageMultiplier) { DamageInput.Value = *DamageMultiplier; }
+		if (Spec.SetByCallerTagMagnitudes.Contains(GGYGOGameplayTags::SetByCaller_Damage))
+		{
+			DamageInput.Reason = TEXT("conflicting-absolute-damage");
+		}
+		else if (!bMultiplierMode)
+		{
+			DamageInput.Reason = TEXT("multiplier-mode-not-selected");
+		}
+		else if (!DamageMultiplier)
+		{
+			DamageInput.Reason = TEXT("required-multiplier-missing");
+		}
+		else if (!FMath::IsFinite(*DamageMultiplier))
+		{
+			DamageInput.Reason = TEXT("non-finite-multiplier");
+		}
+		else if (*DamageMultiplier < 0.0f)
+		{
+			DamageInput.Reason = TEXT("negative-multiplier");
+		}
+		else
+		{
+			// 绝对键已拒绝，此处只消费原生攻击力捕获，保持合法负捕获的最终非负钳制。
+			DamageInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_Damage, DamageStatics().BaseDamageDef);
+			DamageInput.Source = TEXT("CapturedAttribute*SetByCallerMultiplier");
+			if (DamageInput.bValid)
+			{
+				DamageInput.Value *= *DamageMultiplier;
+				if (!FMath::IsFinite(DamageInput.Value))
+				{
+					DamageInput.bValid = false;
+					DamageInput.Reason = TEXT("non-finite-product");
+				}
+			}
+		}
+	}
 	const FBaseInputResult PoiseInput = ResolveBaseInput(GGYGOGameplayTags::SetByCaller_PoiseDamage, DamageStatics().BasePoiseDamageDef);
 	if (!DamageInput.bValid || !PoiseInput.bValid)
 	{

@@ -3,23 +3,27 @@
  * @brief 项目 ASC 实现
  */
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+
 #include "AbilitySystem/GGYGOAttributeCalculation.h"
+#include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "AbilitySystem/GGYGOAbilityTagRelationshipMapping.h"
+#include "AbilitySystem/Groups/GGYGOAbilityGroupConfig.h"
 #include "AbilitySystem/Private/GGYGOAvatarBindingProtocol.h"
+#include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
+#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
+#include "System/GGYGOGameplayTags.h"
+
 #include "Animation/AnimInstance.h"
 #include "GameFramework/MovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameplayEffect.h"
 #include "GameplayEffectAggregator.h"
 
-#include "AbilitySystem/GGYGOAbilitySystemLog.h"
-#include "AbilitySystem/GGYGOAbilityTagRelationshipMapping.h"
-#include "AbilitySystem/Groups/GGYGOAbilityGroupConfig.h"
-#include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "Misc/ScopeExit.h"
+#include "Net/UnrealNetwork.h"
 #include "GameFramework/Pawn.h"
-#include "System/GGYGOGameplayTags.h"
 #include "Templates/UnrealTemplate.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilitySystemComponent)
@@ -34,16 +38,6 @@ namespace
 		return Kind == EGGYGOAvatarBindingKind::Clear
 			|| Kind == EGGYGOAvatarBindingKind::CancelAbilities
 			|| Kind == EGGYGOAvatarBindingKind::RemoveGameplayCues;
-	}
-
-	// History may be the never-issued Bootstrap value; compare all fields, never infer issuance.
-	bool HasSameAvatarBindingContextValue(const FGGYGOAvatarBindingContext& First,
-		const FGGYGOAvatarBindingContext& Second)
-	{
-		return First.Binding.Serial == Second.Binding.Serial
-			&& First.Binding.Issuer.HasSameIndexAndSerialNumber(Second.Binding.Issuer)
-			&& First.LastActorInfoWrite.Serial == Second.LastActorInfoWrite.Serial
-			&& First.LastActorInfoWrite.Issuer.HasSameIndexAndSerialNumber(Second.LastActorInfoWrite.Issuer);
 	}
 
 	/** End/cancel evidence for this stack call, including same-instance reactivation with a zero key. */
@@ -350,15 +344,34 @@ bool UGGYGOAbilitySystemComponent::IsSpecUnderNativeAbilityCleanup(FGameplayAbil
 
 void UGGYGOAbilitySystemComponent::DestroyActiveState()
 {
+	ExecuteWithMontageFXRetirement([&]() { DestroyActiveStateWithRetirementOutput(); });
+}
+
+void UGGYGOAbilitySystemComponent::DestroyActiveStateWithRetirementOutput()
+{
 	FScopedAvatarBindingNativeWrite NativeWrite(this);
 	FScopedNativeAbilityCleanup Cleanup(this, ENativeAbilityCleanupSource::DestroyActiveState);
+	for (const auto& Target : Cleanup.Targets)
+	{
+		if (Target.Activation.HasActivation()) { GetMontageFXRetirementOutput()->Add(Target.Activation); }
+	}
 	Super::DestroyActiveState();
 }
 
 void UGGYGOAbilitySystemComponent::OnRemoveAbility(FGameplayAbilitySpec& AbilitySpec)
 {
+	ExecuteWithMontageFXRetirement([&]() { RemoveAbilityWithRetirementOutput(AbilitySpec); });
+}
+
+void UGGYGOAbilitySystemComponent::RemoveAbilityWithRetirementOutput(FGameplayAbilitySpec& AbilitySpec)
+{
 	FScopedAvatarBindingNativeWrite NativeWrite(this);
 	FScopedNativeAbilityCleanup Cleanup(this, ENativeAbilityCleanupSource::SpecRemoval, &AbilitySpec);
+	// 删除通知早于原生容器实际移除；ScopeLock 拒绝 End 也不能遗失已捕获原资源的归还义务。
+	for (const auto& Target : Cleanup.Targets)
+	{
+		if (Target.Activation.HasActivation()) { GetMontageFXRetirementOutput()->Add(Target.Activation); }
+	}
 	Super::OnRemoveAbility(AbilitySpec);
 }
 
@@ -596,11 +609,175 @@ void UGGYGOAbilitySystemComponent::OnRep_ReplicatedAnimMontage()
 	if (OriginalASC.IsValid()) { ReconcileMontagePlaybackOwnership(); }
 }
 
+UGGYGOAbilitySystemComponent::FScopedMontageFXRetirementOutput::FScopedMontageFXRetirementOutput(
+	UGGYGOAbilitySystemComponent* InASC, TArray<FGGYGOAbilityActivationHandle>& InActivations,
+	TArray<FGGYGOMontageFXCloseObligation>& InObligations)
+	: ASC(InASC), Previous(InASC->MontageFXRetirementOutput), Activations(InActivations), Obligations(InObligations)
+{
+	InASC->MontageFXRetirementOutput = this;
+}
+UGGYGOAbilitySystemComponent::FScopedMontageFXRetirementOutput::~FScopedMontageFXRetirementOutput()
+{
+	if (UGGYGOAbilitySystemComponent* Original = ASC.GetEvenIfUnreachable())
+	{
+		check(Original->MontageFXRetirementOutput == this);
+		Original->MontageFXRetirementOutput = Previous;
+	}
+}
+TArray<FGGYGOAbilityActivationHandle>* UGGYGOAbilitySystemComponent::GetMontageFXRetirementOutput()
+{
+	if (MontageFXRetirementOutput) { return &MontageFXRetirementOutput->Activations; }
+	return ControlledAbilityActivationCall ? ControlledAbilityActivationCall->RetiredActivationsOutput : nullptr;
+}
+TArray<FGGYGOMontageFXCloseObligation>* UGGYGOAbilitySystemComponent::GetMontageFXCloseOutput()
+{
+	if (MontageFXRetirementOutput) { return &MontageFXRetirementOutput->Obligations; }
+	return ControlledAbilityActivationCall ? ControlledAbilityActivationCall->FXCloseOutput : nullptr;
+}
+void UGGYGOAbilitySystemComponent::ExecuteWithMontageFXRetirement(TFunctionRef<void()> Action)
+{
+	check(IsInGameThread());
+	TArray<FGGYGOAbilityActivationHandle> OwnActivations;
+	TArray<FGGYGOMontageFXCloseObligation> OwnObligations;
+	auto* ActivationOutput = GetMontageFXRetirementOutput();
+	auto* CloseOutput = GetMontageFXCloseOutput();
+	check((ActivationOutput == nullptr) == (CloseOutput == nullptr));
+	TArray<FGGYGOAbilityActivationHandle>& Activations = ActivationOutput ? *ActivationOutput : OwnActivations;
+	TArray<FGGYGOMontageFXCloseObligation>& Obligations = CloseOutput ? *CloseOutput : OwnObligations;
+	const TWeakObjectPtr<ThisClass> OriginalASC(this);
+	{
+		FScopedMontageFXRetirementOutput OutputScope(this, Activations, Obligations);
+		Action();
+	}
+	if (!ActivationOutput)
+	{
+		if (UGGYGOAbilitySystemComponent* ASC = OriginalASC.GetEvenIfUnreachable())
+		{
+			ASC->PrepareMontageFXRetirements(OwnActivations, OwnObligations);
+			ASC->PrepareInvalidMontageFXSources(OwnObligations);
+		}
+		DispatchMontageFXRetirements(OwnObligations);
+	}
+}
+
+void UGGYGOAbilitySystemComponent::GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const
+{
+	Super::GetLifetimeReplicatedProps(OutLifetimeProps);
+	DOREPLIFETIME_CONDITION_NOTIFY(UGGYGOAbilitySystemComponent, MontageFXState, COND_None, REPNOTIFY_Always);
+}
+
+void UGGYGOAbilitySystemComponent::OnRegister()
+{
+	const TWeakObjectPtr<ThisClass> OriginalASC(this);
+	Super::OnRegister();
+	UGGYGOAbilitySystemComponent* ASC = OriginalASC.Get();
+	if (!ASC || !ASC->IsRegistered()) { return; }
+	if (!ASC->MontageFXPublicationOwner)
+	{
+		UGGYGOMontageFXPublicationOwner* Owner = UGGYGOMontageFXPublicationOwner::RegisterHost(ASC, ASC->MontageFXState,
+			FGGYGOMontageFXSendTerminal::CreateUObject(ASC, &ThisClass::SendMontageFXTerminal));
+		ASC = OriginalASC.Get();
+		if (!ASC || !ASC->IsRegistered()) { return; }
+		ASC->MontageFXPublicationOwner = Owner;
+	}
+	if (UGGYGOMontageFXPublicationOwner* Owner = ASC->MontageFXPublicationOwner) { Owner->ReceiveState(); }
+}
+
+void UGGYGOAbilitySystemComponent::OnRep_MontageFXState()
+{
+	if (UGGYGOMontageFXPublicationOwner* Owner = MontageFXPublicationOwner) { Owner->ReceiveState(); }
+}
+
+void UGGYGOAbilitySystemComponent::SendMontageFXTerminal(const FGGYGOMontageFXTerminal& Terminal)
+{
+	if (IsOwnerActorAuthoritative()) { MulticastMontageFXTerminal(Terminal); }
+}
+
+void UGGYGOAbilitySystemComponent::MulticastMontageFXTerminal_Implementation(const FGGYGOMontageFXTerminal& Terminal)
+{
+	if (UGGYGOMontageFXPublicationOwner* Owner = MontageFXState.LocalOwner) { Owner->ReceiveTerminal(Terminal); }
+}
+
+bool UGGYGOAbilitySystemComponent::TryPublishMontageFX(UGGYGOGameplayAbility* OriginalAbility,
+	const FGGYGOAbilityActivationHandle& OriginalActivation,
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask, const FGGYGOMontageWindowFact& BeginFact,
+	const FGGYGOMontageFXRecord& Request, FGGYGOMontageFXLease& OutLease, FString& OutDiagnostic)
+{
+	OutLease = {};
+	OutDiagnostic.Reset();
+	if (!IsInGameThread() || !IsRegistered() || !IsOwnerActorAuthoritative() || !IsValid(OriginalAbility)
+		|| OriginalAbility->GetAbilitySystemComponentFromActorInfo() != this
+		|| !OriginalAbility->CaptureCurrentActivation().HasSameActivation(OriginalActivation)
+		|| !IsValid(OriginalTask) || OriginalTask->GetTaskOwner() != OriginalAbility
+		|| !OriginalTask->IsOriginalMontageWindowFact(BeginFact)
+		|| BeginFact.Phase != EGGYGOMontageWindowPhase::Begin
+		|| BeginFact.Mesh != Request.Mesh || !IsValid(BeginFact.Mesh) || !IsValid(Request.Avatar)
+		|| BeginFact.Mesh->GetOwner() != Request.Avatar
+		|| OriginalAbility->GetAvatarActorFromActorInfo() != Request.Avatar || !MontageFXPublicationOwner)
+	{
+		OutDiagnostic = TEXT("Montage FX 发布缺少权威原 ASC/GA/Task 的同步 Begin 来源。");
+		return false;
+	}
+	FGGYGOMontageFXRecord Record = Request;
+	Record.BeginServerTime = BeginFact.DispatchWorldTimeSeconds;
+	return MontageFXPublicationOwner->Begin(OriginalActivation.GetResourceIdentity(), Record, OutLease, OutDiagnostic);
+}
+
+void UGGYGOAbilitySystemComponent::PrepareMontageFXRetirements(
+	const TArray<FGGYGOAbilityActivationHandle>& Originals, TArray<FGGYGOMontageFXCloseObligation>& OutObligations)
+{
+	UGGYGOMontageFXPublicationOwner* Owner = MontageFXState.LocalOwner.Get();
+	if (!Owner) { return; }
+	for (const auto& Original : Originals)
+	{
+		if (Original.HasActivation())
+		{
+			Owner->PrepareCloseSource(Original.GetResourceIdentity(),
+				EGGYGOMontageFXCloseReason::Abort, OutObligations);
+		}
+	}
+}
+
+void UGGYGOAbilitySystemComponent::DispatchMontageFXRetirements(TArray<FGGYGOMontageFXCloseObligation>& Obligations)
+{
+	TArray<FGGYGOMontageFXCloseObligation> OwnObligations = MoveTemp(Obligations);
+	for (auto& Obligation : OwnObligations)
+	{
+		if (UGGYGOMontageFXPublicationOwner* Owner = Obligation.GetIssuer())
+		{
+			if (!Owner->DispatchClose(MoveTemp(Obligation)))
+			{
+				UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("Montage FX 原关闭义务未能通过原签发者派发。"));
+			}
+		}
+	}
+}
+
+void UGGYGOAbilitySystemComponent::PrepareInvalidMontageFXSources(
+	TArray<FGGYGOMontageFXCloseObligation>& OutObligations)
+{
+	UGGYGOMontageFXPublicationOwner* Owner = MontageFXState.LocalOwner.Get();
+	if (!Owner) { return; }
+	TArray<TSharedPtr<const void>> Sources;
+	Owner->GetSourceIdentities(Sources);
+	for (const auto& Source : Sources)
+	{
+		if (!UGGYGOGameplayAbility::IsPublicationSourceCurrent(this, Source))
+		{
+			Owner->PrepareCloseSource(Source, EGGYGOMontageFXCloseReason::Abort, OutObligations);
+		}
+	}
+}
+
 void UGGYGOAbilitySystemComponent::OnUnregister()
 {
 	check(IsInGameThread());
+	TStrongObjectPtr<UGGYGOMontageFXPublicationOwner> OriginalOwner(MontageFXState.LocalOwner.Get());
+	const uint64 OriginalRegistration = OriginalOwner.IsValid() ? OriginalOwner->GetRegistrationSerial() : 0;
+	MontageFXPublicationOwner = nullptr;
 	RetireMontagePlaybackOwnership();
 	Super::OnUnregister();
+	if (OriginalOwner.IsValid()) { OriginalOwner->Shutdown(OriginalRegistration); }
 }
 
 FGGYGOAbilityMontagePlaybackResult UGGYGOAbilitySystemComponent::TryPlayMontageWithOwnership(
@@ -667,6 +844,11 @@ FGGYGOAbilityMontagePlaybackResult UGGYGOAbilitySystemComponent::TryPlayMontageW
 }
 
 void UGGYGOAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AActor* InAvatarActor)
+{
+	ExecuteWithMontageFXRetirement([&]() { InitActorInfoWithRetirementOutput(InOwnerActor, InAvatarActor); });
+}
+
+void UGGYGOAbilitySystemComponent::InitActorInfoWithRetirementOutput(AActor* InOwnerActor, AActor* InAvatarActor)
 {
 	check(IsInGameThread());
 	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
@@ -749,6 +931,11 @@ void UGGYGOAbilitySystemComponent::InitAbilityActorInfo(AActor* InOwnerActor, AA
 
 void UGGYGOAbilitySystemComponent::ClearActorInfo()
 {
+	ExecuteWithMontageFXRetirement([&]() { ClearActorInfoWithRetirementOutput(); });
+}
+
+void UGGYGOAbilitySystemComponent::ClearActorInfoWithRetirementOutput()
+{
 	check(IsInGameThread());
 	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
 	{
@@ -773,6 +960,11 @@ void UGGYGOAbilitySystemComponent::ClearActorInfo()
 }
 
 void UGGYGOAbilitySystemComponent::RefreshAbilityActorInfo()
+{
+	ExecuteWithMontageFXRetirement([&]() { RefreshActorInfoWithRetirementOutput(); });
+}
+
+void UGGYGOAbilitySystemComponent::RefreshActorInfoWithRetirementOutput()
 {
 	check(IsInGameThread());
 	if (IsAvatarBindingNativeWriteBusy() || AvatarSwitchAbilityExitScope)
@@ -1013,13 +1205,16 @@ UGGYGOAbilitySystemComponent::FScopedControlledAbilityActivationCall::FScopedCon
 	: ASC(InASC), Call(&InCall)
 {
 	check(IsInGameThread());
+	InCall.RetiredActivationsOutput = InASC->GetMontageFXRetirementOutput();
+	InCall.FXCloseOutput = InASC->GetMontageFXCloseOutput();
+	check(InCall.RetiredActivationsOutput && InCall.FXCloseOutput);
 	InCall.Previous = InASC->ControlledAbilityActivationCall;
 	InASC->ControlledAbilityActivationCall = &InCall;
 }
 
 UGGYGOAbilitySystemComponent::FScopedControlledAbilityActivationCall::~FScopedControlledAbilityActivationCall()
 {
-	if (UGGYGOAbilitySystemComponent* OriginalASC = ASC.Get())
+	if (UGGYGOAbilitySystemComponent* OriginalASC = ASC.GetEvenIfUnreachable())
 	{
 		check(OriginalASC->ControlledAbilityActivationCall == Call);
 		OriginalASC->ControlledAbilityActivationCall = Call->Previous;
@@ -1035,7 +1230,7 @@ UGGYGOAbilitySystemComponent::FScopedControlledAbilityActivationCall::~FScopedCo
 		{
 			UGGYGOGameplayAbility::FailOriginalTermination(Record, EGGYGOAbilityTerminationReason::InvalidASC);
 		}
-		UGGYGOGameplayAbility::TryCompleteOriginalTermination(Record);
+		UGGYGOGameplayAbility::TryCompleteOriginalTermination(Record, *Call->RetiredActivationsOutput);
 	}
 }
 
@@ -1064,11 +1259,12 @@ FGGYGOAbilityTerminationCompletedEvent& UGGYGOAbilitySystemComponent::OnAbilityT
 }
 
 void UGGYGOAbilitySystemComponent::TryPublishOriginalTerminationCompleted(
-	const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record)
+	const TSharedPtr<UGGYGOGameplayAbility::FOriginalTerminationRecord>& Record, TArray<FGGYGOAbilityActivationHandle>& RetiredActivations)
 {
 	check(IsInGameThread());
 	if (!Record.IsValid() || Record->bSealed || Record->ASC.Get() != this
 		|| Record->Outcome == EGGYGOAbilityTerminationOutcome::Failed || Record->bHasNativeCleanupSource
+		|| !Record->bRequiresCompletion
 		|| Record->OpenDispatches != 0 || Record->OpenTryCalls != 0 || Record->bContinuationQueued || Record->bContinuationReady
 		|| !Record->bNativeEndObserved || !Record->bNativeEndReturned || !Record->bFullEndReturned
 		|| (Record->Context.GetRequestKind() == EGGYGOAbilityTerminationRequestKind::Cancel && !Record->bCancelReturned))
@@ -1092,9 +1288,9 @@ void UGGYGOAbilitySystemComponent::TryPublishOriginalTerminationCompleted(
 	{
 		if (Ability->CurrentControlledActivation.HasSameActivation(Record->Context.GetOriginalActivation()))
 		{
-			Ability->RetireControlledActivation();
+			Ability->RetireControlledActivation(RetiredActivations);
 		}
-		if (Ability->OriginalTermination == Record) { Ability->OriginalTermination.Reset(); }
+		Ability->ReleaseOriginalTermination(Record);
 	}
 	AbilityTerminationCompletedEvent.Broadcast(Notice); // No original state writes after callbacks.
 }
@@ -1120,7 +1316,7 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 		|| !ValidateAvatarBindingActualSnapshot(Actual, SnapshotReason)
 		|| !Actual.Source.OwnerActor.IsValid() || !Actual.Source.AvatarActor.IsValid()
 		|| !HasSameAvatarBindingActualSnapshot(Call.OriginalActual, Actual)
-		|| !HasSameAvatarBindingContextValue(Call.OriginalContext, GetAvatarBindingContext()))
+		|| !Call.OriginalContext.HasSameValue(GetAvatarBindingContext()))
 	{
 		return EReason::InvalidActorInfo;
 	}
@@ -1129,9 +1325,11 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 		const UGGYGOGameplayAbility* Primary = Cast<UGGYGOGameplayAbility>(Spec->GetPrimaryInstance());
 		if (Primary && Primary->IsControlledActivationTerminationBusy()) { return EReason::TerminationInProgress; }
 		if (Primary && Primary->IsActive()) { return EReason::SameInstanceRetrigger; }
+		if (Spec->ActiveCount != 0) { return EReason::SameInstanceRetrigger; }
 		for (const FControlledAbilityActivationCall* Parent = Call.Previous; Parent; Parent = Parent->Previous)
 		{
-			if (Parent->Handle == Call.Handle && Parent->SpecAbility == Call.SpecAbility)
+			if (Parent->Handle == Call.Handle && Parent->SpecAbility == Call.SpecAbility
+				&& (!Primary || !Primary->HasOriginalNativeEnd(Parent->OriginalActivation)))
 			{
 				return EReason::MissingActivationBoundary;
 			}
@@ -1142,6 +1340,14 @@ EGGYGOAbilityActivationRequestReason UGGYGOAbilitySystemComponent::CheckControll
 }
 
 FGGYGOAbilityActivationRequestResult UGGYGOAbilitySystemComponent::TryActivateAbilityWithTerminationBoundary(
+	FGameplayAbilitySpecHandle Handle, bool bAllowRemoteActivation)
+{
+	FGGYGOAbilityActivationRequestResult Result;
+	ExecuteWithMontageFXRetirement([&]() { Result = ActivateAbilityWithRetirementOutput(Handle, bAllowRemoteActivation); });
+	return Result;
+}
+
+FGGYGOAbilityActivationRequestResult UGGYGOAbilitySystemComponent::ActivateAbilityWithRetirementOutput(
 	FGameplayAbilitySpecHandle Handle, bool bAllowRemoteActivation)
 {
 	check(IsInGameThread());
@@ -1264,22 +1470,29 @@ bool UGGYGOAbilitySystemComponent::CompleteControlledAbilityActivationEvaluation
 }
 
 void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
-	FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability)
+	FGameplayAbilitySpecHandle Handle, UGGYGOGameplayAbility* Ability, TArray<FGGYGOAbilityActivationHandle>& RetiredActivations)
 {
 	// This is the actual native PreActivate notification, before public activation listeners.
 	// GA alone issues the identity; a controlled Try supplies only its outer return provenance.
 	// The preceding lease cannot authenticate a later native activation, including
 	// an unsupported raw entry that bypassed admission and fails to issue a new one.
+	if (Ability->NativeCleanupActivation.HasActivation()) { RetiredActivations.Add(MoveTemp(Ability->NativeCleanupActivation)); }
 	Ability->NativeCleanupActivation = {};
 	if (Ability->IsControlledActivationTerminationBusy())
 	{
-		Ability->InvalidateOriginalTerminationForActivation();
+		Ability->InvalidateOriginalTerminationForActivation(RetiredActivations);
 		UE_LOG(LogGGYGOAbilitySystem, Error,
 			TEXT("AbilitySystem native activation ASC [%s] Spec [%s] Instance [%s] rejected: original lifecycle is still busy; raw entry bypassed admission."),
 			*GetPathName(), *Handle.ToString(), *GetPathNameSafe(Ability));
 		return;
 	}
-	Ability->RetireControlledActivation();
+	// 旧记录仍由原调用栈／原 continuation 持有，只撤下当前资源入口；不改旧历史或完成时点。
+	if (Ability->OriginalTermination.IsValid()
+		&& Ability->HasOriginalNativeEnd(Ability->OriginalTermination->Context.GetOriginalActivation()))
+	{
+		Ability->OriginalTermination.Reset();
+	}
+	Ability->RetireControlledActivation(RetiredActivations);
 	FControlledAbilityActivationCall* Call = ControlledAbilityActivationCall;
 	const bool bMatchesCall = Call && Call->Handle == Handle && !Call->bLocalWitnessSeen;
 	FActualAvatarBindingActorInfoSnapshot Actual;
@@ -1291,7 +1504,7 @@ void UGGYGOAbilitySystemComponent::ObserveControlledAbilityActivation(
 		&& Call->Failure == EGGYGOAbilityActivationRequestReason::None
 		&& Spec && Spec->Ability.Get() == Call->SpecAbility.Get()
 		&& bHasActual && HasSameAvatarBindingActualSnapshot(Call->OriginalActual, Actual)
-		&& HasSameAvatarBindingContextValue(Call->OriginalContext, GetAvatarBindingContext());
+		&& Call->OriginalContext.HasSameValue(GetAvatarBindingContext());
 	EGGYGOAbilityActivationRequestReason IssueReason = EGGYGOAbilityActivationRequestReason::InvalidActorInfo;
 	const FGGYGOAbilityActivationHandle Original = bHasActual
 		? Ability->IssueControlledActivation(this, Handle, Actual.Allocation.Get(), bHasTryBoundary, IssueReason)
@@ -1363,17 +1576,6 @@ void UGGYGOAbilitySystemComponent::CancelAbilitiesByFunc(TShouldCancelAbilityFun
 			}
 		}
 	}
-}
-
-void UGGYGOAbilitySystemComponent::CancelInputActivatedAbilities(bool bReplicateCancelAbility)
-{
-	auto ShouldCancelFunc = [](const UGGYGOGameplayAbility* Ability, FGameplayAbilitySpecHandle Handle)
-	{
-		const EGGYGOAbilityActivationPolicy Policy = Ability->GetActivationPolicy();
-		return (Policy == EGGYGOAbilityActivationPolicy::OnInputTriggered) || (Policy == EGGYGOAbilityActivationPolicy::WhileInputActive);
-	};
-
-	CancelAbilitiesByFunc(ShouldCancelFunc, bReplicateCancelAbility);
 }
 
 FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::MakeAbilityInputRequestFailure(
@@ -2561,9 +2763,15 @@ bool UGGYGOAbilitySystemComponent::HasActiveAbilityMatching(TShouldCancelAbility
 
 void UGGYGOAbilitySystemComponent::NotifyAbilityActivated(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability)
 {
+	ExecuteWithMontageFXRetirement([&]() { NotifyAbilityActivatedWithRetirementOutput(Handle, Ability); });
+}
+
+void UGGYGOAbilitySystemComponent::NotifyAbilityActivatedWithRetirementOutput(const FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability)
+{
+	TArray<FGGYGOAbilityActivationHandle>& RetiredActivations = *GetMontageFXRetirementOutput();
 	if (UGGYGOGameplayAbility* GGYGOAbility = Cast<UGGYGOGameplayAbility>(Ability))
 	{
-		ObserveControlledAbilityActivation(Handle, GGYGOAbility);
+		ObserveControlledAbilityActivation(Handle, GGYGOAbility, RetiredActivations);
 		GGYGOAbility->BeginAbilityGroupAdmissionAttempt(AllocateAbilityGroupAdmissionSequence());
 		AddAbilityToActivationGroup(GGYGOAbility);
 	}
@@ -2650,11 +2858,17 @@ void UGGYGOAbilitySystemComponent::NotifyAbilityFailed(const FGameplayAbilitySpe
 
 void UGGYGOAbilitySystemComponent::NotifyAbilityEnded(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled)
 {
+	ExecuteWithMontageFXRetirement([&]() { NotifyAbilityEndedWithRetirementOutput(Handle, Ability, bWasCancelled); });
+}
+
+void UGGYGOAbilitySystemComponent::NotifyAbilityEndedWithRetirementOutput(FGameplayAbilitySpecHandle Handle, UGameplayAbility* Ability, bool bWasCancelled)
+{
+	TArray<FGGYGOAbilityActivationHandle>& RetiredActivations = *GetMontageFXRetirementOutput();
 	UGGYGOGameplayAbility* GGYGOAbility = Cast<UGGYGOGameplayAbility>(Ability);
 	if (GGYGOAbility)
 	{
 		GGYGOAbility->ObserveOriginalNativeEnd(this, Handle);
-		GGYGOAbility->RetireControlledActivationForNativeEnd(Handle);
+		GGYGOAbility->RetireControlledActivationForNativeEnd(Handle, RetiredActivations);
 	}
 	const FGameplayTag GroupTag = GGYGOAbility ? GGYGOAbility->GetGroupTag() : FGameplayTag();
 	const bool bRemovedLastAbilityInGroup = GGYGOAbility
@@ -3053,9 +3267,25 @@ EGGYGOAvatarBindingOutcome UGGYGOAbilitySystemComponent::CheckAvatarBindingClean
 
 bool UGGYGOAbilitySystemComponent::InvalidateAvatarBinding(
 	const FGGYGOAvatarBindingContext& Expected, EGGYGOAvatarBindingReason Reason,
-	EGGYGOAvatarBindingReason& OutRejectionReason)
+	EGGYGOAvatarBindingReason& OutRejectionReason, TArray<FGGYGOMontageFXCloseObligation>* OutRetirements)
 {
-	return AvatarBindingProtocol->InvalidateBinding(Expected, Reason, OutRejectionReason);
+	check(IsInGameThread());
+	if (!OutRetirements) { OutRetirements = GetMontageFXCloseOutput(); }
+	if (!OutRetirements)
+	{
+		const auto* Publication = MontageFXPublicationOwner ? MontageFXPublicationOwner.Get() : MontageFXState.LocalOwner.Get();
+		TArray<TSharedPtr<const void>> Sources;
+		if (Publication) { Publication->GetSourceIdentities(Sources); }
+		if (!Sources.IsEmpty())
+		{
+			OutRejectionReason = EGGYGOAvatarBindingReason::MissingRetirementOutput;
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("ASC [%s] 撤销存在表现资源的原绑定需要显式关闭义务输出。"), *GetPathName());
+			return false;
+		}
+	}
+	const bool bInvalidated = AvatarBindingProtocol->InvalidateBinding(Expected, Reason, OutRejectionReason);
+	if (bInvalidated && OutRetirements) { PrepareInvalidMontageFXSources(*OutRetirements); }
+	return bInvalidated;
 }
 
 bool UGGYGOAbilitySystemComponent::TryReserveAvatarBindingIdentityOperation(
@@ -3895,7 +4125,7 @@ bool UGGYGOAbilitySystemComponent::ValidateFailedAvatarActorInfoInitCleanupSourc
 		return false;
 	}
 	if (AvatarBindingProtocol->GetContext().LastActorInfoWrite.HasSameIdentity(Original->OriginalOperation)
-		|| !HasSameAvatarBindingContextValue(AvatarBindingProtocol->GetContext(), Original->Before)
+		|| !AvatarBindingProtocol->GetContext().HasSameValue(Original->Before)
 		|| (AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity()
 			&& !AvatarBindingProtocol->GetOperation().Identity.HasSameIdentity(Original->OriginalOperation)))
 	{
@@ -3938,6 +4168,15 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 	TFunction<bool()> IsOriginalCallerCurrent)
 {
 	FGGYGOAvatarBindingResult Result;
+	ExecuteWithMontageFXRetirement([&]() { Result = CleanupFailedInitWithRetirementOutput(OriginalOperation, MoveTemp(IsOriginalCallerCurrent)); });
+	return Result;
+}
+
+FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::CleanupFailedInitWithRetirementOutput(
+	const FGGYGOAvatarBindingOperationIdentity& OriginalOperation,
+	TFunction<bool()> IsOriginalCallerCurrent)
+{
+	FGGYGOAvatarBindingResult Result;
 	check(IsInGameThread());
 	if (!IsOriginalCallerCurrent)
 	{
@@ -3967,11 +4206,10 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 	}
 	Result.Before = Original->Before;
 	EGGYGOAvatarBindingReason Reason;
-	if (!ValidateFailedAvatarActorInfoInitCleanupSource(Original, Reason))
-	{
-		return MakeAvatarBindingExecutionFailure(Result, Reason);
-	}
-	FScopedAvatarBindingNativeWrite NativeWrite(this, OriginalOperation);
+	// 进入窗口只置本 ASC 的 Busy 标志，不改变凭证、Context、Operation 或实际 ActorInfo；
+	// 凭证来源校验在窗口内 CheckOriginal 首次执行。上方已拒绝存在待处理 Operation，
+	// 本作用域不持有任何 Operation，析构只归还 Busy。
+	FScopedAvatarBindingNativeWrite NativeWrite(this);
 	if (!NativeWrite.HasEntered())
 	{
 		return MakeAvatarBindingExecutionFailure(Result, EGGYGOAvatarBindingReason::NativeWriteBusy);
@@ -4036,7 +4274,7 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCleanupFailedAvatarAc
 		}
 		if (LiveASC->AvatarBindingProtocol->GetFailedInitCleanup().IsValid()
 			|| LiveASC->AvatarBindingProtocol->GetOperation().Identity.HasIssuedIdentity()
-			|| !HasSameAvatarBindingContextValue(LiveASC->AvatarBindingProtocol->GetContext(), Original->Before))
+			|| !LiveASC->AvatarBindingProtocol->GetContext().HasSameValue(Original->Before))
 		{
 			Reason = EGGYGOAvatarBindingReason::OperationInvalidated;
 			return false;
@@ -4091,6 +4329,15 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryReplaceRevokedAvatarA
 }
 
 FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTransaction(
+	const FGGYGOAvatarBindingRequest& Request, EAvatarBindingIdentityAdmission Admission,
+	FGGYGOAvatarBindingPublicationReceipt& OutPublication)
+{
+	FGGYGOAvatarBindingResult Result;
+	ExecuteWithMontageFXRetirement([&]() { Result = ExecuteActorInfoTransactionWithRetirementOutput(Request, Admission, OutPublication); });
+	return Result;
+}
+
+FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteActorInfoTransactionWithRetirementOutput(
 	const FGGYGOAvatarBindingRequest& Request, EAvatarBindingIdentityAdmission Admission,
 	FGGYGOAvatarBindingPublicationReceipt& OutPublication)
 {
@@ -4182,16 +4429,14 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::ExecuteAvatarActorInfoTr
 	{
 		return ReturnFailure(Reason);
 	}
+	// 以下两项都是本 ASC 的同步纯写入：关闭旧 Context 的发布记录，并在换 Avatar／Clear 时清空输入缓存。
+	// 二者都不外调；上面刚通过的 Operation 复核只读 Context／Operation／已提交来源，生产调用方谓词
+	// 只读 Host／Extension／Pawn 端点，均不读发布记录或输入缓存，因此这里直接进入原生写入。
 	ReleaseAvatarBindingPublicationForContext(Result.Before);
 	if (OriginalKind == EGGYGOAvatarBindingKind::Clear
 		|| !BeforeAvatar.HasSameIndexAndSerialNumber(AfterAvatar))
 	{
 		ClearAbilityInput();
-	}
-	// Input invalidation may invoke external listeners. Recheck before granting this native write.
-	if (!RecheckCallerAndOperation(/*bCheckBeforeActual=*/true))
-	{
-		return ReturnFailure(Reason);
 	}
 	// Only this pending operation keeps BeforeActual. Old committed cleanup rights end at the write.
 	RetireFailedAvatarActorInfoInitCleanup();
@@ -4819,6 +5064,17 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAb
 	TFunction<bool()> IsOriginalCallerCurrent)
 {
 	FGGYGOAvatarBindingResult Result;
+	ExecuteWithMontageFXRetirement([&]() { Result = CancelAvatarAbilitiesWithRetirementOutput(Expected, WithTags, WithoutTags, MoveTemp(IsOriginalCallerCurrent)); });
+	return Result;
+}
+
+FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::CancelAvatarAbilitiesWithRetirementOutput(
+	const FGGYGOAvatarBindingContext& Expected,
+	const FGameplayTagContainer* WithTags,
+	const FGameplayTagContainer* WithoutTags,
+	TFunction<bool()> IsOriginalCallerCurrent)
+{
+	FGGYGOAvatarBindingResult Result;
 	check(IsInGameThread());
 	// Existence only: the external query must run inside the native Busy window.
 	if (!IsOriginalCallerCurrent)
@@ -4912,6 +5168,15 @@ FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryCancelAvatarBindingAb
 }
 
 FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::TryRemoveAvatarBindingGameplayCues(
+	const FGGYGOAvatarBindingContext& Expected,
+	TFunction<bool()> IsOriginalCallerCurrent)
+{
+	FGGYGOAvatarBindingResult Result;
+	ExecuteWithMontageFXRetirement([&]() { Result = RemoveAvatarCuesWithRetirementOutput(Expected, MoveTemp(IsOriginalCallerCurrent)); });
+	return Result;
+}
+
+FGGYGOAvatarBindingResult UGGYGOAbilitySystemComponent::RemoveAvatarCuesWithRetirementOutput(
 	const FGGYGOAvatarBindingContext& Expected,
 	TFunction<bool()> IsOriginalCallerCurrent)
 {

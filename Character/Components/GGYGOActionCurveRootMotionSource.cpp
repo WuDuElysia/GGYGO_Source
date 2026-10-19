@@ -33,7 +33,7 @@ bool FRootMotionSource_GGYGOActionCurve::Matches(const FRootMotionSource* Other)
 	{
 		return OriginalBinding.IsValid() && Typed->OriginalBinding.IsValid()
 			&& OriginalBinding->HasSameConfiguration(*Typed->OriginalBinding)
-			&& MontageStartSeconds == Typed->MontageStartSeconds && PlayRate == Typed->PlayRate
+			&& RotationMode == Typed->RotationMode && MontageStartSeconds == Typed->MontageStartSeconds && PlayRate == Typed->PlayRate
 			&& Duration == Typed->Duration && EntryActorRotation == Typed->EntryActorRotation
 			&& TranslationScale == Typed->TranslationScale;
 	}
@@ -67,6 +67,8 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage)
 	{
 		bPreparedContributionConsumed = false;
+		bPreparedRotationConsumed = false;
+		PreparedSourceIntervals.Reset();
 		bPreparedNaturalEnd = false;
 		const auto Retire = [this]()
 		{
@@ -98,15 +100,15 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 			OriginalBinding->MontageEndSeconds);
 		const float To = FMath::Min(MontageStartSeconds + FMath::Clamp(GetTime() + SimulationTime, 0.0f, Duration) * PlayRate,
 			OriginalBinding->MontageEndSeconds);
-		FVector Delta;
-		if (!GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, From, To, Delta, Error))
+		FGGYGOActionMotionEvaluationResult Evaluation;
+		if (!GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, From, To, RotationMode, Evaluation, Error))
 		{
 			UE_LOG(LogRootMotion, Error, TEXT("%s"), *Error);
 			Retire();
 			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource, Error);
 			return;
 		}
-		const FVector WorldDelta = EntryActorRotation.RotateVector(Delta * TranslationScale);
+		const FVector WorldDelta = EntryActorRotation.RotateVector(Evaluation.Translation * TranslationScale);
 		const FVector OverrideVelocity = WorldDelta / MovementTickTime;
 		if (OverrideVelocity.ContainsNaN())
 		{
@@ -117,7 +119,24 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 				TEXT("[Movement.ActionMotion] scaled original position interval is not finite"));
 			return;
 		}
-		RootMotionParams.Set(FTransform(OverrideVelocity));
+		const float NativeEnd = GetTime() + SimulationTime;
+		if (!FMath::IsFinite(NativeEnd))
+		{
+			Retire();
+			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource,
+				TEXT("[Movement.ActionMotion] original native clock overflowed"));
+			return;
+		}
+		PreparedNativeStartSeconds = GetTime();
+		PreparedNativeEndSeconds = NativeEnd;
+		PreparedMontageStartSeconds = From;
+		PreparedMontageEndSeconds = To;
+		PreparedYawDeltaDegrees = Evaluation.YawDeltaDegrees;
+		PreparedSourceIntervals = MoveTemp(Evaluation.SourceIntervals);
+		// 原 XYZ 保持入口 Actor 基底，Yaw 是该 native 区间的增量，不能二次旋转轨迹。
+		const FQuat LocalYaw = FRotator(0.0f, PreparedYawDeltaDegrees, 0.0f).Quaternion();
+		const FQuat WorldYaw = EntryActorRotation * LocalYaw * EntryActorRotation.Inverse();
+		RootMotionParams.Set(FTransform(WorldYaw, OverrideVelocity));
 		SetTime(GetTime() + SimulationTime); // The only action clock, including zero-displacement intervals.
 		bPreparedNaturalEnd = To == OriginalBinding->MontageEndSeconds && GetTime() >= Duration;
 		return;
@@ -196,7 +215,12 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 	if (Ar.IsLoading())
 	{
 		OriginalResource.Reset(); OriginalBinding.Reset(); bNativeImported = false;
+		RotationMode = EGGYGOMotionRotationMode::TranslationOnly;
 		bPreparedContributionConsumed = false;
+		bPreparedRotationConsumed = false;
+		PreparedSourceIntervals.Reset();
+		PreparedNativeStartSeconds = PreparedNativeEndSeconds = 0.0f;
+		PreparedMontageStartSeconds = PreparedMontageEndSeconds = PreparedYawDeltaDegrees = 0.0f;
 		bPreparedNaturalEnd = false;
 	}
 	else if (static_cast<uint8>(SourceMode) > static_cast<uint8>(EGGYGOActionCurveSourceMode::OriginalMontage)) return false;
@@ -211,6 +235,14 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage)
 	{
 		Ar << EntryActorRotation << MontageStartSeconds;
+		uint8 Rotation = static_cast<uint8>(RotationMode);
+		if (Ar.IsSaving() && Rotation > static_cast<uint8>(EGGYGOMotionRotationMode::SourceYaw))
+		{
+			bOutSuccess = false;
+			return false;
+		}
+		Ar.SerializeBits(&Rotation, 1);
+		if (Ar.IsLoading()) RotationMode = static_cast<EGGYGOMotionRotationMode>(Rotation);
 		Ar << bCompletionRequested << bExplicitlyCancelled;
 		FGGYGOActionMotionSourceBinding Wire;
 		if (Ar.IsSaving())
@@ -256,10 +288,10 @@ bool FRootMotionSource_GGYGOActionCurve::NetSerialize(FArchive& Ar, UPackageMap*
 			OriginalResource.Reset();
 			OriginalBinding.Reset();
 			bNativeImported = true;
-			bPreparedContributionConsumed = false;
-			bPreparedNaturalEnd = false;
 			FString Error;
-			if (Ar.IsError() || !GGYGOActionMotionEvaluation::ValidateSource(Wire, Error))
+			EGGYGOMotionRotationMode ResolvedRotationMode;
+			if (Ar.IsError() || !GGYGOActionMotionEvaluation::ValidateSource(Wire, ResolvedRotationMode, Error)
+				|| RotationMode != ResolvedRotationMode)
 			{
 				bOutSuccess = false; return false;
 			}

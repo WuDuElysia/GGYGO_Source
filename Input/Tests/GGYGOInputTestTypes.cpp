@@ -33,7 +33,6 @@
 #if WITH_EDITOR
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
-#include "GameFramework/GameModeBase.h"
 #include "GameFramework/GameStateBase.h"
 #include "PlayInEditorDataTypes.h"
 #include "Settings/LevelEditorPlaySettings.h"
@@ -66,6 +65,12 @@ void UGGYGOInputTestGameInstance::Shutdown()
 void AGGYGOInputTestController::InitInputSystem()
 {
 	Super::InitInputSystem();
+}
+
+AGGYGOInputTestGameMode::AGGYGOInputTestGameMode(const FObjectInitializer& ObjectInitializer)
+	: Super(ObjectInitializer)
+{
+	PlayerControllerClass = AGGYGOInputTestController::StaticClass();
 }
 
 bool UGGYGOInputTestHeroComponent::HasAbilityInputAssociationForTest(const UGGYGOAbilitySystemComponent* ExpectedASC) const
@@ -192,10 +197,17 @@ UInputComponent* AGGYGOInputTestPawn::CreatePlayerInputComponent()
 	return NewObject<UGGYGOInputComponent>(this, NAME_None, RF_Transient);
 }
 
+bool AGGYGOInputTestPawn::EnableSourceMovementProbeForTest()
+{
+	if (InputComponent || bSourceMovementProbe) { return false; }
+	bSourceMovementProbe = true;
+	return true;
+}
+
 void AGGYGOInputTestPawn::SetupPlayerInputComponent(UInputComponent* PlayerInputComponent)
 {
 	Super::SetupPlayerInputComponent(PlayerInputComponent);
-	Hero->InitializePlayerInput(PlayerInputComponent);
+	if (!bSourceMovementProbe) { Hero->InitializePlayerInput(PlayerInputComponent); }
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -213,6 +225,9 @@ struct FGGYGOInputTestFixture::FState
 	TStrongObjectPtr<UGGYGOInputConfig> InputConfig;
 	TStrongObjectPtr<UGGYGOPawnData> PawnData;
 	TStrongObjectPtr<UGGYGOInputTestMappingContext> Mapping;
+	// 仅记录 Source 探针自己的一份注册，归还时不得作用于后继 PlayerInput。
+	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> NativeMappingSubsystem;
+	TWeakObjectPtr<UEnhancedPlayerInput> NativeMappingPlayerInput;
 	TStrongObjectPtr<UInputAction> MoveAction;
 	TStrongObjectPtr<UInputAction> LookAction;
 	TStrongObjectPtr<UInputAction> AbilityAction;
@@ -409,7 +424,7 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	State->AbilityAction->ValueType = EInputActionValueType::Boolean;
 	if (State->bNativeMovementOrigin)
 	{
-		// Define the fixture asset before setup; installation remains Hero's normal default Add.
+		// Source 探针通过原 Subsystem 的公开入口安装自己的 IMC，等待真实重建。
 		for (const FKey& Key : { EKeys::W, EKeys::A, EKeys::S, EKeys::D })
 		{
 			State->Mapping->MapKey(State->MoveAction.Get(), Key);
@@ -439,6 +454,9 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 
 	State->Pawn = State->World->SpawnActor<AGGYGOInputTestPawn>();
 	if (!Test.TestNotNull(TEXT("private Pawn"), State->Pawn)) { return false; }
+	if (State->bNativeMovementOrigin
+		&& !Test.TestTrue(TEXT("select Source probe ownership before the first input setup"),
+			State->Pawn->EnableSourceMovementProbeForTest())) { return false; }
 	FActorSpawnParameters HostSpawnParameters;
 	HostSpawnParameters.Owner = State->Controller;
 	State->AbilitySystemHost = State->World->SpawnActor<AGGYGOInputTestAbilitySystemHost>(HostSpawnParameters);
@@ -458,8 +476,8 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 			Test.AddError(SubscriptionError);
 			return false;
 		}
+		State->Pawn->GetHeroForTest()->ConfigureMappingForTest(State->Mapping.Get(), 0);
 	}
-	State->Pawn->GetHeroForTest()->ConfigureMappingForTest(State->Mapping.Get(), 0);
 	if (State->bNativeMovementOrigin
 		&& !Test.TestTrue(TEXT("observe only the original subsystem's actual rebuild notification"),
 			State->Pawn->GetHeroForTest()->ObserveNativeMappingRebuildForTest(GetInputSubsystem()))) { return false; }
@@ -481,11 +499,24 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	State->AbilitySystemHost->AttachAvatar(State->Pawn);
 	if (State->bNativeMovementOrigin)
 	{
-		// The source gate needs first normal setup, not the legacy fixture's second Hero init.
+		const TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> OriginalSubsystem(GetInputSubsystem());
+		const TWeakObjectPtr<UEnhancedPlayerInput> OriginalPlayerInput(GetPlayerInput());
+		if (!Test.TestTrue(TEXT("Source IMC registration uses the original native input route"),
+			OriginalSubsystem.IsValid() && OriginalPlayerInput.IsValid()
+			&& OriginalSubsystem->GetPlayerInput() == OriginalPlayerInput.Get())) { return false; }
+		// Add 会同步广播；先记录本次归还义务，不让 Hero 再创建另一份 Source Session。
+		State->NativeMappingSubsystem = OriginalSubsystem;
+		State->NativeMappingPlayerInput = OriginalPlayerInput;
+		OriginalSubsystem->AddMappingContext(State->Mapping.Get(), 0);
 		return RequireNativeMovementCold(Test, TEXT("fixture initialized/pending native rebuild"))
 			&& Test.TestTrue(TEXT("native source route ready, waiting for the actual mapping rebuild"),
-				State->Pawn->IsLocallyControlled() && GetInputSubsystem()->GetPlayerInput() == GetPlayerInput()
-				&& GetInputSubsystem()->HasMappingContext(State->Mapping.Get()));
+				OriginalSubsystem.IsValid() && OriginalPlayerInput.IsValid()
+				&& State->NativeMappingSubsystem == OriginalSubsystem
+				&& State->NativeMappingPlayerInput == OriginalPlayerInput
+				&& GetInputSubsystem() == OriginalSubsystem.Get() && GetPlayerInput() == OriginalPlayerInput.Get()
+				&& IsValid(State->Pawn) && State->Pawn->IsLocallyControlled()
+				&& OriginalSubsystem->GetPlayerInput() == OriginalPlayerInput.Get()
+				&& OriginalSubsystem->HasMappingContext(State->Mapping.Get()));
 	}
 	// Actual Hero initialization associates its original ASC after the real coordinator
 	// initialized it. No fabricated notification or private session-validity override.
@@ -510,6 +541,24 @@ void FGGYGOInputTestFixture::Shutdown()
 		State->Pawn->GetHeroForTest()->ReleasePlayerInput();
 		State->Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem(State->Pawn->GetASCForTest());
 		State->Pawn->GetHeroForTest()->StopObservingLocalAbilitySystemForTest();
+	}
+	// Pawn 销毁可能连带销毁无 PlayerState 的 Controller；先归还原输入的 IMC。
+	const TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> RegisteredSubsystem = State->NativeMappingSubsystem;
+	const TWeakObjectPtr<UEnhancedPlayerInput> RegisteredPlayerInput = State->NativeMappingPlayerInput;
+	State->NativeMappingSubsystem.Reset();
+	State->NativeMappingPlayerInput.Reset();
+	if (UEnhancedInputLocalPlayerSubsystem* Subsystem = RegisteredSubsystem.Get())
+	{
+		if (RegisteredPlayerInput.IsValid() && Subsystem->GetPlayerInput() == RegisteredPlayerInput.Get())
+		{
+			// 记录先摘除，Remove 的同步广播不能重复归还；CountRegistrations 只减自己的一份。
+			Subsystem->RemoveMappingContext(State->Mapping.Get());
+		}
+		else
+		{
+			UE_LOG(LogGGYGONativeBirthDiagnostics, Error,
+				TEXT("[Input.NativeBirthTest] 原 IMC 注册失去 PlayerInput，不向后继输入对象归还旧注册。"));
+		}
 	}
 	if (IsValid(State->AbilitySystemHost)) { State->AbilitySystemHost->DetachAvatar(State->Pawn); }
 	if (IsValid(State->AbilitySystemHost)) { State->AbilitySystemHost->Destroy(); }
@@ -840,7 +889,7 @@ namespace
 					ActualMovementKeys.Add(Mapping.Key.GetVirtualKey());
 				}
 			}
-			if (!Test.TestTrue(TEXT("first default Hero installation produced the actual W/A/S/D mappings"),
+			if (!Test.TestTrue(TEXT("first Source IMC installation produced the actual W/A/S/D mappings"),
 				ActualMovementMappings == 4 && ActualMovementKeys.Num() == 4 && ActualMovementKeys.Contains(EKeys::W)
 				&& ActualMovementKeys.Contains(EKeys::A) && ActualMovementKeys.Contains(EKeys::S) && ActualMovementKeys.Contains(EKeys::D))
 				|| !CheckCold(TEXT("after actual first mapping rebuild, before Begin"))) { return false; }
@@ -872,7 +921,7 @@ namespace
 						FGGYGOMovementInputRequestIdentity Committed;
 						FString LookupError;
 						Test.TestTrue(TEXT("Started callback can query the exact actually committed nonzero request"),
-							IsValid(OriginalProducer.Get()) && OriginalProducer->GetMovementInputRequest(Session, Committed, LookupError)
+							IsValid(OriginalProducer.Get()) && OriginalProducer->QueryMovementInputRequest(Session, Committed, LookupError) == EGGYGOMovementInputRequestQueryResult::Held
 								&& Committed == Fact.Request && Committed.RequestSerial != 0);
 						Test.TestTrue(TEXT("Started contains only its explicit proof, no Session mode"),
 							Fact.SessionMode == EGGYGOMovementInputSessionMode::Invalid && Fact.StartProof != EGGYGOMovementInputStartProof::Invalid);
@@ -894,7 +943,8 @@ namespace
 				Facts[0].Kind == EGGYGOMovementInputFactKind::SessionOpened && Facts[0].Request.RequestSerial == 0
 				&& Facts[0].SessionMode == EGGYGOMovementInputSessionMode::Cold && Facts[0].StartProof == EGGYGOMovementInputStartProof::Invalid)) { return false; }
 			FGGYGOMovementInputRequestIdentity Request;
-			if (!Test.TestFalse(TEXT("before the first injected press no request exists"), Source->GetMovementInputRequest(Session, Request, Error))) { return false; }
+			if (!Test.TestTrue(TEXT("before the first injected press no request exists"),
+				Source->QueryMovementInputRequest(Session, Request, Error) == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof)) { return false; }
 
 			const FInputDeviceId Device = FInputDeviceId::CreateFromInternalId(0);
 			const FInputKeyEventArgs FirstPress(nullptr, Device, EKeys::W, IE_Pressed, 1.0f, false, FPlatformTime::Cycles64());
@@ -912,7 +962,8 @@ namespace
 			if (!Test.TestTrue(TEXT("release closes the exact first request before neutral"),
 				Facts[2].Kind == EGGYGOMovementInputFactKind::RequestReleased && Facts[2].Request == FirstRequest
 				&& Facts[3].Kind == EGGYGOMovementInputFactKind::NeutralConfirmed && Facts[3].Request.RequestSerial == 0)
-				|| !Test.TestFalse(TEXT("released request is no longer queryable"), Source->GetMovementInputRequest(Session, Request, Error))) { return false; }
+				|| !Test.TestTrue(TEXT("released request is no longer queryable"),
+					Source->QueryMovementInputRequest(Session, Request, Error) == EGGYGOMovementInputRequestQueryResult::NotHeld)) { return false; }
 			Source->InputKey(FInputKeyEventArgs(nullptr, Device, EKeys::W, IE_Pressed, 1.0f, false, FPlatformTime::Cycles64()));
 			if (!Test.TestEqual(TEXT("press after actual release produces the second Started"), Facts.Num(), 5)) { return false; }
 			if (!Test.TestTrue(TEXT("second request keeps the original Session and uses a larger ID with release proof"),
@@ -938,7 +989,8 @@ namespace
 				OriginalProducer->EndMovementInputSession(Session, TEXT("NativeBirthTestCleanup"));
 				FGGYGOMovementInputRequestIdentity Request;
 				FString Error;
-				Test.TestFalse(TEXT("ended original Session cannot expose a request"), OriginalProducer->GetMovementInputRequest(Session, Request, Error));
+				Test.TestTrue(TEXT("ended original Session cannot expose a request"),
+					OriginalProducer->QueryMovementInputRequest(Session, Request, Error) == EGGYGOMovementInputRequestQueryResult::Unavailable);
 			}
 			if (bDigitalSequenceCompleted)
 			{
@@ -1092,9 +1144,9 @@ namespace
 					}
 					UWorld* World = OwnedWorld.Get();
 					AGameModeBase* Mode = World->GetAuthGameMode();
-					if (IsValid(Mode) && Mode->GetClass() != AGameModeBase::StaticClass())
+					if (IsValid(Mode) && Mode->GetClass() != AGGYGOInputTestGameMode::StaticClass())
 					{
-						Fail(TEXT("native PIE did not use the explicit GameModeBase test configuration"));
+						Fail(TEXT("native PIE did not use the explicit Input test GameMode configuration"));
 						BeginEnding();
 						return false;
 					}
@@ -1159,7 +1211,7 @@ namespace
 			const TOptional<FPlayInEditorSessionInfo> Info = Engine->GetPlayInEditorSessionInfo();
 			return Info.IsSet() && Info->OriginalRequestParams.EditorPlaySettings == RequestSettings.Get()
 				&& Info->OriginalRequestParams.SessionDestination == EPlaySessionDestinationType::InProcess
-				&& Info->OriginalRequestParams.GameModeOverride == AGameModeBase::StaticClass();
+				&& Info->OriginalRequestParams.GameModeOverride == AGGYGOInputTestGameMode::StaticClass();
 		}
 
 		const FWorldContext* FindOwnedContext() const
@@ -1209,7 +1261,7 @@ namespace
 			Settings->bShouldMinimizeEditorOnNonVRPIE = false;
 			FRequestPlaySessionParams Params;
 			Params.EditorPlaySettings = Settings.Get();
-			Params.GameModeOverride = AGameModeBase::StaticClass();
+			Params.GameModeOverride = AGGYGOInputTestGameMode::StaticClass();
 			Params.bAllowOnlineSubsystem = false;
 			PreHandle = FEditorDelegates::PreBeginPIE.AddRaw(this, &FRunNativeMovementOriginWithOwnedPIE::OnPreBegin);
 			PostHandle = FEditorDelegates::PostPIEStarted.AddRaw(this, &FRunNativeMovementOriginWithOwnedPIE::OnPostStarted);

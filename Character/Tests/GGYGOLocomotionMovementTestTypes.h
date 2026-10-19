@@ -131,7 +131,6 @@ public:
 	void SetTestCurveMotion(const FGGYGOLocomotionCurveSample& InSample) { CurveMotion = InSample; }
 	void SetAuthorityReplayForTest(bool bEnabled) { bReplayLocomotionFromAuthority = bEnabled; }
 	void SetTestSequence(uint16 Sequence) { LocomotionMotionSequence = Sequence; }
-	bool GetPublishedTurnBackForTest() const { return bReplicatedTurnBackCurveDriven; }
 	float GetTestMotionTime() const { return LocomotionMotionTime; }
 	uint16 GetTestSequence() const { return LocomotionMotionSequence; }
 	const FGGYGOLocomotionCurveSample& GetTestCurveMotion() const { return CurveMotion; }

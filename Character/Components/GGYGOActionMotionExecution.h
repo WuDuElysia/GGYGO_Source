@@ -6,6 +6,7 @@
 
 #include "CoreMinimal.h"
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
+#include "Character/Data/GGYGOMotionExecutionTypes.h"
 #include "UObject/StrongObjectPtr.h"
 
 class UGGYGOCharacterMovementComponent;
@@ -33,6 +34,7 @@ struct FGGYGOActionMotionResource
 	TWeakObjectPtr<USkeletalMeshComponent> Mesh;
 	TWeakObjectPtr<UAnimInstance> AnimInstance;
 	FGGYGOActionMotionSourceBindingPtr Source;
+	EGGYGOMotionRotationMode RotationMode = EGGYGOMotionRotationMode::TranslationOnly;
 	/** Only the explicitly selected Profile mode retains this original configuration. */
 	TStrongObjectPtr<const UGGYGOActionMotionProfile> Profile;
 	int32 MontageInstanceId = INDEX_NONE;

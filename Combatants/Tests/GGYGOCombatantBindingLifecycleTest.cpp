@@ -2,10 +2,15 @@
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "System/GGYGOGameplayTags.h"
+
+#if WITH_DEV_AUTOMATION_TESTS
+#include "AbilitySystem/Tests/GGYGOAvatarActorInfoTransactionTestTypes.h"
+#endif
+
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Misc/AutomationTest.h"
-#include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
 #include "UObject/StrongObjectPtr.h"
 
@@ -132,7 +137,12 @@ bool FGGYGOCombatantBindingOwnershipTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("first host owns the Pawn"), FirstHost->GetAvatarPawn(), static_cast<APawn*>(FirstPawn));
 	TestEqual(TEXT("Pawn caches first host ASC"), FirstExtension->GetGGYGOAbilitySystemComponent(), FirstASC);
 
-	AddExpectedError(TEXT("已缓存另一 ASC"), EAutomationExpectedErrorFlags::Contains, 1);
+	// 目标 Pawn 的 Extension 已持有第一宿主的本地资源：选择阶段返回 ResourceConflict，由 AttachAvatar 统一诊断一次。
+	AddExpectedErrorPlain(FString::Printf(TEXT("[Combatants] AttachAvatar stopped: Host=%s Pawn=%s Outcome=%u Reason=%u."),
+		*GetPathNameSafe(SecondHost), *GetPathNameSafe(FirstPawn),
+		static_cast<uint32>(EGGYGOAvatarBindingOutcome::Rejected),
+		static_cast<uint32>(EGGYGOAvatarBindingHostReason::ResourceConflict)),
+		EAutomationExpectedErrorFlags::Contains, 1);
 	SecondHost->AttachAvatar(FirstPawn);
 	TestNull(TEXT("cross-host takeover is rejected before changing the second host"), SecondHost->GetAvatarPawn());
 	TestEqual(TEXT("rejected takeover preserves the original local binding"),
@@ -144,7 +154,12 @@ bool FGGYGOCombatantBindingOwnershipTest::RunTest(const FString& Parameters)
 	FirstHost->AttachAvatar(FirstPawn);
 	TestEqual(TEXT("dead host may repeat the same idempotent attach"),
 		FirstHost->GetAvatarPawn(), static_cast<APawn*>(FirstPawn));
-	AddExpectedError(TEXT("死亡状态宿主"), EAutomationExpectedErrorFlags::Contains, 1);
+	// 死亡宿主不能换绑新 Avatar：选择阶段返回 LifecycleClosed，由 AttachAvatar 统一诊断一次。
+	AddExpectedErrorPlain(FString::Printf(TEXT("[Combatants] AttachAvatar stopped: Host=%s Pawn=%s Outcome=%u Reason=%u."),
+		*GetPathNameSafe(FirstHost), *GetPathNameSafe(SecondPawn),
+		static_cast<uint32>(EGGYGOAvatarBindingOutcome::Rejected),
+		static_cast<uint32>(EGGYGOAvatarBindingHostReason::LifecycleClosed)),
+		EAutomationExpectedErrorFlags::Contains, 1);
 	FirstHost->AttachAvatar(SecondPawn);
 	TestEqual(TEXT("dead host rejects a new Avatar before detaching the current one"),
 		FirstHost->GetAvatarPawn(), static_cast<APawn*>(FirstPawn));
@@ -281,6 +296,8 @@ namespace
 		UGGYGOAbilitySystemComponent* CandidateCachedASC = nullptr;
 		bool bOldDestroyedSubscription = false;
 		bool bCandidateDestroyedSubscription = false;
+		/** ASC 最近一次提交的绑定 Context；同一清理窗口内不推进即证明没有后继提交。 */
+		FGGYGOAvatarBindingContext ASCContext;
 	};
 
 	/** Owns a real playing World and only observes the synchronous native Destroy window. */
@@ -317,6 +334,9 @@ namespace
 		FCombatantRealDestroySnapshot CleanupBeforeAttach;
 		FCombatantRealDestroySnapshot CleanupAfterAttach;
 		FCombatantRealDestroySnapshot Removed;
+		/** Destroy 前捕获的原本地资源 H，以及 Released 通知实际携带的资源。 */
+		FGGYGOPawnASCResourceHandle OriginalResource;
+		FGGYGOPawnASCResourceHandle ReleasedResource;
 
 		bool CheckPlayingActor(FAutomationTestBase& Test, AActor* Actor) const
 		{
@@ -439,6 +459,7 @@ namespace
 			const FName HandlerName(TEXT("HandleAvatarDestroyed"));
 			Snapshot.bOldDestroyedSubscription = OldPawn->OnDestroyed.Contains(Host, HandlerName);
 			Snapshot.bCandidateDestroyedSubscription = CandidatePawn->OnDestroyed.Contains(Host, HandlerName);
+			Snapshot.ASCContext = ASC->GetAvatarBindingContext();
 			return Snapshot;
 		}
 
@@ -469,6 +490,7 @@ namespace
 			++UninitializedCount;
 			if (!bProbeArmed) { return; }
 			Events.Add(FName(TEXT("Uninitialized")));
+			ReleasedResource = Notice.Resource;
 			CleanupBeforeAttach = Capture();
 			++ReattachAttemptCount;
 			Host->AttachAvatar(CandidatePawn);
@@ -537,6 +559,9 @@ bool FGGYGOCombatantRealDestroyReattachTest::RunTest(const FString& Parameters)
 		&& Bound.ReplicatedAvatar == Fixture->OldPawn && Bound.OwnerActor == Fixture->Host
 		&& Bound.ASCAvatar == Fixture->OldPawn && Bound.OldCachedASC == Fixture->ASC
 		&& !Bound.CandidateCachedASC && Bound.bOldDestroyedSubscription && !Bound.bCandidateDestroyedSubscription);
+	Fixture->OriginalResource = Fixture->OldExtension->GetCurrentLocalAbilitySystemResource();
+	bPassed &= TestTrue(TEXT("original local resource H is captured before native Destroy"),
+		Fixture->OriginalResource.HasResource());
 	if (!bPassed) { return false; }
 
 	Fixture->InstallProbe();
@@ -562,9 +587,15 @@ bool FGGYGOCombatantRealDestroyReattachTest::RunTest(const FString& Parameters)
 	if (!bPassed) { return false; }
 
 	const FString ExpectedRejection = FString::Printf(
-		TEXT("[Combatants] AttachAvatar.Entry: 宿主 [%s] ASC [%s] 拒绝绑定 Avatar [%s]，原因：宿主正在原生销毁流程中。"),
+		TEXT("[Combatants] CoordinateAvatarSelection: 宿主 [%s] ASC [%s] 拒绝绑定 Avatar [%s]，原因：宿主正在原生销毁流程中。"),
 		*GetPathNameSafe(Fixture->Host), *GetPathNameSafe(Fixture->ASC), *GetPathNameSafe(Fixture->CandidatePawn));
 	AddExpectedErrorPlain(ExpectedRejection, EAutomationExpectedErrorFlags::Exact, 1);
+	AddExpectedMessagePlain(FString::Printf(
+		TEXT("[Combatants] AttachAvatar stopped: Host=%s Pawn=%s Outcome=%u Reason=%u."),
+		*GetPathNameSafe(Fixture->Host), *GetPathNameSafe(Fixture->CandidatePawn),
+		static_cast<uint32>(EGGYGOAvatarBindingOutcome::Rejected),
+		static_cast<uint32>(EGGYGOAvatarBindingHostReason::LifecycleClosed)),
+		ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
 	Fixture->bProbeArmed = true;
 	const bool bDestroyed = Fixture->Host->Destroy();
 	Fixture->bProbeArmed = false;
@@ -581,16 +612,25 @@ bool FGGYGOCombatantRealDestroyReattachTest::RunTest(const FString& Parameters)
 	bPassed &= TestTrue(TEXT("native Destroy sets BeingDestroyed before routing actual EndPlay"),
 		Fixture->NativeDestroy.bHostValid && Fixture->NativeDestroy.bHostBeingDestroyed
 		&& Fixture->NativeDestroy.bHostHasBegunPlay);
-	bPassed &= TestTrue(TEXT("cleanup callback sees cleared local/ASC binding while retaining Owner"),
+	// 关闭中的宿主以 ClearActorInfo 清理：Released 在退休 Host H、清复制 Avatar、退订旧 Pawn 之后才发出，
+	// 因此 Owner／复制 Avatar／旧订阅此时都已清空，宿主仍在销毁中且尚未 EndPlay。
+	bPassed &= TestTrue(TEXT("cleanup callback sees the original H fully released by ClearActorInfo"),
 		Fixture->CleanupBeforeAttach.bHostValid && Fixture->CleanupBeforeAttach.bHostBeingDestroyed
-		&& Fixture->CleanupBeforeAttach.bHostHasBegunPlay && Fixture->CleanupBeforeAttach.OwnerActor == Fixture->Host
-		&& !Fixture->CleanupBeforeAttach.ASCAvatar && !Fixture->CleanupBeforeAttach.OldCachedASC
-		&& !Fixture->CleanupBeforeAttach.CandidateCachedASC);
+		&& Fixture->CleanupBeforeAttach.bHostHasBegunPlay && !Fixture->CleanupBeforeAttach.OwnerActor
+		&& !Fixture->CleanupBeforeAttach.ASCAvatar && !Fixture->CleanupBeforeAttach.ReplicatedAvatar
+		&& !Fixture->CleanupBeforeAttach.OldCachedASC && !Fixture->CleanupBeforeAttach.CandidateCachedASC
+		&& !Fixture->CleanupBeforeAttach.bOldDestroyedSubscription
+		&& !Fixture->CleanupBeforeAttach.bCandidateDestroyedSubscription);
+	bPassed &= TestTrue(TEXT("Released notice carries the original H captured before Destroy"),
+		Fixture->ReleasedResource.HasSameResource(Fixture->OriginalResource));
 	bPassed &= TestTrue(TEXT("rejected callback Attach cannot commit the candidate or replace cleanup identity"),
-		Fixture->CleanupAfterAttach.ReplicatedAvatar == Fixture->OldPawn
-		&& Fixture->CleanupAfterAttach.OwnerActor == Fixture->Host && !Fixture->CleanupAfterAttach.ASCAvatar
+		!Fixture->CleanupAfterAttach.ReplicatedAvatar && !Fixture->CleanupAfterAttach.OwnerActor
+		&& !Fixture->CleanupAfterAttach.ASCAvatar
 		&& !Fixture->CleanupAfterAttach.OldCachedASC && !Fixture->CleanupAfterAttach.CandidateCachedASC
-		&& Fixture->CleanupAfterAttach.bOldDestroyedSubscription && !Fixture->CleanupAfterAttach.bCandidateDestroyedSubscription);
+		&& !Fixture->CleanupAfterAttach.bOldDestroyedSubscription
+		&& !Fixture->CleanupAfterAttach.bCandidateDestroyedSubscription
+		&& Fixture->CleanupBeforeAttach.ASCContext.HasIssuedContext()
+		&& Fixture->CleanupAfterAttach.ASCContext.HasSameContext(Fixture->CleanupBeforeAttach.ASCContext));
 	bPassed &= TestTrue(TEXT("post-EndPlay snapshot is captured while host remains valid before Garbage"),
 		Fixture->Removed.bHostValid && Fixture->Removed.bHostBeingDestroyed && !Fixture->Removed.bHostHasBegunPlay);
 	bPassed &= TestNull(TEXT("native Owner destruction callback clears ASC Owner before World removal"),
@@ -602,6 +642,172 @@ bool FGGYGOCombatantRealDestroyReattachTest::RunTest(const FString& Parameters)
 	bPassed &= TestFalse(TEXT("old Pawn has no stale host OnDestroyed subscription"), Fixture->Removed.bOldDestroyedSubscription);
 	bPassed &= TestFalse(TEXT("candidate Pawn has no rejected host OnDestroyed subscription"), Fixture->Removed.bCandidateDestroyedSubscription);
 	bPassed &= TestFalse(TEXT("native Destroy marks the host invalid after all observed cleanup"), IsValid(Fixture->Host));
+	return bPassed;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOCombatantFailedInitCleanupTest,
+	"GGYGO.Combatants.Binding.FailedInitCleanupAfterNativeRevocation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOCombatantFailedInitCleanupTest::RunTest(const FString& Parameters)
+{
+	using EOutcome = EGGYGOAvatarBindingOutcome;
+	using EReason = EGGYGOAvatarBindingReason;
+	if (!TestNotNull(TEXT("GEngine"), GEngine)) { return false; }
+	TSharedRef<FCombatantRealDestroyFixture> Fixture = MakeShared<FCombatantRealDestroyFixture>();
+	if (!Fixture->Initialize(*this)) { return false; }
+	if (!TestNotNull(TEXT("test world"), Fixture->World)) { return false; }
+	AGGYGOCombatantBindingTestState* Host = Fixture->Host;
+	AGGYGOCombatantBindingTestPawn* Pawn = Fixture->OldPawn;
+	if (!TestNotNull(TEXT("host"), Host) || !TestNotNull(TEXT("Pawn"), Pawn)) { return false; }
+	UGGYGOAbilitySystemComponent* ASC = Host->GetGGYGOAbilitySystemComponent();
+	UGGYGOPawnExtensionComponent* Extension = Pawn->GetPawnExtensionForTest();
+	if (!TestNotNull(TEXT("host ASC"), ASC) || !TestNotNull(TEXT("PawnExtension"), Extension)) { return false; }
+
+	// 夹具先完成正常 World／Actor 初始化，Host 的 PostInitializeComponents 已提交 Owner-only C0。
+	// 本叶从该真实 C0 发起 Host Initialize。
+	const FGGYGOAvatarBindingContext OwnerOnlyContext = ASC->GetAvatarBindingContext();
+	EReason Reason = EReason::InvalidRequest;
+	if (!TestTrue(TEXT("owner-only Context C0 is the current committed binding"),
+		OwnerOnlyContext.HasIssuedContext()
+		&& ASC->CheckAvatarBindingContext(OwnerOnlyContext, Reason) == EOutcome::Succeeded
+		&& ASC->GetOwnerActor() == Host && !ASC->GetAvatarActor() && !Host->GetAvatarPawn()
+		&& !Extension->GetCurrentLocalAbilitySystemResource().HasResource()
+		&& !Extension->GetGGYGOAbilitySystemComponent()))
+	{
+		return false;
+	}
+
+	// 真实 GiveAbility 的逐 Actor 实例；一次性 OnAvatarSet 钩子只在原生 Init 写入新 Avatar 时执行。
+	const FGameplayAbilitySpecHandle ProbeHandle = ASC->GiveAbility(FGameplayAbilitySpec(
+		UGGYGOAvatarActorInfoTransactionTestAbility::StaticClass(), 1));
+	const FGameplayAbilitySpec* ProbeSpec = ASC->FindAbilitySpecFromHandle(ProbeHandle);
+	UGGYGOAvatarActorInfoTransactionTestAbility* Probe = ProbeSpec
+		? Cast<UGGYGOAvatarActorInfoTransactionTestAbility>(ProbeSpec->GetPrimaryInstance()) : nullptr;
+	if (!TestNotNull(TEXT("real per-actor probe instance"), Probe)
+		|| !TestEqual(TEXT("probe hook has not run before arming"), Probe->GetArmedNativeCallsForTest(), 0))
+	{
+		return false;
+	}
+
+	const TSharedRef<int32> LocalNoticeCount = MakeShared<int32>(0);
+	const FDelegateHandle NoticeHandle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
+		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda(
+			[LocalNoticeCount](const FGGYGOPawnASCLocalNotice&) { ++LocalNoticeCount.Get(); }));
+	if (!TestTrue(TEXT("local notice observer is registered"), NoticeHandle.IsValid())) { return false; }
+	Fixture->OldNoticeHandle = NoticeHandle;
+
+	bool bHookBusy = false;
+	bool bHookAvatarWritten = false;
+	bool bHookRevoked = false;
+	EReason HookRejection = EReason::InvalidRequest;
+	Probe->ArmNativeAvatarHookForTest(FGGYGOAvatarActorInfoNativeHook::CreateLambda(
+		[&](const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilitySpec&)
+		{
+			bHookBusy = ASC->IsAvatarBindingNativeWriteBusy();
+			bHookAvatarWritten = ActorInfo && ActorInfo == ASC->AbilityActorInfo.Get()
+				&& ActorInfo->AvatarActor.Get() == Pawn;
+			// 唯一扰动：撤销 C0，使原生写入返回后的 Init 不能提交，由宿主进入失败 Init 清理。
+			bHookRevoked = ASC->InvalidateAvatarBinding(OwnerOnlyContext, EReason::OperationInvalidated, HookRejection);
+		}));
+
+	// native hook 不公开本次 Operation；这里只匹配非零序号格式，真实身份由下方 Init／Cleanup 返回值证明。
+	const auto EscapeRegexLiteral = [](const FString& Literal)
+	{
+		FString Escaped;
+		for (TCHAR Character : Literal)
+		{
+			if (FCString::Strchr(TEXT("\\.^$|()[]{}*+?"), Character)) { Escaped.AppendChar(TEXT('\\')); }
+			Escaped.AppendChar(Character);
+		}
+		return Escaped;
+	};
+	const FString CleanupDiagnosticPrefix = FString::Printf(
+		TEXT("[Combatants] Failed Init cleanup returned: Host=%s ASC=%s Pawn=%s Operation="),
+		*GetPathNameSafe(Host), *GetPathNameSafe(ASC), *GetPathNameSafe(Pawn));
+	const FString CleanupDiagnosticSuffix = FString::Printf(
+		TEXT(" Outcome=%u Reason=%u Committed=0; original Init remains failed."),
+		static_cast<uint32>(EOutcome::Succeeded), static_cast<uint32>(EReason::None));
+	// UE 的 Exact Regex 给整行加锚；对象路径及固定前后文均逐字转义，只有 Operation 数字可变。
+	AddExpectedMessage(EscapeRegexLiteral(CleanupDiagnosticPrefix) + TEXT("[1-9][0-9]*")
+		+ EscapeRegexLiteral(CleanupDiagnosticSuffix),
+		ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1, true);
+	AddExpectedMessagePlain(FString::Printf(
+		TEXT("[Combatants] RequestAvatarBinding: Host=%s ASC=%s Pawn=%s Extension=%s Operation=%u Binding=%llu Write=%llu Outcome=%u Reason=%u Steps=2"),
+		*GetPathNameSafe(Host), *GetPathNameSafe(ASC), *GetPathNameSafe(Pawn), *GetPathNameSafe(Extension),
+		static_cast<uint32>(EGGYGOAvatarBindingHostOperation::Initialize),
+		static_cast<unsigned long long>(OwnerOnlyContext.Binding.Serial),
+		static_cast<unsigned long long>(OwnerOnlyContext.LastActorInfoWrite.Serial),
+		static_cast<uint32>(EOutcome::Stale), static_cast<uint32>(EGGYGOAvatarBindingHostReason::CallerInvalidated)),
+		ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
+	AddExpectedErrorPlain(FString::Printf(
+		TEXT("[Combatants] Init failed before commit: Host=%s ASC=%s Pawn=%s Operation="),
+		*GetPathNameSafe(Host), *GetPathNameSafe(ASC), *GetPathNameSafe(Pawn)),
+		EAutomationExpectedErrorFlags::Contains, 1);
+	FGGYGOAvatarBindingHostRequest Initialize;
+	Initialize.Operation = EGGYGOAvatarBindingHostOperation::Initialize;
+	Initialize.ExpectedHost = Host;
+	Initialize.ExpectedASC = ASC;
+	Initialize.ExpectedPawn = Pawn;
+	Initialize.ExpectedExtension = Extension;
+	Initialize.ExpectedContext = OwnerOnlyContext;
+	const FGGYGOAvatarBindingHostResult Result = Host->RequestAvatarBinding(Initialize);
+	Probe->DisarmNativeAvatarHookForTest();
+
+	bool bPassed = TestEqual(TEXT("one-shot native Avatar hook ran exactly once"), Probe->GetArmedNativeCallsForTest(), 1);
+	bPassed &= TestTrue(TEXT("hook ran inside the native write window after the new Avatar was written"),
+		bHookBusy && bHookAvatarWritten);
+	bPassed &= TestTrue(TEXT("hook revoked exactly C0"), bHookRevoked && HookRejection == EReason::None);
+	bPassed &= TestTrue(TEXT("top-level Host Initialize remains failed"),
+		Result.Outcome == EOutcome::Stale && Result.Reason == EGGYGOAvatarBindingHostReason::CallerInvalidated);
+	if (!TestTrue(TEXT("history records the failed Init followed by its cleanup"), Result.Steps.Num() == 2
+		&& Result.Steps[0].Step == EGGYGOAvatarBindingHostStep::ActorInfoInit && Result.Steps[0].ASCResult.IsSet()
+		&& Result.Steps[1].Step == EGGYGOAvatarBindingHostStep::ActorInfoClear && Result.Steps[1].ASCResult.IsSet()))
+	{
+		return false;
+	}
+	const FGGYGOAvatarBindingResult& Init = Result.Steps[0].ASCResult.GetValue();
+	const FGGYGOAvatarBindingResult& Cleanup = Result.Steps[1].ASCResult.GetValue();
+	bPassed &= TestTrue(TEXT("Init returned after its native write without commit"),
+		Init.Outcome == EOutcome::Stale && Init.Reason == EReason::OperationInvalidated && !Init.bCommitted
+		&& Init.Operation.HasIssuedIdentity() && Init.Before.HasSameContext(OwnerOnlyContext));
+	bPassed &= TestTrue(TEXT("cleanup consumed the same Operation without commit"),
+		Cleanup.Outcome == EOutcome::Succeeded && Cleanup.Reason == EReason::None && !Cleanup.bCommitted
+		&& Cleanup.Operation.HasSameIdentity(Init.Operation) && Cleanup.Before.HasSameContext(OwnerOnlyContext));
+
+	// 原生 Clear 只清端点与缓存；不要求清空保留的 AnimInstance／Tag 字段。
+	const auto IsClearedScene = [&]()
+	{
+		const FGameplayAbilityActorInfo* ActorInfo = ASC->AbilityActorInfo.Get();
+		return ActorInfo && ActorInfo->OwnerActor.IsExplicitlyNull() && ActorInfo->AvatarActor.IsExplicitlyNull()
+			&& !ASC->GetOwnerActor() && !ASC->GetAvatarActor_Direct()
+			&& !Host->GetAvatarPawn() && !Extension->GetCurrentLocalAbilitySystemResource().HasResource()
+			&& !Extension->GetGGYGOAbilitySystemComponent() && !ASC->IsAvatarBindingNativeWriteBusy()
+			&& ASC->GetAvatarBindingContext().HasSameContext(OwnerOnlyContext)
+			&& *LocalNoticeCount == 0;
+	};
+	bPassed &= TestTrue(TEXT("native Clear emptied ActorInfo/ASC caches; no H, Ready or Released; Busy returned"),
+		IsClearedScene());
+	bPassed &= TestTrue(TEXT("cleanup neither committed nor restored the revoked C0"),
+		ASC->CheckAvatarBindingContext(OwnerOnlyContext, Reason) == EOutcome::Stale
+		&& Reason == EReason::OperationInvalidated);
+
+	const FGGYGOAvatarBindingResult Repeated = ASC->TryCleanupFailedAvatarActorInfoInit(
+		Init.Operation, []() { return true; });
+	bPassed &= TestTrue(TEXT("repeated consumption of the retired cleanup source is rejected"),
+		Repeated.Outcome == EOutcome::Stale && Repeated.Reason == EReason::OperationInvalidated && !Repeated.bCommitted);
+	bPassed &= TestTrue(TEXT("rejected repeat leaves the cleared scene unchanged"), IsClearedScene());
+	// 析构时 C0 已无已提交清理来源，原保护拒绝再做物理 Clear；仅核同一 C0 的元数据退休一次。
+	AddExpectedMessagePlain(FString::Printf(
+		TEXT("[Combatants] Destroyed binding close: Host=%s ASC=%s SelectedPawn=None HasResource=0 Binding=%llu Write=%llu Outcome=%u Reason=%u NativeReason=%u Steps=0; metadata retirement Binding=%llu Write=%llu Accepted=1 Reason=%u (not physical Clear)."),
+		*GetPathNameSafe(Host), *GetPathNameSafe(ASC),
+		static_cast<unsigned long long>(OwnerOnlyContext.Binding.Serial),
+		static_cast<unsigned long long>(OwnerOnlyContext.LastActorInfoWrite.Serial),
+		static_cast<uint32>(EOutcome::Stale), static_cast<uint32>(EGGYGOAvatarBindingHostReason::ContextMismatch),
+		static_cast<uint32>(EReason::OperationInvalidated),
+		static_cast<unsigned long long>(OwnerOnlyContext.Binding.Serial),
+		static_cast<unsigned long long>(OwnerOnlyContext.LastActorInfoWrite.Serial), static_cast<uint32>(EReason::None)),
+		ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
 	return bPassed;
 }
 

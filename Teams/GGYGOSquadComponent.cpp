@@ -610,11 +610,8 @@ bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex)
 		{
 			return ReportStoppedRequest(TEXT("HeroReleaseChangedRequest"));
 		}
+		// 只清旧 ASC 输入缓存；请求／控制谓词与旧技能退出读回都不读输入缓存，无需再次核验。
 		OriginalOldASC->ClearAbilityInput();
-		if (!IsOriginalCancellationCallerCurrent() || !OldAbilitiesAreReady(OldContext))
-		{
-			return ReportStoppedRequest(TEXT("InputRetirementChangedRequest"));
-		}
 	}
 
 	const auto FailControlTransfer = [&](const TCHAR* Reason)

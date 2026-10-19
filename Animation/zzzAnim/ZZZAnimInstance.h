@@ -155,19 +155,22 @@ public:
 	/**
 	 * 转身已进入交还输入的 `RunOut` 段。
 	 *
-	 * **当前没有 AnimGraph 节点消费**：`RunOut` 段 `IsTurnBackCurveDriven`
-	 * 为假，状态机自己就切回 WalkRun 了，不需要读这个标记来做分支。
-	 * 留着是给「想在跑出段单独做表现」留的钩子（那一段方向来自玩家输入而非曲线，
-	 * 朝向交回了 CMC 的自动对齐，玩家改方向时身体朝向会与动画姿势有偏差）。
+	 * Movement 相位事实不等于当前状态机已经退出；退出规则由实际 BP 接线决定。
 	 */
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
 	bool bTurnBackRunOut = false;
 
-	/** Linear signed direction-deviation pose; positive leans toward the right. Only normal exit recovers a previous pose. AnimBP owns bone axis/sign. */
+	/** 角色响应曲线求得的有符号倾身角；正值向胶囊右侧倾身。正常退出才恢复上一姿态。 */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	float WalkRunLeanAngleDegrees = 0.0f;
 
-	/** A usable pose result, including normal recovery; false for disabled, initial waiting or failure. */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	FVector WalkRunLeanAxisCS = FVector::ZeroVector;
+
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	FVector WalkRunLeanUpCS = FVector::ZeroVector;
+
+	/** 有效的表现驱动输入，包含正常恢复；骨控制器仍须校验本次骨链和姿态可达性。 */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	bool bWalkRunLeanPresentationValid = false;
 
@@ -197,7 +200,7 @@ private:
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
 	FZZZLocomotionEvents LocomotionEvents;
 
-	/** Normal exit transition, separate from the instantaneous valid linear mapping. */
+	/** 正常退出恢复；有效方向误差直接求值角色响应曲线。 */
 	void RecoverWalkRunLeanPresentation(float DeltaSeconds, const FZZZWalkRunLeanTuning& Config);
 	void FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason);
 	FName LastWalkRunLeanFailureCode = NAME_None;

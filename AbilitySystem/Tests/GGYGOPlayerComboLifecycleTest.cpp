@@ -1,22 +1,40 @@
 #include "AbilitySystem/Tests/GGYGOPlayerComboLifecycleTestTypes.h"
 
 #include "AbilitySystem/Abilities/GGYGOComboCorrection.h"
+#include "AbilitySystem/Tests/GGYGOMontageTaskTestTypes.h"
+#include "AbilitySystem/Attributes/GGYGOCombatSet.h"
+#include "AbilitySystem/Attributes/GGYGOHealthSet.h"
+#include "AbilitySystem/Executions/GGYGODamageExecution.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_WaitComboInput.h"
+#include "Animation/Data/GGYGOActionMotionSourceBinding.h"
+#include "Animation/Notifies/GGYGOAnimNotifyState_GameplayEventWindow.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "Character/Data/GGYGOMovementSet.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
+#include "System/GGYGOGameplayTags.h"
+
 #include "Animation/AnimSequence.h"
 #include "Animation/AnimData/IAnimationDataController.h"
 #include "Animation/AnimData/CurveIdentifier.h"
 #include "Animation/AnimCurveTypes.h"
 #include "Animation/AnimMontage.h"
+#include "Animation/ActiveMontageInstanceScope.h"
+#include "Animation/AnimNotifyQueue.h"
 #include "Animation/Skeleton.h"
 #include "AnimNotifies/AnimNotify_PlayMontageNotify.h"
-#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Components/SkeletalMeshComponent.h"
-#include "Character/Components/GGYGOCharacterMovementComponent.h"
-#include "Character/Components/GGYGOPawnExtensionComponent.h"
-#include "Character/Data/GGYGOMovementSet.h"
+#include "CoreGlobals.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "GameFramework/GameplayMessageSubsystem.h"
+#include "HAL/CriticalSection.h"
+#include "Misc/OutputDevice.h"
+#include "Misc/OutputDeviceRedirector.h"
+#include "Misc/ScopeLock.h"
+#include "Engine/EngineBaseTypes.h"
 #include "Engine/LocalPlayer.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
@@ -25,9 +43,13 @@
 #include "GameFramework/PlayerInput.h"
 #include "ReferenceSkeleton.h"
 #include "Rendering/SkeletalMeshRenderData.h"
-#include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
+#include "NiagaraComponent.h"
+#include "NiagaraSimCache.h"
+#include "NiagaraSimCacheFunctionLibrary.h"
+#include "NiagaraSystem.h"
+#include "NiagaraSystemInstanceController.h"
 
 #include <limits>
 
@@ -73,9 +95,30 @@ void UGGYGOPlayerComboLifecycleTestAbility::ConfigureStepsForTest(
 	}
 }
 
+UGGYGOPlayerComboLifecycleMultiplierEffect::UGGYGOPlayerComboLifecycleMultiplierEffect()
+{
+	DurationPolicy = EGameplayEffectDurationType::Instant;
+	FGameplayEffectExecutionDefinition& Execution = Executions.AddDefaulted_GetRef();
+	Execution.CalculationClass = UGGYGODamageExecution::StaticClass();
+	Execution.PassedInTags.AddTag(GGYGOGameplayTags::DamageCalculation_AttackPowerMultiplier);
+}
+
+void UGGYGOPlayerComboLifecycleTestAbility::ConfigureDamageMultiplierForTest(float Multiplier)
+{
+	for (FGGYGOComboStep& Step : ComboSteps) { Step.DamageMultiplier = Multiplier; }
+}
+
 void UGGYGOPlayerComboLifecycleTestAbility::SetFirstPlayRateForTest(float PlayRate)
 {
 	if (ComboSteps.IsValidIndex(0)) { ComboSteps[0].PlayRate = PlayRate; }
+}
+
+void UGGYGOPlayerComboLifecycleTestAbility::CleanupAbilityResourcesForTermination(
+	const FGGYGOAbilityTerminationContext& Context)
+{
+	TFunction<void()> OriginalAction = MoveTemp(BeforeCleanupAction);
+	if (OriginalAction) { OriginalAction(); }
+	Super::CleanupAbilityResourcesForTermination(Context);
 }
 
 FName UGGYGOPlayerComboLifecycleTestAbility::GetK2ActivateAbilityFunctionName()
@@ -161,12 +204,7 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 {
 	const float Result = Super::Montage_PlayInternal(MontageToPlay, BlendInSettings, InPlayRate,
 		ReturnValueType, InTimeToStartMontageAt, bStopAllMontages);
-	if (Result > 0.0f) { ++SuccessfulSuperMontagePlayCount; }
-	if (AfterSuperMontagePlayAction)
-	{
-		TFunction<void()> Action = MoveTemp(AfterSuperMontagePlayAction);
-		Action();
-	}
+	if (Result > 0.0f) { ++SuccessfulGuardReturnCount; }
 	return Result;
 }
 
@@ -233,11 +271,15 @@ struct FGGYGOPlayerComboLifecycleFixture
 	static UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetProductionMontageTask(
 		const UGGYGOPlayerComboAbility* Production)
 	{
-		return Production ? Production->MontageTask.Get() : nullptr;
+		return Production ? Production->GetMontageTask() : nullptr;
 	}
 	static UGGYGOAbilityTask_WaitComboInput* GetProductionInputTask(const UGGYGOPlayerComboAbility* Production)
 	{
 		return Production ? Production->InputTask.Get() : nullptr;
+	}
+	static UGGYGOAbilityTask_PlayNiagaraEffect* GetProductionFXTask(const UGGYGOPlayerComboAbility* Production)
+	{
+		return Production ? Production->GetStepFXTask() : nullptr;
 	}
 	static bool ReadProductionStep(const UGGYGOPlayerComboAbility* Production, FGGYGOComboStep& OutStep)
 	{
@@ -256,24 +298,46 @@ struct FGGYGOPlayerComboLifecycleFixture
 		return Production ? Production->LastRequestId : 0;
 	}
 	static bool ReplayCompletedProductionPointForTest(UGGYGOPlayerComboAbility* Production,
-		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask, const FGGYGOMontageNotifyFact& OriginalPoint)
+		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask, const FGGYGOMontageNotifyFact& OriginalPoint,
+		UGGYGOCharacterMovementComponent* OriginalMovement, FString& Error)
 	{
+		Error.Reset();
 		if (!Production || !Production->IsActive() || !OriginalTask
 			|| OriginalTask->GetState() != EGameplayTaskState::Finished
-			|| Production->MontageTask != OriginalTask || !Production->StepMotionResources.IsValid()) { return false; }
-		// Negative replay only after this real native Task has finished while its owner
-		// still awaits CMC. Never manufacture a positive point or completion fact.
+			|| Production->GetMontageTask() != OriginalTask || !Production->StepMotionResources.IsValid())
+		{
+			Error = TEXT("晚到点探针未持有仍属当前能力的原 Finished Task／资源。"); return false;
+		}
 		const auto OriginalResource = Production->StepMotionResources;
+		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> HistoricalTask(OriginalTask);
+		const ACharacter* OriginalCharacter = Production->ActiveMesh ? Cast<ACharacter>(Production->ActiveMesh->GetOwner()) : nullptr;
+		if (HistoricalTask.IsValid() || HistoricalTask.Get(true) != OriginalTask
+			|| OriginalTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			|| !Production->IsMotionResourceCurrent(OriginalResource) || !IsValid(OriginalMovement)
+			|| !OriginalCharacter || OriginalCharacter->GetCharacterMovement() != OriginalMovement
+			|| !OriginalMovement->HasActiveActionMotion())
+		{
+			Error = TEXT("原 Finished Task 未完成原生退役，或原完成资源／原 CMC 等待前提不成立。");
+			return false;
+		}
+		// 原生 EndTask 已使弱 Task 无效，此时生产 IsMotionResourceCurrent 只接受已认证 Completed。
+		// 保留该生产校验和原 CMC 活动查询，不为测试暴露／写入资源内部完成事实。
 		const auto OriginalInput = Production->InputTask;
 		const auto OriginalActivation = Production->CaptureCurrentActivation();
 		const uint64 OriginalToken = Production->CurrentStepToken;
+		const TWeakObjectPtr<UGGYGOCharacterMovementComponent> CapturedMovement(OriginalMovement);
 		Production->HandleMontageNotify(OriginalResource, OriginalPoint);
-		Production->EnableStepInterruption(OriginalResource);
-		return Production->IsActive() && Production->StepMotionResources == OriginalResource
-			&& Production->MontageTask == OriginalTask && Production->InputTask == OriginalInput
+		Production->OpenAttackContinuation(OriginalResource);
+		Production->TryOpenMovementInterruption(OriginalResource);
+		const bool bPreserved = Production->IsActive() && Production->StepMotionResources == OriginalResource
+			&& Production->GetMontageTask() == OriginalTask && Production->InputTask == OriginalInput
 			&& Production->CurrentStepToken == OriginalToken
 			&& Production->CaptureCurrentActivation().HasSameActivation(OriginalActivation)
-			&& !Production->IsInterruptionOpen();
+			&& Production->IsMotionResourceCurrent(OriginalResource)
+			&& CapturedMovement.IsValid() && CapturedMovement->HasActiveActionMotion()
+			&& !Production->IsAttackContinuationOpen() && !Production->IsMovementInterruptionOpen();
+		if (!bPreserved) { Error = TEXT("历史点重放改变原能力／Task／输入／CMC 资源或重新开放权限。"); }
+		return bPreserved;
 	}
 	static bool InstallProductionMainPointProbe(UGGYGOPlayerComboAbility* Production, int32 StepIndex,
 		FGGYGOComboStep& OutOriginal, TStrongObjectPtr<UAnimMontage>& OutProbe, FString& Error)
@@ -319,14 +383,14 @@ struct FGGYGOPlayerComboLifecycleFixture
 	static bool ProductionResourcesReleased(const UGGYGOPlayerComboAbility* Production, UWorld* ProductionWorld)
 	{
 		return Production && ProductionWorld && !Production->StepMotionResources.IsValid()
-			&& !Production->ActiveMesh && !Production->MontageTask && !Production->InputTask
+			&& !Production->ActiveMesh && !Production->GetMontageTask() && !Production->GetStepFXTask() && !Production->InputTask
 			&& !Production->TraceComponent && !Production->TraceWindow.HasWindow()
 			&& !Production->ResourceActivation.HasActivation() && Production->OriginalWorld.IsExplicitlyNull()
-			&& !Production->MontageCallbackRegistration.IsValid() && !Production->InputCallbackRegistration.IsValid()
+			&& !Production->HasMontageCallbackRegistration() && !Production->InputCallbackRegistration.IsValid()
 			&& !Production->TraceHitSubscription.IsValid() && !Production->bChangedMeshTick
 			&& !Production->bAddedMeshPrerequisite && Production->CurrentStepToken == 0
 			&& Production->CurrentStep == INDEX_NONE && Production->CurrentStepRequestId == 0
-			&& !ProductionWorld->GetTimerManager().TimerExists(Production->WatchdogHandle);
+			&& !ProductionWorld->GetTimerManager().TimerExists(Production->GetWatchdogHandle());
 	}
 #endif
 
@@ -485,11 +549,101 @@ struct FGGYGOPlayerComboLifecycleFixture
 		check(Ability && Ability->ComboSteps.IsValidIndex(0));
 		return Ability->ComboSteps[0];
 	}
+	/** 仅修改启动前的作者配置，不创建另一条运行状态写入链。 */
+	FGGYGOComboStep& UseSingleStepForTest() const
+	{
+		check(Ability && !Ability->IsActive() && Ability->ComboSteps.IsValidIndex(0));
+		Ability->ComboSteps.SetNum(1);
+		return Ability->ComboSteps[0];
+	}
+	FAnimNotifyEvent* FindAuthoredPointForTest(FName Name) const
+	{
+		if (!Montage) { return nullptr; }
+		for (FAnimNotifyEvent& Event : Montage->Notifies)
+		{
+			const auto* Point = Cast<UAnimNotify_PlayMontageNotify>(Event.Notify.Get());
+			if (Point && FName(*Point->GetNotifyName_Implementation()) == Name) { return &Event; }
+		}
+		return nullptr;
+	}
+	/** 只在未激活的临时 Montage 中声明第二个原生点，偏移使用引擎原生计算。 */
+	bool AddMovementPointForTest(float AuthoredPosition) const
+	{
+		if (!Ability || Ability->IsActive() || !Montage) { return false; }
+		const FName Name(TEXT("GGYGO.Test.MovementPoint"));
+		if (FindAuthoredPointForTest(Name)) { return false; }
+		UAnimNotify_PlayMontageNotify* Point = NewObject<UAnimNotify_PlayMontageNotify>(Montage);
+		FNameProperty* NameProperty = Point ? FindFProperty<FNameProperty>(Point->GetClass(), TEXT("NotifyName")) : nullptr;
+		if (!NameProperty) { return false; }
+		NameProperty->SetPropertyValue_InContainer(Point, Name);
+		FAnimNotifyEvent Event;
+		Event.Notify = Point;
+		Event.NotifyName = Name;
+		Event.Link(Montage, AuthoredPosition);
+		Event.RefreshTriggerOffset(Montage->CalculateOffsetForNotify(AuthoredPosition));
+		Montage->Notifies.Add(Event);
+		static_cast<UAnimSequenceBase*>(Montage)->RefreshCacheData();
+		FGGYGOComboStep& Step = GetFirstStepForTest();
+		Step.MovementInterruptionMode = EGGYGOActionInterruptionMode::AuthoredNotify;
+		Step.MovementInterruptionNotifyName = Name;
+		return true;
+	}
+	/** 经真实生产 StartStep 创建新的原 Task/实例，从给定原生位置起播。 */
+	bool RestartFirstStepForTest(float Position) const
+	{
+		return Ability && Ability->IsActive()
+			&& Ability->StartStep(Ability->CaptureCurrentActivation(), 0, Position);
+	}
+	/** 在未启动的临时资产声明真实状态窗；不为无命中动作补窗口。 */
+	bool AddHitWindowForTest() const
+	{
+		if (!Ability || Ability->IsActive() || !Montage) { return false; }
+		UGGYGOAnimNotifyState_GameplayEventWindow* Window = NewObject<UGGYGOAnimNotifyState_GameplayEventWindow>(Montage);
+		Window->InitializeEventTags(GGYGOGameplayTags::Event_Montage_HitWindowBegin,
+			GGYGOGameplayTags::Event_Montage_HitWindowEnd);
+		Window->NotifyStateBehaviorFlags = static_cast<uint8>(EAnimNotifyStateBehaviorFlags::NoMergeOnConcurrentPlay);
+		FAnimNotifyEvent Event;
+		Event.NotifyStateClass = Window;
+		Event.MontageTickType = EMontageNotifyTickType::Queued;
+		Event.Link(Montage, 0.0f);
+		Event.SetDuration(Montage->GetPlayLength());
+		Montage->Notifies.Add(Event);
+		static_cast<UAnimSequenceBase*>(Montage)->RefreshCacheData();
+		return true;
+	}
+	/** 使用原资产事件和真实原实例上下文进入生产 Notify 发送端，不手拼 ASC 认证负载。 */
+	bool SendHitWindowForTest(bool bOpen, int32 HistoricalInstanceId = INDEX_NONE, int32 WindowOrdinal = 0) const
+	{
+		if (WindowOrdinal < 0) { return false; }
+		FGGYGOMontageSectionSnapshot Snapshot;
+		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask = GetMontageTask();
+		if (!OriginalTask || !Mesh || !Montage || !OriginalTask->TryGetOriginalSectionSnapshot(Snapshot)
+			|| Snapshot.Montage != Montage || Snapshot.MontageInstanceId == INDEX_NONE) { return false; }
+		FAnimNotifyEvent* WindowEvent = nullptr;
+		int32 HitWindowIndex = 0;
+		for (FAnimNotifyEvent& Event : Montage->Notifies)
+		{
+			const auto* Window = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Event.NotifyStateClass.Get());
+			if (Window && Window->GetBeginEventTag() == GGYGOGameplayTags::Event_Montage_HitWindowBegin
+				&& Window->GetEndEventTag() == GGYGOGameplayTags::Event_Montage_HitWindowEnd)
+			{
+				if (HitWindowIndex++ == WindowOrdinal) { WindowEvent = &Event; break; }
+			}
+		}
+		if (!WindowEvent) { return false; }
+		auto* Window = CastChecked<UGGYGOAnimNotifyState_GameplayEventWindow>(WindowEvent->NotifyStateClass.Get());
+		FAnimNotifyEventReference Reference(WindowEvent, Montage);
+		Reference.AddContextData<UE::Anim::FAnimNotifyMontageInstanceContext>(
+			HistoricalInstanceId != INDEX_NONE ? HistoricalInstanceId : Snapshot.MontageInstanceId);
+		if (bOpen) { Window->NotifyBegin(Mesh, Montage, WindowEvent->GetDuration(), Reference); }
+		else { Window->NotifyEnd(Mesh, Montage, Reference); }
+		return true;
+	}
 	bool WereAllResourcesCleanedBeforeBroadcast(
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* EndingMontageTask,
 		const UGGYGOAbilityTask_WaitComboInput* EndingInputTask) const
 	{
-		return Ability && !Ability->StepMotionResources.IsValid() && !Ability->ActiveMesh && !Ability->MontageTask && !Ability->InputTask
+		return Ability && !Ability->StepMotionResources.IsValid() && !Ability->ActiveMesh && !Ability->GetMontageTask() && !Ability->InputTask
 			&& Movement && !Movement->HasActiveActionMotion()
 			&& Ability->GetCurrentComboStep() == INDEX_NONE
 			&& Ability->GetActiveTaskCountForTest() == 0
@@ -513,7 +667,7 @@ struct FGGYGOPlayerComboLifecycleFixture
 	}
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetMontageTask() const
 	{
-		return Ability ? Ability->MontageTask.Get() : nullptr;
+		return Ability ? Ability->GetMontageTask() : nullptr;
 	}
 	UGGYGOAbilityTask_WaitComboInput* GetInputTask() const
 	{
@@ -521,11 +675,11 @@ struct FGGYGOPlayerComboLifecycleFixture
 	}
 	float GetWatchdogRemaining() const
 	{
-		return World && Ability ? World->GetTimerManager().GetTimerRemaining(Ability->WatchdogHandle) : -1.0f;
+		return World && Ability ? World->GetTimerManager().GetTimerRemaining(Ability->GetWatchdogHandle()) : -1.0f;
 	}
 	FTimerHandle GetWatchdogHandle() const
 	{
-		return Ability ? Ability->WatchdogHandle : FTimerHandle{};
+		return Ability ? Ability->GetWatchdogHandle() : FTimerHandle{};
 	}
 	bool HasResourcesForActivation(const FGGYGOAbilityActivationHandle& Original) const
 	{
@@ -567,13 +721,13 @@ struct FGGYGOPlayerComboLifecycleFixture
 			return false;
 		}
 		const bool bMeshCleared = !Ability->ActiveMesh;
-		const bool bMontageTaskCleared = !Ability->MontageTask;
+		const bool bMontageTaskCleared = !Ability->GetMontageTask();
 		const bool bStepMotionCleared = !Ability->StepMotionResources.IsValid();
 		const bool bInputTaskCleared = !Ability->InputTask;
 		const bool bTraceCleared = !Ability->TraceComponent;
 		const bool bActivationCleared = !Ability->ResourceActivation.HasActivation();
 		const bool bWorldCleared = Ability->OriginalWorld.IsExplicitlyNull();
-		const bool bMontageCallbackCleared = !Ability->MontageCallbackRegistration.IsValid();
+		const bool bMontageCallbackCleared = !Ability->HasMontageCallbackRegistration();
 		const bool bInputCallbackCleared = !Ability->InputCallbackRegistration.IsValid();
 		const bool bHitSubscriptionCleared = !Ability->TraceHitSubscription.IsValid();
 		const bool bMeshRestoreFlagCleared = !Ability->bChangedMeshTick;
@@ -629,9 +783,21 @@ namespace
 		UEngine* Engine = nullptr;
 		UWorld* World = nullptr;
 
-		explicit FGGYGOComboLifecycleTestWorld(UEngine* InEngine, bool bCreatePhysicsScene = false)
+		TStrongObjectPtr<UGameInstance> GameInstance;
+
+		explicit FGGYGOComboLifecycleTestWorld(UEngine* InEngine, bool bCreatePhysicsScene = false, bool bWithMessageRouter = false)
 			: Engine(InEngine)
 		{
+			if (bWithMessageRouter)
+			{
+				GameInstance.Reset(NewObject<UGameInstance>(Engine));
+				if (GameInstance.IsValid())
+				{
+					GameInstance->InitializeStandalone(FName(TEXT("GGYGOComboRuntimeDamageWorld")));
+					World = GameInstance->GetWorld();
+				}
+				return;
+			}
 			UWorld::InitializationValues Init;
 			Init.AllowAudioPlayback(false).RequiresHitProxies(false).CreatePhysicsScene(bCreatePhysicsScene)
 				.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
@@ -647,8 +813,9 @@ namespace
 		{
 			if (World)
 			{
-				// Keep the registered context alive until actors and components are torn down.
+				// 原Router随GI保留到演员和组件退出，最后再退休WorldContext。
 				World->DestroyWorld(false);
+				if (GameInstance.IsValid()) { GameInstance->Shutdown(); }
 				if (Engine) { Engine->DestroyWorldContext(World); }
 				if (UPackage* Package = World->GetPackage()) { Package->SetDirtyFlag(false); }
 			}
@@ -674,6 +841,180 @@ namespace
 	}
 }
 
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboObservationSourceTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Observation.OriginalSource",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboObservationSourceTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.InterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	Step.InterruptionNotifyName = NAME_None;
+	Step.NextStepIndex = INDEX_NONE;
+	FGGYGOPlayerComboObservation Observation;
+	FGGYGOMontageSectionSnapshot Snapshot;
+	FString Error;
+	TestFalse(TEXT("未激活不能捕获原段"), Fixture.Ability->CaptureOriginalStepObservation(Observation, Snapshot, Error));
+	TestFalse(TEXT("CDO不能签发原源"), GetMutableDefault<UGGYGOPlayerComboLifecycleTestAbility>()
+		->CaptureOriginalStepObservation(Observation, Snapshot, Error));
+	const auto Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("真实受控 GAS 启动"), Activation.bNativeAccepted && Activation.OriginalActivation.HasActivation())
+		|| !TestTrue(TEXT("捕获实际原Task快照"), Fixture.Ability->CaptureOriginalStepObservation(Observation, Snapshot, Error)))
+	{
+		Fixture.Ability->FinishForTest();
+		return false;
+	}
+	FGGYGOPlayerComboObservationFacts Facts;
+	TestTrue(TEXT("原历史来源可读"), Observation.ReadHistory(Facts));
+	TestTrue(TEXT("来源精确关联原proof/Step/Task/Mesh/World/CMC"),
+		Facts.Activation.HasSameActivation(Activation.OriginalActivation) && Facts.StepToken != 0 && Facts.StepIndex == 0
+		&& Facts.Ability.Get() == Fixture.Ability && Facts.ASC.Get() == Fixture.ASC && Facts.Pawn.Get() == Fixture.Character
+		&& Facts.Mesh.Get() == Fixture.Character->GetMesh() && Facts.World.Get() == TestWorld.World
+		&& Facts.Task.Get() == Fixture.GetMontageTask() && Facts.Montage.Get() == Fixture.Montage
+		&& Facts.Movement.Get() == Fixture.Movement && Facts.MontageInstanceId == Snapshot.MontageInstanceId
+		&& Facts.MotionHandle != INDEX_NONE);
+	bool bResourceSourceCurrent = false;
+	TestTrue(TEXT("活原源实时快照及GA自有源分别认证"),
+		Fixture.Ability->ReadOriginalStepObservation(Observation, Snapshot, Error, &bResourceSourceCurrent)
+		&& bResourceSourceCurrent);
+	bool bBeforeCleanupHistory = false;
+	Fixture.Ability->SetBeforeCleanupActionForTest([&]
+	{
+		FGGYGOPlayerComboObservationFacts Before;
+		bBeforeCleanupHistory = Observation.ReadHistory(Before) && !Before.bCleanupObserved
+			&& Before.Activation.HasSameActivation(Activation.OriginalActivation);
+	});
+	bool bMatchedCompleted = false;
+	const auto Completion = Fixture.ASC->OnAbilityTerminationCompleted().AddLambda(
+		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+		{
+			FGGYGOPlayerComboObservationFacts Ended;
+			bMatchedCompleted = Notice.HasCompletion() && Observation.ReadHistory(Ended) && Ended.bCleanupObserved
+				&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Ended.Activation);
+		});
+	const auto End = Fixture.Ability->RequestAbilityEnd(Activation.OriginalActivation, false, false);
+	Fixture.ASC->OnAbilityTerminationCompleted().Remove(Completion);
+	TestTrue(TEXT("cleanup入口之前不提前签发cleanup历史"), bBeforeCleanupHistory);
+	TestTrue(TEXT("原完整退出在cleanup之后且匹配固定proof"), bMatchedCompleted
+		&& End.Outcome == EGGYGOAbilityTerminationOutcome::Completed);
+	TestTrue(TEXT("已退役原历史仍读回"), Observation.ReadHistory(Facts) && Facts.bCleanupObserved
+		&& !Facts.bTaskNaturalEnded && !Facts.bConsumerAccepted && !Facts.bDrainAccepted);
+	Snapshot.Montage = Fixture.Montage;
+	TestFalse(TEXT("退出后live快照拒绝"),
+		Fixture.Ability->ReadOriginalStepObservation(Observation, Snapshot, Error, &bResourceSourceCurrent));
+	TestTrue(TEXT("失败live输出及GA源事实完整清空"),
+		!Snapshot.Montage && Snapshot.MontageInstanceId == INDEX_NONE && !bResourceSourceCurrent);
+	const auto Successor = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (TestTrue(TEXT("同资产同实例后继真实启动"), Successor.bNativeAccepted && Successor.OriginalActivation.HasActivation()))
+	{
+		TestFalse(TEXT("旧视图不改绑同资产后继"), Fixture.Ability->ReadOriginalStepObservation(Observation, Snapshot, Error));
+		FGGYGOPlayerComboObservation NewObservation;
+		FGGYGOPlayerComboObservationFacts NewFacts;
+		TestTrue(TEXT("后继显式新捕获具有不同proof及StepToken"),
+			Fixture.Ability->CaptureOriginalStepObservation(NewObservation, Snapshot, Error) && NewObservation.ReadHistory(NewFacts)
+			&& !NewFacts.Activation.HasSameActivation(Facts.Activation) && NewFacts.StepToken != Facts.StepToken);
+		Fixture.Ability->FinishForTest();
+	}
+	Observation.Reset();
+	TestFalse(TEXT("显式清理原视图，清空历史输出"), Observation.ReadHistory(Facts));
+	TestFalse(TEXT("清理不保留原proof副本"), Facts.Activation.HasActivation());
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboObservationRejectedDrainTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Observation.RejectedDrain",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboObservationRejectedDrainTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.InterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	Step.InterruptionNotifyName = NAME_None;
+	Step.NextStepIndex = INDEX_NONE;
+	const auto Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	FGGYGOPlayerComboObservation Observation;
+	FGGYGOMontageSectionSnapshot Snapshot;
+	FString Error;
+	if (!TestTrue(TEXT("实际启动并捕获原源"), Activation.bNativeAccepted
+		&& Fixture.Ability->CaptureOriginalStepObservation(Observation, Snapshot, Error)))
+	{
+		Fixture.Ability->FinishForTest();
+		return false;
+	}
+	FGGYGOPlayerComboObservationFacts Original;
+	if (!TestTrue(TEXT("原来源可读"), Observation.ReadHistory(Original))) { Fixture.Ability->FinishForTest(); return false; }
+	FGGYGOActionMotionSourceBindingPtr Source;
+	if (!TestTrue(TEXT("只读构造完整原Montage source"), GGYGOActionMotionSource::BuildSourceBindingRange(
+		Fixture.Montage, Step.MotionSlotName, Step.MainSection, Step.EndSection, Source, Error)))
+	{
+		Fixture.Ability->FinishForTest(); return false;
+	}
+	// 真实公开CMC入口退役两个令牌，使原GA的已发令牌确实过期；不写CMC内部状态或伪造返回。
+	if (!TestTrue(TEXT("公开取消原CMC资源"), Fixture.Movement->ReleaseMontageActionMotion(
+		Original.MotionHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error)))
+	{ Fixture.Ability->FinishForTest(); return false; }
+	int32 OtherHandle = INDEX_NONE;
+	if (!TestTrue(TEXT("公开入口创建另一真实CMC令牌"), Fixture.Movement->BeginMontageActionMotion(Source,
+		Snapshot.MontageInstanceId, Snapshot.PositionSeconds, Snapshot.InstancePlayRate * Source->MontageRateScale,
+		Step.MotionTranslationScale, OtherHandle, Error) && OtherHandle != Original.MotionHandle)
+		|| !TestTrue(TEXT("公开退役另一令牌，使原令牌不再是末次幂等令牌"), Fixture.Movement->ReleaseMontageActionMotion(
+			OtherHandle, EGGYGOActionMotionReleaseReason::Cancelled, Error)))
+	{ Fixture.Ability->FinishForTest(); return false; }
+	FGGYGOMontageSectionSnapshot Current;
+	bool bResourceSourceCurrent = false;
+	if (!TestTrue(TEXT("仅CMC令牌过期，原GA/Task/Mesh/实例仍认证"),
+		Fixture.Ability->ReadOriginalStepObservation(Observation, Current, Error, &bResourceSourceCurrent)
+		&& bResourceSourceCurrent))
+	{ Fixture.Ability->FinishForTest(); return false; }
+	FAnimMontageInstance* Instance = Fixture.AnimInstance->GetMontageInstanceForID(Original.MontageInstanceId);
+	if (!TestTrue(TEXT("原实例native End delegate确属原Task"), Instance
+		&& Instance->OnMontageEnded.GetUObject() == Fixture.GetMontageTask()))
+	{ Fixture.Ability->FinishForTest(); return false; }
+	// 已绑定原生回调探针，不推进动画时间，不是生产自然结尾／PIE验收。
+	const FOnMontageEnded OriginalEnd = Instance->OnMontageEnded;
+	bool bRejectedBeforeCleanup = false;
+	Fixture.Ability->SetBeforeCleanupActionForTest([&]
+	{
+		FGGYGOPlayerComboObservationFacts During;
+		bRejectedBeforeCleanup = Observation.ReadHistory(During) && During.bTaskNaturalEnded
+			&& During.bConsumerAccepted && During.bDrainRequestReturned && !During.bDrainAccepted && !During.bCleanupObserved;
+	});
+	bool bCancelledCompletion = false;
+	const auto Completion = Fixture.ASC->OnAbilityTerminationCompleted().AddLambda(
+		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+		{
+			bCancelledCompletion = Notice.HasCompletion()
+				&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Original.Activation)
+				&& Notice.GetOriginal().WasCancelled();
+		});
+	const FString ExpectedTokenDiagnostic = FString::Printf(
+		TEXT("[Movement.ActionMotion] token=%d is not the original active/completed resource"), Original.MotionHandle);
+	const FString ExpectedCleanupDiagnostic = FString::Printf(
+		TEXT("MontageAction [%s] original handle %d cleanup failed: %s"),
+		*Fixture.Ability->GetPathName(), Original.MotionHandle, *ExpectedTokenDiagnostic);
+	AddExpectedError(TEXT("Original Task completed but its CMC natural drain was rejected"), EAutomationExpectedErrorFlags::Contains, 1);
+	// 夹具刻意使原令牌过期；故障 cleanup 也须拒绝它，按原实例全文精确校验一次诊断。
+	AddExpectedErrorPlain(ExpectedCleanupDiagnostic, EAutomationExpectedErrorFlags::Exact, 1);
+	OriginalEnd.ExecuteIfBound(Fixture.Montage, false);
+	Fixture.ASC->OnAbilityTerminationCompleted().Remove(Completion);
+	FGGYGOPlayerComboObservationFacts Failed;
+	TestTrue(TEXT("真实拒绝返回在cleanup之前记录"), bRejectedBeforeCleanup);
+	TestTrue(TEXT("原GA因真实CMC拒绝完整故障退出"), bCancelledCompletion && !Fixture.Ability->IsActive());
+	TestTrue(TEXT("Task/bMontageCompleted不能补成自然成功"), Observation.ReadHistory(Failed)
+		&& Failed.bTaskNaturalEnded && Failed.bConsumerAccepted && Failed.bDrainRequestReturned
+		&& !Failed.bDrainAccepted && !Failed.bMotionCompleted && Failed.bCleanupObserved && Failed.bCleanupCancelled
+		&& !Failed.DrainDiagnostic.IsEmpty());
+	TestEqual(TEXT("真实drain拒绝诊断精确关联原令牌"), Failed.DrainDiagnostic, ExpectedTokenDiagnostic);
+	Fixture.Ability->FinishForTest();
+	return true;
+}
+
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboTraceShapeCompatibilityTest,
 	"GGYGO.AbilitySystem.PlayerCombo.TraceShape.Compatibility",
 	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
@@ -693,6 +1034,12 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 			Property->HasAnyPropertyFlags(CPF_Transient | CPF_Deprecated));
 	}
 	FGGYGOComboStep Original;
+	TestTrue(TEXT("既有动作默认仍要求真实攻击接续作者点"),
+		Original.InterruptionMode == EGGYGOActionInterruptionMode::AuthoredNotify
+		&& Original.InterruptionNotifyName == FName(TEXT("Event.Montage.CancelPoint")));
+	TestTrue(TEXT("移动打断默认 Disabled/None，旧序列化数据不自动获得移动门"),
+		Original.MovementInterruptionMode == EGGYGOActionInterruptionMode::Disabled
+		&& Original.MovementInterruptionNotifyName.IsNone());
 	TestTrue(TEXT("历史起终点默认仍为空"), Original.TraceStartSocket.IsNone() && Original.TraceEndSocket.IsNone());
 	TestEqual(TEXT("历史半径默认仍为 20"), Original.TraceRadius, 20.0f);
 	Original.TraceStartSocket = TEXT("StoredLegacyStart");
@@ -700,6 +1047,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	Original.TraceRadius = 37.25f;
 	Original.MotionSlotName = TEXT("StoredMotionSlot");
 	Original.MotionTranslationScale = 0.75f;
+	Original.InterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	Original.InterruptionNotifyName = NAME_None;
 	Original.TraceShape.Mode = EGGYGOMeleeTraceShapeMode::SocketChains;
 	FGGYGOMeleeTraceChain& StoredChain = Original.TraceShape.Chains.AddDefaulted_GetRef();
 	StoredChain.Points = { FName(TEXT("StoredPoint0")), FName(TEXT("StoredPoint1")), FName(TEXT("StoredPoint2")) };
@@ -723,6 +1072,8 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	TestEqual(TEXT("历史半径非默认值留存"), RoundTrip.TraceRadius, Original.TraceRadius);
 	TestEqual(TEXT("显式动作Slot留存"), RoundTrip.MotionSlotName, Original.MotionSlotName);
 	TestEqual(TEXT("显式动作位移倍率留存"), RoundTrip.MotionTranslationScale, Original.MotionTranslationScale);
+	TestTrue(TEXT("显式关闭打断模式留存"), RoundTrip.InterruptionMode == Original.InterruptionMode);
+	TestEqual(TEXT("显式关闭通知名留存"), RoundTrip.InterruptionNotifyName, Original.InterruptionNotifyName);
 	TestTrue(TEXT("新 Shape 模式留存"), RoundTrip.TraceShape.Mode == Original.TraceShape.Mode);
 	if (!TestEqual(TEXT("新 Shape 链数量留存"), RoundTrip.TraceShape.Chains.Num(), 1)) { return false; }
 	TestTrue(TEXT("新 Shape 有序点留存"), RoundTrip.TraceShape.Chains[0].Points == StoredChain.Points);
@@ -761,7 +1112,7 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 		&& ShapeActivation.OriginalActivation.HasActivation()
 		&& Fixture.Ability->CaptureCurrentActivation().HasSameActivation(ShapeActivation.OriginalActivation))) { return false; }
 	TestEqual(TEXT("正常路径提交一次"), CommitCount, 1);
-	TestEqual(TEXT("正常路径实际 Montage 播放一次"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 1);
+	TestEqual(TEXT("正常路径实际 Montage 播放一次"), Fixture.AnimInstance->GetSuccessfulGuardReturnCountForTest(), 1);
 	TestEqual(TEXT("正常路径保留原 Montage 与 Input 两任务"), Fixture.Ability->GetActiveTaskCountForTest(), 2);
 	TestTrue(TEXT("正常Main已取得真实CMC原动作资源"), Fixture.Movement->HasActiveActionMotion());
 	TestEqual(TEXT("Main动作接管时普通Walk/Run速度上限为0"), Fixture.Movement->GetMaxSpeed(), 0.0f);
@@ -778,6 +1129,255 @@ bool FGGYGOPlayerComboTraceShapeCompatibilityTest::RunTest(const FString& Parame
 	TestFalse(TEXT("正常结束释放GA原段动作资源"), Fixture.HasStepMotionResources());
 	TestFalse(TEXT("正常结束精确退出CMC原动作资源"), Fixture.Movement->HasActiveActionMotion());
 	AddInfo(TEXT("成员往返仅证明序列化留存，不代表未知旧 Blueprint Pin/地图消费者已迁移。"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerSingleActionInterruptionTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.ExplicitDisabled",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerSingleActionInterruptionTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FString Error;
+	if (!TestTrue(TEXT("既有作者点配置可用"), Fixture.Ability->ValidateComboConfiguration(Error))) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.NextStepIndex = INDEX_NONE;
+	TestTrue(TEXT("攻击作者点＋默认移动 Disabled/None 可用"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionNotifyName = TEXT("GGYGO.Test.MovementPoint");
+	TestFalse(TEXT("移动 Disabled 不能保留未使用通知名"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionMode = EGGYGOActionInterruptionMode::AuthoredNotify;
+	Step.MovementInterruptionNotifyName = NAME_None;
+	TestFalse(TEXT("AuthoredNotify 移动门必须配置名字"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionNotifyName = Step.InterruptionNotifyName;
+	TestFalse(TEXT("移动点不能与攻击点同名而跨权限授权"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionNotifyName = TEXT("GGYGO.Test.MissingMovementPoint");
+	TestFalse(TEXT("缺失的移动作者点明确拒绝"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionMode = static_cast<EGGYGOActionInterruptionMode>(99);
+	TestFalse(TEXT("未知移动打断模式拒绝"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.MovementInterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	Step.MovementInterruptionNotifyName = NAME_None;
+	Fixture.Montage->Notifies.Reset();
+	TestFalse(TEXT("要求作者点的动作不能因点缺失自动关闭打断"), Fixture.Ability->ValidateComboConfiguration(Error));
+
+	Step.InterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	TestFalse(TEXT("关闭模式不能仍声明未使用通知"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.InterruptionNotifyName = NAME_None;
+	TestTrue(TEXT("单段显式关闭打断无需伪造作者点"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.NextStepIndex = 0;
+	TestFalse(TEXT("关闭打断时不得配置攻击接续"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.NextStepIndex = INDEX_NONE;
+	Step.InterruptionMode = static_cast<EGGYGOActionInterruptionMode>(99);
+	TestFalse(TEXT("未知打断模式拒绝"), Fixture.Ability->ValidateComboConfiguration(Error));
+	Step.InterruptionMode = EGGYGOActionInterruptionMode::AuthoredNotify;
+	TestFalse(TEXT("恢复作者模式后 None 名称仍为必需配置错误"), Fixture.Ability->ValidateComboConfiguration(Error));
+
+	Step.InterruptionMode = EGGYGOActionInterruptionMode::Disabled;
+	const FGGYGOAbilityActivationRequestResult Activation =
+		Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("无作者点的显式关闭动作通过真实 GAS 启动"), Activation.bNativeAccepted
+		&& Activation.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& Activation.OriginalActivation.HasActivation())) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const OriginalMontageTask = Fixture.GetMontageTask();
+	TestTrue(TEXT("启动仍持有原 Montage Task"), IsValid(OriginalMontageTask) && OriginalMontageTask->IsActive());
+	TestTrue(TEXT("启动仍签发原 CMC 动作资源"), Fixture.Movement->HasActiveActionMotion());
+	TestTrue(TEXT("启动仍持有 GA 原动作资源"), Fixture.HasStepMotionResources());
+	TestFalse(TEXT("攻击与移动双 Disabled 不打开任一打断权限"), Fixture.Ability->IsInterruptionOpen()
+		|| Fixture.Ability->IsAttackContinuationOpen() || Fixture.Ability->IsMovementInterruptionOpen());
+	TestEqual(TEXT("未完成的动作保持当前唯一段"), Fixture.Ability->GetCurrentComboStep(), 0);
+	const FGGYGOAbilityTerminationResult Cleanup =
+		Fixture.Ability->RequestAbilityEnd(Activation.OriginalActivation, false, false);
+	TestTrue(TEXT("按原激活正常清理测试动作"), Cleanup.Outcome == EGGYGOAbilityTerminationOutcome::Completed
+		&& Cleanup.Original.GetOriginalActivation().HasSameActivation(Activation.OriginalActivation));
+	TestFalse(TEXT("清理释放原 GA 动作资源"), Fixture.HasStepMotionResources());
+	TestFalse(TEXT("清理释放原 CMC 动作资源"), Fixture.Movement->HasActiveActionMotion());
+	TestEqual(TEXT("清理退役所有原任务"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
+	AddInfo(TEXT("本项验证真实启动和原资源清理；完整自然结束仍需原生动作冒烟。"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboAttackPointOnlyOpensAttackTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.AttackPointOnlyOpensAttack",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboAttackPointOnlyOpensAttackTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FString Error;
+	const FGGYGOComboStep& Step = Fixture.GetFirstStepForTest();
+	if (!TestTrue(TEXT("攻击作者点＋默认移动 Disabled/None 的既有配置可用"),
+		Step.MovementInterruptionMode == EGGYGOActionInterruptionMode::Disabled
+		&& Step.MovementInterruptionNotifyName.IsNone() && Fixture.Ability->ValidateComboConfiguration(Error))) { return false; }
+	const FGGYGOAbilityActivationRequestResult Activation =
+		Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("通过真实 GAS 启动"), Activation.bNativeAccepted
+		&& Activation.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
+		&& Activation.OriginalActivation.HasActivation())) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const OriginalTask = Fixture.GetMontageTask();
+	FGGYGOMontageSectionSnapshot Snapshot;
+	if (!TestTrue(TEXT("原 Task 原实例可读"), IsValid(OriginalTask) && OriginalTask->TryGetOriginalSectionSnapshot(Snapshot)
+		&& Snapshot.Montage == Fixture.Montage && Snapshot.MontageInstanceId != INDEX_NONE)) { return false; }
+	TestFalse(TEXT("起播未越过攻击点时两门均关闭"),
+		Fixture.Ability->IsAttackContinuationOpen() || Fixture.Ability->IsMovementInterruptionOpen());
+	FAnimNotifyEvent* PointEvent = nullptr;
+	for (FAnimNotifyEvent& Event : Fixture.Montage->Notifies)
+	{
+		if (Cast<UAnimNotify_PlayMontageNotify>(Event.Notify.Get())) { PointEvent = &Event; break; }
+	}
+	if (!TestNotNull(TEXT("夹具有唯一原生攻击点"), PointEvent)) { return false; }
+	// 原生入口：AnimInstance 广播 → 原 Task 认证原实例 → GA 消费；不直接写 GA 门状态。
+	const FBranchingPointNotifyPayload Payload(Fixture.Mesh, Fixture.Montage, PointEvent, Snapshot.MontageInstanceId);
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(Step.InterruptionNotifyName, Payload);
+	TestTrue(TEXT("原实例攻击点打开攻击接续门，保留的 IsInterruptionOpen 表示同一攻击事实"),
+		Fixture.Ability->IsAttackContinuationOpen() && Fixture.Ability->IsInterruptionOpen());
+	TestFalse(TEXT("攻击点不打开移动打断门"), Fixture.Ability->IsMovementInterruptionOpen());
+	TestTrue(TEXT("攻击点不取消原 CMC 轨迹，也不结束原能力"), Fixture.Movement->HasActiveActionMotion()
+		&& Fixture.Ability->IsActive() && Fixture.GetMontageTask() == OriginalTask && Fixture.HasStepMotionResources()
+		&& Fixture.Ability->CaptureCurrentActivation().HasSameActivation(Activation.OriginalActivation));
+	const FGGYGOAbilityTerminationResult Cleanup =
+		Fixture.Ability->RequestAbilityEnd(Activation.OriginalActivation, false, false);
+	TestTrue(TEXT("按原激活正常清理"), Cleanup.Outcome == EGGYGOAbilityTerminationOutcome::Completed);
+	TestFalse(TEXT("清理后两门不残留"),
+		Fixture.Ability->IsAttackContinuationOpen() || Fixture.Ability->IsMovementInterruptionOpen());
+	TestFalse(TEXT("清理释放原 GA 动作资源"), Fixture.HasStepMotionResources());
+	TestFalse(TEXT("清理释放原 CMC 动作资源"), Fixture.Movement->HasActiveActionMotion());
+	AddInfo(TEXT("本项经原 Task 的原生委托认证入口核对攻击点不授予移动；未自然 Advance，不替代双点与生产 Held 冒烟。"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboMovementPointConfigurationTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.MovementPointConfiguration",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboMovementPointConfigurationTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.NextStepIndex = INDEX_NONE;
+	const float MainEnd = Fixture.Montage->GetAnimCompositeSection(Fixture.Montage->GetSectionIndex(Step.EndSection)).GetTime();
+	if (!TestTrue(TEXT("以当前 Section 时间声明独立移动点"), Fixture.AddMovementPointForTest(MainEnd))) { return false; }
+	FAnimNotifyEvent* MovementPoint = Fixture.FindAuthoredPointForTest(Step.MovementInterruptionNotifyName);
+	FAnimNotifyEvent* AttackPoint = Fixture.FindAuthoredPointForTest(Step.InterruptionNotifyName);
+	if (!TestNotNull(TEXT("原攻击点保持"), AttackPoint) || !TestNotNull(TEXT("独立移动点存在"), MovementPoint)) { return false; }
+	TestEqual(TEXT("移动作者时间精确等于 Section Main 末端"), MovementPoint->GetTime(), MainEnd, 0.0f);
+	TestTrue(TEXT("引擎段界 OffsetBefore 保持且真实 trigger 早于 Main 末端"), MovementPoint->GetTriggerTime() < MainEnd);
+	FString Error;
+	TestTrue(TEXT("两个不同名/不同真实 trigger 的合法点通过配置核验"), Fixture.Ability->ValidateComboConfiguration(Error));
+
+	MovementPoint->Link(Fixture.Montage, MainEnd * 0.75f);
+	MovementPoint->RefreshTriggerOffset(Fixture.Montage->CalculateOffsetForNotify(MovementPoint->GetTime()));
+	static_cast<UAnimSequenceBase*>(Fixture.Montage)->RefreshCacheData();
+	TestFalse(TEXT("移动作者点提前于真实 Main 末端必须拒绝"), Fixture.Ability->ValidateComboConfiguration(Error));
+	// RefreshCacheData 可排序 Notifies；重新按名字取元素，不能沿排序前的数组地址改另一个点。
+	MovementPoint = Fixture.FindAuthoredPointForTest(Step.MovementInterruptionNotifyName);
+	if (!TestNotNull(TEXT("排序后仍按名字定位移动点"), MovementPoint)) { return false; }
+	MovementPoint->Link(Fixture.Montage, MainEnd);
+	MovementPoint->RefreshTriggerOffset(Fixture.Montage->CalculateOffsetForNotify(MainEnd));
+	static_cast<UAnimSequenceBase*>(Fixture.Montage)->RefreshCacheData();
+	TestTrue(TEXT("恢复真实 Section 边界后配置重新有效"), Fixture.Ability->ValidateComboConfiguration(Error));
+	MovementPoint = Fixture.FindAuthoredPointForTest(Step.MovementInterruptionNotifyName);
+	AttackPoint = Fixture.FindAuthoredPointForTest(Step.InterruptionNotifyName);
+	if (!TestNotNull(TEXT("恢复后的移动点"), MovementPoint) || !TestNotNull(TEXT("恢复后的原攻击点"), AttackPoint)) { return false; }
+
+	// 构造实际 trigger 相等的非法声明；这是负例，不把同名或时间碰撞当合法播放。
+	const float NativeOffset = MovementPoint->TriggerTimeOffset;
+	MovementPoint->TriggerTimeOffset = AttackPoint->TriggerTimeOffset;
+	TestEqual(TEXT("负例的两个实际 trigger 精确重合"), MovementPoint->GetTriggerTime(), AttackPoint->GetTriggerTime(), 0.0f);
+	TestFalse(TEXT("真实 BranchingPoint trigger 碰撞必须拒绝"), Fixture.Ability->ValidateComboConfiguration(Error));
+	MovementPoint->TriggerTimeOffset = NativeOffset;
+	TestTrue(TEXT("恢复原生 offset 后配置有效"), Fixture.Ability->ValidateComboConfiguration(Error));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboAuthoredPointIndependenceTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.AuthoredPointIndependence",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboAuthoredPointIndependenceTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.NextStepIndex = INDEX_NONE;
+	const float MainEnd = Fixture.Montage->GetAnimCompositeSection(Fixture.Montage->GetSectionIndex(Step.EndSection)).GetTime();
+	if (!TestTrue(TEXT("配置独立移动点"), Fixture.AddMovementPointForTest(MainEnd))) { return false; }
+	const FName AttackName = Step.InterruptionNotifyName;
+	const FName MovementName = Step.MovementInterruptionNotifyName;
+	const FGGYGOAbilityActivationRequestResult Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("真实 GAS 激活双点动作"), Activation.bNativeAccepted
+		&& Activation.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted)) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const Task = Fixture.GetMontageTask();
+	FGGYGOMontageSectionSnapshot Snapshot;
+	if (!TestTrue(TEXT("原 Task 原实例快照"), Task && Task->TryGetOriginalSectionSnapshot(Snapshot))) { return false; }
+	FAnimNotifyEvent* const MovementPoint = Fixture.FindAuthoredPointForTest(MovementName);
+	if (!TestNotNull(TEXT("Ready 后按名字取移动原生点"), MovementPoint)) { return false; }
+	FAnimMontageInstance* const Instance = Fixture.AnimInstance->GetMontageInstanceForID(Snapshot.MontageInstanceId);
+	if (!TestNotNull(TEXT("原生原 Montage 实例"), Instance)) { return false; }
+	Instance->SetPosition(MovementPoint->GetTriggerTime());
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(MovementName,
+		FBranchingPointNotifyPayload(Fixture.Mesh, Fixture.Montage, MovementPoint, Snapshot.MontageInstanceId));
+	if (!TestTrue(TEXT("早到移动 Fact 只 Pending：原能力与原 CMC 继续"), Fixture.Ability->IsActive()
+		&& Fixture.Movement->HasActiveActionMotion() && Fixture.GetMontageTask() == Task)) { return false; }
+	TestFalse(TEXT("OffsetBefore 在 Main 内不能打开移动门"), Fixture.Ability->IsMovementInterruptionOpen());
+	TestFalse(TEXT("移动 Fact 不能代开攻击门"), Fixture.Ability->IsAttackContinuationOpen());
+
+	// 原生委托可重入结束资源；回调后按固定原 ID 重新查询，不继续使用旧裸指针。
+	FAnimMontageInstance* const OriginalAfterCallback = Fixture.AnimInstance->GetMontageInstanceForID(Snapshot.MontageInstanceId);
+	FAnimNotifyEvent* const AttackPoint = Fixture.FindAuthoredPointForTest(AttackName);
+	if (!TestNotNull(TEXT("回调后原实例仍在"), OriginalAfterCallback)
+		|| !TestNotNull(TEXT("回调后攻击原生点"), AttackPoint)) { return false; }
+	OriginalAfterCallback->SetPosition(MainEnd);
+	Fixture.AnimInstance->OnPlayMontageNotifyBegin.Broadcast(AttackName,
+		FBranchingPointNotifyPayload(Fixture.Mesh, Fixture.Montage, AttackPoint, Snapshot.MontageInstanceId));
+	TestTrue(TEXT("原攻击 Fact 只打开攻击门"), Fixture.Ability->IsAttackContinuationOpen());
+	TestFalse(TEXT("即使 livePosition 已达 Main 末端，攻击 Fact 也不能消费 Pending 移动门"), Fixture.Ability->IsMovementInterruptionOpen());
+	TestTrue(TEXT("攻击门不查询/取消 CMC，原动作仍在"), Fixture.Ability->IsActive() && Fixture.Movement->HasActiveActionMotion());
+	const FGGYGOAbilityTerminationResult Cleanup = Fixture.Ability->RequestAbilityEnd(Activation.OriginalActivation, false, false);
+	TestTrue(TEXT("原激活幂等清理"), Cleanup.Outcome == EGGYGOAbilityTerminationOutcome::Completed);
+	TestFalse(TEXT("清理后两门与 Pending 不残留"), Fixture.Ability->IsAttackContinuationOpen() || Fixture.Ability->IsMovementInterruptionOpen());
+	TestFalse(TEXT("原 CMC 动作资源释放"), Fixture.Movement->HasActiveActionMotion());
+	AddInfo(TEXT("本项驱动真实原实例位置与原 Task 的原生委托认证入口；未自然 Advance，不替代 QualifiedHeld 生产冒烟。"));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboNonzeroNamedPointSnapshotTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.NonzeroNamedPointSnapshot",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboNonzeroNamedPointSnapshotTest::RunTest(const FString& Parameters)
+{
+	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
+	FGGYGOPlayerComboLifecycleFixture Fixture;
+	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+	Step.NextStepIndex = INDEX_NONE;
+	const int32 EndIndex = Fixture.Montage->GetSectionIndex(Step.EndSection);
+	Fixture.Montage->GetAnimCompositeSection(EndIndex).Link(Fixture.Montage, 0.9f);
+	static_cast<UAnimSequenceBase*>(Fixture.Montage)->RefreshCacheData();
+	const float MainEnd = Fixture.Montage->GetAnimCompositeSection(EndIndex).GetTime();
+	if (!TestTrue(TEXT("按当前 Section 时间配置移动点"), Fixture.AddMovementPointForTest(MainEnd))) { return false; }
+	const FGGYGOAbilityActivationRequestResult Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
+	if (!TestTrue(TEXT("真实 GAS 启动"), Activation.bNativeAccepted)) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const FirstTask = Fixture.GetMontageTask();
+	FGGYGOMontageSectionSnapshot FirstSnapshot;
+	if (!TestTrue(TEXT("初始原实例"), FirstTask && FirstTask->TryGetOriginalSectionSnapshot(FirstSnapshot))) { return false; }
+	if (!TestTrue(TEXT("生产 StartStep 从非零原生位置创建新播放"), Fixture.RestartFirstStepForTest(0.6f))) { return false; }
+	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const RestartedTask = Fixture.GetMontageTask();
+	FGGYGOMontageSectionSnapshot Restarted;
+	TestTrue(TEXT("持有新固定原 ID，而非复用历史实例"), RestartedTask && RestartedTask != FirstTask
+		&& RestartedTask->TryGetOriginalSectionSnapshot(Restarted) && Restarted.MontageInstanceId != FirstSnapshot.MontageInstanceId);
+	TestTrue(TEXT("具名 liveSnapshot 恢复已过攻击点"), Fixture.Ability->IsAttackContinuationOpen());
+	TestFalse(TEXT("尚未达到独立 MainEnd 的移动门保持关闭"), Fixture.Ability->IsMovementInterruptionOpen());
+	TestTrue(TEXT("原能力与新 CMC 动作资源有效"), Fixture.Ability->IsActive() && Fixture.Movement->HasActiveActionMotion());
+	const FGGYGOAbilityTerminationResult Cleanup = Fixture.Ability->RequestAbilityEnd(Activation.OriginalActivation, false, false);
+	TestTrue(TEXT("原激活清理完成"), Cleanup.Outcome == EGGYGOAbilityTerminationOutcome::Completed);
 	return true;
 }
 
@@ -869,7 +1469,7 @@ bool FGGYGOPlayerComboInvalidTraceShapeTest::RunTest(const FString& Parameters)
 	bBehaviorPassed &= TestTrue(TEXT("提交前拒绝按故障取消原激活"), bEndWasCanceled);
 	bBehaviorPassed &= TestTrue(TEXT("结束广播前原资源已清理"), bResourcesCleanAtEnd);
 	bBehaviorPassed &= TestFalse(TEXT("无活动 GA"), Fixture.Ability->IsActive());
-	bBehaviorPassed &= TestEqual(TEXT("从未播放 Montage"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 0);
+	bBehaviorPassed &= TestEqual(TEXT("从未播放 Montage"), Fixture.AnimInstance->GetSuccessfulGuardReturnCountForTest(), 0);
 	bBehaviorPassed &= TestEqual(TEXT("没有残留 Task"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
 	bBehaviorPassed &= TestFalse(TEXT("没有 Trace 执行"), Fixture.Trace->IsTracing());
 	bBehaviorPassed &= TestFalse(TEXT("没有 Owned 窗口"), Fixture.GetTraceWindow().HasWindow());
@@ -940,18 +1540,46 @@ bool FGGYGOPlayerComboActivationReentryTest::RunTest(const FString& Parameters)
 
 		bool bReadyCallbackReentered = false;
 		float OldEffectivePlayRate = 0.0f;
-		Fixture.AnimInstance->SetAfterSuperMontagePlayActionForTest([&]
+		int32 NativeStartedCount = 0;
+		int32 OriginalCreatedInstanceId = INDEX_NONE;
+		int32 SuccessorCreatedInstanceId = INDEX_NONE;
+		TStrongObjectPtr<UGGYGOMontageStartedDiagnosticObserver> StartedObserver(
+			NewObject<UGGYGOMontageStartedDiagnosticObserver>(Fixture.Character));
+		if (!TestNotNull(TEXT("真实 Started 观察者"), StartedObserver.Get())) { return false; }
+		ON_SCOPE_EXIT
 		{
+			StartedObserver->DisarmForTest();
+		};
+		// 真实引擎创建回调仍在 Guard Executing 内；不把 Guard Returned 后的自定义钩子当成创建接缝。
+		StartedObserver->ArmForTest(Fixture.AnimInstance, Fixture.Montage, [&]
+		{
+			++NativeStartedCount;
+			if (const FAnimMontageInstance* Instance = Fixture.AnimInstance->GetActiveInstanceForMontage(Fixture.Montage))
+			{
+				OriginalCreatedInstanceId = Instance->GetInstanceID();
+			}
 			if (const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OldTask = Fixture.GetMontageTask())
 			{
 				OldEffectivePlayRate = OldTask->GetEffectivePlayRate();
 			}
+			// 原观察者在调用动作前已解绑，可复用它观察后继的真实创建，不递归执行原重入动作。
+			StartedObserver->ArmForTest(Fixture.AnimInstance, Fixture.Montage, [&]
+			{
+				++NativeStartedCount;
+				if (const FAnimMontageInstance* Instance = Fixture.AnimInstance->GetActiveInstanceForMontage(Fixture.Montage))
+				{
+					SuccessorCreatedInstanceId = Instance->GetInstanceID();
+				}
+			});
 			Fixture.Ability->SetFirstPlayRateForTest(4.0f);
 			bReadyCallbackReentered = Fixture.Ability->EndAndReactivateForTest();
 		});
 		if (!TestTrue(TEXT("Ready 重入初始激活"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle))) { return false; }
-		TestTrue(TEXT("Montage_PlayInternal 的真实 Super 返回后同步 End/重激活"), bReadyCallbackReentered);
-		TestEqual(TEXT("回调先成功执行真实 Montage 播放"), Fixture.AnimInstance->GetSuccessfulSuperMontagePlayCountForTest(), 2);
+		StartedObserver->DisarmForTest();
+		TestTrue(TEXT("真实 OnMontageStarted 创建回调内同步 End/重激活"), bReadyCallbackReentered);
+		TestEqual(TEXT("原生 Started 证明原播放与后继各创建一次"), NativeStartedCount, 2);
+		TestTrue(TEXT("两次真实创建具有不同原生实例身份"), OriginalCreatedInstanceId != INDEX_NONE
+			&& SuccessorCreatedInstanceId != INDEX_NONE && OriginalCreatedInstanceId != SuccessorCreatedInstanceId);
 		TestTrue(TEXT("旧 Montage ReadyForActivation 栈返回后新激活仍活跃"), Fixture.Ability->IsActive());
 		TestEqual(TEXT("旧 ReadyForActivation 栈没有重建任务"), Fixture.Ability->GetActiveTaskCountForTest(), 2);
 		TestEqual(TEXT("旧 ReadyForActivation 栈没有覆盖新段"), Fixture.Ability->GetCurrentComboStep(), 0);
@@ -1063,6 +1691,7 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
 	FGGYGOPlayerComboLifecycleFixture Fixture;
 	if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+	if (!TestTrue(TEXT("命中叶在启动前声明两个独立作者窗口"), Fixture.AddHitWindowForTest() && Fixture.AddHitWindowForTest())) { return false; }
 	const bool bHadMeshPrerequisiteBeforeActivation = Fixture.HasMeshPrerequisite();
 	// Explicit transient long-mix case: its native mix may outlast the completion grace.
 	// Production trigger/frame policy remains configured in its own Montage assets.
@@ -1248,6 +1877,9 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	WeakSignal.OptionalObject2 = Fixture.Mesh;
 	Fixture.ASC->HandleGameplayEvent(WeakSignal.EventTag, &WeakSignal);
 	TestFalse(TEXT("ASC普通GameplayEvent不能伪造原作者单点开门"), Fixture.Ability->IsInterruptionOpen());
+	if (!TestTrue(TEXT("回放真实旧实例的迟到作者 Begin"),
+		Fixture.SendHitWindowForTest(true, BeforeCorrectionSnapshot.MontageInstanceId))
+		|| !TestFalse(TEXT("同资产旧实例窗口不能给纠正后段开 Trace"), Fixture.GetTraceWindow().HasWindow())) { return false; }
 	if (!CheckActiveResources(ActivationA.OriginalActivation, TEXT("纠正后的 A"), 0.1f)) { return false; }
 	if (!TestFalse(TEXT("A 纠正阶段未取得 Owned Trace 窗口"), Fixture.GetTraceWindow().HasWindow())) { return false; }
 	if (!EndNormalActivation(ActivationA.OriginalActivation, TEXT("A"))) { return false; }
@@ -1273,14 +1905,33 @@ bool FGGYGOPlayerComboCorrectionPayloadTest::RunTest(const FString& Parameters)
 	HitWindowEvent.OptionalObject2 = Fixture.Mesh;
 	HitWindowEvent.EventMagnitude = static_cast<float>(PlayingInstance->GetInstanceID() + 1);
 	Fixture.ASC->HandleGameplayEvent(HitWindowEvent.EventTag, &HitWindowEvent);
+	if (!TestFalse(TEXT("裸 ASC 窗口负载不能伪造已认证原作者窗口"), Fixture.GetTraceWindow().HasWindow())
+		|| !TestTrue(TEXT("生产 Notify 桥接受原作者窗和原实例上下文"), Fixture.SendHitWindowForTest(true))) { return false; }
 	const FGGYGOMeleeTraceWindowHandle WindowB = Fixture.GetTraceWindow();
-	if (!TestTrue(TEXT("ASC 事件经真实 Montage Task/生产 Combo 建立 B 的 Owned Trace 窗口"),
+	if (!TestTrue(TEXT("作者 Notify 事件经真实 Montage Task/生产 Combo 建立 B 的 Owned Trace 窗口"),
 		WindowB.HasWindow() && Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Active
 		&& Fixture.Trace->IsTracing())
 		|| !CheckActiveResources(ActivationB.OriginalActivation, TEXT("开窗后的 B"), 0.0f)) { return false; }
+	HitWindowEvent.EventTag = GGYGOGameplayTags::Event_Montage_HitWindowEnd;
+	Fixture.ASC->HandleGameplayEvent(HitWindowEvent.EventTag, &HitWindowEvent);
+	if (!TestTrue(TEXT("裸 ASC End 不能关闭 B 的真实窗口"), Fixture.GetTraceWindow() == WindowB
+		&& Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Active)
+		|| !TestTrue(TEXT("回放旧实例迟到的作者 End"), Fixture.SendHitWindowForTest(false, BeforeCorrectionSnapshot.MontageInstanceId))
+		|| !TestTrue(TEXT("旧窗口 End 不关闭后继的 Owned Trace"), Fixture.GetTraceWindow() == WindowB
+			&& Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Active)) { return false; }
+	if (!TestTrue(TEXT("同一播放的第二个作者 Begin 接续原 Trace"), Fixture.SendHitWindowForTest(true, INDEX_NONE, 1))) { return false; }
+	const FGGYGOMeleeTraceWindowHandle SecondWindowB = Fixture.GetTraceWindow();
+	if (!TestTrue(TEXT("同值但独立的作者条目获得新的 Owned Trace"), SecondWindowB.HasWindow() && SecondWindowB != WindowB
+		&& Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive
+		&& Fixture.Trace->QueryOwnedTraceWindow(SecondWindowB) == EGGYGOMeleeTraceWindowQueryResult::Active)
+		|| !TestTrue(TEXT("发送同播放第一条目的迟到 End"), Fixture.SendHitWindowForTest(false))
+		|| !TestTrue(TEXT("第一条目 End 不关闭第二条目的 Trace"), Fixture.GetTraceWindow() == SecondWindowB
+			&& Fixture.Trace->QueryOwnedTraceWindow(SecondWindowB) == EGGYGOMeleeTraceWindowQueryResult::Active)) { return false; }
 	if (!EndNormalActivation(ActivationB.OriginalActivation, TEXT("B"))) { return false; }
 	TestTrue(TEXT("B 正常结束后确切原 Owned Trace 窗口为 Inactive"),
 		Fixture.Trace->QueryOwnedTraceWindow(WindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
+	TestTrue(TEXT("B 正常结束回收第二条目仍持有的 Trace"),
+		Fixture.Trace->QueryOwnedTraceWindow(SecondWindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive);
 	return true;
 }
 
@@ -1288,7 +1939,45 @@ namespace
 {
 	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_PlayerComboRuntimeHitCue, "GameplayCue.GGYGO.Tests.PlayerCombo.RuntimeHit");
 
-	enum class EComboRuntimeHitCase : uint8 { NoGE, ValidGE, InvalidRequiredGE, InvalidRequiredSpec };
+	enum class EComboRuntimeHitCase : uint8 { NoGE, ValidGE, InvalidRequiredGE, InvalidRequiredSpec,
+		Multiplier, ConflictingDamageKey, MissingMultiplier };
+
+	struct FComboRuntimeHitLogMessage
+	{
+		FString Text;
+		ELogVerbosity::Type Verbosity;
+		FName Category;
+	};
+
+	/** 只观察原日志，不改变类别、级别或其它输出设备。 */
+	class FComboRuntimeHitLogObservation final : public FOutputDevice
+	{
+	public:
+		FComboRuntimeHitLogObservation() { GLog->AddOutputDevice(this); }
+		virtual ~FComboRuntimeHitLogObservation() override { GLog->RemoveOutputDevice(this); }
+		virtual bool CanBeUsedOnAnyThread() const override { return true; }
+		virtual bool CanBeUsedOnMultipleThreads() const override { return true; }
+		virtual void Serialize(const TCHAR* Text, ELogVerbosity::Type Verbosity, const FName& Category) override
+		{
+			FScopeLock Lock(&Mutex);
+			if (bObserving && Category == FName(TEXT("LogGGYGOAbilitySystem"))
+				&& (Verbosity == ELogVerbosity::Error || Verbosity == ELogVerbosity::Warning))
+			{
+				Messages.Add({FString(Text), Verbosity, Category});
+			}
+		}
+		void Begin() { FScopeLock Lock(&Mutex); bObserving = true; }
+		TArray<FComboRuntimeHitLogMessage> End()
+		{
+			FScopeLock Lock(&Mutex);
+			bObserving = false;
+			return Messages;
+		}
+	private:
+		FCriticalSection Mutex;
+		bool bObserving = false;
+		TArray<FComboRuntimeHitLogMessage> Messages;
+	};
 
 	struct FComboRuntimeResources
 	{
@@ -1459,6 +2148,8 @@ namespace
 		int32 AppliedCount = 0;
 		int32 CueCount = 0;
 		bool bObservedSourcesMatch = true;
+		bool bExpectMultiplier = false;
+		bool bObservedMultiplier = true;
 
 		~FComboRuntimeHitProbe()
 		{
@@ -1496,6 +2187,12 @@ namespace
 				[this, SourceASC](UAbilitySystemComponent* Source, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle)
 				{
 					++AppliedCount;
+					if (bExpectMultiplier)
+					{
+						const float* Value = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_DamageMultiplier);
+						bObservedMultiplier &= Value && *Value == 2.0f
+							&& !Spec.SetByCallerTagMagnitudes.Contains(GGYGOGameplayTags::SetByCaller_Damage);
+					}
 					bObservedSourcesMatch &= Source == SourceASC && IsValid(Spec.Def.Get()) && Spec.GetContext().IsValid();
 				});
 			CueHandle = CueManager->OnGameplayCueRouted().AddLambda(
@@ -1664,14 +2361,7 @@ namespace
 	{
 		FAnimMontageInstance* const Instance = Fixture.AnimInstance->GetActiveInstanceForMontage(Fixture.Montage);
 		if (!Test.TestNotNull(TEXT("真实 hit 窗口事件匹配当前 Montage 实例"), Instance)) { return false; }
-		FGameplayEventData Event;
-		Event.EventTag = bOpen ? GGYGOGameplayTags::Event_Montage_HitWindowBegin : GGYGOGameplayTags::Event_Montage_HitWindowEnd;
-		Event.Instigator = Fixture.Character;
-		Event.Target = Fixture.Character;
-		Event.OptionalObject = Fixture.Montage;
-		Event.OptionalObject2 = Fixture.Mesh;
-		Event.EventMagnitude = static_cast<float>(Instance->GetInstanceID() + 1);
-		Fixture.ASC->HandleGameplayEvent(Event.EventTag, &Event);
+		if (!Test.TestTrue(TEXT("正式 Notify 发送端消费真实原窗口上下文"), Fixture.SendHitWindowForTest(bOpen))) { return false; }
 		const FGGYGOMeleeTraceWindowHandle Window = Fixture.GetTraceWindow();
 		return Test.TestTrue(TEXT("正式窗口事件完成 Owned 资源接线"), bOpen
 			? Window.HasWindow() && Fixture.Trace->QueryOwnedTraceWindow(Window) == EGGYGOMeleeTraceWindowQueryResult::Active
@@ -1681,9 +2371,14 @@ namespace
 
 	bool RunComboRuntimeHitCase(FAutomationTestBase& Test, EComboRuntimeHitCase Case)
 	{
-		FGGYGOComboLifecycleTestWorld TestWorld(GEngine, true);
+		const bool bMultiplier = Case == EComboRuntimeHitCase::Multiplier
+			|| Case == EComboRuntimeHitCase::ConflictingDamageKey || Case == EComboRuntimeHitCase::MissingMultiplier;
+		const bool bMultiplierFault = Case == EComboRuntimeHitCase::ConflictingDamageKey || Case == EComboRuntimeHitCase::MissingMultiplier;
+		const bool bUncancelableFault = Case == EComboRuntimeHitCase::InvalidRequiredSpec || bMultiplierFault;
+		FGGYGOComboLifecycleTestWorld TestWorld(GEngine, true, bMultiplier);
 		FGGYGOPlayerComboLifecycleFixture Fixture;
 		if (!InitializeFixture(Test, TestWorld, Fixture)) { return false; }
+		if (!Test.TestTrue(TEXT("真实 hit 启动前显式声明作者窗口"), Fixture.AddHitWindowForTest())) { return false; }
 		const bool bHadPrerequisite = Fixture.HasMeshPrerequisite();
 		FGGYGOAbilityActivationHandle CleanupOriginal;
 		FComboRuntimeHitProbe Probe;
@@ -1700,14 +2395,73 @@ namespace
 		const FGameplayTag CueTag = TAG_PlayerComboRuntimeHitCue.GetTag();
 		if (!Probe.Initialize(Test, Fixture, CueTag)) { return false; }
 		const bool bNoGE = Case == EComboRuntimeHitCase::NoGE;
-		const TSubclassOf<UGameplayEffect> DamageClass = bNoGE
-			? TSubclassOf<UGameplayEffect>() : TSubclassOf<UGameplayEffect>(UGameplayEffect::StaticClass());
-		Fixture.ConfigureRuntimeHitDamage(DamageClass, CueTag);
-		if (Case == EComboRuntimeHitCase::InvalidRequiredSpec)
+		TStrongObjectPtr<UGGYGOCombatSet> SourceCombat;
+		TStrongObjectPtr<UGGYGOHealthSet> TargetHealth;
+		if (bMultiplier)
 		{
-			// Freeze this scene's explicit policy before the real group admission and activation.
+			if (!Test.TestNotNull(TEXT("倍率结算原生GameInstance"), TestWorld.GameInstance.Get())
+				|| !Test.TestTrue(TEXT("倍率结算World持有原GameInstance"), Fixture.World->GetGameInstance() == TestWorld.GameInstance.Get())
+				|| !Test.TestNotNull(TEXT("倍率结算原生MessageRouter"),
+					UGameInstance::GetSubsystem<UGameplayMessageSubsystem>(TestWorld.GameInstance.Get()))) { return false; }
+			SourceCombat.Reset(NewObject<UGGYGOCombatSet>(Fixture.Character, NAME_None, RF_Transient));
+			if (!Test.TestNotNull(TEXT("倍率专项Source CombatSet"), SourceCombat.Get())) { return false; }
+			SourceCombat->InitBaseDamage(10.0f);
+			Fixture.ASC->AddAttributeSetSubobject(SourceCombat.Get());
+			TargetHealth.Reset(NewObject<UGGYGOHealthSet>(Probe.Target, NAME_None, RF_Transient));
+			if (!Test.TestNotNull(TEXT("倍率专项Target HealthSet"), TargetHealth.Get())) { return false; }
+			TargetHealth->InitMaxHealth(100.0f); TargetHealth->InitHealth(100.0f);
+			TargetHealth->InitMaxPoise(50.0f); TargetHealth->InitPoise(50.0f);
+			Probe.TargetASC->AddAttributeSetSubobject(TargetHealth.Get());
+			Fixture.Ability->ConfigureDamageMultiplierForTest(2.0f);
+			Probe.bExpectMultiplier = true;
+		}
+		ON_SCOPE_EXIT
+		{
+			if (SourceCombat.IsValid()) { Fixture.ASC->RemoveSpawnedAttribute(SourceCombat.Get()); }
+			if (TargetHealth.IsValid()) { Probe.TargetASC->RemoveSpawnedAttribute(TargetHealth.Get()); }
+		};
+		const TSubclassOf<UGameplayEffect> DamageClass = bNoGE ? TSubclassOf<UGameplayEffect>()
+			: bMultiplier ? TSubclassOf<UGameplayEffect>(UGGYGOPlayerComboLifecycleMultiplierEffect::StaticClass())
+			: TSubclassOf<UGameplayEffect>(UGameplayEffect::StaticClass());
+		Fixture.ConfigureRuntimeHitDamage(DamageClass, CueTag);
+		if (bNoGE)
+		{
+			const UGameplayAbility* const AdmissionAbility = Fixture.Ability;
+			FGGYGOComboStep& Step = Fixture.GetFirstStepForTest();
+			const float OriginalMultiplier = Step.DamageMultiplier;
+			const float OriginalDamage = Step.Damage;
+			const float OriginalPoise = Step.PoiseDamage;
+			Step.DamageMultiplier = -2.0f;
+			Test.TestFalse(TEXT("显式无GE的纯准入仍拒绝非法倍率存值"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+			Step.DamageMultiplier = -1.0f;
+			Step.Damage = std::numeric_limits<float>::quiet_NaN();
+			Test.TestFalse(TEXT("显式无GE的纯准入仍拒绝非法旧绝对值"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+			Step.Damage = OriginalDamage;
+			Step.DamageMultiplier = OriginalMultiplier;
+			Step.PoiseDamage = -1.0f;
+			Test.TestFalse(TEXT("显式无GE的纯准入仍拒绝非法削韧值"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+			Step.PoiseDamage = OriginalPoise;
+			Test.TestTrue(TEXT("恢复原数值后显式无GE的纯准入通过"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+		}
+		else if (Case == EComboRuntimeHitCase::Multiplier)
+		{
+			const UGameplayAbility* const AdmissionAbility = Fixture.Ability;
+			Fixture.Ability->ConfigureDamageMultiplierForTest(-1.0f);
+			Test.TestFalse(TEXT("合法未配置哨兵不能通过倍率GE的纯准入"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+			Fixture.Ability->ConfigureDamageMultiplierForTest(2.0f);
+			Test.TestTrue(TEXT("显式段倍率与倍率GE匹配后纯准入通过"),
+				AdmissionAbility->CanActivateAbility(Fixture.AbilityHandle, Fixture.ASC->AbilityActorInfo.Get(), nullptr, nullptr, nullptr));
+		}
+		if (bUncancelableFault)
+		{
+			// 不可取消故障场景先明确占用策略，再进入真实受控准入。
 			Fixture.Ability->ConfigureExclusiveSelfPolicyForTest();
-			if (!Test.TestTrue(TEXT("不可取消 Builder 场景在受控启动前明确配置 Exclusive"),
+			if (!Test.TestTrue(TEXT("不可取消故障场景在受控启动前明确配置 Exclusive"),
 				Fixture.Ability->GetSelfPolicy() == EGGYGOAbilitySelfPolicy::Exclusive)) { return false; }
 		}
 		const FGGYGOAbilityActivationRequestResult Activation = Fixture.ASC->TryActivateAbilityWithTerminationBoundary(Fixture.AbilityHandle);
@@ -1736,8 +2490,21 @@ namespace
 			&& Fixture.Ability->IsActive() && Fixture.Ability->CaptureCurrentActivation().HasSameActivation(CleanupOriginal));
 		bPassed &= Test.TestEqual(TEXT("真实 hit 正向对照使用实际必需 Spec 扩展"),
 			Fixture.Ability->GetSpecExtensionCountForTest(), bNoGE ? 0 : 1);
+		if (bMultiplier)
+		{
+			bPassed &= Test.TestTrue(TEXT("倍率实际Spec只含新键且真实HealthSet消费10×2伤害与独立削韧"),
+				Probe.bObservedMultiplier && SourceCombat->GetBaseDamage() == 10.0f
+				&& TargetHealth->GetHealth() == 80.0f && TargetHealth->GetPoise() == 40.0f);
+		}
 		if (!bPassed) { return false; }
-		const bool bFault = Case == EComboRuntimeHitCase::InvalidRequiredGE || Case == EComboRuntimeHitCase::InvalidRequiredSpec;
+		TArray<FString> ExpectedFaultDiagnostics;
+		const auto RuntimeDiagnostic = [&](const FString& Reason)
+		{
+			return FString::Printf(TEXT("PlayerCombo runtime hit Ability [%s] Source [%s] Target [%s] Step %d Montage [%s] failed: %s."),
+				*Fixture.Ability->GetPathName(), *Fixture.Character->GetPathName(), *Probe.Target->GetPathName(),
+				Fixture.Ability->GetCurrentComboStep(), *Fixture.Montage->GetPathName(), *Reason);
+		};
+		const bool bFault = Case == EComboRuntimeHitCase::InvalidRequiredGE || Case == EComboRuntimeHitCase::InvalidRequiredSpec || bMultiplierFault;
 		if (bFault)
 		{
 			const FGGYGOMeleeTraceWindowHandle ControlWindow = Fixture.GetTraceWindow();
@@ -1747,15 +2514,40 @@ namespace
 				|| !SendRuntimeWindowEvent(Test, Fixture, true)
 				|| !Test.TestTrue(TEXT("故障命中取得同一 Original 的新窗口"), Fixture.GetTraceWindow() != ControlWindow)
 				|| !CheckHeldResources()) { return false; }
-			if (Case == EComboRuntimeHitCase::InvalidRequiredGE)
+			if (bMultiplierFault)
+			{
+				Fixture.Ability->SetCanBeCanceledForTest(false);
+				if (!Test.TestFalse(TEXT("倍率故障原能力实际不可取消"), Fixture.Ability->CanBeCanceled())) { return false; }
+				if (Case == EComboRuntimeHitCase::MissingMultiplier)
+				{
+					Fixture.Ability->ConfigureDamageMultiplierForTest(-1.0f);
+					ExpectedFaultDiagnostics.Add(RuntimeDiagnostic(TEXT("ComboDamage: required-multiplier-missing-or-invalid")));
+				}
+				else
+				{
+					FGameplayAbilitySpec* AbilitySpec = Fixture.ASC->FindAbilitySpecFromHandle(Fixture.AbilityHandle);
+					if (!Test.TestNotNull(TEXT("冲突来自真实原AbilitySpec的SetByCaller"), AbilitySpec)) { return false; }
+					AbilitySpec->SetByCallerTagMagnitudes.Add(GGYGOGameplayTags::SetByCaller_Damage, 7.0f);
+					ExpectedFaultDiagnostics.Add(RuntimeDiagnostic(TEXT("ComboDamage: conflicting-damage-keys-or-multiplier")));
+				}
+			}
+			else if (Case == EComboRuntimeHitCase::InvalidRequiredGE)
 			{
 				Fixture.ConfigureRuntimeHitDamage(UGGYGOPlayerComboLifecycleInvalidDamageEffect::StaticClass(), CueTag);
+				ExpectedFaultDiagnostics.Add(RuntimeDiagnostic(FString::Printf(
+					TEXT("模式=Override，配置=DamageEffect [%s]：已选GE类为抽象、已弃用或已被新版本替换。"),
+					*UGGYGOPlayerComboLifecycleInvalidDamageEffect::StaticClass()->GetPathName())));
 			}
 			else
 			{
 				Fixture.Ability->SetCanBeCanceledForTest(false);
 				if (!Test.TestFalse(TEXT("Builder 故障原能力明确不可取消"), Fixture.Ability->CanBeCanceled())) { return false; }
 				Fixture.Ability->InvalidateNextRequiredSpecForTest();
+				ExpectedFaultDiagnostics.Add(FString::Printf(
+					TEXT("AbilitySystem BuildHitEffectPayload Ability [%s] Source [%s] Target [%s] GE [%s] failed: RequiredSpecInvalidAfterApplyAbilityTags."),
+					*Fixture.Ability->GetPathName(), *Fixture.ASC->GetPathName(), *Probe.TargetASC->GetPathName(), *DamageClass->GetPathName()));
+				ExpectedFaultDiagnostics.Add(RuntimeDiagnostic(FString::Printf(
+					TEXT("BuildHitEffectPayload returned false for GE [%s]; see the original Builder diagnostic."), *DamageClass->GetPathName())));
 			}
 		}
 		FComboRuntimeEndObservation EndObservation(Fixture, CleanupOriginal, bHadPrerequisite);
@@ -1765,12 +2557,34 @@ namespace
 			const int32 AppliedBeforeFault = Probe.AppliedCount;
 			const int32 CuesBeforeFault = Probe.CueCount;
 			const int32 SpecsBeforeFault = Fixture.Ability->GetSpecExtensionCountForTest();
-			if (!Probe.SweepOneHit(Test, Fixture)) { return false; }
+			for (const FString& Message : ExpectedFaultDiagnostics)
+			{
+				Test.AddExpectedMessagePlain(TEXT("LogGGYGOAbilitySystem: ") + Message,
+					ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1);
+			}
+			if (!Test.TestNotNull(TEXT("故障原始日志输出"), GLog)) { return false; }
+			FComboRuntimeHitLogObservation Diagnostics;
+			Diagnostics.Begin();
+			const bool bSwept = Probe.SweepOneHit(Test, Fixture);
+			const TArray<FComboRuntimeHitLogMessage> Messages = Diagnostics.End();
+			if (!bSwept) { return false; }
+			bPassed &= Test.TestEqual(TEXT("故障原日志准确条数"), Messages.Num(), ExpectedFaultDiagnostics.Num());
+			for (const FString& ExpectedMessage : ExpectedFaultDiagnostics)
+			{
+				const TArray<FComboRuntimeHitLogMessage> Matching = Messages.FilterByPredicate(
+					[&](const FComboRuntimeHitLogMessage& Message) { return Message.Text == ExpectedMessage; });
+				bPassed &= Test.TestEqual(TEXT("原对象完整诊断恰好一次"), Matching.Num(), 1);
+				if (Matching.Num() == 1)
+				{
+					bPassed &= Test.TestTrue(TEXT("原诊断保留类别与Error级别"),
+						Matching[0].Category == FName(TEXT("LogGGYGOAbilitySystem")) && Matching[0].Verbosity == ELogVerbosity::Error);
+				}
+			}
 			bPassed &= Test.TestEqual(TEXT("故障 hit 没有继续 Apply"), Probe.AppliedCount, AppliedBeforeFault);
 			bPassed &= Test.TestEqual(TEXT("故障 hit 没有继续 Cue"), Probe.CueCount, CuesBeforeFault);
 			const bool bBuilderFault = Case == EComboRuntimeHitCase::InvalidRequiredSpec;
 			bPassed &= Test.TestEqual(TEXT("故障 hit 实际进入所选 GE/Builder 分支"),
-				Fixture.Ability->GetSpecExtensionCountForTest() - SpecsBeforeFault, bBuilderFault ? 1 : 0);
+				Fixture.Ability->GetSpecExtensionCountForTest() - SpecsBeforeFault, (bBuilderFault || bMultiplierFault) ? 1 : 0);
 			bPassed &= Test.TestEqual(TEXT("Builder 故障来自一次实际已构造 Spec 的扩展失效"),
 				Fixture.Ability->GetInvalidatedSpecCountForTest(), bBuilderFault ? 1 : 0);
 		}
@@ -1782,12 +2596,23 @@ namespace
 				&& EndObservation.Notice.GetOriginal().GetOriginalTermination().HasSameTermination(EndResult.Original.GetOriginalTermination()));
 		}
 		bPassed &= EndObservation.Check(Test, bFault);
-		Test.AddInfo(FString::Printf(TEXT("E14-C Case=%d behavior assertions=%s; Apply=%d Cue=%d SpecExtension=%d InvalidSpec=%d GANativeEnd=%d NativeEnd=%d Completed=%d. Production Error events remain unfiltered."),
+		Test.AddInfo(FString::Printf(TEXT("RuntimeHit Case=%d behavior assertions=%s; Apply=%d Cue=%d SpecExtension=%d InvalidSpec=%d GANativeEnd=%d NativeEnd=%d Completed=%d. 原生产日志保留，预期故障逐条核完整文本/类别/Error级别/次数。"),
 			static_cast<int32>(Case), bPassed ? TEXT("PASS") : TEXT("FAIL"), Probe.AppliedCount, Probe.CueCount,
 			Fixture.Ability->GetSpecExtensionCountForTest(), Fixture.Ability->GetInvalidatedSpecCountForTest(),
 			EndObservation.AbilityEndCount, EndObservation.EndCount, EndObservation.CompletedCount));
 		return bPassed;
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboRuntimeHitMultiplierTest,
+	"GGYGO.AbilitySystem.PlayerCombo.RuntimeHit.DamageMultiplier",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboRuntimeHitMultiplierTest::RunTest(const FString& Parameters)
+{
+	return RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::Multiplier)
+		&& RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::ConflictingDamageKey)
+		&& RunComboRuntimeHitCase(*this, EComboRuntimeHitCase::MissingMultiplier);
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboRuntimeHitNormalModesTest,
@@ -1825,6 +2650,7 @@ namespace
 	enum class EComboPoseFailureProbe : uint8 { None, StartupMissingDeclaration, RuntimeInvalidated };
 	enum class EComboEndAttackProbe : uint8 { None, Restart, Natural };
 	enum class EComboLocomotionObservation : uint8 { Immediate, RunHoldAndRelease };
+	enum class EComboFXProbe : uint8 { None, NaturalTail, WindowCancel, EarlyCancelRestart };
 	/** A finite production PIE smoke. Automation observes; UE alone runs input, animation and movement frames. */
 	class FComboEndProductionPIECommand : public IAutomationLatentCommand
 	{
@@ -1832,13 +2658,17 @@ namespace
 		FComboEndProductionPIECommand(FAutomationTestBase& InTest, bool bInHeldDuringMain,
 			EComboPoseFailureProbe InPoseProbe = EComboPoseFailureProbe::None, int32 InLastMovementStep = 0,
 			EComboEndAttackProbe InEndAttackProbe = EComboEndAttackProbe::None,
-			EComboLocomotionObservation InLocomotionObservation = EComboLocomotionObservation::Immediate)
+			EComboLocomotionObservation InLocomotionObservation = EComboLocomotionObservation::Immediate,
+			EComboFXProbe InFXProbe = EComboFXProbe::None)
 			: Test(InTest), bHeldDuringMain(bInHeldDuringMain), PoseProbe(InPoseProbe), LastMovementStep(InLastMovementStep),
 			EndAttackProbe(InEndAttackProbe), LocomotionObservation(InLocomotionObservation),
+			FXProbe(InFXProbe),
 			TargetStep(InEndAttackProbe == EComboEndAttackProbe::None ? 0 : 2), OuterWorld(GWorld),
 			OuterViewport(GEngine ? GEngine->GameViewport.Get() : nullptr) {}
 		virtual ~FComboEndProductionPIECommand() override
 		{
+			ReleaseFXInputObservation();
+			ReleaseFXFrameObservation();
 			if (Stage != EStage::Done)
 			{
 				Fail(TEXT("automation aborted before owned PIE cleanup"));
@@ -1846,6 +2676,7 @@ namespace
 				ReleaseGameplayObservations();
 				CloseOwnedPIE(true);
 				ReleaseMainPointProbeAfterPIETeardown();
+				RestoreFocusAfterPIETeardown();
 			}
 			FEditorDelegates::PreBeginPIE.Remove(PreHandle);
 			FEditorDelegates::PostPIEStarted.Remove(PostHandle);
@@ -1874,11 +2705,17 @@ namespace
 				return false;
 			}
 			if (!IsProductionChainCurrent()) { Fail(TEXT("original world/player/pawn/input/ASC/mesh/scope or viewport focus changed")); return false; }
+			// FX 阶段只由有限原生 Tick 观察；latent 保留启动、截止时间和原生 PIE 清理。
+			if (FXProbe != EComboFXProbe::None) { return false; }
 			if (Stage == EStage::PoseWaitFailure) { VerifyPoseFailure(); return false; }
 			if (Stage == EStage::PoseSuccessorPress) { StartPoseSuccessor(); return false; }
 			if (Stage == EStage::PoseSuccessorMain) { ObservePoseSuccessorMain(); return false; }
 			if (Stage == EStage::PoseSuccessorEnd) { ObservePoseSuccessorEnd(); return false; }
-			if (Stage == EStage::Main) { TryCaptureMain(); return false; }
+			if (Stage == EStage::Main)
+			{
+				TryCaptureMain();
+				return false;
+			}
 			if (Stage == EStage::AdvanceEnd) { AdvanceAtEnd(); return false; }
 			if (Stage == EStage::MainAttackPress) { PressAttackDuringTerminalMain(); return false; }
 			if (Stage == EStage::MainAttackRejected) { ObserveRejectedMainAttack(); return false; }
@@ -1899,9 +2736,47 @@ namespace
 		}
 
 	private:
+		/** 原 Controller 之后、Pawn／CMC／Mesh 之前的有限观察，不执行输入或姿态 Tick。 */
+		struct FFXInputObservationTick final : FTickFunction
+		{
+			FComboEndProductionPIECommand* Command = nullptr;
+			FFXInputObservationTick()
+			{
+				bCanEverTick = true;
+				bStartWithTickEnabled = true;
+				bRunOnAnyThread = false;
+				TickGroup = TG_PrePhysics;
+				EndTickGroup = TG_PrePhysics;
+			}
+			virtual void ExecuteTick(float, ELevelTick, ENamedThreads::Type, const FGraphEventRef&) override
+			{
+				FComboEndProductionPIECommand* const OriginalCommand = Command;
+				if (OriginalCommand) { OriginalCommand->ObserveFXAfterNativeInput(); }
+			}
+			virtual FString DiagnosticMessage() override { return TEXT("PlayerCombo FX original input observation"); }
+		};
+		/** 在每个真实 UE 帧的原 Mesh 更新后观察短 FX 窗口，不依赖 Automation latent 的轮询频率。 */
+		struct FFXFrameObservationTick final : FTickFunction
+		{
+			FComboEndProductionPIECommand* Command = nullptr;
+			FFXFrameObservationTick()
+			{
+				bCanEverTick = true;
+				bStartWithTickEnabled = true;
+				bRunOnAnyThread = false;
+				TickGroup = TG_PostUpdateWork;
+				EndTickGroup = TG_PostUpdateWork;
+			}
+			virtual void ExecuteTick(float, ELevelTick, ENamedThreads::Type, const FGraphEventRef&) override
+			{
+				if (Command) { Command->ObserveFXNativeFrame(); }
+			}
+			virtual FString DiagnosticMessage() override { return TEXT("PlayerCombo FX native frame observation"); }
+		};
+
 		enum class EStage : uint8 { Start, Player, Main, AdvanceEnd, MainAttackPress, MainAttackRejected, EndAttack, Natural, NaturalIdle,
 			End, Cancel, Locomotion, ResetRelease, Ending, Done, PoseWaitFailure, PoseSuccessorMain, PoseSuccessorEnd, PoseSuccessorPress,
-			RunHold, RunRelease };
+			RunHold, RunRelease, FXCancelWait, FXReady };
 		void Fail(const FString& Reason)
 		{
 			if (bFailed) { return; }
@@ -2188,6 +3063,11 @@ namespace
 				Fail(TEXT("native production viewport did not acquire the actual keyboard focus")); return;
 			}
 			NativeWindow->GetNativeWindow()->SetWindowFocus();
+			if (FXProbe != EComboFXProbe::None)
+			{
+				WindowDeactivatedHandle = NativeWindow->GetOnWindowDeactivatedEvent().AddLambda(
+					[this]() { LogNativeInputBoundary(TEXT("OriginalWindowDeactivated")); });
+			}
 			if (!IsProductionChainCurrent())
 			{
 				FGGYGOQualifiedMovementIntent RejectedIntent;
@@ -2209,6 +3089,7 @@ namespace
 				Fail(TEXT("native focus did not preserve the original Cold first-press/Ready chain")); return;
 			}
 			if (PoseProbe != EComboPoseFailureProbe::None && !PreparePoseProbe()) { return; }
+			if (FXProbe != EComboFXProbe::None && !PrepareFXProbe()) { return; }
 			if (PoseProbe == EComboPoseFailureProbe::None && (bHeldDuringMain || EndAttackProbe != EComboEndAttackProbe::None))
 			{
 				MainPointProbeIndex = bHeldDuringMain ? 0 : 2;
@@ -2239,8 +3120,123 @@ namespace
 			Stage = EStage::Main;
 			if (PoseProbe == EComboPoseFailureProbe::StartupMissingDeclaration) { Stage = EStage::PoseWaitFailure; }
 			Deadline = FPlatformTime::Seconds() + 10.0;
+			if (FXProbe != EComboFXProbe::None)
+			{
+				if (!InstallFXFrameObservation()) { return; }
+				Stage = EStage::FXReady;
+				Deadline = FPlatformTime::Seconds() + 30.0;
+				return;
+			}
 			bAttackDown = true;
 			SendNativeKey(AttackKey, true);
+		}
+		bool InstallFXFrameObservation()
+		{
+			if (!World.IsValid() || !World->PersistentLevel || !Mesh.IsValid() || !Movement.IsValid()
+				|| !Mesh->PrimaryComponentTick.IsTickFunctionRegistered() || !Mesh->PrimaryComponentTick.IsTickFunctionEnabled()
+				|| !Movement->PrimaryComponentTick.IsTickFunctionRegistered() || !Movement->PrimaryComponentTick.IsTickFunctionEnabled())
+			{
+				Fail(TEXT("原 FX 帧观察缺少已注册的生产 Mesh／CMC／Level。")); return false;
+			}
+			FXFrameObservationTick.Command = this;
+			FXFrameObservationTick.AddPrerequisite(Mesh.Get(), Mesh->PrimaryComponentTick);
+			FXFrameObservationTick.AddPrerequisite(Movement.Get(), Movement->PrimaryComponentTick);
+			FXFrameObservationTick.RegisterTickFunction(World->PersistentLevel);
+			if (!FXFrameObservationTick.IsTickFunctionRegistered())
+			{
+				ReleaseFXFrameObservation(); Fail(TEXT("原 FX 帧观察注册失败。")); return false;
+			}
+			return true;
+		}
+		void ReleaseFXFrameObservation()
+		{
+			if (!FXFrameObservationTick.Command && !FXFrameObservationTick.IsTickFunctionRegistered()) { return; }
+			FXFrameObservationTick.Command = nullptr;
+			FXFrameObservationTick.UnRegisterTickFunction();
+			if (Mesh.IsValid()) { FXFrameObservationTick.RemovePrerequisite(Mesh.Get(), Mesh->PrimaryComponentTick); }
+			if (Movement.IsValid()) { FXFrameObservationTick.RemovePrerequisite(Movement.Get(), Movement->PrimaryComponentTick); }
+		}
+		void ObserveFXNativeFrame()
+		{
+			if (bFailed || Stage == EStage::Ending || Stage == EStage::Done) { return; }
+			if (!IsProductionChainCurrent()) { Fail(TEXT("原生产链在真实 FX 帧观察中改变。")); return; }
+			if (Stage == EStage::FXReady)
+			{
+				if (!FXSystem.IsValid()) { Fail(TEXT("原 FX System 在原生启动等待中失效。")); return; }
+				if (!FXSystem->IsReadyToRun()) { return; }
+				if (FXReadyFrame == MAX_uint64)
+				{
+					FXReadyFrame = GFrameCounter; FXReadyWorldSeconds = World->GetTimeSeconds(); return;
+				}
+				if (GFrameCounter <= FXReadyFrame || World->GetTimeSeconds() <= FXReadyWorldSeconds) { return; }
+				// 初始原生世界帧已真实完成；不改 DeltaTime、Montage、输入来源或播放速率。
+				Stage = EStage::Main; Deadline = FPlatformTime::Seconds() + 3.0;
+				if (!InstallFXInputObservation()) { return; }
+				LogNativeInputBoundary(TEXT("StartupNativeFrameReady"));
+				bAttackDown = true; SendNativeKey(AttackKey, true);
+				return;
+			}
+			if (Stage == EStage::FXCancelWait) { VerifyFXCancellation(); return; }
+			if (Stage == EStage::Natural || Stage == EStage::NaturalIdle)
+			{
+				if (!PlayerInput->IsPressed(AttackKey)) { bAttackDown = false; }
+				ObserveFX();
+				if (bFailed) { return; }
+				if (Stage == EStage::Natural) { ObserveFullNaturalEnd(); }
+				else if (Stage == EStage::NaturalIdle) { ObserveNaturalIdle(); }
+			}
+		}
+		void LogNativeInputBoundary(const TCHAR* Boundary)
+		{
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] NativeInputBoundary=%s Stage=%u Frame=%llu WorldSeconds=%.6f DeltaSeconds=%.6f WindowActive=%d ViewportFocus=%d AttackPressed=%d OwnAttackKey=%d Request=%d OriginalTask=%s CurrentTask=%s CurrentStep=%d."),
+				Boundary, static_cast<uint32>(Stage), static_cast<unsigned long long>(GFrameCounter),
+				World.IsValid() ? World->GetTimeSeconds() : -1.0f, World.IsValid() ? World->GetDeltaSeconds() : -1.0f,
+				NativeWindow.IsValid() && NativeWindow->IsActive(),
+				FSlateApplication::IsInitialized() && FSlateApplication::Get().GetKeyboardFocusedWidget() == ViewportWidget,
+				PlayerInput.IsValid() && PlayerInput->IsPressed(AttackKey), bAttackDown,
+				FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get()),
+				*GetPathNameSafe(MontageTask.Get()), *GetPathNameSafe(FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get())),
+				Ability.IsValid() ? Ability->GetCurrentComboStep() : INDEX_NONE));
+		}
+		bool InstallFXInputObservation()
+		{
+			if (!IsProductionChainCurrent() || !World->PersistentLevel
+				|| !Controller->PrimaryActorTick.IsTickFunctionRegistered() || !Controller->PrimaryActorTick.IsTickFunctionEnabled())
+			{
+				Fail(TEXT("FX observation requires the original live native Controller input tick")); return false;
+			}
+			FXInputObservationTick.Command = this;
+			FXInputObservationTick.AddPrerequisite(Controller.Get(), Controller->PrimaryActorTick);
+			// CMC can TickPose before the Mesh component tick; observe before both and the original Pawn.
+			Character->PrimaryActorTick.AddPrerequisite(Character.Get(), FXInputObservationTick);
+			Movement->PrimaryComponentTick.AddPrerequisite(Movement.Get(), FXInputObservationTick);
+			Mesh->PrimaryComponentTick.AddPrerequisite(Mesh.Get(), FXInputObservationTick);
+			FXInputObservationTick.RegisterTickFunction(World->PersistentLevel);
+			if (!FXInputObservationTick.IsTickFunctionRegistered())
+			{
+				ReleaseFXInputObservation();
+				Fail(TEXT("native FX input observation registration failed")); return false;
+			}
+			return true;
+		}
+		void ReleaseFXInputObservation()
+		{
+			if (!FXInputObservationTick.Command && !FXInputObservationTick.IsTickFunctionRegistered()) { return; }
+			FXInputObservationTick.Command = nullptr;
+			FXInputObservationTick.UnRegisterTickFunction();
+			if (Controller.IsValid()) { FXInputObservationTick.RemovePrerequisite(Controller.Get(), Controller->PrimaryActorTick); }
+			if (Character.IsValid()) { Character->PrimaryActorTick.RemovePrerequisite(Character.Get(), FXInputObservationTick); }
+			if (Movement.IsValid()) { Movement->PrimaryComponentTick.RemovePrerequisite(Movement.Get(), FXInputObservationTick); }
+			if (Mesh.IsValid()) { Mesh->PrimaryComponentTick.RemovePrerequisite(Mesh.Get(), FXInputObservationTick); }
+		}
+		void ObserveFXAfterNativeInput()
+		{
+			if (!bFailed && Stage == EStage::Main)
+			{
+				if (!IsProductionChainCurrent()) { Fail(TEXT("original production chain changed at native FX input boundary")); }
+				else { TryCaptureMain(); }
+			}
+			if (bFailed || Stage != EStage::Main) { ReleaseFXInputObservation(); }
 		}
 		void LogPreflight(const TCHAR* Boundary, EGGYGOMovementInputOriginQualification Qualification,
 			EGGYGOQualifiedMovementIntentQueryResult IntentResult, const FString& Diagnostic)
@@ -2256,6 +3252,232 @@ namespace
 				static_cast<unsigned long long>(OwnerNotice.GetNoticeSerial()), Ability.IsValid() && Ability->IsActive(),
 				Movement.IsValid() && Movement->HasActiveActionMotion(), Movement.IsValid() && Movement->IsMovementBlockedByTag(),
 				ASC.IsValid() && ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_Attacking), *Diagnostic));
+		}
+		bool PrepareFXProbe()
+		{
+			FGGYGOComboStep Step;
+			FString Error;
+			if (!FGGYGOPlayerComboLifecycleFixture::ReadProductionFirstStep(Ability.Get(), Step)
+				|| !Ability->ValidateComboConfiguration(Error)
+				|| Step.FX.Mode != EGGYGOComboFXMode::MontageWindow || !Step.FX.System
+				|| Step.FX.System->GetPathName() != TEXT("/Game/Characters/Player/Pyrios/FX/Skill/NS_Eff_Pyrois_Attack_Normal_01_01_Trail.NS_Eff_Pyrois_Attack_Normal_01_01_Trail")
+				|| Step.FX.BeginEventTag != GGYGOGameplayTags::Event_Montage_FXWindowBegin
+				|| Step.FX.EndEventTag != GGYGOGameplayTags::Event_Montage_FXWindowEnd
+				|| Step.FX.Space != EGGYGONiagaraEffectSpace::Attached || !Step.FX.SocketName.IsNone()
+				|| !Step.FX.LocalTransform.Equals(FTransform::Identity)
+				|| Step.FX.NormalStopMode != EGGYGONiagaraEffectStopMode::DeactivateDetachKeepWorld
+				|| Step.FX.AbortStopMode != EGGYGONiagaraEffectStopMode::DestroyImmediately)
+			{
+				Fail(TEXT("formal Normal01 seven-color FX configuration is not installed: ") + Error); return false;
+			}
+			FXSystem = Step.FX.System.Get();
+			for (const FAnimNotifyEvent& Event : Step.Montage->Notifies)
+			{
+				const auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Event.NotifyStateClass.Get());
+				if (Notify && Notify->GetBeginEventTag() == Step.FX.BeginEventTag && Notify->GetEndEventTag() == Step.FX.EndEventTag)
+				{
+					FXWindowBegin = Event.GetTime(); FXWindowEnd = Event.GetTime() + Event.GetDuration();
+				}
+			}
+			if (!FMath::IsNearlyEqual(FXWindowBegin, 0.05f) || !FMath::IsNearlyEqual(FXWindowEnd, 0.217f))
+			{
+				Fail(TEXT("formal FX project-test window differs from the selected .05-.217 seconds")); return false;
+			}
+			FXEventTags.AddTag(Step.FX.BeginEventTag); FXEventTags.AddTag(Step.FX.EndEventTag);
+			FXEventHandle = ASC->AddGameplayEventTagContainerDelegate(FXEventTags,
+				FGameplayEventTagMulticastDelegate::FDelegate::CreateLambda([this](FGameplayTag Tag, const FGameplayEventData* Data)
+				{
+					if (!Data || Data->EventTag != Tag || Data->OptionalObject2 != Mesh.Get() || !FMath::IsFinite(Data->EventMagnitude)) { return; }
+					// Observe the exact old source before filtering current-playback facts. A filtered
+					// old End count of zero cannot prove that native NotifyEnd has not been dispatched.
+					if (Tag == GGYGOGameplayTags::Event_Montage_FXWindowEnd && Data->OptionalObject == Montage.Get()
+						&& FXCancelledInstanceId != INDEX_NONE
+						&& static_cast<double>(Data->EventMagnitude) == static_cast<double>(FXCancelledInstanceId) + 1.0)
+					{
+						if (FXCancelledEndFrame != MAX_uint64) { Fail(TEXT("cancelled native FX source dispatched duplicate End")); return; }
+						FXCancelledEndFrame = GFrameCounter;
+					}
+					auto* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get());
+					FGGYGOMontageSectionSnapshot Snapshot;
+					if (!Task || !Task->TryGetOriginalSectionSnapshot(Snapshot)
+						|| Data->OptionalObject != Snapshot.Montage
+						|| static_cast<double>(Data->EventMagnitude) != static_cast<double>(Snapshot.MontageInstanceId) + 1.0)
+					{
+						++FXRejectedOldEvents; return; // Old queued End/Begin never proves a successor's event.
+					}
+					if (Tag == GGYGOGameplayTags::Event_Montage_FXWindowBegin)
+					{
+						++FXBeginCounts.FindOrAdd(Snapshot.MontageInstanceId);
+						if (bFXRestarted && Snapshot.MontageInstanceId != FXCancelledInstanceId) { FXRestartBeginFrame = GFrameCounter; }
+					}
+					else if (Tag == GGYGOGameplayTags::Event_Montage_FXWindowEnd) { ++FXEndCounts.FindOrAdd(Snapshot.MontageInstanceId); }
+				}));
+			if (!FXEventHandle.IsValid()) { Fail(TEXT("original FX event observation could not register")); return false; }
+			return true;
+		}
+		bool HasOriginalActiveFXNotify(int32 OriginalInstanceId) const
+		{
+			if (!AnimInstance.IsValid() || AnimInstance->ActiveAnimNotifyState.Num() != AnimInstance->ActiveAnimNotifyEventReference.Num()) { return false; }
+			int32 Matches = 0;
+			for (int32 Index = 0; Index < AnimInstance->ActiveAnimNotifyState.Num(); ++Index)
+			{
+				const auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(AnimInstance->ActiveAnimNotifyState[Index].NotifyStateClass.Get());
+				const auto* Context = AnimInstance->ActiveAnimNotifyEventReference[Index].GetContextData<UE::Anim::FAnimNotifyMontageInstanceContext>();
+				if (Notify && Notify->GetOuter() == Montage.Get() && Context && Context->MontageInstanceID == OriginalInstanceId
+					&& Notify->GetBeginEventTag() == GGYGOGameplayTags::Event_Montage_FXWindowBegin
+					&& Notify->GetEndEventTag() == GGYGOGameplayTags::Event_Montage_FXWindowEnd) { ++Matches; }
+			}
+			return Matches == 1;
+		}
+		bool FXComponentRetired() const
+		{
+			UNiagaraComponent* Component = FXComponent.Get(true);
+			return !Component || (Component->IsBeingDestroyed() && !Component->IsRegistered());
+		}
+		void ObserveFX()
+		{
+			if (bFXVerified || bFailed) { return; }
+			const int32 Begins = FXBeginCounts.FindRef(InstanceId), Ends = FXEndCounts.FindRef(InstanceId);
+			if (Begins > 1 || Ends > 1) { Fail(TEXT("original native FX window duplicated Begin/End")); return; }
+			if (!bFXCaptured)
+			{
+				TInlineComponentArray<UNiagaraComponent*> Components(Character.Get());
+				UNiagaraComponent* Found = nullptr;
+				for (UNiagaraComponent* Component : Components)
+				{
+					if (!IsValid(Component) || Component->GetAsset() != FXSystem.Get()) { continue; }
+					if (Found) { Fail(TEXT("multiple components of the selected NS in the original Pawn")); return; }
+					Found = Component;
+				}
+				if (!Found) { return; }
+				if (Begins != 1 || Ends != 0 || Found->GetAttachParent() != Mesh.Get() || Found->GetWorld() != World.Get())
+				{
+					Fail(TEXT("seven-color component was not observed inside its real original attached FX window")); return;
+				}
+				auto* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get());
+				if (!Task || Task->GetStartResult() != EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested)
+				{
+					Fail(TEXT("original component has no accepted original FX Task request")); return;
+				}
+				FXTask.Reset(Task); FXComponent = Found; bFXCaptured = true;
+			}
+			UNiagaraComponent* Component = FXComponent.Get();
+			if (Component && !bFXParticles)
+			{
+				const auto NiagaraController = Component->GetSystemInstanceController();
+				if (NiagaraController.IsValid() && NiagaraController->IsValid()
+					&& !NiagaraController->IsPendingSpawn() && !NiagaraController->IsComplete() && NiagaraController->GetAge() > 0.0f)
+				{
+					if (!FXCache.Get()) { FXCache.Reset(NewObject<UNiagaraSimCache>(GetTransientPackage())); }
+					FNiagaraSimCacheCreateParameters Parameters;
+					Parameters.bAllowDataInterfaceCaching = false;
+					UNiagaraSimCache* Captured = nullptr;
+					// The exported capture validates the original simulation and current data
+					// through Niagara's native BeginWrite/WriteFrame before accepting a frame.
+					if (!UNiagaraSimCacheFunctionLibrary::CaptureNiagaraSimCacheImmediate(FXCache.Get(), Parameters, Component, Captured, false)
+						|| Captured != FXCache.Get() || Captured->GetSystem() != FXSystem.Get() || Captured->GetNumFrames() != 1
+						|| Captured->GetNumEmitters() != 7)
+					{
+						Fail(TEXT("native non-advancing particle capture failed; it cannot stand in for zero particles")); return;
+					}
+					int32 Particles = 0;
+					for (int32 Emitter = 0; Emitter < Captured->GetNumEmitters(); ++Emitter)
+					{
+						Particles += Captured->GetEmitterNumInstances(Emitter, 0);
+					}
+					if (Particles > 0)
+					{
+						bFXParticles = true;
+						Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Component=%s ActualParticles=%d CaptureAdvance=0."),
+							static_cast<uint32>(FXProbe), InstanceId, *Component->GetPathName(), Particles));
+					}
+				}
+			}
+			if (FXProbe == EComboFXProbe::WindowCancel && !bFXRestarted)
+			{
+				if (!bFXParticles) { return; }
+				FGGYGOMontageSectionSnapshot Snapshot;
+				if (Ends != 0 || !ReadOriginalPlayback(Snapshot) || Snapshot.PositionSeconds >= FXWindowEnd || !Component)
+				{
+					Fail(TEXT("particle-bearing FX cancellation missed the real author window")); return;
+				}
+				CancelFXOriginal(); return;
+			}
+			if (FXProbe == EComboFXProbe::WindowCancel && bFXRestarted && Begins == 1 && Ends == 0
+				&& FXCancelledEndFrame != MAX_uint64
+				&& (!Component || !FXTask.Get() || FXTask->GetState() == EGameplayTaskState::Finished
+					|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) != FXTask.Get()
+					|| Component->GetAttachParent() != Mesh.Get()))
+			{
+				Fail(TEXT("old native FX End retired or detached the exact successor resource before its real authored End")); return;
+			}
+			if (Ends == 1 && Component && !bFXDetached)
+			{
+				const auto NiagaraController = Component->GetSystemInstanceController();
+				if (Component->GetAttachParent() || FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get())
+					|| !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished
+					|| !NiagaraController.IsValid() || !NiagaraController->IsValid()
+					|| NiagaraController->GetRequestedExecutionState() != ENiagaraExecutionState::Inactive)
+				{
+					Fail(TEXT("real author End did not detach the exact original tail and request native inactive state")); return;
+				}
+				bFXDetached = true;
+			}
+			if (FXComponentRetired())
+			{
+				if (Begins != 1 || Ends != 1 || !bFXParticles || !bFXDetached || !FXTask.Get()
+					|| FXTask->GetState() != EGameplayTaskState::Finished)
+				{
+					Fail(TEXT("original tail retired without observed particles, authored End and native detach/inactive facts")); return;
+				}
+				if (FXProbe == EComboFXProbe::WindowCancel && bFXNativePlaybackOverlap && FXCancelledEndFrame == MAX_uint64)
+				{
+					Fail(TEXT("observed native playback overlap never dispatched the exact old active FX NotifyEnd")); return;
+				}
+				if (FXProbe == EComboFXProbe::WindowCancel)
+				{
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] NoMergePlaybackOverlap=%s CancelFrame=%llu NewPlaybackObservedFrame=%llu NewBeginFrame=%llu OldEndFrame=%llu OldInstance=%d NewInstance=%d; frame numbers are diagnostics, NOT_OBSERVED leaves NoMerge dynamic coverage open."),
+						bFXNativePlaybackOverlap ? TEXT("OBSERVED") : TEXT("NOT_OBSERVED"),
+						static_cast<unsigned long long>(FXCancelFrame), static_cast<unsigned long long>(FXRestartPlaybackFrame),
+						static_cast<unsigned long long>(FXRestartBeginFrame), static_cast<unsigned long long>(FXCancelledEndFrame), FXCancelledInstanceId, InstanceId));
+				}
+				bFXVerified = true;
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Begin=1 End=1 TailDetached=1 ActualComponentRetired=1 OldEventsRejected=%d."),
+					static_cast<uint32>(FXProbe), InstanceId, FXRejectedOldEvents));
+			}
+		}
+		void CancelFXOriginal()
+		{
+			bFXCancelledWithActiveNotify = FXProbe == EComboFXProbe::WindowCancel && HasOriginalActiveFXNotify(InstanceId);
+			FXCancelledActivation = OriginalActivation; FXCancelledInstanceId = InstanceId;
+			FXCancelFrame = GFrameCounter;
+			Stage = EStage::FXCancelWait; Deadline = FPlatformTime::Seconds() + 3.0;
+			ASC->CancelAbilityHandle(SpecHandle); // Explicit native GAS cancellation; never pretend this is movement before CancelPoint.
+			if (FXProbe == EComboFXProbe::WindowCancel) { VerifyFXCancellation(); }
+		}
+		void VerifyFXCancellation()
+		{
+			if (EndCount == 0 || CompletedCount == 0 || PlayerInput->IsPressed(AttackKey)) { return; }
+			if (EndCount != 1 || CompletedCount != 1 || !EndData.bWasCancelled || !Completion.HasCompletion()
+				|| !Completion.GetOriginal().GetOriginalActivation().HasSameActivation(FXCancelledActivation)
+				|| Ability->IsActive() || !bResourcesRestoredAtEnd || !ResourcesRestored()
+				|| FXInputObservationTick.IsTickFunctionRegistered()
+				|| (bFXCaptured && (!FXComponentRetired() || !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished)))
+			{
+				Fail(TEXT("native FX cancellation did not retire the exact original GA/Task/component resources")); return;
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u CancelledInstance=%d NativeEnd=1 Completed=1 ResourcesRestored=1 CapturedComponentRetired=%d."),
+				static_cast<uint32>(FXProbe), FXCancelledInstanceId, bFXCaptured));
+			EndCount = 0; CompletedCount = 0; EndData = {}; Completion = {};
+			OriginalActivation = {}; MontageTask.Reset(); InputTask.Reset();
+			bResourcesRestoredAtEnd = false; bEndSnapshotAvailable = false; bStoppedAtEnd = false;
+			// Repeat the real same-Montage attack after both pre-window and active-window cancellation.
+			// Key submission alone is not a same-frame activation or native notify overlap proof.
+			FXTask.Reset(); FXComponent.Reset(); FXCache.Reset();
+			bFXCaptured = false; bFXParticles = false; bFXDetached = false;
+			bFXRestarted = true; Stage = EStage::Main; Deadline = FPlatformTime::Seconds() + 3.0;
+			if (!InstallFXInputObservation()) { return; }
+			bAttackDown = true; SendNativeKey(AttackKey, true);
 		}
 		bool HasMeshPrerequisite() const
 		{
@@ -2392,23 +3614,78 @@ namespace
 			}
 			FGGYGOMontageNotifyFact PointSnapshot;
 			float PointReadPosition = 0.0f;
-			if (!Task->TryGetOriginalMontageNotifySnapshot(PointSnapshot, PointReadPosition)
+			if (!Task->TryGetOriginalMontageNotifySnapshotByName(Step.InterruptionNotifyName, PointSnapshot, PointReadPosition)
 				|| PointSnapshot.Montage != Snapshot.Montage || PointSnapshot.MontageInstanceId != Snapshot.MontageInstanceId
 				|| PointSnapshot.NotifyName != Step.InterruptionNotifyName || PointSnapshot.Mesh != Mesh.Get()
-				|| (PointReadPosition < PointSnapshot.NotifyPositionSeconds && Ability->IsInterruptionOpen()))
+				|| (PointReadPosition < PointSnapshot.NotifyPositionSeconds && Ability->IsInterruptionOpen())
+				|| (Snapshot.SectionName == Step.MainSection && Ability->IsMovementInterruptionOpen()))
 			{
 				Fail(TEXT("new original playback did not reset its author-point permission or snapshot identity")); return;
 			}
 			AuthorPointPosition = PointSnapshot.NotifyPositionSeconds;
 			OriginalAuthorPoint = PointSnapshot;
+			OriginalMovementPoint = {};
+			if (Step.MovementInterruptionMode == EGGYGOActionInterruptionMode::AuthoredNotify)
+			{
+				float MovementReadPosition = 0.0f;
+				if (!Task->TryGetOriginalMontageNotifySnapshotByName(Step.MovementInterruptionNotifyName,
+					OriginalMovementPoint, MovementReadPosition)
+					|| OriginalMovementPoint.NotifyName != Step.MovementInterruptionNotifyName
+					|| OriginalMovementPoint.Montage != Snapshot.Montage || OriginalMovementPoint.Mesh != Mesh.Get()
+					|| OriginalMovementPoint.MontageInstanceId != Snapshot.MontageInstanceId
+					|| OriginalMovementPoint.NotifyAuthoredPositionSeconds != EndStart
+					|| OriginalMovementPoint.NotifyPositionSeconds > EndStart
+					|| (MovementReadPosition < EndStart && Ability->IsMovementInterruptionOpen()))
+				{
+					Fail(TEXT("new original movement point identity or exact Main-end permission floor is invalid")); return;
+				}
+			}
 			NaturalEarliestEndWorldSeconds = World->GetTimeSeconds() + (EndEnd - Snapshot.PositionSeconds) / Task->GetEffectivePlayRate();
 			MontageTask.Reset(Task);
 			InputTask.Reset(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(Ability.Get()));
 			OriginalActivation = Captured;
+			NaturalInputRequestId = FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get());
 			if (!OriginalActivation.HasActivation() || !InputTask.IsValid()) { Fail(TEXT("original GA/input task identity unavailable")); return; }
-			SendNativeKey(AttackKey, false); bAttackDown = false;
+			SendNativeKey(AttackKey, false);
+			if (FXProbe == EComboFXProbe::None || !PlayerInput->IsPressed(AttackKey)) { bAttackDown = false; }
+			if (FXProbe != EComboFXProbe::None)
+			{
+				LogNativeInputBoundary(TEXT("OriginalMainKeyUpSubmitted"));
+				ReleaseFXInputObservation();
+			}
 			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] OriginalMain Montage=%s Instance=%d Position=%.6f End=[%.6f,%.6f)."),
 				*Montage->GetPathName(), InstanceId, Snapshot.PositionSeconds, EndStart, EndEnd));
+			if (FXProbe != EComboFXProbe::None)
+			{
+				if (bFXRestarted && (InstanceId == FXCancelledInstanceId || Captured.HasSameActivation(FXCancelledActivation)))
+				{
+					Fail(TEXT("FX restart reused the cancelled native playback or original activation")); return;
+				}
+				if (bFXRestarted && FXProbe == EComboFXProbe::WindowCancel)
+				{
+					// This exact Task snapshot proves the new native playback already exists.
+					// An activated callback or key submission alone occurs too early to prove that.
+					FXRestartPlaybackFrame = GFrameCounter;
+					bFXNativePlaybackOverlap = bFXCancelledWithActiveNotify && FXCancelledEndFrame == MAX_uint64
+						&& HasOriginalActiveFXNotify(FXCancelledInstanceId);
+				}
+				if (FXProbe == EComboFXProbe::EarlyCancelRestart && !bFXRestarted)
+				{
+					if (Snapshot.PositionSeconds >= FXWindowBegin || FXBeginCounts.FindRef(InstanceId) != 0
+						|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()))
+					{
+						Fail(TEXT("early FX cancellation was not observed before the real author Begin")); return;
+					}
+					ReleaseFXInputObservation();
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] EarlyCancelBoundary=AfterOriginalControllerInputBeforePawnCMCAndMesh Position=%.6f Begin=%.6f Instance=%d; real Task/CMC established, no manual input or pose tick."),
+						Snapshot.PositionSeconds, FXWindowBegin, InstanceId));
+					CancelFXOriginal();
+					return;
+				}
+				Stage = EStage::Natural;
+				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
+				return;
+			}
 			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated) { BeginPoseRuntimeFault(); return; }
 			if (bRestartSent)
 			{
@@ -2434,6 +3711,13 @@ namespace
 				Stage = EndAttackProbe == EComboEndAttackProbe::Restart ? EStage::MainAttackPress : EStage::Natural;
 				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
 				return;
+			}
+			// 移动取消只由本段独立移动作者点授予；生产资产未配置时明确失败，不以攻击点或 End 代开。
+			if (Step.MovementInterruptionMode != EGGYGOActionInterruptionMode::AuthoredNotify
+				|| Step.MovementInterruptionNotifyName.IsNone()
+				|| Step.MovementInterruptionNotifyName == Step.InterruptionNotifyName)
+			{
+				Fail(TEXT("production step has no independent authored movement point; movement cancellation is not granted")); return;
 			}
 			Stage = EStage::End;
 			Deadline = FPlatformTime::Seconds() + 10.0;
@@ -2508,6 +3792,10 @@ namespace
 		{
 			FGGYGOMontageSectionSnapshot Snapshot;
 			if (!ReadOriginalPlayback(Snapshot) || !Ability->IsInterruptionOpen()) { return; }
+			if (Ability->IsMovementInterruptionOpen() && Snapshot.SectionName == MainSection)
+			{
+				Fail(TEXT("attack continuation point opened movement interruption inside Main")); return;
+			}
 			if (!bMainAttackRejected) { Fail(TEXT("terminal Main rejection was not observed before End restart")); return; }
 			if (Snapshot.SectionName != MainSection || Snapshot.PositionSeconds >= EndStart)
 			{
@@ -2529,6 +3817,11 @@ namespace
 			FGGYGOQualifiedMovementIntent Intent;
 			FString Error;
 			const EGGYGOQualifiedMovementIntentQueryResult Result = Movement->QueryQualifiedMovementIntent(Scope, Intent, Error);
+			// 移动作者点可按 OffsetBefore 在 Main 内触发，但真实位置未达 Main 末端（End 起点）前不得开门或取消。
+			if (Ability->IsMovementInterruptionOpen() && Snapshot.PositionSeconds < EndStart)
+			{
+				Fail(TEXT("movement interruption opened before the original playback reached the authored Main end")); return;
+			}
 			if (bHeldDuringMain && Snapshot.SectionName == MainSection)
 			{
 				if (Result == EGGYGOQualifiedMovementIntentQueryResult::Qualified
@@ -2619,9 +3912,10 @@ namespace
 		{
 			if (EndCount != 1 || CompletedCount != 1 || !EndData.bWasCancelled || !Completion.HasCompletion()
 				|| Completion.GetReason() != EGGYGOAbilityTerminationReason::None || !bEndSnapshotAvailable
-				|| EndedSection != (bHeldDuringMain ? MainSection : EndSection)
-				|| !FMath::IsFinite(EndPosition) || EndPosition < AuthorPointPosition || EndPosition >= EndEnd
-				|| (bHeldDuringMain && EndPosition >= EndStart)
+				// Main 内持续 Held 也只能在原实例真实到达 Main 末端（End 起点）之后取消；
+				// 攻击接续点、提前触发的移动点事实或 Main 内位置都不是合法取消证据。
+				|| EndedSection != EndSection
+				|| !FMath::IsFinite(EndPosition) || EndPosition < EndStart || EndPosition >= EndEnd
 				|| !bStoppedAtEnd || EndIntentResult != EGGYGOQualifiedMovementIntentQueryResult::Qualified
 				|| EndIntent.Provenance != EGGYGOQualifiedMovementIntentProvenance::LocalSourceHeld
 				|| EndIntent.SessionSerial == 0 || EndIntent.RequestSerial == 0 || EndIntent.ExecutionRequestSerial == 0
@@ -2759,20 +4053,34 @@ namespace
 		}
 		void ObserveFullNaturalEnd()
 		{
+			if (EndCount == 0 && (FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get()) != MontageTask.Get()
+				|| Ability->GetCurrentComboStep() != ExpectedStep
+				|| FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get()) != NaturalInputRequestId))
+			{
+				LogNativeInputBoundary(TEXT("NaturalOriginalReplaced"));
+				Fail(TEXT("无新增攻击输入的自然观察出现新请求／新 Step／替代 Task，不能作为原 Task 自然完成等待。")); return;
+			}
 			if (EndCount == 0 || CompletedCount == 0)
 			{
 				if (EndCount == 0 && MontageTask.Get() && MontageTask->GetState() == EGameplayTaskState::Finished)
 				{
-					if (Ability->IsInterruptionOpen())
+					if (Ability->IsAttackContinuationOpen() || Ability->IsMovementInterruptionOpen())
 					{
 						Fail(TEXT("original native Task finished but its pending CMC owner retained interruption permission")); return;
 					}
 					if (!bObservedCompletedWait)
 					{
+						FString ReplayError;
 						if (!FGGYGOPlayerComboLifecycleFixture::ReplayCompletedProductionPointForTest(
-							Ability.Get(), MontageTask.Get(), OriginalAuthorPoint))
+							Ability.Get(), MontageTask.Get(), OriginalAuthorPoint, Movement.Get(), ReplayError))
 						{
-							Fail(TEXT("late original point reopened permission or retired the pending original CMC owner")); return;
+							Fail(TEXT("late original point reopened permission or retired the pending original CMC owner: ") + ReplayError); return;
+						}
+						if (!OriginalMovementPoint.NotifyName.IsNone()
+							&& !FGGYGOPlayerComboLifecycleFixture::ReplayCompletedProductionPointForTest(
+								Ability.Get(), MontageTask.Get(), OriginalMovementPoint, Movement.Get(), ReplayError))
+						{
+							Fail(TEXT("late original movement point changed the completed resource or reopened permission: ") + ReplayError); return;
 						}
 						bObservedCompletedWait = true;
 						Test.AddInfo(TEXT("[Combat.PlayerCombo.InterruptionProductionSmoke] NativeTaskFinishedBeforeOwnerEnd: original resource retained, permission closed and negative late-point replay rejected; awaiting native CMC completion."));
@@ -2830,7 +4138,8 @@ namespace
 			{
 				Fail(TEXT("without a new request the naturally ended attack restarted or reacquired resources")); return;
 			}
-			if (World->GetTimeSeconds() >= NaturalIdleUntilWorldSeconds) { BeginEnding(); }
+			if (World->GetTimeSeconds() >= NaturalIdleUntilWorldSeconds
+				&& (FXProbe == EComboFXProbe::None || bFXVerified)) { BeginEnding(); }
 		}
 		void LogLocomotionSnapshot(const TCHAR* Boundary)
 		{
@@ -3172,6 +4481,10 @@ namespace
 		}
 		void ReleaseGameplayObservations()
 		{
+			ReleaseFXInputObservation();
+			ReleaseFXFrameObservation();
+			if (NativeWindow.IsValid()) { NativeWindow->GetOnWindowDeactivatedEvent().Remove(WindowDeactivatedHandle); }
+			WindowDeactivatedHandle.Reset();
 			if (PoseProbe != EComboPoseFailureProbe::None)
 			{
 				RestorePoseProbeConfiguration();
@@ -3192,8 +4505,10 @@ namespace
 			{
 				ASC->OnAbilityEnded.Remove(EndHandle);
 				ASC->OnAbilityTerminationCompleted().Remove(CompletedHandle);
+				if (FXEventHandle.IsValid()) { ASC->RemoveGameplayEventTagContainerDelegate(FXEventTags, FXEventHandle); }
 			}
 			EndHandle.Reset(); CompletedHandle.Reset();
+			FXEventHandle.Reset(); FXEventTags.Reset(); FXTask.Reset(); FXCache.Reset(); FXComponent.Reset();
 			ReplacedTask.Reset(); MontageTask.Reset(); InputTask.Reset(); // Observation roots never survive this finite smoke.
 			if (!FSlateApplication::IsInitialized()) { return; }
 			FSlateApplication& Slate = FSlateApplication::Get();
@@ -3217,8 +4532,17 @@ namespace
 				}
 				else { Fail(TEXT("owned key-up route unavailable; original PIE native teardown must release its input")); }
 			}
-			if (CurrentFocus.IsValid() && CurrentFocus != ViewportWidget) { Slate.SetKeyboardFocus(CurrentFocus, EFocusCause::SetDirectly); }
+			FocusBeforeTeardown = CurrentFocus;
+			// 活跃 PIE 的焦点归还会触发真实 InputFlushed；由原生 EndPlay 先退役输入和 CMC。
+		}
+		void RestoreFocusAfterPIETeardown()
+		{
+			if (OwnsPIESession() || CountPIEWorlds() != 0 || !FSlateApplication::IsInitialized()) { return; }
+			FSlateApplication& Slate = FSlateApplication::Get();
+			const TSharedPtr<SWidget> SavedFocus = FocusBeforeTeardown.Pin();
+			if (SavedFocus.IsValid() && SavedFocus != ViewportWidget) { Slate.SetKeyboardFocus(SavedFocus, EFocusCause::SetDirectly); }
 			else if (PreviousFocus.IsValid()) { Slate.SetKeyboardFocus(PreviousFocus.Pin(), EFocusCause::SetDirectly); }
+			FocusBeforeTeardown.Reset(); PreviousFocus.Reset();
 		}
 		void ReleaseMainPointProbeAfterPIETeardown()
 		{
@@ -3268,7 +4592,7 @@ namespace
 			}
 			const bool bReleased = Test.TestTrue(TEXT("production smoke released its original PIE session/context"),
 				!OwnsPIESession() && CountPIEWorlds() == 0);
-			if (bReleased) { ReleaseMainPointProbeAfterPIETeardown(); }
+			if (bReleased) { ReleaseMainPointProbeAfterPIETeardown(); RestoreFocusAfterPIETeardown(); }
 			const bool bGlobalsRestored = Test.TestTrue(TEXT("native teardown restored outer world/viewport"),
 				GWorld == OuterWorld && GEngine && GEngine->GameViewport.Get() == OuterViewport);
 			if (!bFailed && bReleased && bGlobalsRestored)
@@ -3293,7 +4617,28 @@ namespace
 		const int32 LastMovementStep;
 		const EComboEndAttackProbe EndAttackProbe;
 		const EComboLocomotionObservation LocomotionObservation;
+		const EComboFXProbe FXProbe;
+		FFXInputObservationTick FXInputObservationTick;
+		FFXFrameObservationTick FXFrameObservationTick;
+		uint64 FXReadyFrame = MAX_uint64;
+		float FXReadyWorldSeconds = 0.0f;
+		FDelegateHandle WindowDeactivatedHandle;
+		TWeakObjectPtr<UNiagaraSystem> FXSystem;
+		TWeakObjectPtr<UNiagaraComponent> FXComponent;
+		TStrongObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect> FXTask;
+		TStrongObjectPtr<UNiagaraSimCache> FXCache;
+		FGameplayTagContainer FXEventTags;
+		FDelegateHandle FXEventHandle;
+		TMap<int32, int32> FXBeginCounts, FXEndCounts;
+		FGGYGOAbilityActivationHandle FXCancelledActivation;
+		int32 FXCancelledInstanceId = INDEX_NONE, FXRejectedOldEvents = 0;
+		uint64 FXCancelFrame = MAX_uint64, FXRestartPlaybackFrame = MAX_uint64;
+		uint64 FXRestartBeginFrame = MAX_uint64, FXCancelledEndFrame = MAX_uint64;
+		float FXWindowBegin = 0.0f, FXWindowEnd = 0.0f;
+		bool bFXCaptured = false, bFXParticles = false, bFXDetached = false, bFXVerified = false, bFXRestarted = false;
+		bool bFXCancelledWithActiveNotify = false, bFXNativePlaybackOverlap = false;
 		int32 TargetStep = 0, ExpectedStep = 0, ReplacedStep = INDEX_NONE, ReplacedInstanceId = INDEX_NONE, MainAttackRequest = 0;
+		int32 NaturalInputRequestId = 0;
 		bool bRestartSent = false, bRestartCaptured = false, bMainAttackRejected = false;
 		bool bCheckingMovementReset = false, bFinalResetAttack = false;
 		bool bObservedCompletedWait = false;
@@ -3306,6 +4651,7 @@ namespace
 		TStrongObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> ReplacedTask;
 		float AuthorPointPosition = 0.0f;
 		FGGYGOMontageNotifyFact OriginalAuthorPoint;
+		FGGYGOMontageNotifyFact OriginalMovementPoint;
 		int32 MainPointProbeIndex = INDEX_NONE;
 		FGGYGOComboStep OriginalPointProbeStep;
 		TStrongObjectPtr<UAnimMontage> MainPointProbe;
@@ -3372,6 +4718,7 @@ namespace
 		TSharedPtr<SViewport> ViewportWidget;
 		TSharedPtr<SWindow> NativeWindow;
 		TWeakPtr<SWidget> PreviousFocus;
+		TWeakPtr<SWidget> FocusBeforeTeardown;
 		FSceneViewport* SceneViewport = nullptr;
 		UWorld* OuterWorld = nullptr;
 		UGameViewportClient* OuterViewport = nullptr;
@@ -3384,6 +4731,19 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboEndProductionHeldTest,
 bool FGGYGOPlayerComboEndProductionHeldTest::RunTest(const FString& Parameters)
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, true));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboFXProductionTest,
+	"GGYGO.AbilitySystem.PlayerCombo.FX.ProductionNativeNormal01",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboFXProductionTest::RunTest(const FString& Parameters)
+{
+	for (EComboFXProbe Probe : { EComboFXProbe::NaturalTail, EComboFXProbe::WindowCancel, EComboFXProbe::EarlyCancelRestart })
+	{
+		ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0,
+			EComboEndAttackProbe::None, EComboLocomotionObservation::Immediate, Probe));
+	}
 	return true;
 }
 
