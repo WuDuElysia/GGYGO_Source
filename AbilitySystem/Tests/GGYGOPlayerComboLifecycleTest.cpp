@@ -1602,16 +1602,24 @@ bool FGGYGOPlayerComboActivationReentryTest::RunTest(const FString& Parameters)
 		FGGYGOComboLifecycleTestWorld TestWorld(GEngine);
 		FGGYGOPlayerComboLifecycleFixture Fixture;
 		if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+		if (!TestTrue(TEXT("结束重入场景启动前声明真实作者命中窗"), Fixture.AddHitWindowForTest())) { return false; }
 		if (!TestTrue(TEXT("结束重入初始激活"), Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle))) { return false; }
-		Fixture.Trace->BeginTraceWindow(Fixture.TraceStartBone, Fixture.TraceEndBone, 20.0f);
+		if (!TestTrue(TEXT("结束重入场景由真实作者 Notify 开启 Owned Trace"), Fixture.SendHitWindowForTest(true))) { return false; }
+		const FGGYGOMeleeTraceWindowHandle EndingTraceWindow = Fixture.GetTraceWindow();
+		if (!TestTrue(TEXT("原激活在结束前持有准确的活动 Owned Trace"), EndingTraceWindow.HasWindow()
+			&& Fixture.Trace->QueryOwnedTraceWindow(EndingTraceWindow) == EGGYGOMeleeTraceWindowQueryResult::Active
+			&& Fixture.Trace->IsTracing())) { return false; }
 		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const EndingMontageTask = Fixture.GetMontageTask();
 		UGGYGOAbilityTask_WaitComboInput* const EndingInputTask = Fixture.GetInputTask();
 		bool bResourcesWereCleanBeforeBroadcast = false;
+		bool bOriginalTraceWasClosedBeforeBroadcast = false;
 		bool bReactivatedFromEndBroadcast = false;
 		const FDelegateHandle EndHandle = Fixture.ASC->OnAbilityEnded.AddLambda([&](const FAbilityEndedData& Data)
 		{
 			if (Data.AbilityThatEnded == Fixture.Ability && !bReactivatedFromEndBroadcast)
 			{
+				bOriginalTraceWasClosedBeforeBroadcast = Fixture.Trace->QueryOwnedTraceWindow(EndingTraceWindow)
+					== EGGYGOMeleeTraceWindowQueryResult::Inactive;
 				bResourcesWereCleanBeforeBroadcast =
 					Fixture.WereAllResourcesCleanedBeforeBroadcast(EndingMontageTask, EndingInputTask);
 				bReactivatedFromEndBroadcast = Fixture.ASC->TryActivateAbility(Fixture.AbilityHandle);
@@ -1619,6 +1627,8 @@ bool FGGYGOPlayerComboActivationReentryTest::RunTest(const FString& Parameters)
 		});
 		Fixture.Ability->FinishForTest();
 		Fixture.ASC->OnAbilityEnded.Remove(EndHandle);
+		TestTrue(TEXT("Super EndAbility 广播前准确原 Owned Trace 句柄已为 Inactive"),
+			bOriginalTraceWasClosedBeforeBroadcast);
 		TestTrue(TEXT("Super EndAbility 广播前旧资源、Montage、输入任务、Trace 与 Mesh 全部清理"),
 			bResourcesWereCleanBeforeBroadcast);
 		TestTrue(TEXT("Super EndAbility 同步广播内重激活成功"), bReactivatedFromEndBroadcast);
