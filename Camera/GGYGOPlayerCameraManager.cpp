@@ -232,10 +232,18 @@ FGGYGOCameraEvaluationResult AGGYGOPlayerCameraManager::ActivateCameraEvaluation
 	}
 	if (PublicationState == EGGYGOCameraPublicationState::Running)
 	{
-		return IsValid(ExpectedTarget) && IsValid(ExpectedComponent)
-			&& AdmissionTarget.Get() == ExpectedTarget && AdmissionComponent.Get() == ExpectedComponent
-			? FGGYGOCameraEvaluationResult::Success()
-			: CameraPublicationFailure(TEXT("CameraActivation"), TEXT("already-activated-for-another-original-source"));
+		if (IsValid(ExpectedTarget) && IsValid(ExpectedComponent)
+			&& AdmissionTarget.Get() == ExpectedTarget && AdmissionComponent.Get() == ExpectedComponent)
+		{
+			return FGGYGOCameraEvaluationResult::Success();
+		}
+		// 同一 Controller 改附身新 Pawn（队伍切人）后，新 Pawn 的首个 Ready 走下面的完整准入，
+		// 替换准入来源；新来源校验失败照常停止发布。不是当前附身 Pawn 的来源仍拒绝。
+		if (!IsValid(ExpectedTarget) || !IsValid(PCOwner) || PCOwner != AdmissionController.Get()
+			|| PCOwner->GetPawn() != ExpectedTarget)
+		{
+			return CameraPublicationFailure(TEXT("CameraActivation"), TEXT("already-activated-for-another-original-source"));
+		}
 	}
 	AdmissionTarget = ExpectedTarget;
 	AdmissionComponent = ExpectedComponent;

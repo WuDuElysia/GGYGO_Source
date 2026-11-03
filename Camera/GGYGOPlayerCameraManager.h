@@ -29,6 +29,8 @@ public:
 	 * ExpectedTarget must own the exact selected, registered GG camera. Before Ready,
 	 * native UpdateCamera calls do nothing; no provider polling is performed here.
 	 * A repeated Ready for the admitted identity is idempotent, never a Restart.
+	 * Running 时只有准入 Controller 当前附身的 Pawn 能替换准入来源（重新校验并立即求值一次），
+	 * 其它来源仍拒绝。
 	 */
 	FGGYGOCameraEvaluationResult ActivateCameraEvaluation(
 		AActor* ExpectedTarget, UGGYGOCameraComponent* ExpectedComponent);

@@ -177,13 +177,20 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
 	EGGYGOSquadMemberState GetMemberState(int32 SlotIndex) const;
 
-	/** 切到下一个可出战的位置。已死亡或无实体的位置会被跳过。 */
+	/** 切到下一个可出战的位置。已死亡或无实体的位置会被跳过。仅服务器有效。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SwitchToNextSlot();
 
-	/** 切到上一个可出战的位置。 */
+	/** 切到上一个可出战的位置。仅服务器有效。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SwitchToPreviousSlot();
+
+	/**
+	 * 客户端请求按队伍顺序切到相邻的可出战位置：Direction 为 -1 上一个、1 下一个。
+	 * 目标由服务器按权威的出战序号与存活状态选择，来源记为 PlayerRequest；在服务器上调用时直接执行。
+	 */
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "GGYGO|Squad")
+	void ServerRequestSwitchToAdjacentSlot(int32 Direction);
 
 	/** 出战角色变更时广播。UI 与相机据此更新。 */
 	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Squad")
@@ -198,10 +205,10 @@ protected:
 	UFUNCTION()
 	void OnRep_ActiveSlotIndex();
 
-	/** 把位置的 Pawn 设为出战：显示、开碰撞。 */
+	/** 把位置的 Pawn 设为出战：显示、开碰撞、恢复骨架更新。 */
 	void ActivateSlot(AGGYGOCharacterSlot* Slot);
 
-	/** 把位置的 Pawn 设为待命：隐藏、关碰撞、停止移动。 */
+	/** 把位置的 Pawn 设为待命：隐藏、关碰撞、停骨架更新、停止移动。 */
 	void DeactivateSlot(AGGYGOCharacterSlot* Slot);
 
 	/** 位置是否可以出战（有实体且未死亡）。 */
@@ -256,6 +263,9 @@ private:
 	 * 提交责任后返回 true，即使自动激活失败；GameMode 实际创建交付仍须独立接线。
 	 */
 	bool RegisterCreatedSlot(AGGYGOCharacterSlot* Slot, APawn* OriginalCreatedPawn);
+
+	/** 从出战位置起按 Direction（±1）循环找第一个可出战的位置并切换；只试一次真实切换。 */
+	bool SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSource Source);
 
 	/** 两种入口共用接收事务；所有身份验证先于名单和责任提交。 */
 	bool RegisterSlotInternal(AGGYGOCharacterSlot* Slot, APawn* OriginalCreatedPawn, bool bAcceptCreatedResources);

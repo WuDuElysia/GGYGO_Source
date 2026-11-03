@@ -794,10 +794,14 @@ bool FGGYGOSquadSwitchReturnDuringExitSmoke::RunTest(const FString& Parameters)
 }
 
 #if WITH_EDITOR
+#include "Components/SkeletalMeshComponent.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
+#include "GameFramework/Character.h"
 #include "Engine/GameInstance.h"
 #include "Engine/LocalPlayer.h"
+#include "GameFramework/PlayerInput.h"
+#include "InputCoreTypes.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameModes/GGYGOExperienceDefinition.h"
 #include "GameModes/GGYGOGameMode.h"
@@ -840,6 +844,7 @@ namespace GGYGOSquadSwitchNetTests
 				return false;
 			}
 			if (!ResolveSides()) { return false; }
+			ReleaseHeldClientKey();
 			switch (Stage)
 			{
 			case EStage::Ready: ObserveReady(); break;
@@ -891,6 +896,31 @@ namespace GGYGOSquadSwitchNetTests
 		{
 			if (!bCondition) { LastUnmet = Condition; }
 			return bCondition;
+		}
+
+		/**
+		 * 经客户端 PlayerInput 发出真实按键，走 Controller 的 IMC 与换人绑定；
+		 * 默认键位 Z 上一个、C 下一个。下一次 Update 抬起。
+		 */
+		void PressClientKey(const FKey& Key)
+		{
+			UPlayerInput* Input = Client.Controller ? Client.Controller->PlayerInput.Get() : nullptr;
+			if (!Input) { Fail(TEXT("client Controller has no PlayerInput")); return; }
+			Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), Key, IE_Pressed,
+				1.0f, false, FPlatformTime::Cycles64()));
+			HeldClientKey = Key;
+			HeldClientKeyFrame = GFrameCounter;
+		}
+
+		void ReleaseHeldClientKey()
+		{
+			if (!HeldClientKey.IsValid() || GFrameCounter == HeldClientKeyFrame) { return; }
+			if (UPlayerInput* Input = Client.Controller ? Client.Controller->PlayerInput.Get() : nullptr)
+			{
+				Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), HeldClientKey, IE_Released,
+					0.0f, false, FPlatformTime::Cycles64()));
+			}
+			HeldClientKey = FKey();
 		}
 
 		void Advance(EStage Next, double Seconds = 15.0)
@@ -1010,6 +1040,13 @@ namespace GGYGOSquadSwitchNetTests
 
 		static bool IsOnField(const APawn* Pawn) { return Pawn && !Pawn->IsHidden() && Pawn->GetActorEnableCollision(); }
 
+		/** 服务器端骨架更新开关：出战 Pawn 更新，待命 Pawn 停止。 */
+		static bool IsSkeletonUpdating(const APawn* Pawn)
+		{
+			const ACharacter* Character = Cast<ACharacter>(Pawn);
+			return Character && Character->GetMesh() && !Character->GetMesh()->bNoSkeletonUpdate;
+		}
+
 		/** 客户端上的待命队员：不相关时没有副本；相关时（属于本客户端）隐藏且无碰撞。 */
 		static bool IsBenchedOnClient(const APawn* Pawn) { return !Pawn || (Pawn->IsHidden() && !Pawn->GetActorEnableCollision()); }
 
@@ -1031,6 +1068,8 @@ namespace GGYGOSquadSwitchNetTests
 				|| !Require(Server.Squad->GetActiveSlot() == Server.Slot(0)
 					&& Server.Squad->GetMemberState(0) == EGGYGOSquadMemberState::Active
 					&& Server.Squad->GetMemberState(1) == EGGYGOSquadMemberState::Benched, TEXT("server: first member active, second benched"))
+				|| !Require(IsSkeletonUpdating(Server.Avatar(0)) && Server.Avatar(1) && !IsSkeletonUpdating(Server.Avatar(1)),
+					TEXT("server: active member updates its skeleton, never-possessed benched member does not"))
 				|| !Require(IsClientControlling(0), TEXT("client: possessed and views visible collidable first member"))
 				|| !Require(Client.Avatar(1) && IsBenchedOnClient(Client.Avatar(1)),
 					TEXT("client: own benched member replicated hidden without collision")))
@@ -1065,8 +1104,8 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				return;
 			}
-			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Lingering replicated; client requests return to slot 0."));
-			Client.Squad->ServerRequestSwitchToSlot(0);
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Lingering replicated; client presses Z (previous member) to return to slot 0."));
+			PressClientKey(EKeys::Z);
 			Advance(EStage::Returned);
 		}
 
@@ -1094,8 +1133,8 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				return;
 			}
-			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] ReturnPending cleared; client requests switch to benched slot 1."));
-			Client.Squad->ServerRequestSwitchToSlot(1);
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] ReturnPending cleared; client presses C (next member) to switch to benched slot 1."));
+			PressClientKey(EKeys::C);
 			Advance(EStage::Rebenched);
 		}
 
@@ -1105,6 +1144,8 @@ namespace GGYGOSquadSwitchNetTests
 					&& Server.Squad->GetMemberState(1) == EGGYGOSquadMemberState::Active
 					&& Server.Squad->GetMemberState(0) == EGGYGOSquadMemberState::Benched
 					&& IsOnField(Server.Avatar(1)) && !IsOnField(Server.Avatar(0)), TEXT("server: benched member entered, old member benched"))
+				|| !Require(IsSkeletonUpdating(Server.Avatar(1)) && Server.Avatar(0) && !IsSkeletonUpdating(Server.Avatar(0)),
+					TEXT("server: entered member resumes skeleton update, newly benched member stops"))
 				|| !Require(IsClientControlling(1), TEXT("client: controls the re-entered member"))
 				|| !Require(IsBenchedOnClient(Client.Avatar(0)), TEXT("client: old member hidden without collision or not relevant")))
 			{
@@ -1277,7 +1318,7 @@ namespace GGYGOSquadSwitchNetTests
 			Test.TestTrue(TEXT("listen-server smoke released its PIE session"), !OwnsPIESession() && CountPIEWorlds() == 0);
 			if (bPassed && !bFailed)
 			{
-				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC switch, linger/return/bench replication, ")
+				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC and Z/C key switches, linger/return/bench replication, ")
 					TEXT("damage/MaxHealth drop/poise break replication with HealthComponent broadcasts, and PIE teardown observed. ")
 					TEXT("Production errors logged by other modules stay unfiltered and decide the Automation result."));
 			}
@@ -1291,6 +1332,8 @@ namespace GGYGOSquadSwitchNetTests
 		bool bFailed = false;
 		bool bPassed = false;
 		FString LastUnmet;
+		FKey HeldClientKey;
+		uint64 HeldClientKeyFrame = 0;
 		int32 RosterAssignments = 0;
 		FDelegateHandle PostLoginHandle;
 		TStrongObjectPtr<ULevelEditorPlaySettings> RequestSettings;

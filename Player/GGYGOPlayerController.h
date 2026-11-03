@@ -21,7 +21,11 @@
 #include "GGYGOPlayerController.generated.h"
 
 class APawn;
+class UEnhancedInputLocalPlayerSubsystem;
 class UGGYGOAbilitySystemComponent;
+class UInputAction;
+class UInputComponent;
+class UInputMappingContext;
 class UObject;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "GGYGO 玩家控制器"))
@@ -81,8 +85,8 @@ public:
 	void GGYGOClearSquadPresets();
 
 	/**
-	 * 请求切换出战角色，经编队组件的 Server RPC 由服务器校验并执行；监听服务器与客户端都可用。
-	 * 正式按键接线前的调试入口。
+	 * 按序号请求切换出战角色，经编队组件的 Server RPC 由服务器校验并执行；监听服务器与客户端都可用。
+	 * 调试入口；正式按键是下面的上一个／下一个。
 	 *
 	 * 控制台：`GGYGOSwitchToSlot 1`
 	 */
@@ -91,10 +95,42 @@ public:
 
 protected:
 	//~APlayerController interface
+	virtual void SetupInputComponent() override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void PostProcessInput(const float DeltaTime, const bool bGamePaused) override;
 	//~End of APlayerController interface
 
+	/**
+	 * 换人输入属于 Controller：它跨 Pawn 存在，不随 Hero 输入会话在换人中途退役。
+	 * 键位在本 IMC 中配置（默认 Z 上一个、C 下一个）；两个 InputAction 带 PlayerMappableKeySettings，
+	 * 供按键设置界面改键。三项都不配表示本 Controller 不提供换人键；只配一部分是配置错误，整组不安装。
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
+	TObjectPtr<const UInputMappingContext> SquadSwitchInputMapping;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
+	TObjectPtr<const UInputAction> SwitchToPreviousMemberAction;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
+	TObjectPtr<const UInputAction> SwitchToNextMemberAction;
+
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
+	int32 SquadSwitchInputMappingPriority = 0;
+
 private:
+	/** 本地 Controller 的 InputComponent 建好后绑定换人键并注册 IMC；同一 InputComponent 只安装一次。 */
+	void InstallSquadSwitchInput();
+	void Input_SwitchToPreviousMember();
+	void Input_SwitchToNextMember();
+	/** 发给本玩家编队的服务器请求；目标由服务器选择。 */
+	void RequestAdjacentSquadMember(int32 Direction);
+
+	/** 已绑定换人键的 InputComponent；InitInputSystem 可重复进入 SetupInputComponent。 */
+	TWeakObjectPtr<UInputComponent> SquadSwitchBoundComponent;
+	/** 本 Controller 自己注册的那一份 IMC，EndPlay 时归还。 */
+	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> SquadSwitchMappingSubsystem;
+	TWeakObjectPtr<const UInputMappingContext> RegisteredSquadSwitchMapping;
+
 	enum class ENativeInputInitializationStage : uint8 { Idle, Running, Rejected };
 	ENativeInputInitializationStage NativeInputInitializationStage = ENativeInputInitializationStage::Idle;
 	/** Diagnostic suppression only; nested calls never alter the outer execution stage. */

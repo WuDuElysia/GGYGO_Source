@@ -5,26 +5,31 @@
 #include "Player/GGYGOPlayerController.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Camera/GGYGOPlayerCameraManager.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "Input/GGYGOMovementInputOriginResource.h"
+#include "Player/GGYGOLocalPlayer.h"
+#include "Player/GGYGOPlayerState.h"
+#include "Teams/GGYGOSquadComponent.h"
+#include "EnhancedInputComponent.h"
+#include "EnhancedInputSubsystems.h"
 #include "Engine/Level.h"
+#include "Engine/LocalPlayer.h"
 #include "Engine/Player.h"
 #include "Engine/World.h"
 #include "GameFramework/InputSettings.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerInput.h"
-#include "Input/GGYGOMovementInputOriginResource.h"
+#include "InputAction.h"
+#include "InputMappingContext.h"
 #include "Misc/ScopeExit.h"
-#include "Player/GGYGOLocalPlayer.h"
 #include "UObject/Class.h"
 #include "UObject/UnrealType.h"
 
 #if !UE_BUILD_SHIPPING
-#include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Engine/AssetManager.h"
-#include "Player/GGYGOPlayerState.h"
-#include "Teams/GGYGOSquadComponent.h"
 #include "Teams/GGYGOSquadPresets.h"
 #endif
 
@@ -300,6 +305,86 @@ void AGGYGOPlayerController::PostProcessInput(const float DeltaTime, const bool 
 	}
 
 	Super::PostProcessInput(DeltaTime, bGamePaused);
+}
+
+void AGGYGOPlayerController::SetupInputComponent()
+{
+	Super::SetupInputComponent();
+	InstallSquadSwitchInput();
+}
+
+void AGGYGOPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	// 只归还本 Controller 注册的那一份；CountRegistrations 下其它注册者的计数不受影响。
+	UEnhancedInputLocalPlayerSubsystem* Subsystem = SquadSwitchMappingSubsystem.Get();
+	const UInputMappingContext* Mapping = RegisteredSquadSwitchMapping.Get();
+	SquadSwitchMappingSubsystem.Reset();
+	RegisteredSquadSwitchMapping.Reset();
+	SquadSwitchBoundComponent.Reset();
+	if (Subsystem && Mapping)
+	{
+		Subsystem->RemoveMappingContext(Mapping);
+	}
+	Super::EndPlay(EndPlayReason);
+}
+
+void AGGYGOPlayerController::InstallSquadSwitchInput()
+{
+	if (!IsLocalController() || !InputComponent || SquadSwitchBoundComponent.Get() == InputComponent)
+	{
+		return;
+	}
+	if (!SquadSwitchInputMapping && !SwitchToPreviousMemberAction && !SwitchToNextMemberAction)
+	{
+		return; // 本 Controller 不提供换人键。
+	}
+	UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(InputComponent);
+	UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer());
+	if (!SquadSwitchInputMapping || !SwitchToPreviousMemberAction || !SwitchToNextMemberAction || !EnhancedInput || !Subsystem)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Input/Squad] Controller=%s Mapping=%s Previous=%s Next=%s InputComponent=%s Subsystem=%s: 换人输入配置不完整，或输入组件／子系统不是 Enhanced Input；换人键未安装。"),
+			*GetPathNameSafe(this), *GetPathNameSafe(SquadSwitchInputMapping), *GetPathNameSafe(SwitchToPreviousMemberAction),
+			*GetPathNameSafe(SwitchToNextMemberAction), *GetPathNameSafe(InputComponent), *GetPathNameSafe(Subsystem));
+		return;
+	}
+	// Started 每次按下只触发一次；按住不连续切人。
+	SquadSwitchBoundComponent = InputComponent;
+	EnhancedInput->BindAction(SwitchToPreviousMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToPreviousMember);
+	EnhancedInput->BindAction(SwitchToNextMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToNextMember);
+	if (RegisteredSquadSwitchMapping.IsValid())
+	{
+		return; // 换了 InputComponent 只需重绑；IMC 仍是本 Controller 先前注册的那一份。
+	}
+	SquadSwitchMappingSubsystem = Subsystem;
+	RegisteredSquadSwitchMapping = SquadSwitchInputMapping;
+	Subsystem->AddMappingContext(SquadSwitchInputMapping, SquadSwitchInputMappingPriority);
+}
+
+void AGGYGOPlayerController::Input_SwitchToPreviousMember()
+{
+	RequestAdjacentSquadMember(-1);
+}
+
+void AGGYGOPlayerController::Input_SwitchToNextMember()
+{
+	RequestAdjacentSquadMember(1);
+}
+
+void AGGYGOPlayerController::RequestAdjacentSquadMember(int32 Direction)
+{
+	const AGGYGOPlayerState* GGYGOPlayerState = GetPlayerState<AGGYGOPlayerState>();
+	UGGYGOSquadComponent* Squad = GGYGOPlayerState ? GGYGOPlayerState->GetSquadComponent() : nullptr;
+	if (!Squad)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Input/Squad] Controller=%s PlayerState=%s: 没有编队组件，换人请求未发出。"),
+			*GetPathNameSafe(this), *GetPathNameSafe(GGYGOPlayerState));
+		return;
+	}
+	// 监听服务器上请求同步执行并退役旧 Pawn 的 Hero 输入会话；本 Controller 的绑定不在其中。
+	Squad->ServerRequestSwitchToAdjacentSlot(Direction);
 }
 
 #if !UE_BUILD_SHIPPING

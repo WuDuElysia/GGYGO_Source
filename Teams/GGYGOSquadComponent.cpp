@@ -12,6 +12,7 @@
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/GGYGOCharacterBase.h"
 #include "Components/CapsuleComponent.h"
+#include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/PlayerController.h"
@@ -728,39 +729,27 @@ EGGYGOSquadMemberState UGGYGOSquadComponent::GetMemberState(int32 SlotIndex) con
 
 bool UGGYGOSquadComponent::SwitchToNextSlot()
 {
-	if (bSquadTerminationStarted || bSwitchRequestInProgress || !IsValid(this) || IsBeingDestroyed())
-	{
-		return false;
-	}
-	const TWeakObjectPtr<UGGYGOSquadComponent> OriginalSquad(this);
-	const int32 Count = Slots.Num();
-	if (Count <= 1)
-	{
-		return false;
-	}
-
-	// 从下一个开始逐个试，跳过死亡或无实体的位置。
-	// 最多试 Count - 1 次：试满一圈还没成功说明只有自己可出战。
-	for (int32 Offset = 1; Offset < Count; ++Offset)
-	{
-		const int32 Candidate = (ActiveSlotIndex + Offset) % Count;
-		if (CanSlotBeActive(GetSlot(Candidate)))
-		{
-			// Skip unavailable members, but do not retry a partially-executed exit on
-			// another target after a real switch request has failed.
-			return SwitchToSlot(Candidate);
-		}
-		if (!OriginalSquad.IsValid() || OriginalSquad->bSquadTerminationStarted || OriginalSquad->IsBeingDestroyed())
-		{
-			return false;
-		}
-	}
-
-	return false;
+	return SwitchToAdjacentSlot(1, EGGYGOSwitchSource::Script);
 }
 
 bool UGGYGOSquadComponent::SwitchToPreviousSlot()
 {
+	return SwitchToAdjacentSlot(-1, EGGYGOSwitchSource::Script);
+}
+
+void UGGYGOSquadComponent::ServerRequestSwitchToAdjacentSlot_Implementation(int32 Direction)
+{
+	SwitchToAdjacentSlot(Direction, EGGYGOSwitchSource::PlayerRequest);
+}
+
+bool UGGYGOSquadComponent::ServerRequestSwitchToAdjacentSlot_Validate(int32 Direction)
+{
+	return Direction == 1 || Direction == -1;
+}
+
+bool UGGYGOSquadComponent::SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSource Source)
+{
+	check(Direction == 1 || Direction == -1);
 	if (bSquadTerminationStarted || bSwitchRequestInProgress || !IsValid(this) || IsBeingDestroyed())
 	{
 		return false;
@@ -772,13 +761,15 @@ bool UGGYGOSquadComponent::SwitchToPreviousSlot()
 		return false;
 	}
 
+	// 从相邻位置起逐个试，跳过死亡或无实体的位置；最多试 Count - 1 次，
+	// 试满一圈还没有可出战的说明只有自己。加 Count 再取模，避免负数下标。
 	for (int32 Offset = 1; Offset < Count; ++Offset)
 	{
-		// 加 Count 再取模，避免负数下标。
-		const int32 Candidate = ((ActiveSlotIndex - Offset) % Count + Count) % Count;
+		const int32 Candidate = ((ActiveSlotIndex + Direction * Offset) % Count + Count) % Count;
 		if (CanSlotBeActive(GetSlot(Candidate)))
 		{
-			return SwitchToSlot(Candidate);
+			// 真实切换请求失败后不换目标重试：它可能已执行了部分换出。
+			return SwitchToSlot(Candidate, Source);
 		}
 		if (!OriginalSquad.IsValid() || OriginalSquad->bSquadTerminationStarted || OriginalSquad->IsBeingDestroyed())
 		{
@@ -825,6 +816,10 @@ void UGGYGOSquadComponent::ActivateSlot(AGGYGOCharacterSlot* Slot)
 	{
 		return;
 	}
+	if (USkeletalMeshComponent* Mesh = OriginalCharacter->GetMesh())
+	{
+		Mesh->bNoSkeletonUpdate = false;
+	}
 
 	if (UCharacterMovementComponent* MoveComp = OriginalCharacter->GetCharacterMovement())
 	{
@@ -859,6 +854,15 @@ void UGGYGOSquadComponent::DeactivateSlot(AGGYGOCharacterSlot* Slot)
 	if (!CanContinuePresentation())
 	{
 		return;
+	}
+	// 待命 Pawn 不更新动画。服务器上从未附身的队员没有 Controller，PawnExtension 停在 Spawned、
+	// CMC 没有 MovementSet；ACharacter 的 Mesh 隐藏时仍 AlwaysTickPoseAndRefreshBones，
+	// 动画会读到未初始化的移动配置。用 bNoSkeletonUpdate 而不关组件 Tick：登记可能早于
+	// BeginPlay，那时关掉的 Tick 会被注册按 bStartWithTickEnabled 重新打开。
+	// 出战时先 Possess 完成初始化，再由 ActivateSlot 恢复。
+	if (USkeletalMeshComponent* Mesh = OriginalCharacter->GetMesh())
+	{
+		Mesh->bNoSkeletonUpdate = true;
 	}
 
 	if (UCharacterMovementComponent* MoveComp = OriginalCharacter->GetCharacterMovement())
