@@ -21,24 +21,32 @@ struct FZZZWalkRunLeanTuning
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean")
 	bool bEnabled = false;
 
-	/** 输入为方向偏差绝对值（0..180度），输出为偏离直立的倾身角。启用时必须明确配置；符号来自 Movement。 */
+	/** 输入为 Movement 认证的镜头转向偏差绝对值（0..180度），输出为 Walk 目标倾角。 */
 	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled"))
+	FRuntimeFloatCurve WalkDirectionErrorToLeanDegrees;
+
+	/** 同一镜头偏差下的 Run 目标倾角；步态过渡从当前显示角开始，由 AnimBP 唯一混合。 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "WalkRun Lean", meta = (EditCondition = "bEnabled"))
+	FRuntimeFloatCurve RunDirectionErrorToLeanDegrees;
+
+	/** 保留旧 ABP 的单曲线序列化数据；启用时必须分别配置 Walk/Run 曲线。 */
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure WalkDirectionErrorToLeanDegrees and RunDirectionErrorToLeanDegrees; the legacy shared response is no longer consumed."))
 	FRuntimeFloatCurve DirectionErrorToLeanDegrees;
 
 	/** 保留旧 ABP 序列化字段；当前表现只求值角色配置的响应曲线。 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure DirectionErrorToLeanDegrees; the legacy linear reference is no longer consumed."))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure Walk/Run response curves; the legacy linear reference is no longer consumed."))
 	float FullLeanDirectionErrorDegrees = 0.0f;
 
 	/** Serialized legacy yaw-rate tuning; never converted into direction degrees or consumed at runtime. */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure DirectionErrorToLeanDegrees; yaw rate is not a direction angle."))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure Walk/Run response curves; yaw rate is not a direction angle."))
 	float FullLeanYawRateDegreesPerSecond = 0.0f;
 
 	/** 保留旧 ABP 序列化字段，不再缩放新响应曲线。 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure DirectionErrorToLeanDegrees; the legacy Walk maximum is no longer consumed."))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure WalkDirectionErrorToLeanDegrees; the legacy Walk maximum is no longer consumed."))
 	float WalkMaxAngleDegrees = 0.0f;
 
 	/** 保留旧 ABP 序列化字段，不再缩放新响应曲线。 */
-	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure DirectionErrorToLeanDegrees; the legacy Run maximum is no longer consumed."))
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = "Deprecated", meta = (DeprecatedProperty, DeprecationMessage = "Configure RunDirectionErrorToLeanDegrees; the legacy Run maximum is no longer consumed."))
 	float RunMaxAngleDegrees = 0.0f;
 
 	/** Serialized legacy entry filter; valid direction deviations are now mapped directly. */

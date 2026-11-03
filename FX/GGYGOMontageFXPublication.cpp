@@ -1,7 +1,9 @@
 /** @file GGYGOMontageFXPublication.cpp @brief 唯一派生发布集及本地原资源准入。 */
 #include "FX/GGYGOMontageFXPublication.h"
 
+#include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Character/GGYGOCharacterBase.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "FX/Components/GGYGORemoteMontageFXComponent.h"
 #include "AbilitySystemComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -17,6 +19,52 @@
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMontageFX, Log, All);
+
+FGGYGOFXSourceIdentity FGGYGOFXSourceIdentity::FromAbilityActivation(const TSharedPtr<const void>& Proof)
+{
+	FGGYGOFXSourceIdentity Result;
+	if (Proof.IsValid()) { Result.Kind = EGGYGOFXSourceKind::AbilityActivation; Result.ActivationProof = Proof; }
+	return Result;
+}
+
+FGGYGOFXSourceIdentity FGGYGOFXSourceIdentity::FromLocomotion(const FGGYGOLocomotionSourceProof& Proof,
+	const FGGYGOAvatarBindingContext& Context)
+{
+	FGGYGOFXSourceIdentity Result;
+	if (Proof.IsSet() && Proof.GetIssuer() && Context.HasIssuedContext())
+	{
+		Result.Kind = EGGYGOFXSourceKind::Locomotion;
+		Result.LocomotionProof = MakeShared<FGGYGOLocomotionSourceProof>(Proof);
+		Result.BindingContext = Context;
+	}
+	return Result;
+}
+
+bool FGGYGOFXSourceIdentity::IsSet() const
+{
+	return (Kind == EGGYGOFXSourceKind::AbilityActivation && ActivationProof.IsValid())
+		|| (Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid() && BindingContext.HasIssuedContext());
+}
+
+const FGGYGOLocomotionSourceProof& FGGYGOFXSourceIdentity::GetLocomotionSourceProof() const
+{
+	check(Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid());
+	return *LocomotionProof;
+}
+
+UGGYGOCharacterMovementComponent* FGGYGOFXSourceIdentity::GetOriginalMovement() const
+{
+	return LocomotionProof.IsValid() ? LocomotionProof->GetIssuer() : nullptr;
+}
+
+bool FGGYGOFXSourceIdentity::HasSameSource(const FGGYGOFXSourceIdentity& Other) const
+{
+	if (Kind != Other.Kind) { return false; }
+	if (Kind == EGGYGOFXSourceKind::AbilityActivation)
+	{ return ActivationProof.IsValid() && ActivationProof == Other.ActivationProof; }
+	return Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid() && Other.LocomotionProof.IsValid()
+		&& LocomotionProof->IsSameSource(*Other.LocomotionProof) && BindingContext.HasSameValue(Other.BindingContext);
+}
 
 #if WITH_EDITOR
 namespace
@@ -126,10 +174,13 @@ struct FGGYGOMontageFXLeaseState
 	bool bClosed = false;
 };
 
-/** 工厂签发，Task 唯一写实际资源事实；未生产与最终归还不是同一个事实。 */
+/** 工厂签发，由原 Task/本地 Niagara producer 写资源事实；未生产与最终归还不同。 */
 struct FGGYGOMontageFXLocalCapability
 {
-	TWeakObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect> Task;
+	TWeakObjectPtr<UObject> Producer;
+	EGGYGOFXSourceKind Kind = EGGYGOFXSourceKind::Invalid;
+	FGGYGOFXSourceIdentity Source;
+	FSimpleDelegate Shutdown;
 	FNativeFXAvatarReference Avatar;
 	uint64 Nonce = 0;
 	uint64 Registration = 0;
@@ -139,6 +190,7 @@ struct FGGYGOMontageFXLocalCapability
 	bool bReleased = false;
 	bool bStartupGranted = false;
 	bool bLostOwnerReported = false;
+	bool bShutdownRequested = false;
 };
 
 struct UGGYGOMontageFXPublicationOwner::FState
@@ -160,7 +212,7 @@ struct UGGYGOMontageFXPublicationOwner::FState
 	bool bChanged = false;
 	struct FBinding
 	{
-		TSharedPtr<const void> Source;
+		FGGYGOFXSourceIdentity Source;
 		TSharedPtr<FGGYGOMontageFXLeaseState> Lease;
 	};
 	struct FRemote
@@ -180,7 +232,7 @@ struct UGGYGOMontageFXPublicationOwner::FState
 	struct FRequest
 	{
 		TSharedPtr<FGGYGOMontageFXLocalCapability> Capability;
-		FGGYGOMontageFXLocalStartReadyDelegate Observer;
+		FSimpleDelegate Observer;
 		uint64 LastNotifiedRevision = 0;
 		bool bConsumed = false;
 		bool bCancelled = false;
@@ -218,12 +270,14 @@ struct UGGYGOMontageFXPublicationOwner::FState
 		const auto& Cap = Request.Capability;
 		if (bClosed || Request.bCancelled || Request.bEvaluating || !Cap.IsValid() || Cap->bClosed
 			|| Cap->Registration != Registration || !Cap->Avatar.IsValid()
-			|| !Cap->Task.IsValid() || HasRemoteResource(Cap->Avatar.Get())) { return false; }
+			|| !Cap->Producer.IsValid() || HasRemoteResource(Cap->Avatar.Get())) { return false; }
 		for (const auto& Pair : Local)
 		{
 			const auto& Other = Pair.Value;
+			const bool bSameLocomotionSource = Cap->Kind == EGGYGOFXSourceKind::Locomotion
+				&& Other->Kind == EGGYGOFXSourceKind::Locomotion && Cap->Source.HasSameSource(Other->Source);
 			if (Other != Cap && Other->Avatar == Cap->Avatar
-				&& (Other->bOwned || Other->Operations > 0 || Other->bStartupGranted)) { return false; }
+				&& !bSameLocomotionSource && (Other->bOwned || Other->Operations > 0 || Other->bStartupGranted)) { return false; }
 		}
 		return true;
 	}
@@ -231,7 +285,8 @@ struct UGGYGOMontageFXPublicationOwner::FState
 
 bool FGGYGOMontageFXRecord::Validate(FString& OutError) const
 {
-	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfiguration(System, Space, Transform, OutError)) { return false; }
+	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfiguration(System, Space, Transform, OutError)
+		|| !FieldSettings.ValidateConfiguration(OutError)) { return false; }
 	if (!UGGYGOAbilityTask_PlayNiagaraEffect::IsStopModeValid(NormalStopMode)
 		|| !UGGYGOAbilityTask_PlayNiagaraEffect::IsStopModeValid(AbortStopMode)
 		|| !FMath::IsFinite(RemoteSeekDeltaSeconds) || RemoteSeekDeltaSeconds <= 0.f
@@ -351,6 +406,8 @@ TSharedPtr<FGGYGOMontageFXObservation> UGGYGOMontageFXPublicationOwner::BeginObs
 	ObservationWindows.Add(Window);
 	for (const auto& Pair : Data->Remote)
 	{ if (auto* Component = Pair.Value.Component.Get()) { Component->AddObservationWindow(Window); } }
+	for (const auto& Pair : Data->Local)
+	{ if (auto* Component = Cast<UGGYGORemoteMontageFXComponent>(Pair.Value->Producer.Get())) { Component->AddObservationWindow(Window); } }
 	if (!CaptureObservation(Window, Error)) { Window->Stop(); return nullptr; }
 	return Window;
 }
@@ -383,6 +440,16 @@ bool UGGYGOMontageFXPublicationOwner::CaptureObservation(
 		FGGYGOMontageFXObservationFact Fact;
 		CaptureObservationFact(Key, Fact);
 		Window->Add(Fact);
+	}
+	for (const auto& Pair : Data->Local)
+	{
+		if (const auto* Component = Cast<UGGYGORemoteMontageFXComponent>(Pair.Value->Producer.Get()))
+		{
+			FGGYGOMontageFXObservationFact Fact;
+			Component->ReadObservation(Fact);
+			FillObservationContext(Fact);
+			Window->Add(Fact);
+		}
 	}
 	if (!Window->IsActive()) { Error = TEXT("FX 当前快照超过原观察窗容量。"); return false; }
 	return true;
@@ -417,14 +484,14 @@ void UGGYGOMontageFXPublicationOwner::Initialize(UAbilitySystemComponent* Issuer
 	Data->Send = MoveTemp(Send);
 }
 
-bool UGGYGOMontageFXPublicationOwner::Begin(const TSharedPtr<const void>& Source, const FGGYGOMontageFXRecord& Request,
+bool UGGYGOMontageFXPublicationOwner::Begin(const FGGYGOFXSourceIdentity& Source, const FGGYGOMontageFXRecord& Request,
 	FGGYGOMontageFXLease& OutLease, FString& OutError)
 {
 	OutLease = {};
 	UAbilitySystemComponent* Issuer = Data->Issuer.Get();
 	UWorld* World = Data->World.Get();
 	if (Data->bClosed || !Issuer || !IsValid(Issuer->GetOwner()) || !Issuer->GetOwner()->HasAuthority()
-		|| !World || World->bIsTearingDown || !Data->Snapshot || !Source.IsValid()
+		|| !World || World->bIsTearingDown || !Data->Snapshot || !Source.IsSet()
 		|| !IsValid(Request.Avatar) || Request.Avatar->IsActorBeingDestroyed()
 		|| !IsValid(Request.Mesh) || Request.Avatar->GetWorld() != World
 		|| Request.Mesh->GetOwner() != Request.Avatar || !Request.Validate(OutError))
@@ -436,7 +503,6 @@ bool UGGYGOMontageFXPublicationOwner::Begin(const TSharedPtr<const void>& Source
 	{ OutError = TEXT("Montage FX publication identity exhausted."); return false; }
 	FGGYGOMontageFXRecord Record = Request;
 	Record.Occurrence = ++Data->NextOccurrence;
-	Record.BeginServerTime = World->GetTimeSeconds();
 	OutLease.State = MakeShared<FGGYGOMontageFXLeaseState>();
 	OutLease.State->Issuer = this;
 	OutLease.State->Occurrence = Record.Occurrence;
@@ -484,14 +550,14 @@ EGGYGOMontageFXCloseResult UGGYGOMontageFXPublicationOwner::PrepareClose(const F
 	return EGGYGOMontageFXCloseResult::Closed;
 }
 
-void UGGYGOMontageFXPublicationOwner::PrepareCloseSource(const TSharedPtr<const void>& Source,
+void UGGYGOMontageFXPublicationOwner::PrepareCloseSource(const FGGYGOFXSourceIdentity& Source,
 	EGGYGOMontageFXCloseReason Reason, TArray<FGGYGOMontageFXCloseObligation>& Out)
 {
-	if (!Source.IsValid()) { return; }
+	if (!Source.IsSet()) { return; }
 	TArray<FGGYGOMontageFXLease> Leases;
 	for (const auto& Pair : Data->Bindings)
 	{
-		if (Pair.Value.Source == Source)
+		if (Pair.Value.Source.HasSameSource(Source))
 		{
 			FGGYGOMontageFXLease Lease;
 			Lease.State = Pair.Value.Lease;
@@ -525,7 +591,7 @@ bool UGGYGOMontageFXPublicationOwner::DispatchClose(FGGYGOMontageFXCloseObligati
 	return true;
 }
 
-void UGGYGOMontageFXPublicationOwner::GetSourceIdentities(TArray<TSharedPtr<const void>>& Out) const
+void UGGYGOMontageFXPublicationOwner::GetSourceIdentities(TArray<FGGYGOFXSourceIdentity>& Out) const
 {
 	Out.Reset();
 	for (const auto& Pair : Data->Bindings) { Out.AddUnique(Pair.Value.Source); }
@@ -592,16 +658,35 @@ void UGGYGOMontageFXPublicationOwner::CollectClosedKeys()
 TSharedPtr<FGGYGOMontageFXLocalCapability> UGGYGOMontageFXPublicationOwner::RegisterLocalTask(
 	UGGYGOAbilityTask_PlayNiagaraEffect* Task, AActor* Avatar, UWorld* World, FString& OutError)
 {
-	if (Data->bClosed || !Data->Snapshot || !Data->Issuer.IsValid() || !IsValid(Task)
+	if (!IsValid(Task)) { OutError = TEXT("Local FX Task is invalid."); return {}; }
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect> OriginalTask(Task);
+	return RegisterLocalProducer(Task, EGGYGOFXSourceKind::AbilityActivation, Avatar, World,
+		FSimpleDelegate::CreateWeakLambda(Task, [OriginalTask] { if (auto* Original = OriginalTask.Get()) { Original->EndTask(); } }), OutError);
+}
+
+TSharedPtr<FGGYGOMontageFXLocalCapability> UGGYGOMontageFXPublicationOwner::RegisterLocalProducer(
+	UObject* Producer, EGGYGOFXSourceKind Kind, AActor* Avatar, UWorld* World, FSimpleDelegate Shutdown, FString& OutError,
+	const FGGYGOFXSourceIdentity& Source)
+{
+	if (Data->bClosed || !Data->Snapshot || !Data->Issuer.IsValid() || !IsValid(Producer) || !Shutdown.IsBound()
+		|| (Kind != EGGYGOFXSourceKind::AbilityActivation && Kind != EGGYGOFXSourceKind::Locomotion)
+		|| (Kind == EGGYGOFXSourceKind::Locomotion && (!Source.IsSet() || Source.GetKind() != Kind))
+		|| (Kind == EGGYGOFXSourceKind::Locomotion && (!IsValid(Source.GetOriginalMovement())
+			|| Source.GetOriginalMovement()->GetOwner() != Avatar
+			|| Source.GetAvatarBindingContext().Binding.Issuer.Get() != Data->Issuer.Get()))
 		|| !IsValid(Avatar) || !IsValid(World) || World != Data->World.Get() || Avatar->GetWorld() != World)
 	{ OutError = TEXT("Local FX capability requires the initialized original issuer/Avatar/World scope."); return {}; }
 	auto Capability = MakeShared<FGGYGOMontageFXLocalCapability>();
-	Capability->Task = Task;
+	Capability->Producer = Producer;
+	Capability->Kind = Kind;
+	Capability->Source = Source;
+	Capability->Shutdown = MoveTemp(Shutdown);
 	Capability->Avatar = Avatar;
 	Capability->Nonce = Data->IssueId();
 	Capability->Registration = Data->Registration;
 	Data->Local.Add(Capability->Nonce, Capability);
 	++Data->ResourceRevision;
+	ObserveAvatar(Avatar);
 	return Capability;
 }
 
@@ -638,7 +723,7 @@ EGGYGOMontageFXLocalResourceFact UGGYGOMontageFXPublicationOwner::ReadLocalResou
 			{ return EGGYGOMontageFXLocalResourceFact::Unknown; }
 			continue;
 		}
-		if (!Cap->Task.IsValid() && !Cap->bClosed && !Cap->bReleased)
+		if (!Cap->Producer.IsValid() && !Cap->bClosed && !Cap->bReleased)
 		{ return EGGYGOMontageFXLocalResourceFact::Unknown; }
 		if (Cap->bOwned || Cap->Operations || Cap->bStartupGranted)
 		{ return EGGYGOMontageFXLocalResourceFact::Pending; }
@@ -652,13 +737,13 @@ EGGYGOMontageFXLocalStartResult UGGYGOMontageFXPublicationOwner::RequestLocalSta
 	const TSharedPtr<FGGYGOMontageFXLocalCapability>& Cap, FGGYGOMontageFXLocalStartTicket& Out, FString& Error)
 {
 	Out = {};
-	if (Data->bClosed || !Cap.IsValid() || Cap->bClosed || !Cap->Task.IsValid() || !Cap->Avatar.IsValid()
+	if (Data->bClosed || !Cap.IsValid() || Cap->bClosed || !Cap->Producer.IsValid() || !Cap->Avatar.IsValid()
 		|| Cap->Registration != Data->Registration || !Data->Local.Contains(Cap->Nonce))
 	{ Error = TEXT("Original local FX capability has retired."); return EGGYGOMontageFXLocalStartResult::Cancelled; }
 	for (const auto& Pair : Data->Requests)
 	{
 		if (Pair.Value.Capability == Cap)
-		{ Error = TEXT("Local FX Task already has a start request."); return EGGYGOMontageFXLocalStartResult::Rejected; }
+		{ Error = TEXT("Local FX producer already has a start request."); return EGGYGOMontageFXLocalStartResult::Rejected; }
 	}
 	Out.ScopeEpoch = Data->Epoch;
 	Out.Nonce = Data->IssueId();
@@ -688,6 +773,22 @@ EGGYGOMontageFXLocalStartResult UGGYGOMontageFXPublicationOwner::RequestLocalSta
 
 bool UGGYGOMontageFXPublicationOwner::ObserveLocalStart(const FGGYGOMontageFXLocalStartTicket& Ticket,
 	FGGYGOMontageFXLocalStartReadyDelegate Callback)
+{
+	if (!Callback.IsBound()) { return false; }
+	const TWeakObjectPtr<ThisClass> Original(this);
+	return ObserveLocalProducerStart(Ticket, FSimpleDelegate::CreateWeakLambda(this, [Original, Ticket, Callback]
+	{
+		const auto* Owner = Original.Get();
+		const auto* Request = Owner ? Owner->Data->Requests.Find(Ticket.Nonce) : nullptr;
+		if (!Request || Owner->Data->Epoch != Ticket.ScopeEpoch) { return; }
+		const FGGYGOMontageFXLocalStartReadyFact Fact{Cast<UGGYGOAbilityTask_PlayNiagaraEffect>(Request->Capability->Producer.Get()),
+			Ticket, Owner->Data->ResourceRevision};
+		Callback.ExecuteIfBound(Fact);
+	}));
+}
+
+bool UGGYGOMontageFXPublicationOwner::ObserveLocalProducerStart(const FGGYGOMontageFXLocalStartTicket& Ticket,
+	FSimpleDelegate Callback)
 {
 	if (Ticket.ScopeEpoch != Data->Epoch) { return false; }
 	auto* Request = Data->Requests.Find(Ticket.Nonce);
@@ -804,6 +905,10 @@ void UGGYGOMontageFXPublicationOwner::Reconcile()
 			if (bReturning) { continue; }
 		}
 		FString Error;
+		// 与原 System 引用一样，服务器已校验的双场资产可尚未完成 GUID 映射。
+		// 这里只等待空资产引用；Controller 有效后的 ShaderMap Unavailable 仍明确失败。
+		if (Record.FieldSettings.Mode == EGGYGOFXFieldMode::DualSignedField
+			&& (!Record.FieldSettings.Profile || Record.FieldSettings.FieldMaterials.Contains(nullptr))) { continue; }
 		if (!Record.Validate(Error))
 		{
 			UE_LOG(LogGGYGOMontageFX, Error, TEXT("Remote FX %llu: %s"), Record.Occurrence, *Error);
@@ -928,18 +1033,27 @@ void UGGYGOMontageFXPublicationOwner::FlushResourceChanges()
 	do
 	{
 		Data->bChanged = false;
+		TArray<FSimpleDelegate> RetiredLocalProducers;
 		for (const auto& Pair : Data->Local)
 		{
 			const auto& Cap = Pair.Value;
-			if (!Cap->Task.IsValid() && !Cap->bClosed && !Cap->bReleased && !Cap->bLostOwnerReported)
+			if (Cap->Kind == EGGYGOFXSourceKind::Locomotion && !Cap->bClosed && !Cap->bShutdownRequested
+				&& (!Cap->Avatar.IsValid() || (Cap->Avatar.Get()->GetLocalRole() != ROLE_Authority
+					&& Cap->Avatar.Get()->GetLocalRole() != ROLE_AutonomousProxy)))
+			{
+				Cap->bShutdownRequested = true;
+				RetiredLocalProducers.Add(Cap->Shutdown);
+			}
+			if (!Cap->Producer.IsValid() && !Cap->bClosed && !Cap->bReleased && !Cap->bLostOwnerReported)
 			{
 				Cap->bLostOwnerReported = true;
-				UE_LOG(LogGGYGOMontageFX, Error, TEXT("FX witness %llu on '%s' lost its Task before owner closure; admission remains Unknown."),
+				UE_LOG(LogGGYGOMontageFX, Error, TEXT("FX witness %llu on '%s' lost its producer before owner closure; admission remains Unknown."),
 					Cap->Nonce, *GetNameSafe(Data->Issuer.Get()));
 			}
 			if (Cap->bClosed && !Cap->bOwned && !Cap->Operations && !Cap->bReleased)
 			{ Cap->bReleased = true; ++Data->ResourceRevision; }
 		}
+		for (const auto& Callback : RetiredLocalProducers) { Callback.ExecuteIfBound(); }
 		TArray<uint64> Releasing;
 		for (const auto& Pair : Data->Remote)
 		{ if (Pair.Value.bReleaseRequested && !Pair.Value.bReleased && !Pair.Value.Operations) { Releasing.Add(Pair.Key); } }
@@ -953,16 +1067,15 @@ void UGGYGOMontageFXPublicationOwner::FlushResourceChanges()
 			if (!Request || Request->bConsumed || !Data->RequestReady(*Request) || !Request->Observer.IsBound()
 				|| Request->LastNotifiedRevision == Data->ResourceRevision) { continue; }
 			Request->LastNotifiedRevision = Data->ResourceRevision;
-			const FGGYGOMontageFXLocalStartReadyFact Fact{Request->Capability->Task, {Data->Epoch, Id}, Data->ResourceRevision};
 			const auto Callback = Request->Observer;
-			Callback.ExecuteIfBound(Fact);
+			Callback.ExecuteIfBound();
 		}
 		Reconcile();
 		CollectClosedKeys();
 		for (auto It = Data->Requests.CreateIterator(); It; ++It)
 		{ if (It.Value().Capability->bReleased && !It.Value().Capability->Operations) { It.RemoveCurrent(); } }
 		for (auto It = Data->Local.CreateIterator(); It; ++It)
-		{ if (It.Value()->bReleased && !It.Value()->Task.IsValid()) { It.RemoveCurrent(); } }
+		{ if (It.Value()->bReleased && !It.Value()->Producer.IsValid()) { It.RemoveCurrent(); } }
 	} while (Data->bChanged && !Data->bClosed);
 }
 
@@ -990,9 +1103,9 @@ void UGGYGOMontageFXPublicationOwner::Shutdown(uint64 ExpectedRegistration)
 		if (Pair.Value.Capability->Registration == Closing)
 		{ Pair.Value.bCancelled = true; Pair.Value.Observer.Unbind(); }
 	}
-	TArray<TWeakObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect>> Tasks;
+	TArray<FSimpleDelegate> Producers;
 	for (const auto& Pair : Data->Local)
-	{ if (Pair.Value->Registration == Closing && !Pair.Value->bReleased) { Tasks.Add(Pair.Value->Task); } }
+	{ if (Pair.Value->Registration == Closing && !Pair.Value->bReleased) { Producers.Add(Pair.Value->Shutdown); } }
 	TArray<TPair<uint64, uint64>> Resources;
 	for (const auto& Pair : Data->Remote)
 	{ if (Pair.Value.Registration == Closing) { Resources.Emplace(Pair.Key, Pair.Value.Generation); } }
@@ -1010,7 +1123,7 @@ void UGGYGOMontageFXPublicationOwner::Shutdown(uint64 ExpectedRegistration)
 		}
 		Data->Avatars.Reset();
 	}
-	for (const auto& Task : Tasks) { if (Task.IsValid()) { Task->EndTask(); } }
+	for (const auto& Producer : Producers) { Producer.ExecuteIfBound(); }
 	for (const auto& Resource : Resources)
 	{
 		const auto* Entry = Data->Remote.Find(Resource.Key);

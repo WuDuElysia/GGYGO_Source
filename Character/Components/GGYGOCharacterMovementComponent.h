@@ -19,6 +19,7 @@
 #include "Animation/Data/GGYGOLocomotionSourceBinding.h"
 #include "Character/Components/GGYGOActionMotionExecution.h"
 #include "Input/GGYGOMovementInputTypes.h"
+#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Character/Components/GGYGOMovementPrediction.h"
 // Movement-LocalASC-A includes begin.
@@ -29,6 +30,7 @@
 #include "GGYGOCharacterMovementComponent.generated.h"
 
 class AActor;
+class ACharacter;
 class APawn;
 class AController;
 class APlayerController;
@@ -44,6 +46,7 @@ class UAnimInstance;
 class USkeletalMeshComponent;
 struct FRootMotionSource_GGYGOCurve;
 struct FRootMotionSource_GGYGOActionCurve;
+struct FGGYGOCurveRootMotionOrigin;
 struct FGGYGOCurveRootMotionMoveInput;
 struct FGGYGOLocomotionPreparedState;
 
@@ -55,6 +58,110 @@ enum class EGGYGOQualifiedMovementIntentQueryResult : uint8
 enum class EGGYGOQualifiedMovementIntentProvenance : uint8
 {
 	Unavailable = 0, LocalSourceHeld, AuthenticatedNativeRequest
+};
+
+/** 段首基础方向的显式来源；同段纠正只复用已接受基底，不再次读取输入。 */
+enum class EGGYGOActionMotionStartFacingMode : uint8
+{
+	CurrentFacing,
+	QualifiedInput,
+	ReplayBasis
+};
+
+/** 当前原生源的 GT 只读值；不证明该源已经贡献平移或旋转。 */
+enum class EGGYGOActionMotionNativeObservationStatus : uint8
+{
+	Unavailable, Available, NoActionSource
+};
+
+enum class EGGYGOActionMotionNativeSourceContainer : uint8
+{
+	Active, Pending
+};
+
+struct GGYGO_API FGGYGOActionMotionNativeSectionObservation
+{
+	FName Name;
+	int32 Index = INDEX_NONE;
+	float StartSeconds = 0.0f;
+	float EndSeconds = 0.0f;
+};
+
+struct GGYGO_API FGGYGOActionMotionNativeSegmentObservation
+{
+	FString SequencePath;
+	int32 Index = INDEX_NONE;
+	float MontageStartSeconds = 0.0f;
+	float MontageEndSeconds = 0.0f;
+	float SequenceStartSeconds = 0.0f;
+	float SequenceEndSeconds = 0.0f;
+	float SourceSecondsPerMontageSecond = 0.0f;
+};
+
+/** 原 RMS 与 binding 的当栈值副本；不保活源、资产或本地 GA 资源。 */
+struct GGYGO_API FGGYGOActionMotionNativeSourceObservation
+{
+	EGGYGOActionMotionNativeSourceContainer Container = EGGYGOActionMotionNativeSourceContainer::Active;
+	FString ScriptStructPath;
+	FName InstanceName;
+	uint8 SourceMode = 0;
+	/** 仅供本机同一观察内定位，不是跨端逻辑段身份。 */
+	uint16 LocalId = 0;
+	bool bNativeImported = false;
+	bool bFinished = false;
+	bool bMarkedForRemoval = false;
+	bool bExplicitlyCancelled = false;
+	bool bHasOriginalMontageBinding = false;
+	bool bHasEntryActorRotation = false;
+	FQuat EntryActorRotation = FQuat::Identity;
+	float MontageStartSeconds = 0.0f;
+	float NativeTimeSeconds = 0.0f;
+	float DurationSeconds = 0.0f;
+	float PlayRate = 0.0f;
+	FString MontagePath;
+	FName SlotName;
+	/** binding 初选 Section，不冒充 native 当前所在 Section。 */
+	FName BindingInitialSectionName;
+	int32 TrackIndex = INDEX_NONE;
+	int32 BindingInitialSectionIndex = INDEX_NONE;
+	float BindingStartSeconds = 0.0f;
+	float BindingEndSeconds = 0.0f;
+	TArray<FGGYGOActionMotionNativeSectionObservation> Sections;
+	TArray<FGGYGOActionMotionNativeSegmentObservation> Segments;
+};
+
+struct GGYGO_API FGGYGOActionMotionNativeObservation
+{
+	EGGYGOActionMotionNativeObservationStatus Status = EGGYGOActionMotionNativeObservationStatus::Unavailable;
+	FString Diagnostic;
+	uint64 Frame = 0;
+	double WorldTimeSeconds = 0.0;
+	FString WorldPath;
+	FString CharacterPath;
+	FString MovementPath;
+	uint8 LocalRole = 0;
+	TArray<FGGYGOActionMotionNativeSourceObservation> Sources;
+};
+
+/** Scope 属于调用方原 CMC；EntryActorRotation 仅供 ReplayBasis 消费。 */
+struct GGYGO_API FGGYGOActionMotionStartFacing
+{
+	EGGYGOActionMotionStartFacingMode Mode = EGGYGOActionMotionStartFacingMode::CurrentFacing;
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	FQuat EntryActorRotation = FQuat::Identity;
+	/** 正常入场的原 owned 请求；CurrentFacing 也须提交，客户端数据不能签发 ReplayBasis。 */
+	FGGYGOAbilityStepInputRequest InputRequest;
+};
+
+/** 同一入场栈的采样/提交凭据。不能跨帧保存或作为动作后续帧的输入许可。 */
+struct GGYGO_API FGGYGOActionMotionStartInputProof
+{
+	FGGYGOAbilityStepInputRequest Request;
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	FGGYGOMovementInputStepFact Fact;
+	TWeakObjectPtr<ACharacter> OriginalCharacter;
+	TWeakObjectPtr<APlayerController> OriginalController;
+	uint64 Frame = 0;
 };
 
 struct GGYGO_API FGGYGOQualifiedMovementIntent
@@ -91,6 +198,25 @@ enum class EGGYGOMovementInitialRequestAdmissionResult : uint8
 	Admitted, AlreadyAdmitted, Stale, Rejected, ExecutionFailed
 };
 
+/** 蓝图保存的本次转身观察值；不延长 Origin／源资产寿命，资格由原 CMC 校验。 */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOTurnBackRetriggerHandle
+{
+	GENERATED_BODY()
+public:
+	// 空／过期观察值相等仅为正常值相等；不代表同源或任何执行许可。
+	bool operator==(const FGGYGOTurnBackRetriggerHandle& Other) const { return Origin == Other.Origin; }
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	TWeakPtr<const FGGYGOCurveRootMotionOrigin> Origin;
+};
+
+template<>
+struct TStructOpsTypeTraits<FGGYGOTurnBackRetriggerHandle> : TStructOpsTypeTraitsBase2<FGGYGOTurnBackRetriggerHandle>
+{
+	enum { WithCopy = true, WithIdenticalViaEquality = true };
+};
+
 /** Local resource identity; only the original CMC issues and consumes this reference. */
 struct FGGYGOCurveRootMotionOrigin
 {
@@ -109,6 +235,12 @@ struct FGGYGOCurveRootMotionOrigin
 	float BaseYaw = 0.0f;
 	float RootMotionScale = 0.0f;
 	bool bEndOnZeroSpeed = false;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	/** 同一 Origin 的弱观察容器只创建一次；保留历史比较，不保活 Origin 或另签来源编号。 */
+	mutable TSharedPtr<const TWeakPtr<const FGGYGOCurveRootMotionOrigin>> SourceProofObserver;
+	/** 仅记录真实退休事实已携出，防同步重入重复派发；不参与运动准入或当前性判定。 */
+	mutable bool bSourceRetirementFactIssued = false;
 };
 
 enum class EGGYGOCurveRootMotionPrepareResult : uint8
@@ -129,6 +261,8 @@ struct FGGYGOCurveRootMotionPrepared
 	float MovementTickTime = 0.0f;
 	FGGYGOLocomotionCurveSample Sample;
 	FVector OverrideVelocity = FVector::ZeroVector;
+	/** 仅本原生区间实际从首段进入 RunOut；回放从实际起始 Candidate 派生。 */
+	bool bEnteredTurnBackRunOut = false;
 	EGGYGOCurveRootMotionPrepareResult Result = EGGYGOCurveRootMotionPrepareResult::Failed;
 };
 // Movement-LocalASC-A forward declarations begin.
@@ -258,6 +392,19 @@ public:
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, int32& OutHandle, FString& OutError);
+	/** 真正新段可采当前有效输入；纠正以原基底恢复，返回实际接受的整段基础方向。 */
+	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
+		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
+		float TranslationScale, const FGGYGOActionMotionStartFacing& Facing,
+		int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError);
+	/** 只采样/提交原 owned 请求，不安装 RMS 或更换动作；供原 gate 拒绝的真实 attempt 上报。 */
+	EGGYGOMovementInputEvaluationState PrepareActionMotionStartInput(const FGGYGOActionMotionStartFacing& Facing,
+		FGGYGOActionMotionStartInputProof& OutProof, FString& OutError) const;
+	/** 同栈外调返栈后核原来源/评价/Yaw，绝不重采或改写已提交事实。 */
+	bool ValidateActionMotionStartInput(const FGGYGOActionMotionStartInputProof& Proof, FString& OutError) const;
+	/** 同段权威纠偏只重基原 RMS，不重建播放、时间或窗口；仅对齐已消费的源 Yaw。 */
+	bool RebaseMontageActionMotion(const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+		int32 OriginalHandle, const FQuat& EntryActorRotation, FString& OutError);
 	/** Completed accepts the original Task's natural completion and drains the finite native tail.
 	 *  Acceptance is not motion completion; observe the consumed final interval separately. */
 	bool ReleaseMontageActionMotion(int32 OriginalHandle, EGGYGOActionMotionReleaseReason Reason, FString& OutError);
@@ -308,8 +455,45 @@ public:
 
 	/** GT-only, original native interval qualification and lifecycle validation owned here. */
 	FGGYGOLocomotionSteeringSnapshot GetLocomotionSteeringSnapshot() const;
+	/** 原 Hero 在 AddMovementInput 后记录实际使用的投影基底；只供表现，不签发移动许可。 */
+	bool RecordLocomotionInputProjection(const FGGYGOMovementInputConsumerBindingId& OriginalBinding,
+		const FGGYGOMovementInputRequestIdentity& OriginalRequest,
+		const FGGYGOMovementInputEvaluationToken& OriginalEvaluation, float ProjectionControlYaw, FString& OutError);
 	/** GT-only，原生平移／旋转结束后的完成区间；不是当前 pose 或执行许可。 */
 	FGGYGOMotionExecutionSnapshot GetMotionExecutionSnapshot() const;
+	/** GT 当栈读取 active/pending action RMS 原值，含 SimulatedProxy imported 源；不授予执行权。 */
+	FGGYGOActionMotionNativeObservation GetActionMotionNativeObservation() const;
+	/**
+	 * GT：对照原真实完成区间签出来源观察值，不签发运动或播放权。
+	 * @param Interval 原 Character 移动回调中取得的完整单 Sequence 区间。
+	 * @param OutProof 成功时原来源的弱观察值；失败清空。
+	 * @param OutError 拒绝原因；成功清空。
+	 * @return 该值仍是本 issuer 可认证的原完成区间。
+	 */
+	bool TryGetLocomotionSourceProof(const FGGYGOMotionExecutionSnapshot& Interval,
+		FGGYGOLocomotionSourceProof& OutProof, FString& OutError) const;
+	/**
+	 * GT：原 Origin／请求／段／绑定与 owner 当前性，不以完成帧期限替代来源寿命。
+	 * @param Proof 已由原 issuer 签出的观察值；历史相等不提供当前资格。
+	 * @param OutError 原身份、生命周期、角色或配置失效的原因。
+	 * @return 原来源仍属于本机当前语义段；RMS 归还后的同 Origin 尾段仍可成立。
+	 */
+	bool IsLocomotionSourceProofCurrent(const FGGYGOLocomotionSourceProof& Proof, FString& OutError) const;
+	/**
+	 * GT：认证原完成事件的 World 采样，不认证 cue 内部连续或亚帧映射。
+	 * @param Proof 与该原区间同源的观察值。
+	 * @param CompletedIntervalSerial 原完成区间编号，不能用末端秒数替代。
+	 * @param CompletedFrame 原本机 GFrameCounter 域的生产帧，不是网络样本键。
+	 * @param OutWorld 原生产 World；失败为 nullptr。
+	 * @param OutWorldTimeSeconds 原生产事件采样；失败清零但不代表可用 Age0。
+	 * @param OutError 认证失败原因。
+	 * @return 原 World／完成序号／帧及采样均可认证；接收端不得补 Now。
+	 */
+	bool TryGetLocomotionCompletionWorldTime(const FGGYGOLocomotionSourceProof& Proof,
+		uint64 CompletedIntervalSerial, uint64 CompletedFrame, UWorld*& OutWorld,
+		double& OutWorldTimeSeconds, FString& OutError) const;
+	/** 原订阅者保存标准 FDelegateHandle，并向同一原 CMC 退订；回调不得重取后继作为关闭对象。 */
+	FGGYGOLocomotionSourceRetiredDelegate& OnLocomotionSourceRetired() { return LocomotionSourceRetired; }
 	/**
 	 * GT-only，远端观察端的权威完成区间姿态：SimulatedProxy，或 listen server 上由远端客户端控制的角色。
 	 * 其它角色返回 NotRemote，调用方继续使用 GetMotionExecutionSnapshot。
@@ -354,6 +538,17 @@ public:
 	/** 转身是否已进入交还输入的 `RunOut` 段；模拟代理同样读取已接受远端记录的相位。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
 	bool IsTurnBackRunOut() const;
+
+	/** 在本次转身入场后保存 handle；后续通知须携带此值，不能在通知时重取后继身份。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|TurnBack")
+	bool TryGetTurnBackRetriggerHandle(FGGYGOTurnBackRetriggerHandle& OutHandle) const;
+
+	/**
+	 * 仅开放 handle 所属转身的再次触发资格，不切相位。旧段、模拟代理及历史回放拒绝。
+	 * 作用于调用端；Authority／Autonomous 须各自由同源作者信号调用，此入口不向服务器转发。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|TurnBack")
+	bool OpenTurnBackRetrigger(const FGGYGOTurnBackRetriggerHandle& Handle);
 
 	/**
 	 * 请求下一次移动直接进入 Run，跳过走跑计时。
@@ -489,6 +684,8 @@ private:
 		uint64 OriginalClientGeneration = 0;
 		float OriginalTimeStamp = 0.0f;
 		uint8 OriginalFlags = 0;
+		bool bOriginalHasCameraProjection = false;
+		float OriginalCameraProjectionYaw = 0.0f;
 		bool bHasOriginalSync = false;
 		bool bOriginalNewMove = false;
 		FMovementOwnerSyncNativeReceipt Receipt;
@@ -505,6 +702,8 @@ private:
 		uint64 ExecutionRequestSerial = 0;
 	};
 	TSharedPtr<const FMovementInputNativeSource> MovementInputNativeSource;
+	bool ResolveActionMotionStartFacing(const FGGYGOActionMotionStartFacing& Facing,
+		FQuat& OutEntryActorRotation, FGGYGOActionMotionStartInputProof& OutInputProof, FString& OutError) const;
 	/** Consume authenticated original Source values into the sole CMC request; no physical observation. */
 	bool ConsumeNativeMovementInputCheckpoint(const FMovementOwnerSyncNativeMove& OriginalMove);
 	UFUNCTION()
@@ -600,7 +799,19 @@ private:
 		float StartCycle = 0.0f, float EndCycle = 0.0f);
 	bool PrepareNativeMotionExecutionRotation();
 	bool ApplyOrdinaryMotionCurveYaw();
+	/** RunOut 切段对齐当前位移，后续按既有角速度准备源旋转基准。 */
+	bool PrepareTurnBackRunOutFacing(float DeltaSeconds);
 	void CompleteMotionExecutionInterval(float DeltaSeconds, const FVector& OldLocation);
+	FGGYGOLocomotionSourceProof MakeLocomotionSourceProof(const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin) const;
+	bool IsLocomotionSourceProofContextCurrent(const FGGYGOLocomotionSourceProof& Proof,
+		const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin) const;
+	void QueueLocomotionSourceRetirement(const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin,
+		EGGYGOMotionExecutionEndReason EndReason, FName Cause, const FString& Diagnostic = FString(),
+		bool bLifecycleRetirement = false);
+	void QueueCurrentLocomotionSourceRetirement(EGGYGOMotionExecutionEndReason EndReason,
+		FName Cause, const FString& Diagnostic = FString(), bool bLifecycleRetirement = false);
+	void DispatchLocomotionSourceRetirements(bool bNativeSafeExit = false);
+	struct FLocomotionSourceRetirementScope;
 	bool GetLocomotionSourceBinding(FGGYGOLocomotionSourceBindingPtr& OutBinding, FString& OutError,
 		bool bValidateSourceConfiguration = true) const;
 	bool IsLocomotionSourceBindingCurrent(const FGGYGOLocomotionSourceBindingPtr& Binding, FString& OutError,
@@ -712,6 +923,7 @@ private:
 	struct FRemoteMotionPoseCandidate
 	{
 		FGGYGOMotionExecutionSnapshot Snapshot;
+		FGGYGOLocomotionSteeringSnapshot Steering;
 		uint64 MoveEntrySerial = 0;
 		uint32 PublisherEpoch = 0;
 		bool bFinalized = false;
@@ -814,6 +1026,12 @@ private:
 	/** Derived observation/scratch for the original native interval; never saved-move authority. */
 	FGGYGOLocomotionSteeringSnapshot LocomotionSteeringSnapshot;
 	mutable FGGYGOMotionExecutionSnapshot MotionExecutionSnapshot;
+	/** 仅原同步修改栈／当前 native move 携出的退休义务；在原安全出口排空，无独立调度。 */
+	TArray<FGGYGOLocomotionSourceRetirementFact> PendingLocomotionSourceRetirements;
+	int32 LocomotionSourceRetirementScopeDepth = 0;
+	/** 客户端校正／历史移动调用栈；与输入观察者的事实回放深度是不同寿命。 */
+	int32 HistoricalLocomotionSourceRetirementScopeDepth = 0;
+	FGGYGOLocomotionSourceRetiredDelegate LocomotionSourceRetired;
 	FGGYGOMotionExecutionSnapshot PendingMotionExecution;
 	uint64 MotionExecutionIntervalSerial = 0;
 	bool bMotionExecutionIntervalOpen = false;
@@ -830,6 +1048,37 @@ private:
 	bool bLocomotionSteeringIntervalExcluded = false;
 	FString LocomotionSteeringIntervalError;
 	TOptional<float> LocomotionSteeringRotationBudget;
+	/** 原 AddMovementInput 到下一 native 区间的投影来源；只含身份/Yaw，不保存运动方向。 */
+	struct FLocomotionInputProjectionReceipt
+	{
+		FGGYGOMovementInputConsumerBindingId Binding;
+		FGGYGOMovementInputRequestIdentity Request;
+		FGGYGOMovementInputEvaluationToken Evaluation;
+		TWeakObjectPtr<APlayerController> Controller;
+		uint64 Frame = 0;
+		float ControlYaw = 0.0f;
+		bool bRemoteNative = false;
+		bool bHasProjection = false;
+		uint64 BindingSerial = 0;
+		uint64 SessionSerial = 0;
+		FMovementOwnerSyncNativeReceipt NativeReceipt;
+		bool bAmbiguous = false;
+		FString Diagnostic;
+	};
+	FLocomotionInputProjectionReceipt PendingLocomotionInputProjection;
+	FLocomotionInputProjectionReceipt IntervalLocomotionInputProjection;
+	/** 原 scope/controller 的镜头派生残差；不参与实际转向，不随健康步态/Sequence 切换重置。 */
+	FGGYGOMovementOwnerSyncScopeId LocomotionCameraScope;
+	uint64 LocomotionCameraBindingSerial = 0;
+	uint64 LocomotionCameraSessionSerial = 0;
+	TWeakObjectPtr<APlayerController> LocomotionCameraController;
+	TWeakObjectPtr<USceneComponent> LocomotionCameraComponent;
+	float LocomotionCameraPreviousYaw = 0.0f;
+	float LocomotionCameraRemainingYaw = 0.0f;
+	bool bLocomotionCameraBaselineValid = false;
+	void ResetLocomotionCameraTurn();
+	void CompleteLocomotionCameraTurn(FGGYGOLocomotionSteeringSnapshot& Completed);
+	bool CaptureLocomotionInputProjectionForNativeMove(float& OutYaw) const;
 	void ResetLocomotionSteeringObservation();
 	void BeginLocomotionSteeringInterval();
 	bool CanExecuteOrdinaryLocomotionSteering() const;
@@ -986,12 +1235,7 @@ protected:
 	/** 本次转身已进行的时长（秒）。只用于兜底超时，相位推进不看它。 */
 	float TurnBackElapsed = 0.0f;
 
-	/**
-	 * 反向输入已被本次转身消费。
-	 *
-	 * 转身结束后玩家往往还按着同一个方向键，而那个方向此时已经是角色的正前方，
-	 * 不该再触发一次转身。必须等输入离开反向阈值才允许下一次触发。
-	 */
+	/** 本次转身已消费触发资格；仅原段的独立信号重新开放，请求取消时清理。 */
 	bool bTurnBackInputLatched = false;
 
 	/** 进入转身时的 Actor yaw（度）。曲线的段起点方向转世界方向的基准。 */

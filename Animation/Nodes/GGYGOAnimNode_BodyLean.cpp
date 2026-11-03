@@ -12,18 +12,26 @@ DEFINE_LOG_CATEGORY_STATIC(LogGGYGOBodyLean, Log, All);
 void FGGYGOAnimNode_BodyLean::Initialize_AnyThread(const FAnimationInitializeContext& Context)
 {
 	LastLoggedDiagnostic.Reset();
-	BoneDiagnostic.Reset();
-	Legs[0] = {};
-	Legs[1] = {};
+	// 状态重入可只调用 Initialize；同一 RequiredBones 的 CacheBones 会被引擎跳过。
+	// 骨索引和对应诊断只在 InitializeBoneReferences 中一起重建。
 	FAnimNode_SkeletalControlBase::Initialize_AnyThread(Context);
 }
 
 void FGGYGOAnimNode_BodyLean::InitializeBoneReferences(const FBoneContainer& RequiredBones)
 {
+	CachedBoneContainerSerialNumber = 0;
+	Legs[0] = {};
+	Legs[1] = {};
+	BoneDiagnostic.Reset();
+	if (!RequiredBones.IsValid() || RequiredBones.GetSerialNumber() == 0)
+	{
+		BoneDiagnostic = TEXT("本次RequiredBones尚未建立有效骨集合");
+		return;
+	}
 	Body.Initialize(RequiredBones);
 	LeftLeg.Foot.Initialize(RequiredBones);
 	RightLeg.Foot.Initialize(RequiredBones);
-	BoneDiagnostic.Reset();
+	FLegIndices CandidateLegs[2];
 	const FGGYGOBodyLeanLegDefinition* Definitions[2] = { &LeftLeg, &RightLeg };
 	if (!Body.IsValidToEvaluate(RequiredBones))
 	{
@@ -33,8 +41,7 @@ void FGGYGOAnimNode_BodyLean::InitializeBoneReferences(const FBoneContainer& Req
 	const FCompactPoseBoneIndex BodyIndex = Body.GetCompactPoseIndex(RequiredBones);
 	for (int32 LegIndex = 0; LegIndex < 2; ++LegIndex)
 	{
-		FLegIndices& Indices = Legs[LegIndex];
-		Indices = {};
+		FLegIndices& Indices = CandidateLegs[LegIndex];
 		const FGGYGOBodyLeanLegDefinition& Definition = *Definitions[LegIndex];
 		if (!Definition.Foot.IsValidToEvaluate(RequiredBones)
 			|| Definition.KneeBendAxisLocal.ContainsNaN()
@@ -65,8 +72,8 @@ void FGGYGOAnimNode_BodyLean::InitializeBoneReferences(const FBoneContainer& Req
 			return;
 		}
 	}
-	const FCompactPoseBoneIndex LeftIndices[] = { Legs[0].Upper, Legs[0].Lower, Legs[0].Foot };
-	const FCompactPoseBoneIndex RightIndices[] = { Legs[1].Upper, Legs[1].Lower, Legs[1].Foot };
+	const FCompactPoseBoneIndex LeftIndices[] = { CandidateLegs[0].Upper, CandidateLegs[0].Lower, CandidateLegs[0].Foot };
+	const FCompactPoseBoneIndex RightIndices[] = { CandidateLegs[1].Upper, CandidateLegs[1].Lower, CandidateLegs[1].Foot };
 	for (const FCompactPoseBoneIndex Left : LeftIndices)
 	{
 		for (const FCompactPoseBoneIndex Right : RightIndices)
@@ -78,11 +85,17 @@ void FGGYGOAnimNode_BodyLean::InitializeBoneReferences(const FBoneContainer& Req
 			}
 		}
 	}
+	Legs[0] = CandidateLegs[0];
+	Legs[1] = CandidateLegs[1];
+	CachedBoneContainerSerialNumber = RequiredBones.GetSerialNumber();
 }
 
 bool FGGYGOAnimNode_BodyLean::IsValidToEvaluate(const USkeleton* Skeleton, const FBoneContainer& RequiredBones)
 {
-	return BoneDiagnostic.IsEmpty() && Body.IsValidToEvaluate(RequiredBones)
+	// 完整父链、配置轴和双腿不重叠已在 CacheBones 校验；当前只核原生骨集合身份。
+	return CachedBoneContainerSerialNumber != 0
+		&& CachedBoneContainerSerialNumber == RequiredBones.GetSerialNumber()
+		&& RequiredBones.IsValid() && BoneDiagnostic.IsEmpty() && Body.IsValidToEvaluate(RequiredBones)
 		&& LeftLeg.Foot.IsValidToEvaluate(RequiredBones) && RightLeg.Foot.IsValidToEvaluate(RequiredBones);
 }
 
@@ -112,8 +125,21 @@ void FGGYGOAnimNode_BodyLean::EvaluateSkeletalControl_AnyThread(
 	FComponentSpacePoseContext& Output, TArray<FBoneTransform>& OutBoneTransforms)
 {
 	const FBoneContainer& Bones = Output.Pose.GetPose().GetBoneContainer();
+	const FCompactPose& Pose = Output.Pose.GetPose();
+	const FCompactPoseBoneIndex BodyIndex = Body.GetCompactPoseIndex(Bones);
+	bool bPoseIndicesValid = Pose.IsValidIndex(BodyIndex);
+	for (const FLegIndices& Indices : Legs)
+	{
+		bPoseIndicesValid = bPoseIndicesValid && Pose.IsValidIndex(Indices.Upper)
+			&& Pose.IsValidIndex(Indices.Lower) && Pose.IsValidIndex(Indices.Foot);
+	}
+	if (!bPoseIndicesValid)
+	{
+		RejectPose(Output, TEXT("当前输入姿态不包含完整Body/髋/膝/脚索引"));
+		return;
+	}
 	FGGYGOBodyLeanInput Input;
-	Input.Body = Output.Pose.GetComponentSpaceTransform(Body.GetCompactPoseIndex(Bones));
+	Input.Body = Output.Pose.GetComponentSpaceTransform(BodyIndex);
 	Input.LeanDegrees = LeanDegrees;
 	Input.LeanAxisCS = LeanAxisCS;
 	Input.UpDirectionCS = UpDirectionCS;
@@ -134,7 +160,7 @@ void FGGYGOAnimNode_BodyLean::EvaluateSkeletalControl_AnyThread(
 		return;
 	}
 	LastLoggedDiagnostic.Reset();
-	OutBoneTransforms.Add(FBoneTransform(Body.GetCompactPoseIndex(Bones), Result.Body));
+	OutBoneTransforms.Add(FBoneTransform(BodyIndex, Result.Body));
 	for (int32 LegIndex = 0; LegIndex < 2; ++LegIndex)
 	{
 		OutBoneTransforms.Add(FBoneTransform(Legs[LegIndex].Upper, Result.Legs[LegIndex].Upper));

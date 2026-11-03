@@ -15,6 +15,17 @@ bool FGGYGOComboCorrectionData::NetSerialize(FArchive& Ar, UPackageMap* Map, boo
 	Ar << bWindowOpen;
 	Ar << bWindowClosed;
 	Ar << bAccepted;
+	Ar << bHasEntryActorRotation;
+	if (bHasEntryActorRotation)
+	{
+		Ar << ServerStepRequestId;
+		Ar << EntryActorRotation;
+	}
+	else if (Ar.IsLoading())
+	{
+		ServerStepRequestId = INDEX_NONE;
+		EntryActorRotation = FQuat::Identity;
+	}
 	bOutSuccess = !Ar.IsError();
 	return bOutSuccess;
 }
@@ -25,5 +36,9 @@ bool FGGYGOComboCorrectionData::HasValidFields() const
 		&& RequestId > 0 && RequestId <= 65535
 		&& ServerStep >= 0
 		&& FMath::IsFinite(Position) && Position >= 0.0f
-		&& !(bWindowOpen && bWindowClosed);
+		&& !(bWindowOpen && bWindowClosed)
+		&& (bHasEntryActorRotation
+			? ServerStepRequestId >= 0 && ServerStepRequestId <= 65535
+				&& !EntryActorRotation.ContainsNaN() && EntryActorRotation.IsNormalized()
+			: ServerStepRequestId == INDEX_NONE);
 }

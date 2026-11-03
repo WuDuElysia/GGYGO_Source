@@ -30,12 +30,16 @@ public class GGYGO : ModuleRules
 			"PhysicsCore",
 			// 命中特效：GameplayCue 里生成 Niagara 系统。
 			"Niagara",
+			// 角色公开组件直接暴露Rendering的可调阴影USTRUCT，依赖随公共头导出。
+			"GGYGORendering",
 		});
 
 		PrivateDependencyModuleNames.AddRange(new string[]
 		{
 			// 整身倾身复用原生两骨 IK；只处理输入姿态，不执行角色位移。
 			"AnimationCore",
+			// 跨进程曲线身份按实际 ACL codec 的轨道映射及压缩流校验。
+			"ACLPlugin",
 			"Json",
 			// Native输入测试夹具直接使用Slate窗口/控件，须显式声明所属模块链接依赖。
 			"Slate",

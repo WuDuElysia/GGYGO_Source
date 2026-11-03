@@ -1,8 +1,10 @@
-/** @file GGYGOAbilityTask_PlayNiagaraEffect.h @brief GAS 所持单个 Niagara 表现资源的创建与释放。 */
+/** @file GGYGOAbilityTask_PlayNiagaraEffect.h @brief GAS 所持 Niagara 单元组合的创建与释放。 */
 #pragma once
 
 #include "Abilities/Tasks/AbilityTask.h"
 #include "Engine/EngineTypes.h"
+#include "FX/GGYGOFXFieldSettings.h"
+#include "UObject/StrongObjectPtr.h"
 #include "GGYGOAbilityTask_PlayNiagaraEffect.generated.h"
 
 class UNiagaraComponent;
@@ -13,12 +15,22 @@ class UAbilitySystemComponent;
 class AActor;
 class UWorld;
 class USkeletalMeshComponent;
+class UGGYGOFXNiagaraComponent;
 class UGGYGOMontageFXPublicationOwner;
 struct FGGYGOMontageFXLocalCapability;
 struct FGGYGOMontageFXLocalStartTicket;
 struct FGGYGOMontageFXLocalStartReadyFact;
 enum class EGGYGOMontageFXLocalStartResult : uint8;
 enum class EGGYGOMontageFXPermitResult : uint8;
+
+/** 同一动作窗内独立编译的实际单元；每个 System 只消费自己的场材质。 */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGONiagaraEffectUnit
+{
+	GENERATED_BODY()
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX") TObjectPtr<UNiagaraSystem> System = nullptr;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX|Field") FGGYGOFXFieldSettings FieldSettings;
+};
 DECLARE_DELEGATE_OneParam(FGGYGOMontageFXLocalStartReadyDelegate, const FGGYGOMontageFXLocalStartReadyFact&);
 
 UENUM(BlueprintType)
@@ -53,10 +65,12 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGONiagaraEffectFailedDelegate,
 	UGGYGOAbilityTask_PlayNiagaraEffect*, Task, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGONiagaraEffectSpawnedDelegate,
 	UGGYGOAbilityTask_PlayNiagaraEffect*, Task, UNiagaraComponent*, Component);
+DECLARE_MULTICAST_DELEGATE_TwoParams(FGGYGONiagaraEffectUnitNaturallyCompletedDelegate,
+	UGGYGOAbilityTask_PlayNiagaraEffect*, UNiagaraComponent*);
 
 /**
- * 只拥有自身生成的一个瞬态组件。招式窗口、动作身份与取消原因由调用 GA 管理；
- * 原生完成仅结束本 Task，不能作为动作完成事件。未显式交出的资源随 Task 销毁。
+ * 一个 Task/cap/ticket 拥有自身生成的完整瞬态组件组。招式窗口、动作身份与取消原因由调用 GA 管理；
+ * 全部单元原生完成才结束本 Task，不能作为动作完成事件。未显式交出的资源随 Task 销毁。
  */
 UCLASS()
 class GGYGO_API UGGYGOAbilityTask_PlayNiagaraEffect : public UAbilityTask
@@ -73,6 +87,12 @@ public:
 		HidePin = "OwningAbility", DefaultToSelf = "OwningAbility", BlueprintInternalUseOnly = "true"))
 	static UGGYGOAbilityTask_PlayNiagaraEffect* PlayNiagaraEffect(UGameplayAbility* OwningAbility,
 		FName TaskInstanceName, UNiagaraSystem* System, EGGYGONiagaraEffectSpace Space,
+		USceneComponent* AttachComponent, FName SocketName, const FTransform& Transform,
+		const FGGYGOFXFieldSettings& FieldSettings);
+
+	/** 一个原 Task/cap/ticket 同时持有完整组合；OnSpawned 逐实际组件发出原生激活请求事实。 */
+	static UGGYGOAbilityTask_PlayNiagaraEffect* PlayNiagaraEffects(UGameplayAbility* OwningAbility,
+		FName TaskInstanceName, const TArray<FGGYGONiagaraEffectUnit>& Units, EGGYGONiagaraEffectSpace Space,
 		USceneComponent* AttachComponent, FName SocketName, const FTransform& Transform);
 
 	/** 显式释放原资源；Tail 成功交回后结束 Task，后继取消不会追收已交出的组件。 */
@@ -82,6 +102,8 @@ public:
 	/** 仅验证必需资产、明确空间及变换；World、实际 Socket 和原生就绪在 Activate 核验。 */
 	static bool ValidateConfiguration(UNiagaraSystem* System, EGGYGONiagaraEffectSpace Space,
 		const FTransform& Transform, FString& OutFailureReason);
+	static bool ValidateConfigurations(const TArray<FGGYGONiagaraEffectUnit>& Units,
+		EGGYGONiagaraEffectSpace Space, const FTransform& Transform, FString& OutFailureReason);
 	static bool IsStopModeValid(EGGYGONiagaraEffectStopMode Mode);
 	/** 同一编译/VM 结构校验供远端实例复用；合法编译暂态交原生组件等待。 */
 	static bool ValidateCompiledSystem(UNiagaraSystem* System, FString& OutFailureReason);
@@ -105,6 +127,8 @@ public:
 	/** 原组件已取得并调用原生 Activate；编译／PSO 等待由组件处理，不表示模拟或画面已完成。 */
 	UPROPERTY(BlueprintAssignable)
 	FGGYGONiagaraEffectSpawnedDelegate OnSpawned;
+	/** 原 owned 单元无失败地触发 OnSystemFinished 后、销毁前发出；显式 Stop/取消不发出。 */
+	FGGYGONiagaraEffectUnitNaturallyCompletedDelegate OnUnitNaturallyCompleted;
 
 	virtual void Activate() override;
 	virtual void OnDestroy(bool AbilityEnded) override;
@@ -115,22 +139,24 @@ private:
 	void DestroyNative(bool AbilityEnded);
 	void ResumeLegacyStart(const FGGYGOMontageFXLocalStartReadyFact& Fact);
 	void FailAndEndTask(const FString& Reason);
-	UNiagaraComponent* ReleaseOwnedComponent();
+	void HandleEffectFailed(UGGYGOFXNiagaraComponent* Component, const FString& Reason);
+	TArray<TStrongObjectPtr<UNiagaraComponent>> ReleaseOwnedComponents();
+	void UnbindOwnedComponent(UNiagaraComponent* Component);
 	UFUNCTION()
 	void HandleSystemFinished(UNiagaraComponent* Component);
 	UFUNCTION()
 	void HandleOriginalAvatarEndPlay(AActor* Actor, EEndPlayReason::Type Reason);
 #if WITH_EDITOR
 	void HandleSystemCompiled(UNiagaraSystem* System);
-	FDelegateHandle SystemCompiledHandle;
+	TMap<UNiagaraSystem*, FDelegateHandle> SystemCompiledHandles;
 #endif
 
 	UPROPERTY()
-	TObjectPtr<UNiagaraSystem> RequestedSystem;
+	TArray<FGGYGONiagaraEffectUnit> RequestedUnits;
 	UPROPERTY()
 	TWeakObjectPtr<USceneComponent> RequestedAttachComponent;
 	UPROPERTY(Transient)
-	TObjectPtr<UNiagaraComponent> OwnedComponent;
+	TArray<TObjectPtr<UNiagaraComponent>> OwnedComponents;
 	FName RequestedSocketName;
 	FTransform RequestedTransform = FTransform::Identity;
 	EGGYGONiagaraEffectSpace RequestedSpace = EGGYGONiagaraEffectSpace::Unspecified;

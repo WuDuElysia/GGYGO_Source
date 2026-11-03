@@ -1,18 +1,27 @@
-/** @file 校验 Toon 接口、适配运行时/编辑器主方向光，并仅释放自有表现资源。 */
+/** @file GGYGOCharacterRenderComponent.cpp
+ *  @brief 校验Toon接口，向自有及登记MID写同次场景灯样本，并归还原表现资源。
+ */
 #include "Character/Components/GGYGOCharacterRenderComponent.h"
 
 #include "Components/DirectionalLightComponent.h"
+#include "Components/PointLightComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/DirectionalLight.h"
+#include "Engine/Light.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "GameFramework/Character.h"
 #include "Materials/Material.h"
 #include "Materials/MaterialInstanceDynamic.h"
+#include "Misc/ScopeExit.h"
 #if WITH_EDITOR
+#include "Editor.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
+#include "UObject/ObjectSaveContext.h"
+#include "UObject/Package.h"
+#include "UObject/UObjectGlobals.h"
 #endif
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterRenderComponent)
@@ -25,6 +34,13 @@ namespace
 	const FName LightColorParameter(TEXT("KeyLightColor"));
 	const FName LightStrengthParameter(TEXT("SceneLightStrength"));
 	const FName LightVisibilityParameter(TEXT("KeyLightVisibility"));
+	const FName AdditionalCountParameter(TEXT("AdditionalLightCount"));
+	const FName AdditionalGlobalParameter(TEXT("AdditionalLightGlobalIntensity"));
+	const FName PreviewTransportParameter(TEXT("UseScenePreviewCPD"));
+	FName AdditionalParameter(const TCHAR* Family, int32 Index)
+	{
+		return FName(*FString::Printf(TEXT("AdditionalLight%s%d"), Family, Index));
+	}
 	const FName PreviewDataParameters[] = {
 		TEXT("ScenePreviewValid"), TEXT("ScenePreviewDirectionX"), TEXT("ScenePreviewDirectionY"),
 		TEXT("ScenePreviewDirectionZ"), TEXT("ScenePreviewColorR"), TEXT("ScenePreviewColorG"),
@@ -34,6 +50,11 @@ namespace
 	{
 		return FMath::IsFinite(Color.R) && FMath::IsFinite(Color.G)
 			&& FMath::IsFinite(Color.B) && FMath::IsFinite(Color.A);
+	}
+
+	bool FitsMaterialFloat(double Value)
+	{
+		return FMath::IsFinite(Value) && FMath::Abs(Value) <= double(MAX_flt);
 	}
 
 	bool IsUnlitSurface(const UMaterialInterface* Material)
@@ -67,12 +88,19 @@ void UGGYGOCharacterRenderComponent::EndPlay(const EEndPlayReason::Type Reason)
 void UGGYGOCharacterRenderComponent::OnRegister()
 {
 	Super::OnRegister();
+#if WITH_EDITOR
+	BindEditorLifecycle();
+	RestoreSerializedPreviewOverrides();
+#endif
 	if (HasBegunPlay() && IsActive()) RefreshMaterials();
-	else if (UsesEditorSceneLighting()) RefreshEditorLighting();
+	else if (UsesEditorSceneLighting()) RefreshMaterials();
 }
 
 void UGGYGOCharacterRenderComponent::OnUnregister()
 {
+#if WITH_EDITOR
+	UnbindEditorLifecycle();
+#endif
 	ReleaseMaterials();
 	Super::OnUnregister();
 }
@@ -81,7 +109,7 @@ void UGGYGOCharacterRenderComponent::Activate(bool bReset)
 {
 	Super::Activate(bReset);
 	if (HasBegunPlay()) RefreshMaterials();
-	else if (UsesEditorSceneLighting()) RefreshEditorLighting();
+	else if (UsesEditorSceneLighting()) RefreshMaterials();
 }
 
 void UGGYGOCharacterRenderComponent::Deactivate()
@@ -92,8 +120,22 @@ void UGGYGOCharacterRenderComponent::Deactivate()
 
 bool UGGYGOCharacterRenderComponent::ValidateLightSettings(FString& OutError) const
 {
-	if (!FMath::IsFinite(LightingUpdateInterval) || LightingUpdateInterval < 0.01f)
-		OutError = TEXT("LightingUpdateInterval must be finite and >= 0.01");
+	if (KeyLightSelection != EGGYGOCharacterKeyLightSelection::AutomaticDirectional
+		&& KeyLightSelection != EGGYGOCharacterKeyLightSelection::Explicit)
+		OutError = TEXT("主灯来源模式无效");
+	else if (KeyLightSelection == EGGYGOCharacterKeyLightSelection::Explicit
+		&& (!IsValid(KeyLight) || KeyLight->IsActorBeingDestroyed() || KeyLight->GetWorld() != GetWorld()))
+		OutError = TEXT("明确主灯模式缺同World的实际BP/配置引用");
+	else if (KeyLightSelection == EGGYGOCharacterKeyLightSelection::Explicit && !IsValid(KeyLight->GetLightComponent()))
+		OutError = TEXT("明确主灯缺实际发光组件");
+	else if (ShadowSettings.Mode == EGGYGOCharacterShadowMode::DepthCaptures
+		&& KeyLightSelection != EGGYGOCharacterKeyLightSelection::Explicit)
+		OutError = TEXT("深度捕获阴影需要BP明确绑定主灯");
+	else if (EditorPreviewTransport != EGGYGOCharacterPreviewTransport::PrimitiveData
+		&& EditorPreviewTransport != EGGYGOCharacterPreviewTransport::TransientMaterials)
+		OutError = TEXT("编辑器传输模式无效，须明确PrimitiveData或TransientMaterials");
+	else if (!FMath::IsFinite(LightingUpdateInterval) || LightingUpdateInterval < 0.0f)
+		OutError = TEXT("LightingUpdateInterval须有限且非负；0表示原Tick逐帧采样");
 	else if (!FMath::IsFinite(KeyLightIntensityResponse) || KeyLightIntensityResponse < 0.0f || KeyLightIntensityResponse > 1.0f)
 		OutError = TEXT("KeyLightIntensityResponse must be finite and in [0, 1]");
 	else if (KeyLightIntensityResponse > 0.0f && (!FMath::IsFinite(ReferenceKeyLightIntensity) || ReferenceKeyLightIntensity < 0.01f))
@@ -109,8 +151,8 @@ bool UGGYGOCharacterRenderComponent::ValidateLightSettings(FString& OutError) co
 		OutError = TEXT("OccludedKeyLightVisibility must be finite and in [0, 1]");
 	else
 	{
-		OutError.Reset();
-		return true;
+		return UGGYGOCharacterLightSources::ValidateSelection(FXLightSelection, OutError)
+			&& FGGYGOCharacterShadowCapture::ValidateSettings(ShadowSettings, OutError);
 	}
 	return false;
 }
@@ -141,6 +183,8 @@ bool UGGYGOCharacterRenderComponent::ValidateMaterialBindings(const USkeletalMes
 				*Entry.SlotName.ToString(), *GetPathNameSafe(Entry.Material));
 			return false;
 		}
+		if (ShadowSettings.Mode == EGGYGOCharacterShadowMode::DepthCaptures
+			&& !FGGYGOCharacterShadowCapture::ValidateMaterial(*Entry.Material, OutError)) return false;
 		FLinearColor VectorValue;
 		float ScalarValue;
 		for (const FName Parameter : {LightDirectionParameter, LightColorParameter})
@@ -182,7 +226,7 @@ void UGGYGOCharacterRenderComponent::FailRendering(const FString& Error)
 {
 	UE_LOG(LogGGYGOCharacterRendering, Error, TEXT("[Character Rendering] %s owner=%s: %s. Rendering stopped; correct configuration and call RefreshMaterials."),
 		*GetPathName(), *GetPathNameSafe(GetOwner()), *Error);
-	ReleaseMaterials();
+	ReleaseMaterialResources(EGGYGOCharacterLightingReadiness::Invalid, Error);
 }
 
 bool UGGYGOCharacterRenderComponent::HasCurrentMesh() const
@@ -193,14 +237,25 @@ bool UGGYGOCharacterRenderComponent::HasCurrentMesh() const
 	const TArray<FName> Slots = TargetMesh->GetMaterialSlotNames();
 	for (const FGGYGOCharacterRenderBinding& Binding : MaterialBindings)
 	{
-		if (!Slots.IsValidIndex(Binding.SlotIndex) || Slots[Binding.SlotIndex] != Binding.SlotName) return false;
+		if (!Slots.IsValidIndex(Binding.SlotIndex) || Slots[Binding.SlotIndex] != Binding.SlotName
+			|| TargetMesh->GetMaterial(Binding.SlotIndex) != Binding.InstalledMaterial) return false;
 	}
 	return true;
 }
 
 void UGGYGOCharacterRenderComponent::ReleaseMaterials()
 {
+	ReleaseMaterialResources(EGGYGOCharacterLightingReadiness::Invalid, TEXT("原角色表现租用期已归还"));
+}
+
+void UGGYGOCharacterRenderComponent::ReleaseMaterialResources(
+	EGGYGOCharacterLightingReadiness Readiness, const FString& Reason, bool bNotify)
+{
+	if (bReleasingMaterials) return;
+	bReleasingMaterials = true;
+	auto RetiredTargets = MoveTemp(SceneMaterialTargets);
 	SetComponentTickEnabled(false);
+	ShadowCapture.Reset();
 	ReleasePreviewLighting();
 	if (IsValid(TargetMesh))
 	{
@@ -224,25 +279,97 @@ void UGGYGOCharacterRenderComponent::ReleaseMaterials()
 	BoundMeshAsset.Reset();
 	ResolvedKeyLight.Reset();
 	TargetMesh = nullptr;
+	bRetryLighting = Readiness == EGGYGOCharacterLightingReadiness::WaitingForRegistration
+		|| Readiness == EGGYGOCharacterLightingReadiness::SourceFailed;
+	bUsesAdditionalInputs = false;
+	bReleasingMaterials = false;
+	const uint64 OriginalNotice = SceneLightingNotificationSerial;
+	const FString NotificationReason = Reason;
+	// 外部回调可结束FX实例并注销旧handle；全部自有状态已先归还，返栈不再清理后继。
+	for (auto& Pair : RetiredTargets)
+		Pair.Value.OnInvalidated.ExecuteIfBound(Pair.Key, Readiness, NotificationReason);
+	// 失效回调可已重入创建/应用新租用期；旧释放不再发布其已过期状态。
+	if (bNotify && IsValid(this) && SceneLightingNotificationSerial == OriginalNotice
+		&& DynamicMaterials.IsEmpty() && !PreviewMesh.IsValid())
+		PublishSceneLightingReadiness(Readiness, NotificationReason);
+}
+
+void UGGYGOCharacterRenderComponent::PublishSceneLightingReadiness(
+	EGGYGOCharacterLightingReadiness Readiness, const FString& Reason)
+{
+	if (LastSceneLightingReadiness.IsSet() && LastSceneLightingReadiness.GetValue() == Readiness
+		&& LastSceneLightingReason == Reason) return;
+	const FString NotificationReason = Reason;
+	LastSceneLightingReadiness = Readiness;
+	LastSceneLightingReason = NotificationReason;
+	checkf(SceneLightingNotificationSerial != MAX_uint64, TEXT("场景光照通知序列已耗尽"));
+	++SceneLightingNotificationSerial;
+	SceneLightingReadinessChanged.Broadcast(Readiness, NotificationReason);
 }
 
 void UGGYGOCharacterRenderComponent::RefreshMaterials()
 {
-	ReleaseMaterials();
-	if (UsesEditorSceneLighting())
+	const bool bHadResources = !DynamicMaterials.IsEmpty() || PreviewMesh.IsValid() || bRetryLighting;
+	const bool bRetryingLighting = bRetryLighting;
+	ReleaseMaterialResources(EGGYGOCharacterLightingReadiness::Invalid, TEXT("原角色表现配置刷新"),
+		bHadResources && !bRetryingLighting);
+	if (!IsValid(this) || !IsRegistered()) return;
+	// 释放通知可能重入并安装后继；外层不再重新创建/覆盖该租用期。
+	if (!DynamicMaterials.IsEmpty() || PreviewMesh.IsValid() || bRetryLighting) return;
+	if (GetWorld() && GetWorld()->GetNetMode() == NM_DedicatedServer) return;
+	if (UsesEditorSceneLighting() && !UsesEditorMaterialPreview())
 	{
 		RefreshEditorLighting();
 		return;
 	}
-	if (!HasBegunPlay() || !IsActive() || MaterialSlots.IsEmpty()) return;
+	if ((!HasBegunPlay() && !UsesEditorMaterialPreview()) || !IsActive()) return;
+	if (MaterialSlots.IsEmpty())
+	{ PublishSceneLightingReadiness(EGGYGOCharacterLightingReadiness::Invalid, TEXT("原角色未配置表面材质槽")); return; }
+#if WITH_EDITOR
+	if (UsesEditorMaterialPreview() && (bEditorPreviewSuspendedForPIE || GIsSavingPackage || GIsTransacting)) return;
+	RestoreSerializedPreviewOverrides();
+#endif
 	const ACharacter* Character = Cast<ACharacter>(GetOwner());
 	TargetMesh = Character ? Character->GetMesh() : nullptr;
 	FString Error;
+	if (UsesEditorMaterialPreview() && TargetMesh && !TargetMesh->IsRegistered())
+	{ HandleLightingUnavailable(EGGYGOCharacterLightingReadiness::WaitingForRegistration, TEXT("原角色Mesh等待真实注册")); return; }
 	// Validate the complete configuration before installing the first override.
 	if (!ValidateLightSettings(Error) || !ValidateMaterialBindings(TargetMesh, Error))
 	{
 		FailRendering(Error);
 		return;
+	}
+	if (!ValidateAdditionalMaterialContract(bUsesAdditionalInputs, Error))
+	{
+		FailRendering(Error);
+		return;
+	}
+	if (KeyLightSelection == EGGYGOCharacterKeyLightSelection::Explicit
+		&& (!KeyLight->GetLightComponent() || !KeyLight->GetLightComponent()->IsRegistered()))
+	{ HandleLightingUnavailable(EGGYGOCharacterLightingReadiness::WaitingForRegistration, TEXT("原角色主灯等待真实注册")); return; }
+	if (UsesEditorMaterialPreview())
+	{
+		for (const FGGYGOCharacterRenderSlot& Entry : MaterialSlots)
+		{
+			if (TargetMesh->GetMaterial(TargetMesh->GetMaterialIndex(Entry.SlotName)) != Entry.Material)
+			{
+				FailRendering(TEXT("编辑器实际槽已由用户修改；保持该覆盖，不安装临时MID"));
+				return;
+			}
+		}
+	}
+	if (bUsesAdditionalInputs)
+	{
+		const TWeakObjectPtr<USkeletalMeshComponent> OriginalMesh = TargetMesh.Get();
+		const TWeakObjectPtr<USkeletalMesh> OriginalAsset = TargetMesh->GetSkeletalMeshAsset();
+		FGGYGOCharacterAdditionalLightingSample Sample;
+		const auto Readiness = ReadAdditionalLighting(AdditionalLighting, Sample, Error);
+		// Getter的原FX首错可同步结束实例并通知外部；旧初始化不处理已变更的角色或后继租用。
+		if (!IsValid(this) || !IsRegistered() || !IsActive() || !OriginalMesh.IsValid() || !OriginalAsset.IsValid()
+			|| TargetMesh.Get() != OriginalMesh.Get() || TargetMesh->GetSkeletalMeshAsset() != OriginalAsset.Get()
+			|| !DynamicMaterials.IsEmpty() || PreviewMesh.IsValid() || bRetryLighting) return;
+		if (Readiness != EGGYGOCharacterLightingReadiness::Ready) { HandleLightingUnavailable(Readiness, Error); return; }
 	}
 	BoundMeshAsset = TargetMesh->GetSkeletalMeshAsset();
 	const TArray<FName> Slots = TargetMesh->GetMaterialSlotNames();
@@ -262,6 +389,20 @@ void UGGYGOCharacterRenderComponent::RefreshMaterials()
 		Binding.OriginalOverride = TargetMesh->OverrideMaterials.IsValidIndex(Index)
 			? TargetMesh->OverrideMaterials[Index].Get() : nullptr;
 		Binding.InstalledMaterial = Instance;
+		Instance->SetFlags(RF_Transient | RF_DuplicateTransient);
+#if WITH_EDITOR
+		if (UsesEditorMaterialPreview())
+		{
+			auto* Data = NewObject<UGGYGOCharacterPreviewMaterialData>(Instance, NAME_None, RF_Transient);
+			Data->OwnerActor = GetOwner();
+			Data->ComponentName = GetFName();
+			Data->MeshAsset = TargetMesh->GetSkeletalMeshAsset();
+			Data->SlotIndex = Index;
+			Data->SlotName = Binding.SlotName;
+			Data->OriginalOverride = Binding.OriginalOverride;
+			Instance->AddAssetUserData(Data);
+		}
+#endif
 		TargetMesh->SetMaterial(Index, Instance);
 		DynamicMaterials.Add(Instance);
 	}
@@ -318,9 +459,27 @@ bool UGGYGOCharacterRenderComponent::UpdateOutline(USkeletalMeshComponent* Mesh)
 void UGGYGOCharacterRenderComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction)
 {
 	Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+#if WITH_EDITOR
+	if (bEditorPreviewSuspendedForPIE || GIsSavingPackage || GIsTransacting) return;
+	if (bResumeEditorPreview)
+	{
+		bResumeEditorPreview = false;
+		if (UsesEditorSceneLighting()) RefreshMaterials();
+		return;
+	}
+#endif
+	if (bRetryLighting) { RefreshMaterials(); return; }
 	if (UsesEditorSceneLighting())
 	{
-		RefreshEditorLighting();
+		if (!UsesEditorMaterialPreview()) { RefreshEditorLighting(); return; }
+		if (!HasCurrentMesh()) { ReleaseMaterials(); return; }
+		UpdateLighting();
+		if (!IsValid(this) || !IsRegistered()) return;
+		if (OutlineMesh && TargetMesh)
+		{
+			OutlineMesh->SetVisibility(TargetMesh->IsVisible());
+			OutlineMesh->SetHiddenInGame(TargetMesh->bHiddenInGame);
+		}
 		return;
 	}
 	if (PreviewMesh.IsValid()) ReleasePreviewLighting();
@@ -340,8 +499,158 @@ bool UGGYGOCharacterRenderComponent::IsEligibleKeyLight(const ADirectionalLight*
 		&& Component->bAffectsWorld && Component->Intensity > 0.0f;
 }
 
+bool UGGYGOCharacterRenderComponent::UsesEditorMaterialPreview() const
+{
+	return UsesEditorSceneLighting() && EditorPreviewTransport == EGGYGOCharacterPreviewTransport::TransientMaterials;
+}
+
+void UGGYGOCharacterRenderComponent::HandleLightingUnavailable(
+	EGGYGOCharacterLightingReadiness Readiness, const FString& Reason)
+{
+	if (Readiness != EGGYGOCharacterLightingReadiness::WaitingForRegistration
+		&& Readiness != EGGYGOCharacterLightingReadiness::SourceFailed)
+	{ FailRendering(Reason); return; }
+	const FString UnavailableReason = Reason;
+	if (Readiness == EGGYGOCharacterLightingReadiness::SourceFailed
+		&& (!LastSceneLightingReadiness.IsSet() || LastSceneLightingReadiness.GetValue() != Readiness
+			|| LastSceneLightingReason != UnavailableReason))
+		UE_LOG(LogGGYGOCharacterRendering, Error, TEXT("[Character Rendering] %s owner=%s: %s. 外部灯源本次采样失败；归还本次表现，原Tick后续重采。"),
+			*GetPathName(), *GetPathNameSafe(GetOwner()), *UnavailableReason);
+	ReleaseMaterialResources(Readiness, UnavailableReason);
+	if (!IsValid(this) || !IsRegistered() || !IsActive()) return;
+	if (!DynamicMaterials.IsEmpty() || PreviewMesh.IsValid()) return;
+	if (!bRetryLighting) return;
+	SetComponentTickInterval(LightingUpdateInterval);
+	SetComponentTickEnabled(IsActive());
+}
+
+EGGYGOCharacterLightingReadiness UGGYGOCharacterRenderComponent::ReadAdditionalLighting(
+	const FGGYGOCharacterAdditionalLighting& Configuration, FGGYGOCharacterAdditionalLightingSample& OutSample,
+	FString& OutError) const
+{
+	OutSample = {};
+	OutError.Reset();
+	if (!GetWorld() || !Configuration.bConfigured || !FMath::IsFinite(Configuration.GlobalIntensity)
+		|| Configuration.GlobalIntensity < 0 || Configuration.Lights.Num() > 4)
+	{
+		OutError = TEXT("附加灯必须显式配置有限非负global和0..4个选中来源；不自动选灯或填零");
+		return EGGYGOCharacterLightingReadiness::Invalid;
+	}
+	FGGYGOCharacterAdditionalLightingSample Sample;
+	Sample.GlobalIntensity = Configuration.GlobalIntensity;
+	for (int32 Index = 0; Index < Configuration.Lights.Num(); ++Index)
+	{
+		const auto& Input = Configuration.Lights[Index];
+		const ALight* Source = Input.SourceLight;
+		if (!Input.bConfigured || !IsValid(Source) || Source->IsActorBeingDestroyed() || Source->GetWorld() != GetWorld()
+			|| !FMath::IsFinite(Input.IntensityScale) || Input.IntensityScale < 0
+			|| (Input.DirectionSign != -1 && Input.DirectionSign != 1)
+			|| !FitsMaterialFloat(Input.Attenuation.X) || !FitsMaterialFloat(Input.Attenuation.Y)
+			|| !FitsMaterialFloat(Input.Attenuation.Z) || !FitsMaterialFloat(Input.Attenuation.W))
+		{
+			OutError = FString::Printf(TEXT("附加灯[%d]缺同World原来源/明确系数或方向符号: %s"), Index, *GetPathNameSafe(Source));
+			return EGGYGOCharacterLightingReadiness::Invalid;
+		}
+		const UPointLightComponent* Light = Cast<UPointLightComponent>(Source->GetLightComponent());
+		if (!IsValid(Light))
+		{
+			OutError = FString::Printf(TEXT("附加灯[%d]须为明确Point/Spot局部灯，不将其它光型猜成源点光"), Index);
+			return EGGYGOCharacterLightingReadiness::Invalid;
+		}
+		if (!Light->IsRegistered())
+		{
+			OutError = FString::Printf(TEXT("附加灯[%d]等待真实注册: %s"), Index, *GetPathNameSafe(Source));
+			return EGGYGOCharacterLightingReadiness::WaitingForRegistration;
+		}
+		const FVector Position = Light->GetComponentLocation() * 0.01;
+		const FVector Direction = Light->GetForwardVector() * Input.DirectionSign;
+		const float Intensity = Light->Intensity;
+		const bool bEnabled = !Source->IsHidden() && Light->IsVisible() && Light->bAffectsWorld;
+		const FLinearColor Color = Light->GetLightColor() * (bEnabled ? Intensity * Input.IntensityScale : 0.0f);
+		if (!FitsMaterialFloat(Position.X) || !FitsMaterialFloat(Position.Y) || !FitsMaterialFloat(Position.Z)
+			|| Direction.ContainsNaN() || !FMath::IsFinite(Intensity) || Intensity < 0 || !IsFiniteColor(Color))
+		{
+			OutError = FString::Printf(TEXT("附加灯[%d]的实际位置/方向/强度/色值无效: %s"), Index, *GetPathNameSafe(Source));
+			return EGGYGOCharacterLightingReadiness::Invalid;
+		}
+		Sample.PositionsMeters.Add(Position);
+		Sample.Directions.Add(Direction);
+		Sample.Attenuations.Add(Input.Attenuation);
+		Sample.Colors.Add(Color);
+	}
+	if (!UGGYGOCharacterLightSources::ValidateSelection(FXLightSelection, OutError))
+		return EGGYGOCharacterLightingReadiness::Invalid;
+	if (FXLightSelection.Mode != EGGYGOCharacterFXLightMode::Disabled
+		&& Sample.PositionsMeters.Num() < 4 && FXLightSelection.IntensityScale > 0)
+	{
+		const auto* Character = Cast<ACharacter>(GetOwner());
+		const auto* Mesh = Character ? Character->GetMesh() : nullptr;
+		auto* Sources = GetWorld()->GetSubsystem<UGGYGOCharacterLightSources>();
+		if (!IsValid(Mesh) || !Sources)
+		{ OutError = TEXT("FX选灯缺实际角色Mesh/同World来源登记"); return EGGYGOCharacterLightingReadiness::Invalid; }
+		TArray<FGGYGOCharacterSelectedPointLight> Selected;
+		const auto Readiness = Sources->SelectLights(Mesh->Bounds.Origin, 4 - Sample.PositionsMeters.Num(),
+			FXLightSelection, Selected, OutError);
+		if (Readiness == EGGYGOCharacterLightSourceReadiness::WaitingForSimulation)
+			return EGGYGOCharacterLightingReadiness::WaitingForRegistration;
+		if (Readiness == EGGYGOCharacterLightSourceReadiness::SourceFailed)
+			return EGGYGOCharacterLightingReadiness::SourceFailed;
+		if (Readiness != EGGYGOCharacterLightSourceReadiness::Ready)
+			return EGGYGOCharacterLightingReadiness::Invalid;
+		for (const auto& Point : Selected)
+		{
+			Sample.PositionsMeters.Add(Point.Light.PositionWorldCm * 0.01);
+			Sample.Directions.Add(FVector::ZeroVector); // Point映射z=0,w=1，无Spot角度衰减。
+			Sample.Attenuations.Add(Point.Attenuation);
+			Sample.Colors.Add(Point.Light.Color);
+		}
+	}
+	OutSample = MoveTemp(Sample);
+	return EGGYGOCharacterLightingReadiness::Ready;
+}
+
+bool UGGYGOCharacterRenderComponent::ValidateAdditionalMaterialContract(bool& OutUsesAdditional, FString& OutError) const
+{
+	TOptional<bool> Contract;
+	for (const auto& Slot : MaterialSlots)
+	{
+		if (!IsValid(Slot.Material)) { OutError = TEXT("附加灯材质接口缺少实际材质"); return false; }
+		TArray<FMaterialParameterInfo> Vectors, Scalars;
+		TArray<FGuid> VectorIds, ScalarIds;
+		Slot.Material->GetAllVectorParameterInfo(Vectors, VectorIds);
+		Slot.Material->GetAllScalarParameterInfo(Scalars, ScalarIds);
+		int32 Found = 0;
+		for (int32 Index = 0; Index < 4; ++Index)
+			for (const TCHAR* Family : {TEXT("Position"), TEXT("Direction"), TEXT("Attenuation"), TEXT("Color")})
+				Found += Vectors.ContainsByPredicate([&](const FMaterialParameterInfo& Info) { return Info.Association == EMaterialParameterAssociation::GlobalParameter && Info.Name == AdditionalParameter(Family, Index); }) ? 1 : 0;
+		for (const FName Name : {AdditionalCountParameter, AdditionalGlobalParameter, PreviewTransportParameter})
+			Found += Scalars.ContainsByPredicate([&](const FMaterialParameterInfo& Info) { return Info.Association == EMaterialParameterAssociation::GlobalParameter && Info.Name == Name; }) ? 1 : 0;
+		if ((Found != 0 && Found != 19) || (Contract.IsSet() && Contract.GetValue() != (Found == 19)))
+		{
+			OutError = FString::Printf(TEXT("材质%s的附加灯/CPD选择接口不完整或各槽混用了不同接口"), *GetPathNameSafe(Slot.Material));
+			return false;
+		}
+		Contract = Found == 19;
+	}
+	OutUsesAdditional = Contract.Get(false);
+	if (FXLightSelection.Mode != EGGYGOCharacterFXLightMode::Disabled && !OutUsesAdditional)
+	{ OutError = TEXT("FX选灯模式需要完整四灯材质接口"); return false; }
+	if (UsesEditorMaterialPreview() && !OutUsesAdditional)
+	{
+		OutError = TEXT("完整MID编辑器模式需要已制作的附加灯/UseScenePreviewCPD材质接口");
+		return false;
+	}
+	OutError.Reset();
+	return true;
+}
+
 ADirectionalLight* UGGYGOCharacterRenderComponent::ResolveKeyLight()
 {
+	if (KeyLightSelection == EGGYGOCharacterKeyLightSelection::Explicit)
+	{
+		ResolvedKeyLight.Reset();
+		return KeyLight.Get(); // 已校验的明确来源即使关闭也保实际方向；强度在原采样中归零。
+	}
 	if (KeyLight != nullptr)
 	{
 		ResolvedKeyLight.Reset();
@@ -359,21 +668,180 @@ ADirectionalLight* UGGYGOCharacterRenderComponent::ResolveKeyLight()
 	return Candidate;
 }
 
+EGGYGOCharacterLightingReadiness UGGYGOCharacterRenderComponent::RegisterSceneMaterialTargets(
+	UObject* SourceOwner, TConstArrayView<UMaterialInstanceDynamic*> Materials,
+	FSceneMaterialsInvalidated OnInvalidated, uint64& OutHandle, FString& OutError)
+{
+	check(IsInGameThread());
+	OutHandle = 0;
+	OutError.Reset();
+	if (!IsRegistered() || !IsActive() || bReleasingMaterials || !IsValid(SourceOwner)
+		|| !GetWorld() || GetWorld()->bIsTearingDown || SourceOwner->GetWorld() != GetWorld()
+		|| GetWorld()->GetNetMode() == NM_DedicatedServer || Materials.IsEmpty() || !OnInvalidated.IsBound())
+	{ OutError = TEXT("外部材质登记缺同World活动Owner/MID/弱失效回调"); return EGGYGOCharacterLightingReadiness::Invalid; }
+	if (!HasBegunPlay() && GetWorld()->IsGameWorld())
+	{ OutError = TEXT("原角色表现等待BeginPlay"); return EGGYGOCharacterLightingReadiness::WaitingForRegistration; }
+	if (bRetryLighting)
+	{ OutError = TEXT("原角色等待下一次真实光照采样"); return EGGYGOCharacterLightingReadiness::WaitingForRegistration; }
+	if (!HasCurrentMesh() || DynamicMaterials.IsEmpty() || NextSceneMaterialHandle == MAX_uint64)
+	{ OutError = TEXT("原角色没有活动材质租用期或登记handle已耗尽"); return EGGYGOCharacterLightingReadiness::Invalid; }
+	FSceneMaterialTargets Target;
+	Target.SourceOwner = SourceOwner;
+	Target.OnInvalidated = MoveTemp(OnInvalidated);
+	TSet<const UMaterialInstanceDynamic*> Unique;
+	for (UMaterialInstanceDynamic* Material : Materials)
+	{
+		if (!IsValid(Material) || !IsUnlitSurface(Material) || Unique.Contains(Material) || DynamicMaterials.Contains(Material))
+		{ OutError = TEXT("外部MID无效、非Unlit、重复或属于本组件"); return EGGYGOCharacterLightingReadiness::Invalid; }
+		for (const auto& Pair : SceneMaterialTargets)
+			if (Pair.Value.Materials.Contains(Material))
+			{ OutError = TEXT("外部MID已有场景灯写入登记"); return EGGYGOCharacterLightingReadiness::Invalid; }
+		FLinearColor Vector;
+		float Scalar;
+		for (const FName Name : {LightDirectionParameter, LightColorParameter})
+			if (!Material->GetVectorParameterValue(FHashedMaterialParameterInfo(Name), Vector))
+			{ OutError = FString::Printf(TEXT("外部MID缺主光vector %s"), *Name.ToString()); return EGGYGOCharacterLightingReadiness::Invalid; }
+		for (const FName Name : {LightStrengthParameter, LightVisibilityParameter, AdditionalCountParameter, AdditionalGlobalParameter})
+			if (!Material->GetScalarParameterValue(FHashedMaterialParameterInfo(Name), Scalar))
+			{ OutError = FString::Printf(TEXT("外部MID缺灯scalar %s"), *Name.ToString()); return EGGYGOCharacterLightingReadiness::Invalid; }
+		for (int32 Index = 0; Index < 4; ++Index)
+			for (const TCHAR* Family : {TEXT("Position"), TEXT("Direction"), TEXT("Attenuation"), TEXT("Color")})
+				if (!Material->GetVectorParameterValue(FHashedMaterialParameterInfo(AdditionalParameter(Family, Index)), Vector))
+				{ OutError = TEXT("外部MID缺完整四灯vector接口"); return EGGYGOCharacterLightingReadiness::Invalid; }
+		Unique.Add(Material);
+		Target.Materials.Add(Material);
+	}
+	FGGYGOCharacterAdditionalLightingSample Additional;
+	const TWeakObjectPtr<UMaterialInstanceDynamic> OriginalMID = DynamicMaterials[0].Get();
+	const auto AdditionalReadiness = ReadAdditionalLighting(AdditionalLighting, Additional, OutError);
+	if (!IsValid(this) || !IsRegistered() || !HasCurrentMesh() || DynamicMaterials.IsEmpty() || !OriginalMID.IsValid() || DynamicMaterials[0].Get() != OriginalMID.Get())
+	{ OutError = TEXT("采样期间原角色材质租用期已改变"); return EGGYGOCharacterLightingReadiness::Invalid; }
+	if (AdditionalReadiness != EGGYGOCharacterLightingReadiness::Ready)
+	{
+		HandleLightingUnavailable(AdditionalReadiness, OutError);
+		return AdditionalReadiness;
+	}
+	FVector Direction;
+	FLinearColor Color;
+	float Strength, Visibility;
+	if (!SampleLighting(Direction, Color, Strength, Visibility))
+	{
+		OutError = TEXT("原主光采样尚未就绪或已拒绝配置");
+		return bRetryLighting ? EGGYGOCharacterLightingReadiness::WaitingForRegistration : EGGYGOCharacterLightingReadiness::Invalid;
+	}
+	if (!Target.SourceOwner.IsValid() || Target.SourceOwner->GetWorld() != GetWorld())
+	{ OutError = TEXT("采样期间原外部材质Owner已归还"); return EGGYGOCharacterLightingReadiness::Invalid; }
+	for (const auto& Material : Target.Materials)
+	{
+		if (!Material.IsValid() || !Target.OnInvalidated.IsBound())
+		{ OutError = TEXT("采样期间原外部MID/弱通知端点已失效"); return EGGYGOCharacterLightingReadiness::Invalid; }
+		for (const auto& Pair : SceneMaterialTargets)
+			if (Pair.Value.Materials.Contains(Material))
+			{ OutError = TEXT("采样回调已为该MID建立其它登记"); return EGGYGOCharacterLightingReadiness::Invalid; }
+	}
+	// 原Sampler成功后没有用户回调；首次提交前已取得真实同次主光/四灯，不发布预览初值。
+	// Getter可能结束FX并释放调用方数组；返栈只消费预检阶段保存的弱端点副本。
+	for (const auto& Material : Target.Materials)
+		WriteSceneMaterialLighting(*Material.Get(), Direction, Color, Strength, Visibility, &Additional);
+	OutHandle = NextSceneMaterialHandle++;
+	SceneMaterialTargets.Add(OutHandle, MoveTemp(Target));
+	return EGGYGOCharacterLightingReadiness::Ready;
+}
+
+void UGGYGOCharacterRenderComponent::UnregisterSceneMaterialTargets(uint64 Handle)
+{
+	check(IsInGameThread());
+	SceneMaterialTargets.Remove(Handle);
+}
+
+void UGGYGOCharacterRenderComponent::WriteSceneMaterialLighting(UMaterialInstanceDynamic& Material,
+	const FVector& Direction, const FLinearColor& Color, float Strength, float Visibility,
+	const FGGYGOCharacterAdditionalLightingSample* Additional) const
+{
+	Material.SetVectorParameterValue(LightDirectionParameter, FLinearColor(Direction.X, Direction.Y, Direction.Z));
+	Material.SetVectorParameterValue(LightColorParameter, Color);
+	Material.SetScalarParameterValue(LightStrengthParameter, Strength);
+	Material.SetScalarParameterValue(LightVisibilityParameter, Visibility);
+	if (!Additional) return;
+	float PreviewValue;
+	if (Material.GetScalarParameterValue(FHashedMaterialParameterInfo(PreviewTransportParameter), PreviewValue))
+		Material.SetScalarParameterValue(PreviewTransportParameter, 0);
+	Material.SetScalarParameterValue(AdditionalCountParameter, Additional->PositionsMeters.Num());
+	Material.SetScalarParameterValue(AdditionalGlobalParameter, Additional->GlobalIntensity);
+	for (int32 Index = 0; Index < Additional->PositionsMeters.Num(); ++Index)
+	{
+		const FVector& P = Additional->PositionsMeters[Index];
+		const FVector& D = Additional->Directions[Index];
+		const FVector4& A = Additional->Attenuations[Index];
+		Material.SetVectorParameterValue(AdditionalParameter(TEXT("Position"), Index), FLinearColor(P.X, P.Y, P.Z, 0));
+		Material.SetVectorParameterValue(AdditionalParameter(TEXT("Direction"), Index), FLinearColor(D.X, D.Y, D.Z, 0));
+		Material.SetVectorParameterValue(AdditionalParameter(TEXT("Attenuation"), Index), FLinearColor(A.X, A.Y, A.Z, A.W));
+		Material.SetVectorParameterValue(AdditionalParameter(TEXT("Color"), Index), Additional->Colors[Index]);
+	}
+}
+
 void UGGYGOCharacterRenderComponent::UpdateLighting()
 {
 	if (DynamicMaterials.IsEmpty() || !GetWorld()) return;
+	const TWeakObjectPtr<UMaterialInstanceDynamic> OriginalMID = DynamicMaterials[0].Get();
+	TArray<TPair<uint64, FSceneMaterialTargets>> RetiredTargets;
+	ON_SCOPE_EXIT
+	{
+		// 同一Update返回时再通知；回调后不再读写本次角色状态或已摘除的旧登记。
+		for (auto& Pair : RetiredTargets)
+			Pair.Value.OnInvalidated.ExecuteIfBound(Pair.Key, EGGYGOCharacterLightingReadiness::Invalid,
+				TEXT("原外部Owner/MID已失效或离开同World"));
+	};
+	for (auto It = SceneMaterialTargets.CreateIterator(); It; ++It)
+	{
+		bool bValid = It.Value().SourceOwner.IsValid() && It.Value().SourceOwner->GetWorld() == GetWorld();
+		for (const auto& Material : It.Value().Materials) bValid &= Material.IsValid();
+		if (!bValid)
+		{
+			RetiredTargets.Emplace(It.Key(), MoveTemp(It.Value()));
+			It.RemoveCurrent();
+		}
+	}
 	FVector ToLight;
 	FLinearColor LightColor;
 	float LightStrength, Visibility;
 	if (!SampleLighting(ToLight, LightColor, LightStrength, Visibility)) return;
-	for (UMaterialInstanceDynamic* Instance : DynamicMaterials)
+	FGGYGOCharacterAdditionalLightingSample Additional;
+	const bool bReadAdditional = bUsesAdditionalInputs || !SceneMaterialTargets.IsEmpty();
+	if (bReadAdditional)
 	{
-		if (!Instance) continue;
-		Instance->SetVectorParameterValue(LightDirectionParameter, FLinearColor(ToLight.X, ToLight.Y, ToLight.Z));
-		Instance->SetVectorParameterValue(LightColorParameter, LightColor);
-		Instance->SetScalarParameterValue(LightStrengthParameter, LightStrength);
-		Instance->SetScalarParameterValue(LightVisibilityParameter, Visibility);
+		FString Error;
+		const auto Readiness = ReadAdditionalLighting(AdditionalLighting, Additional, Error);
+		if (!IsValid(this) || !IsRegistered() || !HasCurrentMesh() || DynamicMaterials.IsEmpty() || !OriginalMID.IsValid() || DynamicMaterials[0].Get() != OriginalMID.Get()) return;
+		if (Readiness != EGGYGOCharacterLightingReadiness::Ready) { HandleLightingUnavailable(Readiness, Error); return; }
 	}
+	for (UMaterialInstanceDynamic* Instance : DynamicMaterials)
+		if (Instance) WriteSceneMaterialLighting(*Instance, ToLight, LightColor, LightStrength, Visibility,
+			bUsesAdditionalInputs ? &Additional : nullptr);
+	for (const auto& Pair : SceneMaterialTargets)
+		for (const auto& Material : Pair.Value.Materials)
+			WriteSceneMaterialLighting(*Material.Get(), ToLight, LightColor, LightStrength, Visibility, &Additional);
+	if (ShadowSettings.Mode == EGGYGOCharacterShadowMode::DepthCaptures)
+	{
+		if (!HasCurrentMesh() || !IsValid(KeyLight))
+		{ FailRendering(TEXT("逐像素阴影需要原Mesh及明确实际主灯")); return; }
+		if (!ShadowCapture) { ShadowCapture = MakeShared<FGGYGOCharacterShadowCapture>(); }
+		const auto OriginalCapture = ShadowCapture;
+		TArray<UMaterialInstanceDynamic*> Materials;
+		for (const auto& Material : DynamicMaterials) { Materials.Add(Material.Get()); }
+		FString Error;
+		const bool bQueued = OriginalCapture->Update(*this, *TargetMesh, *KeyLight, ShadowSettings, Materials, Error);
+		if (!IsValid(this) || !IsRegistered() || ShadowCapture != OriginalCapture || !HasCurrentMesh()) return;
+		if (!bQueued) { FailRendering(Error); return; }
+	}
+	else
+	{
+		ShadowCapture.Reset();
+		// CharacterTrace是明确的正常模式；父MI的捕获开关不能使私有MID误采尚无生产者的贴图。
+		for (UMaterialInstanceDynamic* Instance : DynamicMaterials)
+			if (IsValid(Instance)) { Instance->SetScalarParameterValue(TEXT("UseCharacterShadowCaptures"), 0); }
+	}
+	PublishSceneLightingReadiness(EGGYGOCharacterLightingReadiness::Ready, FString());
 }
 
 bool UGGYGOCharacterRenderComponent::SampleLighting(FVector& ToLight, FLinearColor& LightColor, float& LightStrength, float& Visibility)
@@ -387,13 +855,15 @@ bool UGGYGOCharacterRenderComponent::SampleLighting(FVector& ToLight, FLinearCol
 		return false;
 	}
 	ADirectionalLight* Light = ResolveKeyLight();
-	ToLight = Light ? -Light->GetActorForwardVector() : FVector::UpVector;
+	if (KeyLightSelection == EGGYGOCharacterKeyLightSelection::Explicit && !KeyLight->GetLightComponent()->IsRegistered())
+	{ HandleLightingUnavailable(EGGYGOCharacterLightingReadiness::WaitingForRegistration, TEXT("原角色主灯等待真实注册")); return false; }
+	ToLight = Light ? -Light->GetLightComponent()->GetForwardVector() : FVector::UpVector;
 	LightColor = Light ? Light->GetLightColor() * KeyLightTint : FLinearColor::Black;
 	LightStrength = 0.0f;
 	if (Light)
 	{
 		const float Intensity = Light->GetLightComponent()->Intensity;
-		if (!FMath::IsFinite(Intensity) || !IsFiniteColor(LightColor) || ToLight.ContainsNaN())
+		if (!FMath::IsFinite(Intensity) || Intensity < 0 || !IsFiniteColor(LightColor) || ToLight.ContainsNaN())
 		{
 			FailRendering(FString::Printf(TEXT("Key light '%s' has nonfinite intensity, color or direction"), *GetPathNameSafe(Light)));
 			return false;
@@ -404,9 +874,11 @@ bool UGGYGOCharacterRenderComponent::SampleLighting(FVector& ToLight, FLinearCol
 			: FMath::Pow(static_cast<double>(Intensity) / ReferenceKeyLightIntensity, static_cast<double>(KeyLightIntensityResponse));
 		LightStrength = static_cast<float>(FMath::Min(static_cast<double>(KeyLightOutputScale) * Factor,
 			static_cast<double>(MaxKeyLightStrength)));
+		if (Intensity == 0 || Light->IsHidden() || !Light->GetLightComponent()->IsVisible() || !Light->GetLightComponent()->bAffectsWorld)
+			LightStrength = 0;
 	}
 	Visibility = 1.0f;
-	if (bTraceKeyLightOcclusion && Light && GetOwner())
+	if (bTraceKeyLightOcclusion && Light && LightStrength > 0 && GetOwner())
 	{
 		FCollisionQueryParams Params(SCENE_QUERY_STAT(CharacterKeyLight), false, GetOwner());
 		const USkeletalMeshComponent* Mesh = PreviewMesh.IsValid() ? PreviewMesh.Get() : TargetMesh.Get();
@@ -421,7 +893,7 @@ bool UGGYGOCharacterRenderComponent::UsesEditorSceneLighting() const
 {
 #if WITH_EDITOR
 	// 独立材质球和 BP 的 EditorPreview 使用 MI 的明确预览值；仅关卡 Editor 世界消费真实场景灯。
-	return !IsTemplate() && IsActive() && bPreviewSceneLighting && GetWorld()
+	return !IsTemplate() && IsActive() && bPreviewSceneLighting && !bEditorPreviewSuspendedForPIE && GetWorld()
 		&& GetWorld()->WorldType == EWorldType::Editor;
 #else
 	return false;
@@ -542,6 +1014,12 @@ void UGGYGOCharacterRenderComponent::RefreshEditorLighting()
 		FailRendering(Error);
 		return;
 	}
+	bool bAdditional = false;
+	if (!ValidateAdditionalMaterialContract(bAdditional, Error) || bAdditional)
+	{
+		FailRendering(Error.IsEmpty() ? TEXT("附加灯材质不能由九CPD完整运输；须明确使用TransientMaterials预览") : Error);
+		return;
+	}
 	const ACharacter* Character = Cast<ACharacter>(GetOwner());
 	USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
 	// OnRegister/Construction 重建中 Mesh 尚未注册是原生暂态，复用本组件 Tick 等真正就绪。
@@ -608,6 +1086,110 @@ void UGGYGOCharacterRenderComponent::RefreshEditorLighting()
 }
 
 #if WITH_EDITOR
+void UGGYGOCharacterRenderComponent::BindEditorLifecycle()
+{
+	if (IsTemplate() || !GetWorld() || GetWorld()->WorldType != EWorldType::Editor || PackagePreSaveHandle.IsValid()) return;
+	PackagePreSaveHandle = UPackage::PreSavePackageWithContextEvent.AddUObject(this, &ThisClass::HandleEditorPackagePreSave);
+	PrePIEHandle = FEditorDelegates::PreBeginPIE.AddUObject(this, &ThisClass::HandleEditorPrePIE);
+	EndPIEHandle = FEditorDelegates::EndPIE.AddUObject(this, &ThisClass::HandleEditorEndPIE);
+	UndoRedoHandle = FEditorDelegates::PostUndoRedo.AddUObject(this, &ThisClass::HandleEditorPostUndoRedo);
+}
+
+void UGGYGOCharacterRenderComponent::UnbindEditorLifecycle()
+{
+	UPackage::PreSavePackageWithContextEvent.Remove(PackagePreSaveHandle);
+	FEditorDelegates::PreBeginPIE.Remove(PrePIEHandle);
+	FEditorDelegates::EndPIE.Remove(EndPIEHandle);
+	FEditorDelegates::PostUndoRedo.Remove(UndoRedoHandle);
+	PackagePreSaveHandle.Reset(); PrePIEHandle.Reset(); EndPIEHandle.Reset(); UndoRedoHandle.Reset();
+	bResumeEditorPreview = false;
+	bEditorPreviewSuspendedForPIE = false;
+}
+
+void UGGYGOCharacterRenderComponent::RestoreSerializedPreviewOverrides()
+{
+	if (IsTemplate() || !GetWorld() || GetWorld()->WorldType != EWorldType::Editor) return;
+	const ACharacter* Character = Cast<ACharacter>(GetOwner());
+	USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+	if (!Mesh) return;
+	const TArray<FName> Names = Mesh->GetMaterialSlotNames();
+	for (int32 Index = 0; Index < Mesh->OverrideMaterials.Num(); ++Index)
+	{
+		auto* MID = Cast<UMaterialInstanceDynamic>(Mesh->OverrideMaterials[Index]);
+		auto* Data = MID ? Cast<UGGYGOCharacterPreviewMaterialData>(MID->GetAssetUserDataOfClass(UGGYGOCharacterPreviewMaterialData::StaticClass())) : nullptr;
+		if (Data && Data->OwnerActor == GetOwner() && Data->ComponentName == GetFName() && Data->SlotIndex == Index)
+		{
+			const bool bSameSlot = Data->MeshAsset == Mesh->GetSkeletalMeshAsset()
+				&& Names.IsValidIndex(Index) && Data->SlotName == Names[Index];
+			// 同ReleaseMaterials：只消费本槽创建凭据；换网格后仅清自有孤立覆盖。
+			Mesh->SetMaterial(Index, bSameSlot ? Data->OriginalOverride.Get() : nullptr);
+		}
+	}
+}
+
+void UGGYGOCharacterRenderComponent::ResumeEditorPreview()
+{
+	if (!UsesEditorSceneLighting() || bEditorPreviewSuspendedForPIE) return;
+	const ACharacter* Character = Cast<ACharacter>(GetOwner());
+	const USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+	if (!Mesh) return;
+	for (const auto& Slot : MaterialSlots)
+	{
+		const int32 Index = Mesh->GetMaterialIndex(Slot.SlotName);
+		if (Index == INDEX_NONE || Mesh->GetMaterial(Index) != Slot.Material) return;
+	}
+	bResumeEditorPreview = true;
+	SetComponentTickInterval(LightingUpdateInterval);
+	SetComponentTickEnabled(true);
+}
+
+void UGGYGOCharacterRenderComponent::HandleEditorPackagePreSave(UPackage* Package, FObjectPreSaveContext)
+{
+	const ACharacter* Character = Cast<ACharacter>(GetOwner());
+	USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+	if (!UsesEditorMaterialPreview() || !Mesh || (Package != GetWorld()->GetPackage()
+		&& Package != GetOwner()->GetPackage() && Package != Mesh->GetPackage())) return;
+	ReleaseMaterials();
+	RestoreSerializedPreviewOverrides();
+	// 保存成功或失败均只在原Tick且GIsSavingPackage退出后恢复；不在序列化栈内装回MID。
+	ResumeEditorPreview();
+}
+
+void UGGYGOCharacterRenderComponent::HandleEditorPrePIE(bool)
+{
+	ReleaseMaterials();
+	RestoreSerializedPreviewOverrides();
+	bEditorPreviewSuspendedForPIE = true;
+	bResumeEditorPreview = false;
+}
+
+void UGGYGOCharacterRenderComponent::HandleEditorEndPIE(bool)
+{
+	bEditorPreviewSuspendedForPIE = false;
+	if (UsesEditorMaterialPreview()) ResumeEditorPreview();
+	else if (UsesEditorSceneLighting()) RefreshMaterials();
+}
+
+void UGGYGOCharacterRenderComponent::HandleEditorPostUndoRedo()
+{
+	if (!GetWorld() || GetWorld()->WorldType != EWorldType::Editor) return;
+	ReleaseMaterials();
+	RestoreSerializedPreviewOverrides();
+	ResumeEditorPreview();
+}
+
+void UGGYGOCharacterRenderComponent::PreEditUndo()
+{
+	ReleaseMaterials();
+	Super::PreEditUndo();
+}
+
+void UGGYGOCharacterRenderComponent::PostEditUndo()
+{
+	Super::PostEditUndo();
+	if (IsValid(this) && IsRegistered()) HandleEditorPostUndoRedo();
+}
+
 void UGGYGOCharacterRenderComponent::PostEditChangeProperty(FPropertyChangedEvent& PropertyChangedEvent)
 {
 	ReleaseMaterials();

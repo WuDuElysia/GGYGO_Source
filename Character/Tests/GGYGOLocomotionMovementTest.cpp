@@ -4,6 +4,7 @@
 #include "Character/Data/GGYGOLocomotionMotionProfile.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
+#include "Character/Data/GGYGOLocomotionSteeringEvaluation.h"
 #include "Components/BoxComponent.h"
 #include "Components/CapsuleComponent.h"
 #include "Components/SkeletalMeshComponent.h"
@@ -12,7 +13,9 @@
 #include "Input/GGYGOMovementInputTypes.h"
 #include "InputAction.h"
 #include "Misc/AutomationTest.h"
+#include "UObject/Class.h"
 #include "UObject/StrongObjectPtr.h"
+#include "UObject/Package.h"
 #endif
 
 AGGYGOLocomotionTestCharacter::AGGYGOLocomotionTestCharacter(const FObjectInitializer& ObjectInitializer)
@@ -26,6 +29,24 @@ AGGYGOLocomotionTestCharacter::AGGYGOLocomotionTestCharacter(const FObjectInitia
 #if WITH_DEV_AUTOMATION_TESTS
 namespace
 {
+	/** 仅接收 CreateWorld 自建的 World 及其独占 Package，成功与早退共用同一释放路径。 */
+	struct FLocomotionTestWorldCleanup
+	{
+		FAutomationTestBase& Test;
+		UWorld* World;
+		TStrongObjectPtr<UPackage> Package;
+		FLocomotionTestWorldCleanup(FAutomationTestBase& InTest, UWorld* InWorld)
+			: Test(InTest), World(InWorld), Package(InWorld->GetPackage()) {}
+		~FLocomotionTestWorldCleanup()
+		{
+			const FString WorldPath = World->GetPathName();
+			World->DestroyWorld(false);
+			Package->SetDirtyFlag(false);
+			Test.AddInfo(FString::Printf(TEXT("自建 World 已归还：World='%s', Package='%s', DirtyAfter=%d"),
+				*WorldPath, *Package->GetPathName(), Package->IsDirty()));
+		}
+	};
+
 	// Synthetic upstream protocol values exercise only the public CMC consumer.
 	// They do not certify physical input or PlayerInput request issuance.
 	class FLocomotionMovementConsumerFixture
@@ -237,7 +258,7 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 		.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
 	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
 	if (!TestNotNull(TEXT("World"), World)) return false;
-	struct FCleanup { UWorld* World; ~FCleanup() { World->DestroyWorld(false); } } Cleanup{World};
+	FLocomotionTestWorldCleanup Cleanup(*this, World);
 
 	AGGYGOLocomotionTestCharacter* Character = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
 	if (!TestNotNull(TEXT("Character"), Character)) return false;
@@ -729,30 +750,101 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 	if (!TestTrue(TEXT("RunOut 挂接原原生源"), HandoffNative.IsValid()
 		&& HandoffNative->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct())) return false;
 	const auto HandoffOrigin = static_cast<const FRootMotionSource_GGYGOCurve&>(*HandoffNative).Origin;
+	FGGYGOTurnBackRetriggerHandle HandoffHandle;
+	bool bHasHandoffHandle = false;
+	if (!TestFalse(TEXT("空 handle 不授予资格"), HandoffMove->OpenTurnBackRetrigger({}))) return false;
 	bool bSawNativeExit = false, bSawOwnedZeroTail = false, bSawFreeTrajectory = false, bSawSourceEnd = false;
+	bool bSawLockedEntryDirection = false, bSawBlockedRetrigger = false;
+	const FVector HandoffRunOutInput(0.0, 2048.0, 0.0);
 	float HandoffTotalYaw = 0.0f;
+	bool bSawTailFacingLag = false;
 	for (int32 Step = 0; Step < 64 && !bSawSourceEnd; ++Step)
 	{
-		HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, HandoffReverse);
+		// 首段换侧向输入；RunOut 先探测关闭的反向资格，再持续换向验证尾段角速度。
+		const bool bProbeClosedSignal = bSawNativeExit && !bSawBlockedRetrigger;
+		const FVector TickInput = bProbeClosedSignal ? -HandoffCharacter->GetActorForwardVector() * 2048.0
+			: (bSawBlockedRetrigger ? FVector(2048.0, 0.0, 0.0) : HandoffRunOutInput);
+		const float BeforeIntervalYaw = HandoffCharacter->GetActorRotation().Yaw;
+		HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, TickInput);
 		HandoffTime += HandoffDelta;
+		if (bProbeClosedSignal)
+		{
+			bSawBlockedRetrigger = true;
+			if (!TestTrue(TEXT("RunOut 信号前反向不重触发"), HandoffMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::RunOut
+				&& HandoffMove->GetTestSequence() == HandoffOrigin->MotionSequence)) return false;
+		}
 		const auto Completed = HandoffMove->GetMotionExecutionSnapshot();
-		if (!TestTrue(TEXT("RunOut 原源区间完整旋转合同"), Completed.Status == EGGYGOMotionExecutionStatus::Valid
+		const bool bCompleteRotationContract = Completed.Status == EGGYGOMotionExecutionStatus::Valid
 			&& Completed.OriginalLocomotionOrigin == HandoffOrigin
 			&& Completed.RotationMode == EGGYGOMotionRotationMode::SourceYaw && Completed.bCurveYawApplied
 			&& Completed.RotationAfter.Equals(FRotator(0.0f, Completed.RequestedYawDeltaDegrees, 0.0f).Quaternion()
-				* Completed.RotationBefore, 1.e-4))) return false;
+				* Completed.RotationBefore, 1.e-4);
+		if (!bCompleteRotationContract)
+		{
+			FSavedMove_GGYGO FailureMove;
+			FNetworkPredictionData_Client_GGYGO FailurePrediction(*HandoffMove);
+			FailureMove.SetMoveFor(HandoffCharacter, HandoffDelta, TickInput, FailurePrediction);
+			const auto Native = HandoffMove->GetRootMotionSource(TEXT("GGYGO.CurveTurnBack"));
+			const auto* Curve = Native.IsValid() && Native->GetScriptStruct() == FRootMotionSource_GGYGOCurve::StaticStruct()
+				? static_cast<const FRootMotionSource_GGYGOCurve*>(Native.Get()) : nullptr;
+			AddError(FString::Printf(TEXT("RunOut 合同失败 Step=%d Status=%d Diagnostic='%s' SameOrigin=%d NativeOriginMatches=%d "
+				"Motion=%d Phase=%d Request=%llu OriginRequest=%llu Sequence=%u OriginSequence=%u CurrentSequence=%u NativePrepared=%d NativeFinished=%d "
+				"CapturedInput=%d CapturedPrepared=%d PreparedInputMatches=%d RotationMode=%d Applied=%d "
+				"SourceInterval=[%.9g,%.9g] Yaw=%.9g Before=%s After=%s Velocity=%s Acceleration=%s World='%s' Package='%s'"),
+				Step, static_cast<int32>(Completed.Status), *Completed.Diagnostic, Completed.OriginalLocomotionOrigin == HandoffOrigin,
+				Curve && Curve->Origin == HandoffOrigin, static_cast<int32>(Completed.MotionType), static_cast<int32>(HandoffMove->GetTurnBackPhase()),
+				static_cast<unsigned long long>(Completed.ExecutionRequestSerial), static_cast<unsigned long long>(HandoffOrigin->ExecutionRequestSerial),
+				Completed.MotionSequence, HandoffOrigin->MotionSequence, HandoffMove->GetTestSequence(),
+				Native.IsValid() && Native->Status.HasFlag(ERootMotionSourceStatusFlags::Prepared),
+				Native.IsValid() && Native->Status.HasFlag(ERootMotionSourceStatusFlags::Finished),
+				FailureMove.SavedCurveRootMotionInput.IsValid(), FailureMove.SavedCurveRootMotionPrepared.IsValid(),
+				Curve && Curve->Prepared.IsValid() && Curve->Prepared->Input == FailureMove.SavedCurveRootMotionInput,
+				static_cast<int32>(Completed.RotationMode), Completed.bCurveYawApplied, Completed.MotionStartSeconds, Completed.MotionEndSeconds,
+				Completed.RequestedYawDeltaDegrees, *Completed.RotationBefore.ToString(), *Completed.RotationAfter.ToString(),
+				*HandoffMove->Velocity.ToString(), *HandoffMove->GetCurrentAcceleration().ToString(), *World->GetPathName(), *World->GetPackage()->GetPathName()));
+		}
+		if (!TestTrue(TEXT("RunOut 原源区间完整旋转合同"), bCompleteRotationContract)) return false;
+		if (!bHasHandoffHandle)
+		{
+			const int32 StrongCountBeforeHandle = HandoffOrigin.GetSharedReferenceCount();
+			if (!TestTrue(TEXT("已消费的本次转身可取得独立信号 handle"), HandoffMove->TryGetTurnBackRetriggerHandle(HandoffHandle))) return false;
+			bHasHandoffHandle = true;
+			FGGYGOTurnBackRetriggerHandle CopiedHandle, EmptyHandle;
+			FGGYGOTurnBackRetriggerHandle::StaticStruct()->CopyScriptStruct(&CopiedHandle, &HandoffHandle);
+			if (!TestTrue(TEXT("蓝图结构复制与比较保留原段身份"), CopiedHandle == HandoffHandle
+				&& FGGYGOTurnBackRetriggerHandle::StaticStruct()->CompareScriptStruct(&CopiedHandle, &HandoffHandle, 0)
+				&& !FGGYGOTurnBackRetriggerHandle::StaticStruct()->CompareScriptStruct(&CopiedHandle, &EmptyHandle, 0)
+				&& FGGYGOTurnBackRetriggerHandle::StaticStruct()->CompareScriptStruct(&EmptyHandle, &EmptyHandle, 0))) return false;
+			if (!TestEqual(TEXT("保存及反射复制 handle 不增加 Origin 强持有"),
+				HandoffOrigin.GetSharedReferenceCount(), StrongCountBeforeHandle)) return false;
+		}
 		HandoffTotalYaw += Completed.RequestedYawDeltaDegrees;
+		if (Completed.TurnBackPhase == EGGYGOTurnBackPhase::Turning || Completed.TurnBackPhase == EGGYGOTurnBackPhase::Braking)
+		{
+			bSawLockedEntryDirection = true;
+			if (!TestTrue(TEXT("首段换键仍使用入场位移基准"), FMath::Abs(HandoffMove->Velocity.Y) < 0.01)) return false;
+		}
 		if (Completed.bNativeSourceFinished && !Completed.bEnded)
 		{
 			bSawNativeExit = true;
-			if (!TestTrue(TEXT("RMS 退出保原正向小动量，未伪造反向速度"), HandoffMove->Velocity.X > 0.0
-				&& HandoffMove->Velocity.Size2D() < 20.0)) return false;
+			if (!TestTrue(TEXT("D1 按当前侧向输入和原曲线速度跑出，胶囊同向"),
+				FMath::Abs(HandoffMove->Velocity.X) < 0.01 && HandoffMove->Velocity.Y > 150.0
+					&& FVector::DotProduct(HandoffCharacter->GetActorForwardVector(), HandoffMove->Velocity.GetSafeNormal2D()) > 0.9999)) return false;
 		}
 		if (bSawNativeExit && !Completed.bHasNativeSourceInterval && !Completed.bEnded)
 		{
 			bSawOwnedZeroTail = true;
-			if (!TestTrue(TEXT("原源零 Yaw 尾段不让普通朝向改写"), Completed.RequestedYawDeltaDegrees == 0.0f
-				&& Completed.RotationAfter.Equals(Completed.RotationBefore, 1.e-4))) return false;
+			float Budget = 0.0f;
+			FString BudgetError;
+			const float FacingError = FMath::FindDeltaAngleDegrees(BeforeIntervalYaw, HandoffMove->Velocity.Rotation().Yaw);
+			if (!TestTrue(TEXT("RunOut 尾段使用原角速度配置"), GGYGOLocomotionSteeringEvaluation::EvaluateAngularBudget(*HandoffSet,
+				FacingError, HandoffMove->GetWalkRunBlendAlpha(), HandoffDelta, Budget, BudgetError))) { AddError(BudgetError); return false; }
+			const float ActualStep = FMath::Abs(FMath::FindDeltaAngleDegrees(BeforeIntervalYaw, HandoffCharacter->GetActorRotation().Yaw));
+			if (!TestTrue(FString::Printf(TEXT("RunOut 同源零 Yaw 完整消费且胶囊总角步长受限 Step=%d Actual=%.9g Budget=%.9g"), Step, ActualStep, Budget),
+				Completed.RequestedYawDeltaDegrees == 0.0f && Completed.RotationAfter.Equals(Completed.RotationBefore, 1.e-4)
+				&& ActualStep <= Budget + 1.e-3f)) return false;
+			bSawTailFacingLag |= FMath::Abs(FMath::FindDeltaAngleDegrees(HandoffCharacter->GetActorRotation().Yaw,
+				HandoffMove->Velocity.Rotation().Yaw)) > 0.1f;
 			bSawFreeTrajectory |= FMath::Abs(HandoffMove->Velocity.Y) > 1.0;
 		}
 		bSawSourceEnd = Completed.bEnded;
@@ -760,10 +852,11 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 			Completed.EndReason, EGGYGOMotionExecutionEndReason::Completed)) return false;
 	}
 	if (!TestTrue(TEXT("RMS 与整源寿命分开、RunOut 轨迹仍自由且原 Yaw 完整"),
-		bSawNativeExit && bSawOwnedZeroTail && bSawFreeTrajectory && bSawSourceEnd
-			&& FMath::IsNearlyEqual(HandoffTotalYaw, 180.0f, 0.01f))) return false;
+		bSawLockedEntryDirection && bSawBlockedRetrigger && bSawNativeExit && bSawOwnedZeroTail && bSawFreeTrajectory && bSawSourceEnd
+			&& bSawTailFacingLag && FMath::IsNearlyEqual(HandoffTotalYaw, 180.0f, 0.01f))) return false;
 	const float HandoffEndYaw = HandoffCharacter->GetActorRotation().Yaw;
-	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, FVector(0.0, 2048.0, 0.0));
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, FVector(2048.0, 0.0, 0.0));
+	HandoffTime += HandoffDelta;
 	const auto Successor = HandoffMove->GetMotionExecutionSnapshot();
 	if (!TestTrue(TEXT("原源结束后才由已准入普通转向接回"),
 		Successor.Status == EGGYGOMotionExecutionStatus::Valid
@@ -771,7 +864,62 @@ bool FGGYGOLocomotionMovementTest::RunTest(const FString& Parameters)
 			&& !Successor.OriginalLocomotionOrigin.IsValid() && !Successor.bCurveYawApplied
 			&& HandoffMove->GetLocomotionSteeringSnapshot().Status == EGGYGOLocomotionSteeringStatus::Valid
 			&& FMath::Abs(FMath::FindDeltaAngleDegrees(HandoffEndYaw, HandoffCharacter->GetActorRotation().Yaw)) > 1.0f)) return false;
+	// 同一输入请求内再次反向，尚未收到独立信号，不能靠离开阈值或原片结束自动解闩。
+	const uint16 FinishedSequence = HandoffMove->GetTestSequence();
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, -HandoffCharacter->GetActorForwardVector() * 2048.0);
+	HandoffTime += HandoffDelta;
+	if (!TestTrue(TEXT("未开放资格不再次转身"), HandoffMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::None
+		&& HandoffMove->GetTestSequence() == FinishedSequence)) return false;
+	if (!TestFalse(TEXT("已离开的旧段信号拒绝"), HandoffMove->OpenTurnBackRetrigger(HandoffHandle))) return false;
+
+	// 新输入请求开始后，沿同一真实 native 链检验信号前后及同类型新段的 Origin 隔离。
+	if (!HandoffSource.StartFreshRequest(TEXT("独立再次触发信号"))) return false;
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, HandoffCharacter->GetActorForwardVector() * 2048.0);
+	HandoffTime += HandoffDelta;
+	HandoffMove->RequestRunOnNextMove();
+	const FVector SecondReverse = -HandoffCharacter->GetActorForwardVector() * 2048.0;
+	FGGYGOTurnBackRetriggerHandle SecondHandle;
+	for (int32 Step = 0; Step < 64 && HandoffMove->GetTurnBackPhase() != EGGYGOTurnBackPhase::RunOut; ++Step)
+	{
+		HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, SecondReverse);
+		HandoffTime += HandoffDelta;
+		if (Step == 1)
+		{
+			if (!TestTrue(TEXT("首段取得本段 handle"), HandoffMove->TryGetTurnBackRetriggerHandle(SecondHandle))) return false;
+			const auto LockedPhase = HandoffMove->GetTurnBackPhase();
+			if (!TestTrue(TEXT("独立信号可提前开放，重复幂等，不切 RunOut"), HandoffMove->OpenTurnBackRetrigger(SecondHandle)
+				&& HandoffMove->OpenTurnBackRetrigger(SecondHandle) && HandoffMove->GetTurnBackPhase() == LockedPhase)) return false;
+		}
+	}
+	if (!TestTrue(TEXT("独立信号不妨碍原曲线正常切 RunOut"), HandoffMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::RunOut)) return false;
+	const uint16 SecondSequence = HandoffMove->GetTestSequence();
+	const FVector ThirdReverse = -HandoffCharacter->GetActorForwardVector() * 2048.0;
+	for (int32 Step = 0; Step < 2; ++Step)
+	{
+		HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, ThirdReverse);
+		HandoffTime += HandoffDelta;
+	}
+	if (!TestTrue(TEXT("开放后反向在原片结束前进入新转身"), HandoffMove->GetTurnBackPhase() == EGGYGOTurnBackPhase::Turning
+		&& HandoffMove->GetTestSequence() != SecondSequence && HandoffMove->GetTestMotionTime() < 0.1f)) return false;
+	if (!TestFalse(TEXT("旧转身 handle 不得开放后继资格"), HandoffMove->OpenTurnBackRetrigger(SecondHandle))) return false;
+	FSavedMove_GGYGO SignalSaved;
+	FNetworkPredictionData_Client_GGYGO SignalPrediction(*HandoffMove);
+	SignalSaved.SetMoveFor(HandoffCharacter, HandoffDelta, ThirdReverse, SignalPrediction);
+	if (!TestTrue(TEXT("新段已重新消费资格，SavedMove 保存当前闩"), SignalSaved.bSavedTurnBackInputLatched)) return false;
+	FGGYGOTurnBackRetriggerHandle ReleasedHandle, CopiedReleasedHandle;
+	if (!TestTrue(TEXT("归还前取得真实当前段观察值"), HandoffMove->TryGetTurnBackRetriggerHandle(ReleasedHandle))) return false;
+	FGGYGOTurnBackRetriggerHandle::StaticStruct()->CopyScriptStruct(&CopiedReleasedHandle, &ReleasedHandle);
+	const TWeakPtr<const FGGYGOCurveRootMotionOrigin> ReleasedOrigin =
+		HandoffMove->GetMotionExecutionSnapshot().OriginalLocomotionOrigin;
+	if (!TestTrue(TEXT("归还前原生源仍存活"), ReleasedOrigin.IsValid())) return false;
+	SignalSaved.Clear();
 	if (!HandoffSource.Close()) return false;
+	// 原输入退役后的下一次真实 native move 清理 RMS／Prepared／完成快照；观察副本不参与退休。
+	HandoffMove->MoveAutonomous(HandoffTime, HandoffDelta, 0, FVector::ZeroVector);
+	if (!TestFalse(TEXT("原生资源归还后 BP 观察副本不延长 Origin 寿命"), ReleasedOrigin.IsValid())) return false;
+	if (!TestTrue(TEXT("过期副本保持反射值相等"), ReleasedHandle == CopiedReleasedHandle
+		&& FGGYGOTurnBackRetriggerHandle::StaticStruct()->CompareScriptStruct(&ReleasedHandle, &CopiedReleasedHandle, 0))) return false;
+	if (!TestFalse(TEXT("过期观察值不授予再次触发资格"), HandoffMove->OpenTurnBackRetrigger(ReleasedHandle))) return false;
 
 	return true;
 }
@@ -787,11 +935,7 @@ bool FGGYGOLocomotionInputConsumerModeTest::RunTest(const FString& Parameters)
 		.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
 	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
 	if (!TestNotNull(TEXT("Consumer protocol world"), World)) return false;
-	struct FProtocolWorldCleanup
-	{
-		UWorld* World;
-		~FProtocolWorldCleanup() { World->DestroyWorld(false); }
-	} WorldCleanup{World};
+	FLocomotionTestWorldCleanup WorldCleanup(*this, World);
 
 	// Only owns original public binding resources; no physical or execution state.
 	struct FConsumerBindingCleanup
@@ -1011,11 +1155,7 @@ bool FGGYGOLocomotionFailedRequestRecoveryTest::RunTest(const FString& Parameter
 		.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
 	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
 	if (!TestNotNull(TEXT("Failed recovery world"), World)) return false;
-	struct FRecoveryWorldCleanup
-	{
-		UWorld* World;
-		~FRecoveryWorldCleanup() { World->DestroyWorld(false); }
-	} WorldCleanup{World};
+	FLocomotionTestWorldCleanup WorldCleanup(*this, World);
 
 	AGGYGOLocomotionTestCharacter* Character = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
 	if (!TestNotNull(TEXT("Failed recovery character"), Character)) return false;

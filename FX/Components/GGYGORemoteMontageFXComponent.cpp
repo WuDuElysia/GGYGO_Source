@@ -20,6 +20,10 @@ void UGGYGORemoteMontageFXComponent::InitializePresentation(UGGYGOMontageFXPubli
 #endif
 	Playback = Record;
 	ResourceGeneration = Generation;
+	FString FieldError;
+	if (!ConfigureField(Record.FieldSettings, FieldError)) { FailPresentation(FieldError); return; }
+	if (!ConfigureSceneLightingSource(Record.Avatar, FieldError)) { FailPresentation(FieldError); return; }
+	OnEffectFailed.AddUObject(this, &ThisClass::HandleEffectFailed);
 	bAutoActivate = false;
 	SetAutoDestroy(false);
 	bAllowAnyoneToDestroyMe = true;
@@ -38,6 +42,78 @@ void UGGYGORemoteMontageFXComponent::InitializePresentation(UGGYGOMontageFXPubli
 	OnSystemFinished.AddUniqueDynamic(this, &ThisClass::HandlePresentationFinished);
 }
 
+bool UGGYGORemoteMontageFXComponent::InitializeLocalPresentation(UGGYGOMontageFXPublicationOwner* Owner,
+	const FGGYGOFXSourceIdentity& Source, const FGGYGOMontageFXRecord& Request, double BeginWorldTime, FString& OutError)
+{
+	if (!IsValid(Owner) || ResourceOwner.IsValid() || LocalCapability.IsValid() || bTransferred || !IsValid(Request.Avatar)
+		|| (Request.Avatar->GetLocalRole() != ROLE_Authority && Request.Avatar->GetLocalRole() != ROLE_AutonomousProxy)
+		|| !Request.Validate(OutError)
+		|| !FMath::IsFinite(BeginWorldTime) || BeginWorldTime < 0.)
+	{ if (OutError.IsEmpty()) { OutError = TEXT("本地 FX 缺原 publisher、事件时间或本机运动来源。"); } return false; }
+	const TStrongObjectPtr<UGGYGOMontageFXPublicationOwner> OriginalOwner(Owner);
+	const TWeakObjectPtr<ThisClass> Self(this);
+	bLocalProducer = true;
+	LocalBeginWorldTime = BeginWorldTime;
+	ResourceOwner = Owner;
+	const auto Capability = Owner->RegisterLocalProducer(this, EGGYGOFXSourceKind::Locomotion,
+		Request.Avatar, Request.Avatar->GetWorld(),
+		FSimpleDelegate::CreateUObject(this, &ThisClass::ReleasePresentation, EGGYGONiagaraEffectStopMode::DestroyImmediately), OutError, Source);
+	if (!Capability.IsValid()) { ResourceOwner.Reset(); return false; }
+	LocalCapability = Capability;
+	InitializePresentation(Owner, Request, 0);
+	if (!Self.IsValid() || bTransferred || ResourceOwner.Get() != Owner)
+	{ OriginalOwner->SealLocalProducer(Capability); OriginalOwner->FlushResourceChanges(); return false; }
+#if WITH_EDITOR
+	for (const auto& Weak : Owner->ObservationWindows)
+	{ if (const auto Window = Weak.Pin()) { AddObservationWindow(Window); } }
+#endif
+	FGGYGOMontageFXLocalStartTicket Ticket;
+	const auto Result = Owner->RequestLocalStart(Capability, Ticket, OutError);
+	if (!Self.IsValid() || bTransferred || ResourceOwner.Get() != Owner)
+	{
+		OriginalOwner->CancelLocalStart(Ticket);
+		OriginalOwner->SealLocalProducer(Capability);
+		OriginalOwner->FlushResourceChanges();
+		return false;
+	}
+	LocalStartTicket = Ticket;
+	if (Result == EGGYGOMontageFXLocalStartResult::DedicatedServerNoPresentation)
+	{ ReleasePresentation(EGGYGONiagaraEffectStopMode::DestroyImmediately); return true; }
+	if ((Result != EGGYGOMontageFXLocalStartResult::ReadyToActivate
+		&& Result != EGGYGOMontageFXLocalStartResult::WaitingForRemoteRelease) || !Ticket.IsSet())
+	{ ReleasePresentation(EGGYGONiagaraEffectStopMode::DestroyImmediately); return false; }
+	if (!Owner->ObserveLocalProducerStart(Ticket, FSimpleDelegate::CreateUObject(this, &ThisClass::HandleLocalStartReady)))
+	{ OutError = TEXT("本地 FX 原 Ticket 就绪观察未安装。"); ReleasePresentation(EGGYGONiagaraEffectStopMode::DestroyImmediately); return false; }
+	return true;
+}
+
+void UGGYGORemoteMontageFXComponent::HandleLocalStartReady()
+{
+	const TStrongObjectPtr<UGGYGOMontageFXPublicationOwner> Owner(ResourceOwner.Get());
+	if (!Owner.IsValid() || bTransferred) { return; }
+	const TWeakObjectPtr<ThisClass> Self(this);
+	const auto Result = Owner->ConsumeLocalStart(LocalStartTicket);
+	if (!Self.IsValid() || bTransferred || ResourceOwner.Get() != Owner.Get()) { return; }
+	if (Result == EGGYGOMontageFXPermitResult::AlreadyConsumed || Result == EGGYGOMontageFXPermitResult::StillWaiting) { return; }
+	if (Result != EGGYGOMontageFXPermitResult::Granted)
+	{ FailPresentation(TEXT("本地 FX 原 Ticket 未获激活许可。")); return; }
+	const auto Capability = LocalCapability;
+	Owner->BeginLocalOperation(Capability);
+	Owner->SetLocalOwnership(Capability, true);
+	StartPresentation();
+	Owner->EndLocalOperation(Capability);
+	Owner->FlushResourceChanges();
+}
+
+bool UGGYGORemoteMontageFXComponent::CanPresent() const
+{
+	if (!ResourceOwner.IsValid() || !GetEffectFailure().IsEmpty()) { return false; }
+	if (!bLocalProducer) { return ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration); }
+	return !bTransferred && IsValid(Playback.Avatar) && !Playback.Avatar->IsActorBeingDestroyed()
+		&& (Playback.Avatar->GetLocalRole() == ROLE_Authority || Playback.Avatar->GetLocalRole() == ROLE_AutonomousProxy)
+		&& ResourceOwner->HasLocalPermit(LocalStartTicket);
+}
+
 #if WITH_EDITOR
 void UGGYGORemoteMontageFXComponent::ReadObservation(FGGYGOMontageFXObservationFact& Fact) const
 {
@@ -49,7 +125,7 @@ void UGGYGORemoteMontageFXComponent::ReadObservation(FGGYGOMontageFXObservationF
 	Fact.Occurrence = Playback.Occurrence;
 	Fact.Generation = ResourceGeneration;
 	Fact.OwnerRegistration = ObservationRegistration;
-	Fact.bHasRecord = true;
+	Fact.bHasRecord = !bLocalProducer || Playback.Occurrence != 0;
 	Fact.Avatar = Playback.Avatar.Get();
 	Fact.Mesh = Playback.Mesh.Get();
 	Fact.System = Playback.System.Get();
@@ -58,7 +134,7 @@ void UGGYGORemoteMontageFXComponent::ReadObservation(FGGYGOMontageFXObservationF
 	if (const auto* Mesh = Playback.Mesh.Get())
 	{ Fact.MeshObjectId = Mesh->GetUniqueID(); Fact.MeshPath = Mesh->GetPathName(); }
 	Fact.SystemPath = GetPathNameSafe(Playback.System.Get());
-	Fact.BeginServerTime = Playback.BeginServerTime;
+	Fact.BeginServerTime = Fact.bHasRecord ? Playback.BeginServerTime : 0.;
 	Fact.RemoteSeekDeltaSeconds = Playback.RemoteSeekDeltaSeconds;
 	Fact.RemoteMaxSimTimeSeconds = Playback.RemoteMaxSimTimeSeconds;
 	Fact.DesiredAge = GetDesiredAge();
@@ -68,12 +144,17 @@ void UGGYGORemoteMontageFXComponent::ReadObservation(FGGYGOMontageFXObservationF
 	Fact.bRegistered = IsRegistered();
 	Fact.bTailTransferred = bObservationTailTransferred;
 	Fact.bNaturalCompletion = bNaturalCompletion || bObservationNaturalCompletion;
-	Fact.bFailed = bFailed;
+	Fact.bFailed = bFailed || !GetEffectFailure().IsEmpty();
 	if (const auto* System = Playback.System.Get())
 	{ Fact.EffectiveStep = System->HasFixedTickDelta() ? System->GetFixedTickDeltaTime() : Playback.RemoteSeekDeltaSeconds; }
 	if (const UWorld* World = GetWorld())
 	{
-		if (const AGameStateBase* GameState = World->GetGameState())
+		if (bLocalProducer)
+		{
+			Fact.TargetAge = World->GetTimeSeconds() - LocalBeginWorldTime;
+			Fact.bTargetAgeValid = FMath::IsFinite(Fact.TargetAge) && Fact.TargetAge >= 0.;
+		}
+		else if (const AGameStateBase* GameState = World->GetGameState())
 		{
 			Fact.TargetAge = GameState->GetServerWorldTimeSeconds() - Playback.BeginServerTime;
 			Fact.bTargetAgeValid = FMath::IsFinite(Fact.TargetAge) && Fact.TargetAge >= 0.;
@@ -122,9 +203,10 @@ void UGGYGORemoteMontageFXComponent::AppendObservation(EGGYGOMontageFXObservatio
 
 void UGGYGORemoteMontageFXComponent::StartPresentation()
 {
+	if (bFailed) { return; }
 	const TWeakObjectPtr<ThisClass> Self(this);
 	UWorld* World = GetWorld();
-	if (!World || !ResourceOwner.IsValid() || !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration)) { return; }
+	if (!World || !CanPresent()) { return; }
 	FString Error;
 	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateCompiledSystem(Playback.System, Error))
 	{ FailPresentation(Error); return; }
@@ -142,7 +224,7 @@ void UGGYGORemoteMontageFXComponent::StartPresentation()
 	}
 	RegisterComponentWithWorld(World);
 	if (!Self.IsValid()) { return; }
-	if (!ResourceOwner.IsValid() || !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration))
+	if (!CanPresent())
 	{ DestroyComponent(); return; }
 	// Mesh 注册可晚于引用映射；使用此组件原本的 Tick 等待，不新建轮询任务。
 	SetComponentTickEnabled(true);
@@ -152,6 +234,7 @@ void UGGYGORemoteMontageFXComponent::RefreshSourceReferences(const FGGYGOMontage
 {
 	if (Record.Occurrence != Playback.Occurrence || Playback.Space != EGGYGONiagaraEffectSpace::World) { return; }
 	// 同一原复制记录的 GUID 重新映射；保留既有世界变换及模拟，不查当前 Pawn。
+	// field 资产须全部映射才创建本实例，配置已一次提交；这里不改活动材质配置。
 	Playback.Avatar = Record.Avatar;
 	Playback.Mesh = Record.Mesh;
 }
@@ -162,16 +245,26 @@ void UGGYGORemoteMontageFXComponent::TickComponent(float Delta, ELevelTick TickT
 	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Owner = ResourceOwner;
 	const uint64 Key = Playback.Occurrence;
 	const uint64 Generation = ResourceGeneration;
+	const auto Capability = LocalCapability;
+	const bool bLocal = bLocalProducer;
 	if (!Owner.IsValid()) { DestroyComponent(); return; }
-	Owner->BeginRemoteOperation(Key, Generation);
+	if (bLocal) { Owner->BeginLocalOperation(Capability); }
+	else { Owner->BeginRemoteOperation(Key, Generation); }
 	RestoreAge(Delta, TickType, Tick);
-	if (Owner.IsValid()) { Owner->EndRemoteOperation(Key, Generation); }
+	if (Owner.IsValid())
+	{
+		if (bLocal) { Owner->EndLocalOperation(Capability); Owner->FlushResourceChanges(); }
+		else { Owner->EndRemoteOperation(Key, Generation); }
+	}
 }
 
 void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType, FActorComponentTickFunction* Tick)
 {
+	const FString RuntimeFailure = GetEffectFailure();
+	if (!RuntimeFailure.IsEmpty()) { FailPresentation(RuntimeFailure); return; }
+	if (bLocalProducer && !CanPresent()) { DestroyComponent(); return; }
 	if (bReached) { Super::TickComponent(Delta, TickType, Tick); return; }
-	if (!ResourceOwner.IsValid() || !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration))
+	if (!CanPresent())
 	{ SetRenderingEnabled(false); return; } // 缺条目尚无 Terminal：保持隐藏等准确终结。
 	if (!IsValid(Playback.Mesh) || !Playback.Mesh->IsRegistered()) { return; }
 	FString CompilationError;
@@ -180,9 +273,12 @@ void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType
 	if (Playback.Space == EGGYGONiagaraEffectSpace::Attached && !Playback.SocketName.IsNone()
 		&& !Playback.Mesh->DoesSocketExist(Playback.SocketName))
 	{ FailPresentation(TEXT("Required original socket does not exist.")); return; }
-	const AGameStateBase* GameState = GetWorld()->GetGameState();
-	if (!GameState) { return; }
-	const double Age = GameState->GetServerWorldTimeSeconds() - Playback.BeginServerTime;
+	const UWorld* World = GetWorld();
+	if (!World) { return; }
+	const AGameStateBase* GameState = World->GetGameState();
+	if (!bLocalProducer && !GameState) { return; }
+	const double Age = bLocalProducer ? World->GetTimeSeconds() - LocalBeginWorldTime
+		: GameState->GetServerWorldTimeSeconds() - Playback.BeginServerTime;
 	if (!FMath::IsFinite(Age) || Age < 0.) { return; } // 时钟未到达原 Begin，不换成 Age0。
 	const float Step = Playback.System->HasFixedTickDelta() ? Playback.System->GetFixedTickDeltaTime()
 		: Playback.RemoteSeekDeltaSeconds;
@@ -194,18 +290,16 @@ void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType
 	{
 		bActivationRequested = true;
 		Activate(true);
-		if (!Self.IsValid() || !ResourceOwner.IsValid()
-			|| !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration)) { return; }
+		if (!Self.IsValid() || !CanPresent()) { return; }
 	}
 	Super::TickComponent(Delta, TickType, Tick);
-	if (!Self.IsValid() || !ResourceOwner.IsValid()
-		|| !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration)) { return; }
+	if (!Self.IsValid() || !CanPresent()) { return; }
 	const auto OriginalController = GetSystemInstanceController();
 	if (!OriginalController.IsValid()) { return; }
 	OriginalController->WaitForConcurrentTickAndFinalize();
-	if (!Self.IsValid() || GetSystemInstanceController() != OriginalController || !ResourceOwner.IsValid()
-		|| !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration)) { return; }
+	if (!Self.IsValid() || GetSystemInstanceController() != OriginalController || !CanPresent()) { return; }
 	if (OriginalController->IsComplete() || OriginalController->IsPendingSpawn()
+		|| !AreSceneMaterialsApplied()
 		|| !Playback.System->IsReadyToRun()
 		|| OriginalController->GetActualExecutionState() != ENiagaraExecutionState::Active
 		|| OriginalController->GetRequestedExecutionState() != ENiagaraExecutionState::Active
@@ -216,8 +310,7 @@ void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType
 	SetDesiredAge(static_cast<float>(Age));
 	SetAgeUpdateMode(OriginalAgeMode);
 	SetRenderingEnabled(bOriginalRendering);
-	if (!Self.IsValid() || !ResourceOwner.IsValid()
-		|| !ResourceOwner->CanRestore(Playback.Occurrence, ResourceGeneration)) { return; }
+	if (!Self.IsValid() || !CanPresent()) { return; }
 	SetForceSolo(bOriginalForceSolo);
 }
 
@@ -229,6 +322,29 @@ EGGYGONiagaraEffectStopMode UGGYGORemoteMontageFXComponent::GetStopMode(EGGYGOMo
 void UGGYGORemoteMontageFXComponent::ReleasePresentation(EGGYGONiagaraEffectStopMode Mode)
 {
 	if (bTransferred) { return; }
+	if (bLocalProducer)
+	{
+		const TStrongObjectPtr<UGGYGOMontageFXPublicationOwner> Owner(ResourceOwner.Get());
+		const auto Capability = LocalCapability;
+		const auto Ticket = LocalStartTicket;
+		const auto Callback = MoveTemp(LocalClosed);
+		LocalClosed.Unbind();
+		if (Owner.IsValid())
+		{ Owner->BeginLocalOperation(Capability); Owner->CancelLocalStart(Ticket); Owner->SealLocalProducer(Capability); }
+		bTransferred = true;
+		ResourceOwner.Reset();
+		OnSystemFinished.RemoveDynamic(this, &ThisClass::HandlePresentationFinished);
+		const TWeakObjectPtr<ThisClass> Self(this);
+		const bool bReturned = UGGYGOAbilityTask_PlayNiagaraEffect::StopComponent(this,
+			bReached ? Mode : EGGYGONiagaraEffectStopMode::DestroyImmediately,
+			[Self] { return Self.IsValid() && !Self->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed); });
+		if (!bReturned)
+		{ UE_LOG(LogGGYGORemoteFX, Error, TEXT("原本地 FX 停止策略无效，销毁其原组件。")); if (Self.IsValid()) { Self->DestroyComponent(); } }
+		if (Owner.IsValid())
+		{ Owner->SetLocalOwnership(Capability, false); Owner->EndLocalOperation(Capability); Owner->FlushResourceChanges(); }
+		Callback.ExecuteIfBound(this, !bReturned);
+		return;
+	}
 	bTransferred = true;
 	ResourceOwner.Reset();
 #if WITH_EDITOR
@@ -258,6 +374,8 @@ void UGGYGORemoteMontageFXComponent::ReleasePresentation(EGGYGONiagaraEffectStop
 void UGGYGORemoteMontageFXComponent::HandlePresentationFinished(UNiagaraComponent* Component)
 {
 	if (Component != this) { return; }
+	const FString Failure = GetEffectFailure();
+	if (!Failure.IsEmpty()) { FailPresentation(Failure); return; }
 #if WITH_EDITOR
 	bObservationNaturalCompletion = true;
 	AppendObservation(EGGYGOMontageFXObservationKind::NaturalCompleted);
@@ -269,9 +387,16 @@ void UGGYGORemoteMontageFXComponent::HandlePresentationFinished(UNiagaraComponen
 
 void UGGYGORemoteMontageFXComponent::FailPresentation(const FString& Reason)
 {
+	if (bFailed) { return; }
 	bFailed = true;
 	UE_LOG(LogGGYGORemoteFX, Error, TEXT("Remote Montage FX %llu: %s"), Playback.Occurrence, *Reason);
 	DestroyComponent();
+}
+
+void UGGYGORemoteMontageFXComponent::HandleEffectFailed(
+	UGGYGOFXNiagaraComponent* Component, const FString& Reason)
+{
+	if (Component == this && !bTransferred) { FailPresentation(Reason); }
 }
 
 void UGGYGORemoteMontageFXComponent::OnUnregister()
@@ -279,25 +404,49 @@ void UGGYGORemoteMontageFXComponent::OnUnregister()
 	const auto Owner = ResourceOwner;
 	const uint64 Key = Playback.Occurrence;
 	const uint64 Generation = ResourceGeneration;
-	if (Owner.IsValid()) { Owner->BeginRemoteOperation(Key, Generation); }
+	const auto Capability = LocalCapability;
+	const auto Ticket = LocalStartTicket;
+	const bool bLocal = bLocalProducer;
+	const bool bCompleted = bNaturalCompletion;
+	const bool bWasFailed = bFailed;
+	const auto Callback = MoveTemp(LocalClosed);
+	LocalClosed.Unbind();
+	if (Owner.IsValid())
+	{
+		if (bLocal) { Owner->BeginLocalOperation(Capability); Owner->CancelLocalStart(Ticket); Owner->SealLocalProducer(Capability); }
+		else { Owner->BeginRemoteOperation(Key, Generation); }
+	}
 	ResourceOwner.Reset();
 	OnSystemFinished.RemoveDynamic(this, &ThisClass::HandlePresentationFinished);
+	OnEffectFailed.RemoveAll(this);
 	Super::OnUnregister();
 #if WITH_EDITOR
 	AppendObservation(EGGYGOMontageFXObservationKind::ComponentUnregistered);
 #endif
 	if (Owner.IsValid())
 	{
-		Owner->RemoteDestroyed(Key, Generation, bNaturalCompletion, bFailed);
-		Owner->EndRemoteOperation(Key, Generation);
+		if (bLocal)
+		{ Owner->SetLocalOwnership(Capability, false); Owner->EndLocalOperation(Capability); Owner->FlushResourceChanges(); }
+		else { Owner->RemoteDestroyed(Key, Generation, bCompleted, bWasFailed); Owner->EndRemoteOperation(Key, Generation); }
 	}
+	Callback.ExecuteIfBound(this, bWasFailed);
 }
 
 void UGGYGORemoteMontageFXComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
 {
 	const auto Owner = ResourceOwner;
+	const auto Capability = LocalCapability;
+	const auto Ticket = LocalStartTicket;
+	const bool bLocal = bLocalProducer;
+	const uint64 Key = Playback.Occurrence;
+	const uint64 Generation = ResourceGeneration;
+	const bool bCompleted = bNaturalCompletion;
+	const bool bWasFailed = bFailed;
+	const auto Callback = MoveTemp(LocalClosed);
+	LocalClosed.Unbind();
 	ResourceOwner.Reset();
 	OnSystemFinished.RemoveDynamic(this, &ThisClass::HandlePresentationFinished);
+	OnEffectFailed.RemoveAll(this);
 	Super::OnComponentDestroyed(bDestroyingHierarchy);
 #if WITH_EDITOR
 	AppendObservation(EGGYGOMontageFXObservationKind::ComponentDestroyed, true);
@@ -305,6 +454,9 @@ void UGGYGORemoteMontageFXComponent::OnComponentDestroyed(bool bDestroyingHierar
 	if (Owner.IsValid())
 	{
 		// 未完成 Register 的失败也有实际销毁事实，不能只等 OnUnregister。
-		Owner->RemoteDestroyed(Playback.Occurrence, ResourceGeneration, bNaturalCompletion, bFailed);
+		if (bLocal)
+		{ Owner->CancelLocalStart(Ticket); Owner->SealLocalProducer(Capability); Owner->SetLocalOwnership(Capability, false); Owner->FlushResourceChanges(); }
+		else { Owner->RemoteDestroyed(Key, Generation, bCompleted, bWasFailed); }
 	}
+	Callback.ExecuteIfBound(this, bWasFailed);
 }

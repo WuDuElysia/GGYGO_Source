@@ -1,28 +1,67 @@
-/** @file GGYGOAbilityTask_WaitComboInput.cpp */
+/** @file GGYGOAbilityTask_WaitComboInput.cpp @brief 原步骤订阅、真入场一次提交及 owned 数据派发。 */
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_WaitComboInput.h"
 #include "AbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "CoreGlobals.h"
+#include "Engine/World.h"
+#include "GameFramework/Actor.h"
+#include "Serialization/Archive.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilityTask_WaitComboInput)
 
+bool FGGYGOAbilityStepInputTargetData::NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess)
+{
+	(void)Map;
+	if (Ar.IsLoading()) OwnedRequest = {};
+	uint8 KindValue = static_cast<uint8>(Kind);
+	uint8 StateValue = static_cast<uint8>(StepFact.InputState);
+	Ar << KindValue << SourceStep << RequestId;
+	Ar << StepFact.SourceSessionSerial << StepFact.OriginalEdgeEvaluationSerial << StepFact.StepEvaluationSerial;
+	Ar << StateValue << StepFact.ActionValue.X << StepFact.ActionValue.Y << StepFact.ControlYaw;
+	if (Ar.IsLoading())
+	{
+		Kind = static_cast<EGGYGOAbilityStepInputKind>(KindValue);
+		StepFact.InputState = static_cast<EGGYGOMovementInputRequestQueryResult>(StateValue);
+	}
+	bOutSuccess = !Ar.IsError() && HasValidFields();
+	return bOutSuccess;
+}
+
+bool FGGYGOAbilityStepInputTargetData::HasValidFields() const
+{
+	const bool bInitial = Kind == EGGYGOAbilityStepInputKind::Initial;
+	if (!(bInitial ? SourceStep == INDEX_NONE && RequestId == 0
+		: Kind == EGGYGOAbilityStepInputKind::Continue && SourceStep >= 0 && SourceStep <= 65535
+			&& RequestId > 0 && RequestId <= 65535)) return false;
+	const bool bHeld = StepFact.InputState == EGGYGOMovementInputRequestQueryResult::Held;
+	const bool bNotHeld = StepFact.InputState == EGGYGOMovementInputRequestQueryResult::NotHeld;
+	return StepFact.SourceSessionSerial != 0 && StepFact.OriginalEdgeEvaluationSerial != 0
+		&& StepFact.StepEvaluationSerial >= StepFact.OriginalEdgeEvaluationSerial && (bHeld || bNotHeld)
+		&& FMath::IsFinite(StepFact.ActionValue.X) && FMath::IsFinite(StepFact.ActionValue.Y)
+		&& FMath::IsFinite(StepFact.ControlYaw)
+		&& (!bNotHeld || (StepFact.ActionValue.X == 0.0 && StepFact.ActionValue.Y == 0.0));
+}
+
 struct UGGYGOAbilityTask_WaitComboInput::FNativeCallbackRegistration
 {
-	explicit FNativeCallbackRegistration(FGGYGOComboInputNativeDelegate&& InCallback)
-		: Handle(FDelegateHandle::GenerateNewHandle), Callback(MoveTemp(InCallback)) {}
+	FNativeCallbackRegistration(FGGYGOComboInputNativeDelegate&& InCallback, FSimpleDelegate&& InUnavailable)
+		: Handle(FDelegateHandle::GenerateNewHandle), Callback(MoveTemp(InCallback)), InitialUnavailable(MoveTemp(InUnavailable)) {}
 
 	const FDelegateHandle Handle;
 	const FGGYGOComboInputNativeDelegate Callback;
+	const FSimpleDelegate InitialUnavailable;
 };
 
 struct UGGYGOAbilityTask_WaitComboInput::FOriginalInputSubscription
 {
 	FOriginalInputSubscription(UAbilitySystemComponent* InASC, UGameplayAbility* InAbility,
 		FGameplayAbilitySpecHandle InSpec, FPredictionKey InKey, bool bInRemote, bool bInPredicting,
-		FDelegateHandle InHandle)
+		FDelegateHandle InHandle, FDelegateHandle InCancelHandle, const FGGYGOAbilityActivationHandle& InActivation)
 		: ASC(InASC), OwningAbility(InAbility), Spec(InSpec), PredictionKey(InKey),
-		bRemote(bInRemote), bPredicting(bInPredicting), Handle(InHandle) {}
+		bRemote(bInRemote), bPredicting(bInPredicting), Handle(InHandle), CancellationHandle(InCancelHandle), Activation(InActivation) {}
 
-	// This immutable resource locates one task subscription, never a GA activation identity.
+	// 桶定位与已签发原激活分别保存；Task 不签发或更新激活身份。
 	const TWeakObjectPtr<UAbilitySystemComponent> ASC;
 	const TWeakObjectPtr<UGameplayAbility> OwningAbility;
 	const FGameplayAbilitySpecHandle Spec;
@@ -30,14 +69,41 @@ struct UGGYGOAbilityTask_WaitComboInput::FOriginalInputSubscription
 	const bool bRemote;
 	const bool bPredicting;
 	const FDelegateHandle Handle;
+	const FDelegateHandle CancellationHandle;
+	const FGGYGOAbilityActivationHandle Activation;
 };
 
 UGGYGOAbilityTask_WaitComboInput* UGGYGOAbilityTask_WaitComboInput::WaitComboInput(UGameplayAbility* OwningAbility)
 {
-	return NewAbilityTask<UGGYGOAbilityTask_WaitComboInput>(OwningAbility);
+	UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(OwningAbility);
+	UGGYGOAbilitySystemComponent* ASC = ProjectAbility ? Cast<UGGYGOAbilitySystemComponent>(ProjectAbility->GetAbilitySystemComponentFromActorInfo()) : nullptr;
+	if (!ASC) return nullptr;
+	FString Error;
+	const auto Route = ASC->CaptureInitialInputRoute(ProjectAbility, ProjectAbility->CaptureCurrentActivation(), Error);
+	return WaitComboInput(OwningAbility, Route);
 }
 
-FDelegateHandle UGGYGOAbilityTask_WaitComboInput::RegisterNativeCallback(FGGYGOComboInputNativeDelegate Callback)
+UGGYGOAbilityTask_WaitComboInput* UGGYGOAbilityTask_WaitComboInput::WaitComboInput(
+	UGameplayAbility* OwningAbility, const FGGYGOAbilityInitialInputRoute& InitialRoute)
+{
+	const TWeakObjectPtr<UGGYGOGameplayAbility> OriginalAbility(Cast<UGGYGOGameplayAbility>(OwningAbility));
+	const auto Original = OriginalAbility.IsValid() ? OriginalAbility->CaptureCurrentActivation() : FGGYGOAbilityActivationHandle{};
+	if (!Original.HasActivation()) return nullptr;
+	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(OriginalAbility->GetAbilitySystemComponentFromActorInfo());
+	FString Error;
+	const auto Canonical = ASC ? ASC->CaptureInitialInputRoute(OriginalAbility.Get(), Original, Error) : FGGYGOAbilityInitialInputRoute{};
+	if (!InitialRoute.HasSameRoute(Canonical)) return nullptr;
+	auto* Task = NewAbilityTask<UGGYGOAbilityTask_WaitComboInput>(OwningAbility);
+	if (!Task) return nullptr;
+	if (!OriginalAbility.IsValid() || !OriginalAbility->CaptureCurrentActivation().HasSameActivation(Original))
+	{ Task->EndTask(); return nullptr; }
+	Task->OriginalActivationIdentity = Original.GetResourceIdentity();
+	Task->InitialInputRoute = InitialRoute;
+	return Task;
+}
+
+FDelegateHandle UGGYGOAbilityTask_WaitComboInput::RegisterNativeCallback(
+	FGGYGOComboInputNativeDelegate Callback, FSimpleDelegate InitialUnavailable)
 {
 	check(IsInGameThread());
 	const TCHAR* Reason = nullptr;
@@ -47,7 +113,7 @@ FDelegateHandle UGGYGOAbilityTask_WaitComboInput::RegisterNativeCallback(FGGYGOC
 		Reason = TEXT("Task is not in its original pre-Ready AwaitingActivation state");
 	}
 	else if (NativeCallbackRegistration.IsValid()) { Reason = TEXT("a native callback is already registered"); }
-	else if (!Callback.IsBound()) { Reason = TEXT("the native callback is not bound"); }
+	else if (!Callback.IsBound() || !InitialUnavailable.IsBound()) { Reason = TEXT("owned 请求及 Initial 不可提供回调均须绑定"); }
 	if (Reason)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error,
@@ -58,7 +124,7 @@ FDelegateHandle UGGYGOAbilityTask_WaitComboInput::RegisterNativeCallback(FGGYGOC
 
 	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
 	const FString OriginalPath = GetPathName();
-	TSharedPtr<FNativeCallbackRegistration> Registration = MakeShared<FNativeCallbackRegistration>(MoveTemp(Callback));
+	TSharedPtr<FNativeCallbackRegistration> Registration = MakeShared<FNativeCallbackRegistration>(MoveTemp(Callback), MoveTemp(InitialUnavailable));
 	// Moving delegate captures may run external code; install only after it has returned.
 	UGGYGOAbilityTask_WaitComboInput* Task = OriginalTask.Get();
 	if (!Task || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || Task->bActivationStarted
@@ -87,55 +153,74 @@ bool UGGYGOAbilityTask_WaitComboInput::UnregisterNativeCallback(FDelegateHandle 
 
 void UGGYGOAbilityTask_WaitComboInput::Activate()
 {
-	if (bEndingTask || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| GetState() == EGameplayTaskState::Finished) { return; }
+	if (bEndingTask || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed) || GetState() == EGameplayTaskState::Finished) return;
 	if (bActivationStarted)
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("WaitComboInput [%s] rejected repeated Activate: the original subscription cannot be reused."), *GetPathName());
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("WaitComboInput [%s] 重复 Ready 被拒绝。"), *GetPathName());
 		return;
 	}
 	bActivationStarted = true;
 	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
-	FSimpleMulticastDelegate::FDelegate InputCallback =
-		FSimpleMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::HandlePress);
-	// Capture every bucket/mode value once, before Super or synchronous GAS callbacks.
-	const TSharedPtr<FOriginalInputSubscription> Subscription = MakeShared<FOriginalInputSubscription>(
-		AbilitySystemComponent.Get(), Ability, GetAbilitySpecHandle(), GetActivationPredictionKey(),
-		IsForRemoteClient(), IsPredictingClient(), InputCallback.GetHandle());
-	if (!Subscription->ASC.IsValid() || !Subscription->OwningAbility.IsValid()
-		|| !Subscription->Spec.IsValid() || !Subscription->Handle.IsValid())
+	const bool bRemote = IsForRemoteClient();
+	const UGGYGOGameplayAbility* OriginalAbility = Cast<UGGYGOGameplayAbility>(Ability);
+	const auto OriginalActivation = OriginalAbility ? OriginalAbility->CaptureCurrentActivation() : FGGYGOAbilityActivationHandle{};
+	if (!OriginalActivation.HasActivation() || OriginalActivation.GetResourceIdentity() != OriginalActivationIdentity)
 	{
-		RejectAndEndTask(TEXT("missing ASC/owning ability or invalid original Spec/delegate handle"), Subscription);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("WaitComboInput [%s] Ready 不属于创建时原激活。"), *GetPathName());
+		EndTask();
 		return;
 	}
-	// A zero prediction key is legal: it is an event bucket locator, not an identity proof.
+	FSimpleMulticastDelegate::FDelegate LocalCallback;
+	FSimpleMulticastDelegate::FDelegate CancelCallback;
+	FAbilityTargetDataSetDelegate::FDelegate RemoteCallback;
+	if (bRemote)
+	{
+		RemoteCallback = FAbilityTargetDataSetDelegate::FDelegate::CreateUObject(this, &ThisClass::HandleTargetData);
+		CancelCallback = FSimpleMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::HandleInitialUnavailable);
+	}
+	else LocalCallback = FSimpleMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::HandlePress);
+	const auto Subscription = MakeShared<FOriginalInputSubscription>(
+		AbilitySystemComponent.Get(), Ability, GetAbilitySpecHandle(), GetActivationPredictionKey(),
+		bRemote, IsPredictingClient(), bRemote ? RemoteCallback.GetHandle() : LocalCallback.GetHandle(),
+		CancelCallback.GetHandle(), OriginalActivation);
+	if (!Subscription->ASC.IsValid() || !Subscription->OwningAbility.IsValid()
+		|| !Subscription->Spec.IsValid() || !Subscription->Handle.IsValid() || !Subscription->Activation.HasActivation()
+		|| (bRemote && !Subscription->CancellationHandle.IsValid()))
+	{ RejectAndEndTask(TEXT("原 ASC/Ability/Spec/订阅不存在"), Subscription); return; }
 	Super::Activate();
 	UGGYGOAbilityTask_WaitComboInput* Task = OriginalTask.Get();
 	if (!Task || Task->bEndingTask || Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| Task->GetState() == EGameplayTaskState::Finished) { return; }
+		|| Task->GetState() == EGameplayTaskState::Finished) return;
 	if (!Subscription->ASC.IsValid() || !Subscription->OwningAbility.IsValid()
 		|| !Subscription->ASC.HasSameIndexAndSerialNumber(Task->AbilitySystemComponent)
 		|| !Subscription->OwningAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Task->Ability))
+		|| !OriginalAbility->CaptureCurrentActivation().HasSameActivation(Subscription->Activation)
 		|| !Task->ShouldBroadcastAbilityTaskDelegates())
-	{
-		Task->RejectAndEndTask(TEXT("original input source changed or owning ability ended before subscription"), Subscription);
-		return;
-	}
+	{ Task->RejectAndEndTask(TEXT("Ready 返回后原来源失效"), Subscription); return; }
 	Task->OriginalInputSubscription = Subscription;
 	UAbilitySystemComponent* ASC = Subscription->ASC.Get();
-	// This GAS accessor/Add does not invoke callbacks. The delegate's exact handle was captured above.
-	ASC->AbilityReplicatedEventDelegate(EAbilityGenericReplicatedEvent::InputPressed,
-		Subscription->Spec, Subscription->PredictionKey).Add(MoveTemp(InputCallback));
-	// 不测试 Spec.InputPressed，首次激活的按下不算下一段请求。
-	if (Subscription->bRemote)
+	if (bRemote)
 	{
-		const bool bReplayed = ASC->CallReplicatedEventDelegateIfSet(
-			EAbilityGenericReplicatedEvent::InputPressed, Subscription->Spec, Subscription->PredictionKey);
+		ASC->AbilityTargetDataSetDelegate(Subscription->Spec, Subscription->PredictionKey).Add(MoveTemp(RemoteCallback));
+		ASC->AbilityTargetDataCancelledDelegate(Subscription->Spec, Subscription->PredictionKey).Add(MoveTemp(CancelCallback));
+		ASC->CallReplicatedTargetDataDelegatesIfSet(Subscription->Spec, Subscription->PredictionKey);
 		Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-		if (Task && !bReplayed) { Task->SetWaitingOnRemotePlayerData(); }
-		// Waiting may call into the ability. No old task access follows.
+		if (Task && !Task->bInitialReceived) Task->SetWaitingOnRemotePlayerData();
+		return;
 	}
+	ASC->AbilityReplicatedEventDelegate(EAbilityGenericReplicatedEvent::InputPressed,
+		Subscription->Spec, Subscription->PredictionKey).Add(MoveTemp(LocalCallback));
+	// 首次请求只取原受控激活来源，不读 Spec.InputPressed 或合成续击。
+	UGGYGOAbilitySystemComponent* ProjectASC = Cast<UGGYGOAbilitySystemComponent>(ASC);
+	FString Error;
+	const auto Initial = ProjectASC ? ProjectASC->CaptureStepInputRequest(Task,
+		Cast<UGGYGOGameplayAbility>(Subscription->OwningAbility.Get()),
+		EGGYGOAbilityStepInputKind::Initial, INDEX_NONE, 0, Error) : FGGYGOAbilityStepInputRequest{};
+	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task) return;
+	if (!Initial.HasRequest())
+	{ Task->RejectAndEndTask(Error.IsEmpty() ? TEXT("缺少原首次输入请求") : *Error, Subscription); return; }
+	Task->DispatchRequest(Initial, Subscription);
 }
 
 UGGYGOAbilityTask_WaitComboInput* UGGYGOAbilityTask_WaitComboInput::RecheckOriginalSubscription(
@@ -152,6 +237,12 @@ UGGYGOAbilityTask_WaitComboInput* UGGYGOAbilityTask_WaitComboInput::RecheckOrigi
 		|| !Subscription->OwningAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Task->Ability)))
 	{
 		Task->RejectAndEndTask(TEXT("original input subscription/ASC/owner is invalid or changed"), Subscription);
+		return nullptr;
+	}
+	const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Subscription->OwningAbility.Get());
+	if (!ProjectAbility || !ProjectAbility->CaptureCurrentActivation().HasSameActivation(Subscription->Activation))
+	{
+		Task->RejectAndEndTask(TEXT("原 Task 激活已结束或被同实例后继替换"), Subscription);
 		return nullptr;
 	}
 	// GAS owns activity; a caller's native closure owns the original activation check.
@@ -174,61 +265,167 @@ void UGGYGOAbilityTask_WaitComboInput::RejectAndEndTask(
 void UGGYGOAbilityTask_WaitComboInput::HandlePress()
 {
 	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
-	const TSharedPtr<FOriginalInputSubscription> Subscription = OriginalInputSubscription;
+	const auto Subscription = OriginalInputSubscription;
 	UGGYGOAbilityTask_WaitComboInput* Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-	if (!Task) { return; }
-	UAbilitySystemComponent* ASC = Subscription->ASC.Get();
-	const FString OriginalPath = Task->GetPathName();
-	FScopedPredictionWindow Prediction(ASC, Subscription->bPredicting);
+	if (!Task || Subscription->bRemote) return;
+	if (Task->LocalRequestId >= 65535)
+	{ Task->RejectAndEndTask(TEXT("原输入请求序号耗尽"), Subscription); return; }
+	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(Subscription->ASC.Get());
+	const int32 OriginalSourceStep = Task->SourceStep;
+	const int32 RequestId = Task->LocalRequestId + 1;
+	FString Error;
+	const auto Request = ASC ? ASC->CaptureStepInputRequest(Task,
+		Cast<UGGYGOGameplayAbility>(Subscription->OwningAbility.Get()),
+		EGGYGOAbilityStepInputKind::Continue, OriginalSourceStep, RequestId, Error) : FGGYGOAbilityStepInputRequest{};
 	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-	if (!Task) { return; }
-	int32 RequestStep = Task->SourceStep; // SourceStep remains mutable for later combo steps.
-	int32 RequestId = 0;
-	if (Subscription->bRemote)
+	if (!Task) return;
+	// 只消费本次 local edge；网络等真入场样本完成后走 TargetData。
+	Subscription->ASC->ConsumeGenericReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed,
+		Subscription->Spec, Subscription->PredictionKey);
+	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task) return;
+	if (!Request.HasRequest())
 	{
-		const FAbilityReplicatedData Data = ASC->GetReplicatedDataOfGenericReplicatedEvent(
-			EAbilityGenericReplicatedEvent::InputPressed, Subscription->Spec, Subscription->PredictionKey);
-		// GAS 通用事件提供 VectorPayload；这里只传精确的小整数 X=段序、Y=请求序号。
-		const FVector& Payload = Data.VectorPayload;
-		if (!FMath::IsFinite(Payload.X) || !FMath::IsFinite(Payload.Y)
-			|| Payload.X < 0.0 || Payload.X > 65535.0 || Payload.Y < 1.0 || Payload.Y > 65535.0
-			|| Payload.X != FMath::FloorToDouble(Payload.X) || Payload.Y != FMath::FloorToDouble(Payload.Y))
-		{
-			UE_LOG(LogGGYGOAbilitySystem, Error,
-				TEXT("WaitComboInput [%s] rejected InputPressed payload: original ASC [%s], Spec [%s], PredictionKey [%s], X=%g Y=%g; expected integer X in [0,65535], Y in [1,65535]."),
-				*OriginalPath, *GetNameSafe(ASC), *Subscription->Spec.ToString(), *Subscription->PredictionKey.ToString(),
-				static_cast<double>(Payload.X), static_cast<double>(Payload.Y));
-			ASC->ConsumeGenericReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed,
-				Subscription->Spec, Subscription->PredictionKey);
-			return;
-		}
-		RequestStep = FMath::RoundToInt(Data.VectorPayload.X);
-		RequestId = FMath::RoundToInt(Data.VectorPayload.Y);
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("WaitComboInput [%s] 拒绝非本次真实 Press 来源：%s。"),
+			*Task->GetPathName(), Error.IsEmpty() ? TEXT("原 Press edge 不可用") : *Error);
+		return;
+	}
+	Task->LocalRequestId = RequestId;
+	Task->DispatchRequest(Request, Subscription);
+}
+
+void UGGYGOAbilityTask_WaitComboInput::HandleTargetData(
+	const FGameplayAbilityTargetDataHandle& Data, FGameplayTag ApplicationTag)
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
+	const auto Subscription = OriginalInputSubscription;
+	UGGYGOAbilityTask_WaitComboInput* Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task || !Subscription->bRemote) return;
+	FGGYGOAbilityStepInputRequest Request;
+	if (Data.Num() == 1 && !ApplicationTag.IsValid() && Data.Get(0)
+		&& Data.Get(0)->GetScriptStruct() == FGGYGOAbilityStepInputTargetData::StaticStruct())
+	{
+		// 复制 owned 封装后再 Consume；不跨缓存清理借用 Data。
+		Request = static_cast<const FGGYGOAbilityStepInputTargetData*>(Data.Get(0))->OwnedRequest;
+	}
+	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task) return;
+	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(Subscription->ASC.Get());
+	if (ASC)
+	{
+		FGameplayAbilityTargetDataHandle Cached;
+		ASC->GetAbilityTargetData(Subscription->Spec, Subscription->OwningAbility->GetCurrentActivationInfo(), Cached);
+		bool bSameCache = Cached.Num() == Data.Num();
+		for (int32 Index = 0; bSameCache && Index < Cached.Num(); ++Index)
+			bSameCache = Cached.Get(Index) == Data.Get(Index);
+		// 同 Spec/key 可能已有后继包；只消费仍是本次原对象集合的桶。
+		if (bSameCache) ASC->ConsumeClientReplicatedTargetData(Subscription->Spec, Subscription->PredictionKey);
+	}
+	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task) return;
+	FString Error;
+	if (!Request.HasRequest() || !Request.IsRemote() || !Request.HasSubmittedEntryFact() || !ASC
+		|| !ASC->CheckStepInputRequestForTask(Request, Subscription->OwningAbility.Get(), Subscription->Activation, Error))
+	{
+		// 旧缓存可能与后继复用 Spec/key；拒它自身，不结束后继 Task 或消费其初段状态。
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("WaitComboInput [%s] 丢弃非本原激活的 owned 数据：%s。"),
+			*Task->GetPathName(), Error.IsEmpty() ? TEXT("缺少原 ASC 受验封装") : *Error);
+		return;
+	}
+	if (Request.GetKind() == EGGYGOAbilityStepInputKind::Initial)
+	{
+		if (Task->bInitialReceived) return;
+		Task->bInitialReceived = true;
 	}
 	else
 	{
-		RequestId = ++Task->LocalRequestId;
-		if (Subscription->bPredicting)
-		{
-			ASC->ServerSetReplicatedEventWithPayload(EAbilityGenericReplicatedEvent::InputPressed,
-				Subscription->Spec, Subscription->PredictionKey, ASC->ScopedPredictionKey,
-				FVector(RequestStep, RequestId, 0.0));
-		}
+		if (!Task->bInitialReceived || Request.GetRequestId() <= Task->LastRemoteRequestId) return;
+		Task->LastRemoteRequestId = Request.GetRequestId();
 	}
+	Task->DispatchRequest(Request, Subscription);
+}
+
+void UGGYGOAbilityTask_WaitComboInput::HandleInitialUnavailable()
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
+	const auto Subscription = OriginalInputSubscription;
+	// 失败归还不要求 ResourceWork Capture；来源可能正因失效而需要结束原 pending。
+	const auto RecheckCleanupTask = [&]() -> UGGYGOAbilityTask_WaitComboInput*
+	{
+		auto* Candidate = OriginalTask.Get();
+		if (!Candidate || Candidate->bEndingTask || Candidate->GetState() == EGameplayTaskState::Finished
+			|| !Subscription.IsValid() || Candidate->OriginalInputSubscription != Subscription
+			|| !Subscription->ASC.IsValid() || !Subscription->OwningAbility.IsValid()
+			|| !Subscription->ASC.HasSameIndexAndSerialNumber(Candidate->AbilitySystemComponent)
+			|| !Subscription->OwningAbility.HasSameIndexAndSerialNumber(TWeakObjectPtr<UGameplayAbility>(Candidate->Ability))) return nullptr;
+		return Candidate;
+	};
+	UGGYGOAbilityTask_WaitComboInput* Task = RecheckCleanupTask();
+	if (!Task || !Subscription->bRemote || Task->bInitialReceived) return;
+	const FGGYGOAbilityInitialInputRoute Route = Task->InitialInputRoute;
+	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(Subscription->ASC.Get());
+	if (!ASC || !ASC->ConsumeInitialInputUnavailable(Route, Subscription->Activation)) return;
+	Task = RecheckCleanupTask();
+	if (!Task) return;
+	const auto Snapshot = Task->NativeCallbackRegistration;
+	if (!Snapshot.IsValid() || !Snapshot->InitialUnavailable.IsBound())
+	{ Task->RejectAndEndTask(TEXT("原 Initial 不可提供事实缺少 GA 消费者"), Subscription); return; }
+	Snapshot->InitialUnavailable.Execute();
+}
+
+void UGGYGOAbilityTask_WaitComboInput::DispatchRequest(const FGGYGOAbilityStepInputRequest& Request,
+	const TSharedPtr<FOriginalInputSubscription>& Subscription)
+{
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
+	UGGYGOAbilityTask_WaitComboInput* Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task) return;
+	TSharedPtr<FNativeCallbackRegistration> Snapshot = Task->NativeCallbackRegistration;
+	if (!Snapshot.IsValid())
+	{ Task->RejectAndEndTask(TEXT("原 owned 请求缺少 native 消费者"), Subscription); return; }
+	Snapshot->Callback.ExecuteIfBound(Request);
+	Snapshot.Reset();
 	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-	if (!Task) { return; }
-	// 先消费原桶，再通知；旧 Task 结束后的解绑不消费，避免清掉后继请求。
-	ASC->ConsumeGenericReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed,
-		Subscription->Spec, Subscription->PredictionKey);
+	if (Task && Request.GetKind() == EGGYGOAbilityStepInputKind::Continue)
+		Task->OnPress.Broadcast(Request.GetSourceStep(), Request.GetRequestId());
+}
+
+bool UGGYGOAbilityTask_WaitComboInput::SubmitEntryFact(const FGGYGOAbilityStepInputRequest& Request,
+	const FGGYGOMovementInputStepFact& Fact, FString& OutError)
+{
+	OutError.Reset();
+	const TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> OriginalTask(this);
+	const auto Subscription = OriginalInputSubscription;
+	UGGYGOAbilityTask_WaitComboInput* Task = RecheckOriginalSubscription(OriginalTask, Subscription);
+	if (!Task || Subscription->bRemote) { OutError = TEXT("原本地 Task 不可提交"); return false; }
+	const auto OriginalFact = Fact;
+	UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(Subscription->ASC.Get());
+	if (!ASC) { OutError = TEXT("原 ASC 不支持 owned 输入"); return false; }
+	const bool bInitial = Request.GetKind() == EGGYGOAbilityStepInputKind::Initial;
+	if ((bInitial && Task->InitialInputRoute.HasSubmittedInitial()) || (!bInitial && !Task->InitialInputRoute.HasSubmittedInitial()))
+	{ OutError = TEXT("步骤请求不符合原 Initial 一次提交后才可 Continue 的运输顺序。"); return false; }
+	if (!Subscription->bPredicting && (!ASC->GetOwnerActor() || !ASC->GetOwnerActor()->HasAuthority()))
+	{ OutError = TEXT("步骤事实需要本地 Authority 或原 LocalPredicted 发送通路。"); return false; }
+	FScopedPredictionWindow Prediction(ASC, Subscription->bPredicting);
 	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-	if (!Task) { return; }
-	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = Task->NativeCallbackRegistration;
-	if (NativeSnapshot.IsValid()) { NativeSnapshot->Callback.ExecuteIfBound(RequestStep, RequestId); }
-	NativeSnapshot.Reset(); // Captured destructors are external code too; wait for their return.
-	Task = RecheckOriginalSubscription(OriginalTask, Subscription);
-	if (!Task) { return; }
-	Task->OnPress.Broadcast(RequestStep, RequestId);
-	// Preserve the original prediction window through notification; no task writes after it unwinds.
+	if (!Task) { OutError = TEXT("预测窗口返回后原 Task 已失效"); return false; }
+	if (!ASC->CheckStepInputRequestForTask(Request, Subscription->OwningAbility.Get(), Subscription->Activation, OutError)) return false;
+	if (!ASC->CommitStepInputFact(Task, Request, OriginalFact, Task->InitialInputRoute, OutError)) return false;
+	if (Subscription->bPredicting)
+	{
+		auto* Payload = new FGGYGOAbilityStepInputTargetData;
+		Payload->Kind = Request.GetKind(); Payload->SourceStep = Request.GetSourceStep();
+		Payload->RequestId = Request.GetRequestId(); Payload->StepFact = OriginalFact;
+		const FGameplayAbilityTargetDataHandle Packet(Payload);
+		UE_LOG(LogGGYGOAbilitySystem, Display,
+			TEXT("[AbilitySystem.OwnedStepInput] Boundary=SendAttempt ASC='%s' World='%s' Spec=%s ActivationKey=%s ScopedKey=%s Kind=%u SourceStep=%d Request=%d Edge=%llu Entry=%llu Frame=%llu"),
+			*ASC->GetPathName(), *GetPathNameSafe(ASC->GetWorld()), *Subscription->Spec.ToString(),
+			*Subscription->PredictionKey.ToString(), *ASC->ScopedPredictionKey.ToString(), static_cast<uint32>(Payload->Kind),
+			Payload->SourceStep, Payload->RequestId, static_cast<unsigned long long>(OriginalFact.OriginalEdgeEvaluationSerial),
+			static_cast<unsigned long long>(OriginalFact.StepEvaluationSerial), static_cast<unsigned long long>(GFrameCounter));
+		ASC->ServerSetReplicatedTargetData(Subscription->Spec, Subscription->PredictionKey,
+			Packet, FGameplayTag{}, ASC->ScopedPredictionKey);
+	}
+	return true;
 }
 
 void UGGYGOAbilityTask_WaitComboInput::OnDestroy(bool AbilityEnded)
@@ -237,14 +434,21 @@ void UGGYGOAbilityTask_WaitComboInput::OnDestroy(bool AbilityEnded)
 	bEndingTask = true;
 	TSharedPtr<FNativeCallbackRegistration> DetachedNative = MoveTemp(NativeCallbackRegistration);
 	TSharedPtr<FOriginalInputSubscription> DetachedSubscription = MoveTemp(OriginalInputSubscription);
+	const FGGYGOAbilityInitialInputRoute EndingRoute = MoveTemp(InitialInputRoute);
 	if (DetachedSubscription.IsValid())
 	{
 		if (UAbilitySystemComponent* ASC = DetachedSubscription->ASC.Get())
 		{
-			ASC->AbilityReplicatedEventDelegate(EAbilityGenericReplicatedEvent::InputPressed,
+			if (DetachedSubscription->bRemote)
+			{
+				ASC->AbilityTargetDataSetDelegate(DetachedSubscription->Spec, DetachedSubscription->PredictionKey).Remove(DetachedSubscription->Handle);
+				ASC->AbilityTargetDataCancelledDelegate(DetachedSubscription->Spec, DetachedSubscription->PredictionKey).Remove(DetachedSubscription->CancellationHandle);
+			}
+			else ASC->AbilityReplicatedEventDelegate(EAbilityGenericReplicatedEvent::InputPressed,
 				DetachedSubscription->Spec, DetachedSubscription->PredictionKey).Remove(DetachedSubscription->Handle);
 		}
 	}
+	EndingRoute.NotifyInitialUnavailable();
 	Super::OnDestroy(AbilityEnded);
 	DetachedNative.Reset(); // Own cleanup/Super returned; no task access after capture destruction.
 }

@@ -23,13 +23,13 @@ namespace
 		}
 	}
 
-	bool ValidateWalkRunLeanTuning(const FZZZWalkRunLeanTuning& Config, FString& OutError)
+	bool ValidateLeanResponse(const FRuntimeFloatCurve& Curve, const TCHAR* FieldName, FString& OutError)
 	{
 		OutError.Reset();
-		const FRichCurve* Response = Config.DirectionErrorToLeanDegrees.GetRichCurveConst();
+		const FRichCurve* Response = Curve.GetRichCurveConst();
 		if (!Response || Response->GetNumKeys() < 2)
 		{
-			OutError = TEXT("DirectionErrorToLeanDegrees must contain an authored response covering [0,180] direction degrees");
+			OutError = FString::Printf(TEXT("%s must contain an authored response covering [0,180] camera direction degrees"), FieldName);
 			return false;
 		}
 		float FirstInput = 0.0f;
@@ -37,7 +37,7 @@ namespace
 		Response->GetTimeRange(FirstInput, LastInput);
 		if (FirstInput != 0.0f || LastInput != 180.0f || Response->Eval(0.0f) != 0.0f)
 		{
-			OutError = TEXT("DirectionErrorToLeanDegrees must cover [0,180] exactly and map zero deviation to zero lean");
+			OutError = FString::Printf(TEXT("%s must cover [0,180] exactly and map zero deviation to zero lean"), FieldName);
 			return false;
 		}
 		for (const FRichCurveKey& Key : Response->GetConstRefOfKeys())
@@ -47,16 +47,17 @@ namespace
 				|| !FMath::IsFinite(Key.ArriveTangent) || !FMath::IsFinite(Key.LeaveTangent)
 				|| !FMath::IsFinite(Key.ArriveTangentWeight) || !FMath::IsFinite(Key.LeaveTangentWeight))
 			{
-				OutError = TEXT("DirectionErrorToLeanDegrees keys/tangents must be finite with lean in [0,90) degrees");
+				OutError = FString::Printf(TEXT("%s keys/tangents must be finite with lean in [0,90) degrees"), FieldName);
 				return false;
 			}
 		}
-		if (!FMath::IsFinite(Config.RecoveryResponseSpeed) || Config.RecoveryResponseSpeed <= 0.0f)
-		{
-			OutError = TEXT("RecoveryResponseSpeed must be finite and positive for normal exit recovery");
-			return false;
-		}
 		return true;
+	}
+
+	bool ValidateWalkRunLeanTuning(const FZZZWalkRunLeanTuning& Config, FString& OutError)
+	{
+		return ValidateLeanResponse(Config.WalkDirectionErrorToLeanDegrees, TEXT("WalkDirectionErrorToLeanDegrees"), OutError)
+			&& ValidateLeanResponse(Config.RunDirectionErrorToLeanDegrees, TEXT("RunDirectionErrorToLeanDegrees"), OutError);
 	}
 
 }
@@ -69,7 +70,19 @@ void UZZZAnimInstance::NativeUpdateAnimation(float DeltaSeconds)
 {
 	Super::NativeUpdateAnimation(DeltaSeconds);
 	RefreshDecisionContext();
-	UpdateWalkRunLeanPresentation(DeltaSeconds);
+	UpdateWalkRunLeanTarget();
+}
+
+bool UZZZAnimInstance::TryGetWalkRunLeanGait(EGGYGOGait& OutGait, float& OutBlendAlpha) const
+{
+	OutGait = EGGYGOGait::None;
+	OutBlendAlpha = 0.0f;
+	if (!bWalkRunLeanPresentationValid || !bWalkRunLeanTargetApplicable) { return false; }
+	// 双资格由本次目标求值发布；图与目标只读同一捕获帧，不再读取独立复制的步态对。
+	const FGGYGOLocomotionSteeringSnapshot& Steering = GetAnimationStateFrame().LocomotionSteering;
+	OutGait = Steering.CameraTurnGait;
+	OutBlendAlpha = Steering.CameraTurnWalkRunBlendAlpha;
+	return true;
 }
 
 void UZZZAnimInstance::OnAnimationLifecycleReset()
@@ -88,19 +101,18 @@ void UZZZAnimInstance::OnAnimationLifecycleReset()
 	ActualVelocityBlendY = 0.f;
 	ActualVelocityAngle = 0.f;
 	bTurnBackRunOut = false;
-	ResetWalkRunLeanPresentation();
+	ResetWalkRunLeanTarget();
 }
 
-void UZZZAnimInstance::ResetWalkRunLeanPresentation()
+void UZZZAnimInstance::ResetWalkRunLeanTarget()
 {
 	WalkRunLeanAngleDegrees = 0.0f;
 	WalkRunLeanAxisCS = FVector::ZeroVector;
 	WalkRunLeanUpCS = FVector::ZeroVector;
 	bWalkRunLeanPresentationValid = false;
+	bWalkRunLeanTargetApplicable = false;
 	WalkRunLeanFailureReason.Reset();
 	LastWalkRunLeanFailureCode = NAME_None;
-	WalkRunLeanSource.Reset();
-	WalkRunLeanSourceEpoch = 0;
 }
 
 void UZZZAnimInstance::FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason)
@@ -109,6 +121,7 @@ void UZZZAnimInstance::FailWalkRunLeanPresentation(FName FailureCode, const FStr
 	WalkRunLeanAxisCS = FVector::ZeroVector;
 	WalkRunLeanUpCS = FVector::ZeroVector;
 	bWalkRunLeanPresentationValid = false;
+	bWalkRunLeanTargetApplicable = false;
 	WalkRunLeanFailureReason = Reason;
 	if (LastWalkRunLeanFailureCode != FailureCode)
 	{
@@ -119,31 +132,7 @@ void UZZZAnimInstance::FailWalkRunLeanPresentation(FName FailureCode, const FStr
 	}
 }
 
-void UZZZAnimInstance::RecoverWalkRunLeanPresentation(float DeltaSeconds, const FZZZWalkRunLeanTuning& Config)
-{
-	if (!FMath::IsFinite(DeltaSeconds) || DeltaSeconds < 0.0f)
-	{
-		FailWalkRunLeanPresentation(TEXT("AnimationDelta"), TEXT("normal recovery requires a finite nonnegative native animation delta"));
-		return;
-	}
-	if (!FMath::IsFinite(WalkRunLeanAngleDegrees))
-	{
-		FailWalkRunLeanPresentation(TEXT("PresentationState"), TEXT("the previous normal-recovery pose contains a non-finite angle"));
-		return;
-	}
-
-	WalkRunLeanAngleDegrees = static_cast<float>(WalkRunLeanAngleDegrees
-		* FMath::Exp(-static_cast<double>(Config.RecoveryResponseSpeed) * DeltaSeconds));
-	if (FMath::IsNearlyZero(WalkRunLeanAngleDegrees))
-	{
-		WalkRunLeanAngleDegrees = 0.0f;
-		bWalkRunLeanPresentationValid = false;
-	}
-	WalkRunLeanFailureReason.Reset();
-	LastWalkRunLeanFailureCode = NAME_None;
-}
-
-void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
+void UZZZAnimInstance::UpdateWalkRunLeanTarget()
 {
 	check(IsInGameThread());
 	const FZZZWalkRunLeanTuning& Config = Tuning.WalkRunLean;
@@ -151,7 +140,7 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 	if (!Config.bEnabled || !Frame.bLocomotionSteeringCaptured)
 	{
 		// Explicit disabled mode, or legal native initialization before a Character exists.
-		ResetWalkRunLeanPresentation();
+		ResetWalkRunLeanTarget();
 		return;
 	}
 
@@ -162,27 +151,17 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 		return;
 	}
 	const FGGYGOLocomotionSteeringSnapshot& Steering = Frame.LocomotionSteering;
-	if (Steering.Status == EGGYGOLocomotionSteeringStatus::Invalid)
+	if (!Steering.bCameraTurnRemote && Steering.Status == EGGYGOLocomotionSteeringStatus::Invalid)
 	{
-		WalkRunLeanSource.Reset();
-		WalkRunLeanSourceEpoch = 0;
 		FailWalkRunLeanPresentation(TEXT("MovementSnapshot"), Steering.Diagnostic.IsEmpty()
 			? FString(TEXT("Movement returned Invalid without a diagnostic")) : Steering.Diagnostic);
 		return;
 	}
 	if (!Steering.OriginalMovement.IsValid() || !Steering.OriginalCharacter.IsValid()
-		|| !Steering.OriginalUpdatedComponent.IsValid() || Steering.SourceEpoch == 0)
+		|| !Steering.OriginalUpdatedComponent.IsValid() || (!Steering.bCameraTurnRemote && Steering.SourceEpoch == 0))
 	{
-		WalkRunLeanSource.Reset();
-		WalkRunLeanSourceEpoch = 0;
 		FailWalkRunLeanPresentation(TEXT("OriginalSource"), TEXT("captured steering result has no live original identity or source epoch"));
 		return;
-	}
-	if (WalkRunLeanSource != Steering.OriginalMovement || WalkRunLeanSourceEpoch != Steering.SourceEpoch)
-	{
-		ResetWalkRunLeanPresentation();
-		WalkRunLeanSource = Steering.OriginalMovement;
-		WalkRunLeanSourceEpoch = Steering.SourceEpoch;
 	}
 	if (!Frame.bCapsuleMeshBasisValid || Frame.LeanAxisCS.ContainsNaN() || Frame.CapsuleUpCS.ContainsNaN())
 	{
@@ -192,46 +171,82 @@ void UZZZAnimInstance::UpdateWalkRunLeanPresentation(float DeltaSeconds)
 	WalkRunLeanAxisCS = Frame.LeanAxisCS;
 	WalkRunLeanUpCS = Frame.CapsuleUpCS;
 
-	switch (Steering.Status)
+	// 远端 camera 资格来自同一 accepted native 样本，不冒充本机普通转向完成区间。
+	switch (Steering.CameraTurnStatus)
 	{
 	case EGGYGOLocomotionSteeringStatus::Initial:
 		WalkRunLeanAngleDegrees = 0.0f;
 		bWalkRunLeanPresentationValid = false;
+		bWalkRunLeanTargetApplicable = false;
 		WalkRunLeanFailureReason.Reset();
 		LastWalkRunLeanFailureCode = NAME_None;
 		return;
 	case EGGYGOLocomotionSteeringStatus::NotApplicable:
-		// Movement owns exclusion of Action/TurnBack/no input. This is exit recovery, not a valid zero deviation.
-		RecoverWalkRunLeanPresentation(DeltaSeconds, Config);
+		// 不适用是独立事实，不伪装成有效方向零观测；图持有显示角及恢复策略。
+		WalkRunLeanAngleDegrees = 0.0f;
+		bWalkRunLeanTargetApplicable = false;
+		bWalkRunLeanPresentationValid = true;
+		WalkRunLeanFailureReason.Reset();
+		LastWalkRunLeanFailureCode = NAME_None;
 		return;
 	case EGGYGOLocomotionSteeringStatus::Valid:
-		if (Steering.CompletedIntervalSerial == 0 || !FMath::IsFinite(Steering.NativeDeltaSeconds)
-			|| Steering.NativeDeltaSeconds <= 0.0f)
+		if (Steering.bCameraTurnRemote)
 		{
-			FailWalkRunLeanPresentation(TEXT("CompletedInterval"), TEXT("Valid steering requires a completed serial and finite positive native delta"));
+			if (Steering.CameraTurnPublisherEpoch == 0 || Steering.CameraTurnPublicationSerial == 0
+				|| !FMath::IsFinite(Steering.CameraTurnNativeSampleKey))
+			{
+				FailWalkRunLeanPresentation(TEXT("CameraTurnRemoteSource"), TEXT("Valid remote camera turn requires its accepted publisher/publication identity and finite native sample key"));
+				return;
+			}
+		}
+		else if (Steering.Status != EGGYGOLocomotionSteeringStatus::Valid || Steering.CompletedIntervalSerial == 0
+			|| !FMath::IsFinite(Steering.NativeDeltaSeconds) || Steering.NativeDeltaSeconds <= 0.0f)
+		{
+			FailWalkRunLeanPresentation(TEXT("CompletedInterval"), TEXT("Valid local camera turn requires the original completed steering interval and finite positive native delta"));
 			return;
 		}
 		break;
+	case EGGYGOLocomotionSteeringStatus::Invalid:
+		FailWalkRunLeanPresentation(TEXT("CameraTurnSnapshot"), Steering.CameraTurnDiagnostic.IsEmpty()
+			? FString(TEXT("Movement returned Invalid camera turn without a diagnostic")) : Steering.CameraTurnDiagnostic);
+		return;
 	default:
-		FailWalkRunLeanPresentation(TEXT("SteeringStatus"), TEXT("captured steering status is outside the shared contract"));
+		FailWalkRunLeanPresentation(TEXT("SteeringStatus"), TEXT("captured steering or camera turn status is outside the shared contract"));
 		return;
 	}
 
-	if (!FMath::IsFinite(Steering.DesiredDirectionError) || Steering.DesiredDirectionError < -180.0f
-		|| Steering.DesiredDirectionError > 180.0f)
+	if (!FMath::IsFinite(Steering.CameraTurnDemandDegrees) || Steering.CameraTurnDemandDegrees < -180.0f
+		|| Steering.CameraTurnDemandDegrees > 180.0f)
 	{
 		FailWalkRunLeanPresentation(TEXT("DirectionValues"),
-			TEXT("DesiredDirectionError must be finite in [-180,180] degrees"));
+			TEXT("CameraTurnDemandDegrees must be finite in [-180,180] degrees"));
 		return;
 	}
 
-	const float Magnitude = Config.DirectionErrorToLeanDegrees.GetRichCurveConst()->Eval(FMath::Abs(Steering.DesiredDirectionError));
+	if (!FMath::IsFinite(Steering.CameraTurnWalkRunBlendAlpha) || Steering.CameraTurnWalkRunBlendAlpha < 0.0f
+		|| Steering.CameraTurnWalkRunBlendAlpha > 1.0f)
+	{
+		FailWalkRunLeanPresentation(TEXT("CameraTurnGait"), TEXT("CameraTurnWalkRunBlendAlpha must be the same camera record's finite [0,1] gait alpha"));
+		return;
+	}
+	const FRuntimeFloatCurve* Response = nullptr;
+	switch (Steering.CameraTurnGait)
+	{
+	case EGGYGOGait::Walk: Response = &Config.WalkDirectionErrorToLeanDegrees; break;
+	case EGGYGOGait::Run: Response = &Config.RunDirectionErrorToLeanDegrees; break;
+	default:
+		FailWalkRunLeanPresentation(TEXT("TargetGait"), TEXT("Valid camera steering requires the same camera record's target gait Walk or Run"));
+		return;
+	}
+	// 只发布目标步态端点；从当前显示角开始的步态过渡由 AnimBP 唯一持有。
+	const float Magnitude = Response->GetRichCurveConst()->Eval(FMath::Abs(Steering.CameraTurnDemandDegrees));
 	if (!FMath::IsFinite(Magnitude) || Magnitude < 0.0f || Magnitude >= 90.0f)
 	{
 		FailWalkRunLeanPresentation(TEXT("ResponseValue"), TEXT("the authored response must evaluate to a finite lean in [0,90) degrees"));
 		return;
 	}
-	WalkRunLeanAngleDegrees = Steering.DesiredDirectionError < 0.0f ? -Magnitude : Magnitude;
+	WalkRunLeanAngleDegrees = Steering.CameraTurnDemandDegrees < 0.0f ? -Magnitude : Magnitude;
+	bWalkRunLeanTargetApplicable = true;
 	bWalkRunLeanPresentationValid = true;
 	WalkRunLeanFailureReason.Reset();
 	LastWalkRunLeanFailureCode = NAME_None;

@@ -19,6 +19,67 @@
 class ACharacter;
 class UGGYGOCharacterMovementComponent;
 
+/** 一次只读查询的姿态与来源值。来源仅可复制、比较；不签发播放权，也不推进时间。 */
+USTRUCT(BlueprintType)
+struct GGYGO_API FGGYGOAnimationMotionPoseView
+{
+	GENERATED_BODY()
+
+	/** 即使当前没有所查动作，仍可据宿主上下文变化清理图内表现记忆。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	bool bContextAvailable = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	bool bHasPose = false;
+
+	/** 仅本机有效未结束区间或远端 Current；Held 不允许新锁存入场表现。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	bool bCanEnter = false;
+
+	/** 原已进入段的合法等待：可比较原来源，但没有可采样的 Sequence 或时间。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	bool bRetainedWait = false;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	bool bEnded = false;
+
+	/** 仅 bHasPose 时可用；已在原 Sequence 坐标，不得重复乘 RateScale。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	TObjectPtr<UAnimSequence> Sequence = nullptr;
+
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	float SequenceSeconds = 0.0f;
+
+	/** 与姿态或保留等待出自同一条已认证记录。 */
+	UPROPERTY(BlueprintReadOnly, Category = "Animation|Motion Pose")
+	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;
+
+private:
+	friend class UGGYGOAnimInstanceBase;
+
+	// 保留原始身份宽度。反射复制保留完整值，蓝图不拆解或构造来源。
+	UPROPERTY(Transient)
+	TWeakObjectPtr<const UObject> Instance;
+	UPROPERTY(Transient)
+	TWeakObjectPtr<const UObject> Provider;
+	UPROPERTY(Transient)
+	uint64 LifecycleGeneration = 0;
+	UPROPERTY(Transient)
+	bool bRemote = false;
+	UPROPERTY(Transient)
+	bool bHasSource = false;
+	UPROPERTY(Transient)
+	EGGYGOLocomotionMotionType MotionType = EGGYGOLocomotionMotionType::None;
+	UPROPERTY(Transient)
+	uint64 ExecutionRequestSerial = 0;
+	UPROPERTY(Transient)
+	uint16 MotionSequence = 0;
+	UPROPERTY(Transient)
+	uint32 PublisherEpoch = 0;
+	UPROPERTY(Transient)
+	uint32 SegmentSerial = 0;
+};
+
 /**
  * 不知道任何 AnimBP 状态名或过渡拓扑，只负责游戏线程抓取与只读发布。
  */
@@ -51,6 +112,23 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
 	bool TryGetMotionPose(EGGYGOLocomotionMotionType MotionType, UAnimSequence*& Sequence,
 		float& SequenceSeconds, bool& bEnded) const;
+
+	/** 一次查询本机完成区间或远端认证姿态及其来源。
+	 * bHasPose=false 时不得读取缺省时间；bRetainedWait 只保原已进入段，不产生姿态或入场资格。
+	 * 无所查片段仍可返回宿主上下文；图先比较上下文，再决定是否保留自有显示角。
+	 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
+	FGGYGOAnimationMotionPoseView QueryMotionPose(EGGYGOLocomotionMotionType MotionType) const;
+
+	/** 只比较本次捕获值中的实例生命周期、原 Provider 和本机/远端角色；两个空上下文不相等。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
+	static bool AreMotionPoseContextsEqual(const FGGYGOAnimationMotionPoseView& A, const FGGYGOAnimationMotionPoseView& B);
+
+	/** 比较同宿主下的原请求/片段，或原发布端 Epoch/Segment；不把时间、逐帧发布号当来源。
+	 * 合法 Held/保留等待保留原键；空键、退休或 Invalid 不相等，比较本身不授予入场。
+	 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Animation", meta = (BlueprintThreadSafe))
+	static bool AreMotionPoseSourcesEqual(const FGGYGOAnimationMotionPoseView& A, const FGGYGOAnimationMotionPoseView& B);
 
 	/** 由 SequenceEvaluator 的 UpdateFunction 调用：把同源姿态写入该节点（SetSequence/SetExplicitTime）。
 	 * 远端 Current 可写入任意实际被更新的节点并记录真实消费；Held 只写入已消费进入该段的同一节点；

@@ -9,6 +9,7 @@
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Animation/AnimSequence.h"
 #include "GameFramework/Character.h"
+#include "Engine/World.h"
 
 namespace
 {
@@ -216,6 +217,18 @@ void UGGYGOCharacterMovementComponent::CompleteMotionExecutionInterval(float Del
 	Completed.LocationBefore = OldLocation;
 	Completed.LocationAfter = UpdatedComponent->GetComponentLocation();
 	Completed.WorldVelocity = Velocity;
+	// cue 穿越按这个原生完成事件触发；保存生产点时刻，接收端不从源坐标或 dt 回推 World 时间。
+	if (UWorld* CompletionWorld = CharacterOwner->GetWorld(); Completed.SourceKind == EGGYGOMotionExecutionSource::Locomotion
+		&& Completed.bHasSingleSequenceTime && CompletionWorld && !CompletionWorld->bIsTearingDown)
+	{
+		const double CompletionTime = CompletionWorld->GetTimeSeconds();
+		if (FMath::IsFinite(CompletionTime))
+		{
+			Completed.bHasCompletionWorldTime = true;
+			Completed.CompletionWorld = CompletionWorld;
+			Completed.CompletionWorldTimeSeconds = CompletionTime;
+		}
+	}
 	const auto OriginalAction = Completed.OriginalActionResource;
 	const bool bActionRetired = Completed.SourceKind == EGGYGOMotionExecutionSource::Montage && OriginalAction.IsValid()
 		&& ActionMotionExecution.ActiveMontageActionResource != OriginalAction && ActionMotionExecution.CompletedMontageActionResource != OriginalAction;

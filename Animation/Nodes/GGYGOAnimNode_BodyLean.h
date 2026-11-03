@@ -63,6 +63,8 @@ private:
 		FCompactPoseBoneIndex Foot = FCompactPoseBoneIndex(INDEX_NONE);
 	};
 	FLegIndices Legs[2];
+	/** 随原生 CacheBones 发布；状态重入 Initialize 不退休同一 RequiredBones 的骨缓存。 */
+	uint16 CachedBoneContainerSerialNumber = 0;
 	FString BoneDiagnostic;
 	FString LastLoggedDiagnostic;
 	void RejectPose(FComponentSpacePoseContext& Output, const FString& Diagnostic);

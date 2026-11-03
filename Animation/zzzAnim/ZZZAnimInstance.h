@@ -31,7 +31,7 @@
  * 并以 `StateMemory.GaitBlendY` 驱动它的 **X 轴**（BlendSpace1D 的单轴是 X）。
  *
  * AnimGraph 顶层由 ActionPoseSlot 保留 Body XYZ 余量及原组件对齐，再进入原惯性化。
- * WalkRun 倾身仅作用于其内部姿态分支，不修改动作轨迹、Body 平移或胶囊。
+ * 倾身输入只发布镜头转向响应目标与真实依赖资格；显示角与恢复由 AnimBP 持有。
  *
  * ## 蓝图当前读取面
  * 过渡图读取 `AnimationState.bHasMoveInput` 与两个通用语义查询；状态图读取
@@ -49,6 +49,7 @@
 
 #include "CoreMinimal.h"
 #include "Animation/Runtime/GGYGOAnimInstanceBase.h"
+#include "Character/Data/GGYGOMovementTypes.h"
 #include "Animation/zzzAnim/Data/ZZZAnimSet.h"
 #include "Animation/zzzAnim/Data/ZZZAnimTuning.h"
 #include "Animation/zzzAnim/Data/ZZZAnimContext.h"
@@ -160,7 +161,7 @@ public:
 	UPROPERTY(BlueprintReadOnly, Category = "State|TurnBack")
 	bool bTurnBackRunOut = false;
 
-	/** 角色响应曲线求得的有符号倾身角；正值向胶囊右侧倾身。正常退出才恢复上一姿态。 */
+	/** 角色曲线按同一 camera 记录的目标步态求得的有符号端点；显示角由 AnimBP 唯一混合。 */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	float WalkRunLeanAngleDegrees = 0.0f;
 
@@ -170,13 +171,27 @@ public:
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	FVector WalkRunLeanUpCS = FVector::ZeroVector;
 
-	/** 有效的表现驱动输入，包含正常恢复；骨控制器仍须校验本次骨链和姿态可达性。 */
+	/** 配置、原来源和轴均可用；健康的 NotApplicable 仍为 true，精确零不关闭此门。 */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	bool bWalkRunLeanPresentationValid = false;
+
+	/** Movement 本次提供有效镜头响应；真实零仍适用，健康 NotApplicable 由 AnimBP 恢复显示角。 */
+	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
+	bool bWalkRunLeanTargetApplicable = false;
 
 	/** An enabled dependency/configuration failure stays visible; neutral pose is cleanup, not success. */
 	UPROPERTY(Transient, BlueprintReadOnly, Category = "State|WalkRun Lean")
 	FString WalkRunLeanFailureReason;
+
+	/**
+	 * 线程安全只读查询：返回与本次 WalkRunLeanAngleDegrees 同一捕获 camera 记录的步态及 alpha。
+	 * 本次 NativeUpdate 完成后保持不变，下一捕获或生命周期复位替换；不读取实时 CMC/PC。
+	 * @param OutGait true 时为该记录的真实目标步态。
+	 * @param OutBlendAlpha true 时为同一记录的真实步态混合值。
+	 * @return 仅本次目标有效且适用时为 true；false 的输出不得用作观测或混合输入。
+	 */
+	UFUNCTION(BlueprintPure, Category = "State|WalkRun Lean", meta = (BlueprintThreadSafe))
+	bool TryGetWalkRunLeanGait(EGGYGOGait& OutGait, float& OutBlendAlpha) const;
 
 protected:
 	/** 迁移期表现快照（游戏线程写入，表现记忆只读）。 */
@@ -187,10 +202,10 @@ protected:
 	virtual void ResolveLocomotionSourceBinding(FGGYGOLocomotionSourceBinding& OutBinding) const override;
 	virtual bool IsLocomotionSourceConfigurationCurrent(const FGGYGOLocomotionSourceBinding& Binding) const override;
 
-	/** Map a valid captured direction deviation directly; Movement owns qualification. NotApplicable only recovers this instance's pose. */
-	void UpdateWalkRunLeanPresentation(float DeltaSeconds);
-	/** Retire only this instance's presentation state while preserving authored Tuning. */
-	void ResetWalkRunLeanPresentation();
+	/** 只映射认证镜头响应目标并发布依赖资格；不持有显示角、恢复记忆或姿态时钟。 */
+	void UpdateWalkRunLeanTarget();
+	/** 清理本实例的响应目标及资格，保留作者 Tuning。 */
+	void ResetWalkRunLeanTarget();
 
 private:
 	/** 通用语义帧适配成旧快照，再映射到现有 AnimBP 表现存储。 */
@@ -200,11 +215,6 @@ private:
 	FZZZAnimSnapshotCapture LegacySnapshotAdapter;
 	FZZZLocomotionEvents LocomotionEvents;
 
-	/** 正常退出恢复；有效方向误差直接求值角色响应曲线。 */
-	void RecoverWalkRunLeanPresentation(float DeltaSeconds, const FZZZWalkRunLeanTuning& Config);
 	void FailWalkRunLeanPresentation(FName FailureCode, const FString& Reason);
 	FName LastWalkRunLeanFailureCode = NAME_None;
-	/** Borrowed identity for retiring the previous pose/recovery; never authorizes movement. */
-	TWeakObjectPtr<UGGYGOCharacterMovementComponent> WalkRunLeanSource;
-	uint64 WalkRunLeanSourceEpoch = 0;
 };

@@ -35,6 +35,18 @@ namespace
 				static_cast<unsigned long long>(OriginalLease.GetOccurrence()));
 		}
 	}
+
+	/** 旧资产显式使用原单项配置；新制作单元按作者顺序消费，不合并为新的 Niagara System。 */
+	TArray<FGGYGONiagaraEffectUnit> GetFXUnits(const FGGYGOComboStepFX& FX)
+	{
+		if (!FX.SystemUnits.IsEmpty()) { return FX.SystemUnits; }
+		FGGYGONiagaraEffectUnit Unit;
+		Unit.System = FX.System;
+		Unit.FieldSettings = FX.FieldSettings;
+		TArray<FGGYGONiagaraEffectUnit> Units;
+		Units.Add(MoveTemp(Unit));
+		return Units;
+	}
 }
 
 /** 读取作者配置，不建立窗口计时或运行期有效缓存。 */
@@ -61,7 +73,13 @@ bool FGGYGOMontageActionResources::ValidateFXConfiguration(const UAnimMontage* M
 		OutError = TEXT("FX 原动作绑定范围必须有限、非负且具有正时长。");
 		return false;
 	}
-	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfiguration(FX.System, FX.Space, FX.LocalTransform, OutError))
+	if (FX.System && !FX.SystemUnits.IsEmpty())
+	{
+		OutError = TEXT("FX System 与 SystemUnits 是互斥的显式配置，不能同时启用。");
+		return false;
+	}
+	const TArray<FGGYGONiagaraEffectUnit> Units = GetFXUnits(FX);
+	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfigurations(Units, FX.Space, FX.LocalTransform, OutError))
 	{
 		return false;
 	}
@@ -163,6 +181,29 @@ bool FGGYGOMontageActionResources::BeginMotion(const FGGYGOMontageSectionSnapsho
 		EffectiveRate, TranslationScale, MotionHandle, OutError) && MotionHandle != INDEX_NONE;
 }
 
+bool FGGYGOMontageActionResources::BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot,
+	const FGGYGOActionMotionStartFacing& StartFacing, FQuat& OutEntryActorRotation, FString& OutError)
+{
+	OutError.Reset();
+	OutEntryActorRotation = FQuat::Identity;
+	if (!Movement.IsValid() || !Source.IsValid() || MotionHandle != INDEX_NONE
+		|| Snapshot.Montage != Source->Montage.Get() || Snapshot.MontageInstanceId == INDEX_NONE)
+	{
+		OutError = TEXT("Original CMC/source/playback is invalid or motion has already been issued.");
+		return false;
+	}
+	MontageInstanceId = Snapshot.MontageInstanceId;
+	FQuat AcceptedEntryActorRotation = FQuat::Identity;
+	if (!Movement->BeginMontageActionMotion(Source, MontageInstanceId, Snapshot.PositionSeconds,
+		EffectiveRate, TranslationScale, StartFacing, MotionHandle, AcceptedEntryActorRotation, OutError)
+		|| MotionHandle == INDEX_NONE)
+	{
+		return false;
+	}
+	OutEntryActorRotation = AcceptedEntryActorRotation;
+	return true;
+}
+
 bool FGGYGOMontageActionResources::ObserveMotion(FGGYGOActionMotionFailureDelegate Failure,
 	FGGYGOActionMotionCompletionDelegate Completion, TFunctionRef<bool()> IsCurrent, FString& OutError)
 {
@@ -229,7 +270,7 @@ void FGGYGOMontageActionResources::ReleaseFX(bool bNormalExit)
 	const FScriptDelegate OriginalFailureCallback = FXFailureCallback;
 	const FGGYGOMontageFXLocalStartTicket OriginalTicket = FXLocalStartTicket;
 	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> OriginalPublisher = FXPublicationOwner;
-	const FGGYGOMontageFXLease OriginalLease = MoveTemp(FXPublicationLease);
+	const TArray<FGGYGOMontageFXLease> OriginalLeases = MoveTemp(FXPublicationLeases);
 	const EGGYGONiagaraEffectStopMode StopMode = bNormalExit ? FX.NormalStopMode : FX.AbortStopMode;
 	const EGGYGOMontageFXCloseReason CloseReason = bNormalExit
 		? EGGYGOMontageFXCloseReason::Normal : EGGYGOMontageFXCloseReason::Abort;
@@ -245,7 +286,10 @@ void FGGYGOMontageActionResources::ReleaseFX(bool bNormalExit)
 		if (OriginalTicket.IsSet()) { TaskToRelease->CancelMontageFXLocalStartRequest(OriginalTicket); }
 	}
 	// 专服无本地组件、Task 自然 Finished 等路径仍须关闭原发布。
-	ClosePublication(OriginalPublisher, OriginalLease, CloseReason);
+	for (const FGGYGOMontageFXLease& OriginalLease : OriginalLeases)
+	{
+		ClosePublication(OriginalPublisher, OriginalLease, CloseReason);
+	}
 	TaskToRelease = OriginalFX.Get();
 	if (TaskToRelease) { TaskToRelease->StopEffect(StopMode); }
 	// 不在外调后访问 holder；本地 Released 由 Task 的真实原生资源收尾事实发布。
@@ -340,10 +384,11 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 		PlaybackTransform = FX.LocalTransform * Origin;
 	}
 	if (!IsCurrent()) { return true; }
-	if (!PublishFXWindow(Owner, Issuer, OriginalAvatar.Get(), Fact, PlaybackTransform, IsCurrent, OutError)) { return false; }
+	const TArray<FGGYGONiagaraEffectUnit> Units = GetFXUnits(FX);
+	if (!PublishFXWindow(Owner, Issuer, OriginalAvatar.Get(), Fact, Units, PlaybackTransform, IsCurrent, OutError)) { return false; }
 	if (!IsCurrent() || bFXWindowClosed) { return true; }
-	UGGYGOAbilityTask_PlayNiagaraEffect* const StartedTask = UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffect(
-		Owner, TEXT("PlayerComboFX"), FX.System, FX.Space,
+	UGGYGOAbilityTask_PlayNiagaraEffect* const StartedTask = UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffects(
+		Owner, TEXT("PlayerComboFX"), Units, FX.Space,
 		FX.Space == EGGYGONiagaraEffectSpace::Attached ? Mesh : nullptr,
 		FX.Space == EGGYGONiagaraEffectSpace::Attached ? FX.SocketName : NAME_None, PlaybackTransform);
 	if (!IsCurrent() || bFXWindowClosed)
@@ -354,7 +399,7 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 	}
 	if (!IsValid(StartedTask))
 	{
-		OutError = FString::Printf(TEXT("FX Task factory failed for System [%s]."), *GetPathNameSafe(FX.System));
+		OutError = FString::Printf(TEXT("FX 组合 Task 创建失败，独立单元数=%d。"), Units.Num());
 		ReleaseFX(false);
 		return false;
 	}
@@ -405,7 +450,8 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 
 bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 	UGGYGOAbilitySystemComponent* Issuer, AActor* Avatar, const FGGYGOMontageWindowFact& Fact,
-	const FTransform& PlaybackTransform, TFunctionRef<bool()> IsCurrent, FString& OutError)
+	const TArray<FGGYGONiagaraEffectUnit>& Units, const FTransform& PlaybackTransform,
+	TFunctionRef<bool()> IsCurrent, FString& OutError)
 {
 	if (!Issuer->IsOwnerActorAuthoritative()) { return true; }
 	IGGYGOMontageFXHost* Host = Cast<IGGYGOMontageFXHost>(Issuer);
@@ -416,7 +462,6 @@ bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 	FGGYGOMontageFXRecord Record;
 	Record.Avatar = Avatar;
 	Record.Mesh = Fact.Mesh;
-	Record.System = FX.System;
 	Record.Space = FX.Space;
 	Record.SocketName = FX.Space == EGGYGONiagaraEffectSpace::Attached ? FX.SocketName : NAME_None;
 	Record.Transform = PlaybackTransform;
@@ -424,23 +469,28 @@ bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 	Record.AbortStopMode = FX.AbortStopMode;
 	Record.RemoteSeekDeltaSeconds = FX.RemoteSeekDeltaSeconds;
 	Record.RemoteMaxSimTimeSeconds = FX.RemoteMaxSimTimeSeconds;
-	FGGYGOMontageFXLease NewLease;
-	const bool bPublished = Issuer->TryPublishMontageFX(Owner, Activation, Task.Get(), Fact, Record, NewLease, OutError);
-	if (!IsCurrent() || bFXWindowClosed)
+	for (const FGGYGONiagaraEffectUnit& Unit : Units)
 	{
-		const EGGYGOMontageFXCloseReason Reason = FXTerminalReason.IsSet()
-			? FXTerminalReason.GetValue() : EGGYGOMontageFXCloseReason::Abort;
-		ClosePublication(Publisher, NewLease, Reason);
-		return true;
+		Record.System = Unit.System;
+		Record.FieldSettings = Unit.FieldSettings;
+		FGGYGOMontageFXLease NewLease;
+		const bool bPublished = Issuer->TryPublishMontageFX(Owner, Activation, Task.Get(), Fact, Record, NewLease, OutError);
+		if (!IsCurrent() || bFXWindowClosed)
+		{
+			const EGGYGOMontageFXCloseReason Reason = FXTerminalReason.IsSet()
+				? FXTerminalReason.GetValue() : EGGYGOMontageFXCloseReason::Abort;
+			ClosePublication(Publisher, NewLease, Reason);
+			return true;
+		}
+		if (!bPublished || !NewLease.HasLease())
+		{
+			ClosePublication(Publisher, NewLease, EGGYGOMontageFXCloseReason::Abort);
+			if (OutError.IsEmpty()) { OutError = TEXT("FX 发行者未返回明确成功及原 lease。"); }
+			return false;
+		}
+		FXPublicationOwner = Publisher;
+		FXPublicationLeases.Add(MoveTemp(NewLease));
 	}
-	if (!bPublished || !NewLease.HasLease())
-	{
-		ClosePublication(Publisher, NewLease, EGGYGOMontageFXCloseReason::Abort);
-		if (OutError.IsEmpty()) { OutError = TEXT("FX 发行者未返回明确成功及原 lease。"); }
-		return false;
-	}
-	FXPublicationOwner = Publisher;
-	FXPublicationLease = MoveTemp(NewLease);
 	return true;
 }
 
@@ -495,8 +545,8 @@ bool FGGYGOMontageActionResources::TryActivateFXLocalTask(TFunctionRef<bool()> I
 	if (StartResult != EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested
 		&& StartResult != EGGYGONiagaraEffectStartResult::DedicatedServerNoPresentation)
 	{
-		OutError = FString::Printf(TEXT("FX System [%s] startup did not produce an explicit accepted result (%d)."),
-			*GetPathNameSafe(FX.System), static_cast<int32>(StartResult));
+		OutError = FString::Printf(TEXT("FX 组合 Task [%s] 未返回明确的成功启动结果 (%d)。"),
+			*GetPathNameSafe(HistoricalTask), static_cast<int32>(StartResult));
 		ReleaseFX(false);
 		return false;
 	}

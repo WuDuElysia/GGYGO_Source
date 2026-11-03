@@ -1,6 +1,7 @@
 /** @file GGYGOComboCorrection.h @brief PlayerCombo 的强类型 TargetData 纠正负载。 */
 #pragma once
 
+#include "CoreMinimal.h"
 #include "Abilities/GameplayAbilityTargetTypes.h"
 #include "GGYGOComboCorrection.generated.h"
 
@@ -12,7 +13,8 @@ struct FGGYGOComboCorrectionData : public FGameplayAbilityTargetData
 
 	FGGYGOComboCorrectionData() = default;
 	FGGYGOComboCorrectionData(int32 InRevision, int32 InRequestId, int32 InServerStep, float InPosition,
-		bool bInWindowOpen, bool bInWindowClosed, bool bInAccepted)
+		bool bInWindowOpen, bool bInWindowClosed, bool bInAccepted,
+		int32 InServerStepRequestId = INDEX_NONE, const FQuat* InEntryActorRotation = nullptr)
 		: Revision(InRevision)
 		, RequestId(InRequestId)
 		, ServerStep(InServerStep)
@@ -20,6 +22,9 @@ struct FGGYGOComboCorrectionData : public FGameplayAbilityTargetData
 		, bWindowOpen(bInWindowOpen)
 		, bWindowClosed(bInWindowClosed)
 		, bAccepted(bInAccepted)
+		, ServerStepRequestId(InServerStepRequestId)
+		, bHasEntryActorRotation(InEntryActorRotation != nullptr)
+		, EntryActorRotation(InEntryActorRotation ? *InEntryActorRotation : FQuat::Identity)
 	{
 	}
 
@@ -43,6 +48,17 @@ struct FGGYGOComboCorrectionData : public FGameplayAbilityTargetData
 
 	UPROPERTY()
 	bool bAccepted = false;
+
+	/** 当前服务器段的真实起段请求；RequestId 是本消息确认／拒绝的请求，二者不等价。 */
+	UPROPERTY()
+	int32 ServerStepRequestId = INDEX_NONE;
+
+	/** 旧 CurrentFacing 调用可不带 basis；QualifiedInput 的重放必须有原实际接受值。 */
+	UPROPERTY()
+	bool bHasEntryActorRotation = false;
+
+	UPROPERTY()
+	FQuat EntryActorRotation = FQuat::Identity;
 
 	virtual UScriptStruct* GetScriptStruct() const override
 	{

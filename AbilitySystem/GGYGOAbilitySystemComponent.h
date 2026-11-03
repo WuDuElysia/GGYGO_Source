@@ -58,6 +58,7 @@ class UMovementComponent;
 class USkeletalMeshComponent;
 class UGameplayAbility;
 class UGGYGOAbilityGroupConfig;
+class UGGYGOCharacterMovementComponent;
 class FGGYGOAvatarBindingProtocol;
 class UGGYGOAbilityTagRelationshipMapping;
 class UObject;
@@ -66,6 +67,7 @@ struct FFrame;
 struct FGameplayAbilityTargetDataHandle;
 struct FGGYGOAbilityGroupRule;
 struct FGGYGOMontagePlayGuardResult;
+struct FGGYGOMotionExecutionSnapshot;
 
 enum class EGGYGOAvatarSwitchAbilityExitOutcome : uint8
 {
@@ -232,6 +234,13 @@ public:
 		const FGGYGOAbilityActivationHandle& OriginalActivation,
 		class UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask,
 		const struct FGGYGOMontageWindowFact& BeginFact, const FGGYGOMontageFXRecord& Request,
+		FGGYGOMontageFXLease& OutLease, FString& OutDiagnostic);
+	/** 原 CMC 认证本次完成区间及 producer 事件时间后，才发布 Locomotion 表现。
+	 * @param CompletedInterval 原生完成区间；不接受回放、代理或调用方拼造的历史快照。
+	 * @param Request 表现配置；BeginServerTime只取原区间认证时间，不消费调用方填值。
+	 * @return 仅证明发布成功并返回原 lease，不证明本地 Niagara 已启动或完成。 */
+	bool TryPublishLocomotionFX(UGGYGOCharacterMovementComponent* OriginalMovement,
+		const FGGYGOMotionExecutionSnapshot& CompletedInterval, const FGGYGOMontageFXRecord& Request,
 		FGGYGOMontageFXLease& OutLease, FString& OutDiagnostic);
 	/** 纯数据退休；不执行本地表现、RPC 或 GA/BP 回调。 */
 	void PrepareMontageFXRetirements(const TArray<FGGYGOAbilityActivationHandle>& Originals,
@@ -448,6 +457,17 @@ public:
 	 */
 	FGGYGOAbilityInputRequestResult ReceiveAbilityInputRequest(const FGameplayTag& InputTag,
 		const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline);
+	FGGYGOAbilityInputRequestResult ReceiveAbilityInputRequest(const FGameplayTag& InputTag,
+		const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline,
+		const FGGYGOMovementInputEvaluationToken& OriginalEvaluationToken);
+	virtual void ServerSetReplicatedTargetData_Implementation(FGameplayAbilitySpecHandle AbilityHandle,
+		FPredictionKey AbilityOriginalPredictionKey, const FGameplayAbilityTargetDataHandle& TargetData,
+		FGameplayTag ApplicationTag, FPredictionKey CurrentPredictionKey) override;
+	/** Initialize 最早阶段保存原激活运输来源，不依赖 Task、edge 或方向就绪。 */
+	FGGYGOAbilityInitialInputRoute CaptureInitialInputRoute(UGGYGOGameplayAbility* Ability,
+		const FGGYGOAbilityActivationHandle& Original, FString& OutError);
+	virtual void ServerSetReplicatedTargetDataCancelled_Implementation(FGameplayAbilitySpecHandle AbilityHandle,
+		FPredictionKey AbilityOriginalPredictionKey, FPredictionKey CurrentPredictionKey) override;
 
 	/** Exact retirement. Released retains a finite tap; Invalidated never emits InputReleased. */
 	FGGYGOAbilityInputRequestResult EndAbilityInputRequest(const FGGYGOAbilityInputRequestIdentity& Identity,
@@ -661,7 +681,47 @@ private:
 		TWeakObjectPtr<AActor> AvatarActor;
 		TWeakObjectPtr<UWorld> World;
 		TArray<FGGYGOAbilityInputRequestIdentity> Sources;
+		FGGYGOMovementInputEvaluationToken OriginalEvaluationToken;
 	};
+	/** 仅原 Process 的同步调用栈可借用；不会保存到 pending 请求。 */
+	struct FStepInputDispatch
+	{
+		FGameplayAbilitySpecHandle Spec;
+		FGGYGOMovementInputEvaluationToken OriginalEvaluationToken;
+		bool bInitial = false;
+		uint64 InputRevision = 0;
+		bool bDelivering = false;
+		/** 只在 ASC 自身 Invoke 窗口认领一次；Super/raw 重入不借原边沿。 */
+		mutable bool bClaimed = false;
+		mutable bool bNativePressEntered = false;
+	};
+	const FStepInputDispatch* ActiveStepInputDispatch = nullptr;
+	FGGYGOAbilityStepInputRequest MakeStepInputRequest(UGGYGOGameplayAbility* Ability,
+		UGGYGOAbilityTask_WaitComboInput* Task, EGGYGOAbilityStepInputKind Kind,
+		int32 SourceStep, int32 RequestId, bool bRemote, FString& OutError);
+	FGGYGOAbilityStepInputRequest CaptureStepInputRequest(UGGYGOAbilityTask_WaitComboInput* Task,
+		UGGYGOGameplayAbility* Ability,
+		EGGYGOAbilityStepInputKind Kind, int32 SourceStep, int32 RequestId, FString& OutError);
+	bool CheckStepInputRequestCurrent(const FGGYGOAbilityStepInputRequest& Request, FString& OutError) const;
+	bool CheckStepInputRequestForTask(const FGGYGOAbilityStepInputRequest& Request,
+		const UGameplayAbility* Ability, const FGGYGOAbilityActivationHandle& Activation, FString& OutError) const;
+	bool CommitStepInputFact(UGGYGOAbilityTask_WaitComboInput* Task,
+		const FGGYGOAbilityStepInputRequest& Request, const FGGYGOMovementInputStepFact& Fact,
+		const FGGYGOAbilityInitialInputRoute& Route, FString& OutError);
+	TArray<TWeakPtr<FGGYGOAbilityInitialInputRoute::FRouteProof>> InitialInputRoutes;
+	bool CheckInitialInputRoute(const FGGYGOAbilityInitialInputRoute& Route, FString& OutError) const;
+	FGGYGOAbilityInitialInputRoute FindInitialInputRoute(FGameplayAbilitySpecHandle Spec, FPredictionKey Key) const;
+	void NotifyInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route);
+	void DispatchInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route,
+		FPredictionKey CurrentPredictionKey, const TCHAR* Boundary);
+	bool ConsumeInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route,
+		const FGGYGOAbilityActivationHandle& Original);
+	FGGYGOAbilityStepInputRequest WrapRemoteStepInputRequest(FGameplayAbilitySpecHandle Spec,
+		FPredictionKey ActivationKey, EGGYGOAbilityStepInputKind Kind, int32 SourceStep, int32 RequestId,
+		const FGGYGOMovementInputStepFact& Fact, FString& OutError);
+	friend class FGGYGOAbilityStepInputRequest;
+	friend class FGGYGOAbilityInitialInputRoute;
+	friend class UGGYGOAbilityTask_WaitComboInput;
 
 	FGGYGOAbilityInputRequestResult MakeAbilityInputRequestFailure(
 		EGGYGOAbilityInputRequestOutcome Outcome, EGGYGOAbilityInputRequestReason Reason,
@@ -1091,6 +1151,11 @@ private:
 	UFUNCTION(NetMulticast, Reliable)
 	void MulticastMontageFXTerminal(const FGGYGOMontageFXTerminal& Terminal);
 	void SendMontageFXTerminal(const FGGYGOMontageFXTerminal& Terminal);
+	/** 复用原绑定资格；撤绑后即使 Avatar 尚未清空，也不再允许原 Locomotion 表现工作。 */
+	bool IsLocomotionFXAvatarCurrent(const UGGYGOCharacterMovementComponent* OriginalMovement,
+		const FGGYGOAvatarBindingContext& OriginalBinding,
+		const AActor* OriginalAvatar, const USkeletalMeshComponent* OriginalMesh) const;
+	bool IsLocomotionFXSourceCurrent(const FGGYGOFXSourceIdentity& Source) const;
 	void PrepareInvalidMontageFXSources(TArray<FGGYGOMontageFXCloseObligation>& OutObligations);
 
 	/** 当前 native 调用栈的显式输出通道；析构仅恢复栈链接。 */

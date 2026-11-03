@@ -97,6 +97,84 @@ bool UGGYGOAnimInstanceBase::TryGetMotionPose(EGGYGOLocomotionMotionType MotionT
 	return true;
 }
 
+FGGYGOAnimationMotionPoseView UGGYGOAnimInstanceBase::QueryMotionPose(EGGYGOLocomotionMotionType MotionType) const
+{
+	FGGYGOAnimationMotionPoseView View;
+	// Provider 身份已在同次 GT Capture 固定；图线程只复制弱身份，不回查 Actor/CMC。
+	if (AnimationLifecycleGeneration == 0 || bSourceGenerationExhausted || RemotePosePreviousProvider.IsExplicitlyNull())
+	{
+		return View;
+	}
+	View.Instance = this;
+	View.Provider = RemotePosePreviousProvider;
+	View.LifecycleGeneration = AnimationLifecycleGeneration;
+	View.bRemote = RemoteMotionPose.bRemote;
+	View.bContextAvailable = true;
+
+	UAnimSequence* Sequence = nullptr;
+	float Seconds = 0.0f;
+	bool bEnded = false;
+	const bool bHasPose = TryGetMotionPose(MotionType, Sequence, Seconds, bEnded);
+	if (RemoteMotionPose.bRemote)
+	{
+		if (RemoteMotionPose.MotionType != MotionType || (!bHasPose && !RemoteMotionPose.bRetainedWait)
+			|| RemoteMotionPose.PublisherEpoch == 0 || RemoteMotionPose.SegmentSerial == 0)
+		{
+			return View;
+		}
+		View.bHasSource = true;
+		View.MotionType = MotionType;
+		View.PublisherEpoch = RemoteMotionPose.PublisherEpoch;
+		View.SegmentSerial = RemoteMotionPose.SegmentSerial;
+		View.bRetainedWait = RemoteMotionPose.bRetainedWait;
+		View.bCanEnter = bHasPose && RemoteMotionPose.IsAdmissible(MotionType);
+		View.bEnded = RemoteMotionPose.bEnded;
+		View.TurnBackPhase = RemoteMotionPose.TurnBackPhase;
+	}
+	else
+	{
+		const FGGYGOAnimationMotionFrame& Motion = AnimationState.MotionExecution;
+		if (!bHasPose || Motion.ExecutionRequestSerial == 0 || Motion.CompletedIntervalSerial == 0)
+		{
+			return View;
+		}
+		View.bHasSource = true;
+		View.MotionType = MotionType;
+		View.ExecutionRequestSerial = Motion.ExecutionRequestSerial;
+		View.MotionSequence = Motion.MotionSequence;
+		View.bCanEnter = !bEnded;
+		View.bEnded = bEnded;
+		View.TurnBackPhase = Motion.TurnBackPhase;
+	}
+	if (bHasPose)
+	{
+		View.bHasPose = true;
+		View.Sequence = Sequence;
+		View.SequenceSeconds = Seconds;
+	}
+	return View;
+}
+
+bool UGGYGOAnimInstanceBase::AreMotionPoseContextsEqual(
+	const FGGYGOAnimationMotionPoseView& A, const FGGYGOAnimationMotionPoseView& B)
+{
+	return A.LifecycleGeneration != 0 && B.LifecycleGeneration != 0
+		&& !A.Instance.IsExplicitlyNull() && !A.Provider.IsExplicitlyNull()
+		&& A.Instance.HasSameIndexAndSerialNumber(B.Instance) && A.Provider.HasSameIndexAndSerialNumber(B.Provider)
+		&& A.LifecycleGeneration == B.LifecycleGeneration && A.bRemote == B.bRemote;
+}
+
+bool UGGYGOAnimInstanceBase::AreMotionPoseSourcesEqual(
+	const FGGYGOAnimationMotionPoseView& A, const FGGYGOAnimationMotionPoseView& B)
+{
+	if (!A.bHasSource || !B.bHasSource || !AreMotionPoseContextsEqual(A, B) || A.MotionType != B.MotionType)
+	{
+		return false;
+	}
+	return A.bRemote ? (A.PublisherEpoch == B.PublisherEpoch && A.SegmentSerial == B.SegmentSerial)
+		: (A.ExecutionRequestSerial == B.ExecutionRequestSerial && A.MotionSequence == B.MotionSequence);
+}
+
 bool UGGYGOAnimInstanceBase::IsMotionPoseEnded(EGGYGOLocomotionMotionType MotionType) const
 {
 	if (RemoteMotionPose.bRemote)

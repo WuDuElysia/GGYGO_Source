@@ -13,6 +13,7 @@
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedPlayerInput.h"
 #include "GameFramework/InputSettings.h"
+#include "HAL/CriticalSection.h"
 #include "HAL/PlatformTime.h"
 #include "Input/GGYGOInputComponent.h"
 #include "Input/GGYGOInputConfig.h"
@@ -20,6 +21,10 @@
 #include "Input/GGYGOPlayerInput.h"
 #include "InputAction.h"
 #include "Misc/AutomationTest.h"
+#include "Misc/OutputDevice.h"
+#include "Misc/OutputDeviceRedirector.h"
+#include "Misc/ScopeExit.h"
+#include "Misc/ScopeLock.h"
 #include "Player/GGYGOLocalPlayer.h"
 #include "System/GGYGOGameplayTags.h"
 #include "UObject/Package.h"
@@ -1045,6 +1050,143 @@ namespace
 		bool bCleaned = false;
 	};
 
+	/** 精确期望诊断并观察原始日志；不改变生产日志、类别捕获或全局警告策略。 */
+	class FScopedExpectedMovementProof final : public FOutputDevice
+	{
+	public:
+		FScopedExpectedMovementProof(const FNativeMovementOriginProbe& Probe, bool bHeld, const TCHAR* ReleaseReason)
+			: Test(Probe.Test)
+			, Label(FString::Printf(TEXT("SourceProofUnavailable Held=%d Unproven=%s"), static_cast<int32>(bHeld), ReleaseReason))
+		{
+			const UGGYGOPlayerInput* Producer = Probe.OriginalProducer.Get();
+			const AGGYGOInputTestPawn* Pawn = Probe.Fixture.GetPawn();
+			ExpectedRaw = FString::Printf(
+				TEXT("[Input.MovementSource] PlayerInput=%s Controller=%s Pawn=%s Component=%s Action=%s: Physical source cannot identify a movement request; requires an observed neutral then a real press. Key=W Device=0 Mapped=1 Held=%d Axes=0/1 RequiresRelease=1 Unproven=%s NativeGap=None; Reason=SourceProofUnavailable"),
+				*GetPathNameSafe(Producer), *GetPathNameSafe(Producer ? Producer->GetOuter() : nullptr),
+				*GetPathNameSafe(Pawn), *GetPathNameSafe(Pawn ? Pawn->GetInputComponentForTest() : nullptr),
+				*GetPathNameSafe(Probe.Fixture.GetMoveAction()), static_cast<int32>(bHeld), ReleaseReason);
+			if (!Test.TestNotNull(Label + TEXT(" original logger exists"), GLog)) { return; }
+			GLog->AddOutputDevice(this);
+			bRegistered = true;
+			Test.TestTrue(Label + TEXT(" raw observer registered"), GLog->IsRedirectingTo(this));
+			Test.AddExpectedMessagePlain(TEXT("LogGGYGOMovementInput: ") + ExpectedRaw,
+				ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Exact, 1);
+		}
+
+		virtual ~FScopedExpectedMovementProof() override
+		{
+			if (!bRegistered) { return; }
+			GLog->RemoveOutputDevice(this);
+			TArray<FObservedMessage> Observed;
+			{
+				FScopeLock Lock(&Mutex);
+				Observed = MoveTemp(Messages);
+			}
+			if (Test.TestEqual(Label + TEXT(" scoped source Warning/Error count"), Observed.Num(), 1))
+			{
+				// Automation 的 Warning 期望也接受更高级别；原始观察必须另外锁定恰 Warning。
+				Test.TestTrue(Label + TEXT(" exact raw category, Warning severity and complete literal"),
+					Observed[0].Category == FName(TEXT("LogGGYGOMovementInput"))
+					&& Observed[0].Verbosity == ELogVerbosity::Warning
+					&& Observed[0].Text.Equals(ExpectedRaw, ESearchCase::CaseSensitive));
+			}
+		}
+
+		virtual bool CanBeUsedOnAnyThread() const override { return true; }
+		virtual bool CanBeUsedOnMultipleThreads() const override { return true; }
+		virtual void Serialize(const TCHAR* Text, ELogVerbosity::Type Verbosity, const FName& Category) override
+		{
+			if (Category == FName(TEXT("LogGGYGOMovementInput"))
+				&& (Verbosity == ELogVerbosity::Warning || Verbosity == ELogVerbosity::Error))
+			{
+				FScopeLock Lock(&Mutex);
+				Messages.Add({FString(Text), Verbosity, Category});
+			}
+		}
+
+	private:
+		struct FObservedMessage { FString Text; ELogVerbosity::Type Verbosity; FName Category; };
+		FAutomationTestBase& Test;
+		FString Label;
+		FString ExpectedRaw;
+		FCriticalSection Mutex;
+		TArray<FObservedMessage> Messages;
+		bool bRegistered = false;
+	};
+
+	/** 在原真实 Source 上验证会话前 Held 及旧 End 的隔离，不借用 Hero 的私有令牌。 */
+	bool RunNativeMovementSuccessorAssertions(FNativeMovementOriginProbe& Probe)
+	{
+		UGGYGOPlayerInput* Source = Probe.OriginalProducer.Get();
+		AGGYGOInputTestPawn* Pawn = Probe.Fixture.GetPawn();
+		if (!Probe.Test.TestTrue(TEXT("successor check retains the original live route"),
+			IsValid(Source) && IsValid(Pawn) && Probe.Fixture.GetPlayerInput() == Source)) { return false; }
+		Source->EndMovementInputSession(Probe.Session, TEXT("NativeBirthSuccessorCheck"));
+		if (!Probe.Test.TestEqual(TEXT("original digital sequence has exactly its terminal fact before successor"), Probe.Facts.Num(), 6)) { return false; }
+		FGGYGOMovementInputSessionIdentity Successor;
+		TArray<FGGYGOMovementInputFact> Facts;
+		ON_SCOPE_EXIT
+		{
+			if (Successor.SessionSerial != 0) { Source->EndMovementInputSession(Successor, TEXT("NativeBirthSuccessorCleanup")); }
+			Source->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), EKeys::W,
+				IE_Released, 0.0f, false, FPlatformTime::Cycles64()));
+		};
+		FString Error;
+		if (!Probe.Test.TestTrue(TEXT("same original Producer issues a new real successor Session"),
+			Source->BeginMovementInputSession(Pawn, Pawn->GetInputComponentForTest(), Probe.Fixture.GetMoveAction(), Successor, Error)))
+		{
+			Probe.Test.AddError(Error);
+			return false;
+		}
+		FGGYGOMovementInputConsumerBindingId Binding;
+		Binding.Consumer = Pawn->GetInputComponentForTest();
+		Binding.ConsumerBindingSerial = 2;
+		Binding.SourceSession = Successor;
+		FGGYGOMovementInputRequestIdentity Request;
+		{
+			FScopedExpectedMovementProof ExpectedProof(Probe, true, TEXT("NativeBirthSuccessorCheck"));
+			if (!Probe.Test.TestTrue(TEXT("successor receiver attaches only to its own returned Source Session"),
+				Source->AttachMovementInputReceiver(Successor, Binding,
+					FGGYGOMovementInputFactDelegate::CreateLambda([&Facts, &Probe, Binding](const FGGYGOMovementInputConsumerBindingId& OriginalBinding,
+						const FGGYGOMovementInputFact& Fact)
+					{
+						Probe.Test.TestTrue(TEXT("all successor facts preserve their real returned Session and consumer binding"),
+							OriginalBinding == Binding && Fact.Request.Session == Binding.SourceSession && Fact.EventSerial != 0);
+						Facts.Add(Fact);
+					}), Error))) { return false; }
+			if (!Probe.Test.TestTrue(TEXT("held before successor cannot start or inherit the old request"),
+				Facts.Num() == 2 && Facts[0].Kind == EGGYGOMovementInputFactKind::SessionOpened
+				&& Facts[0].SessionMode == EGGYGOMovementInputSessionMode::Rearm
+				&& Facts[1].Kind == EGGYGOMovementInputFactKind::SourceUnresolved && Facts[1].Request.RequestSerial == 0
+				&& Source->QueryMovementInputRequest(Successor, Request, Error) == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof)) { return false; }
+		}
+		Source->EndMovementInputSession(Probe.Session, TEXT("StaleEndBeforeSuccessorRelease"));
+		if (!Probe.Test.TestTrue(TEXT("End(old) preserves the successor awaiting real release"),
+			Facts.Num() == 2 && Source->QueryMovementInputRequest(Successor, Request, Error)
+				== EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof)) { return false; }
+		const FInputDeviceId Device = FInputDeviceId::CreateFromInternalId(0);
+		Source->InputKey(FInputKeyEventArgs(nullptr, Device, EKeys::W, IE_Released, 0.0f, false, FPlatformTime::Cycles64()));
+		if (!Probe.Test.TestTrue(TEXT("real successor release confirms neutral without a Started"),
+			Facts.Num() == 3 && Facts[2].Kind == EGGYGOMovementInputFactKind::NeutralConfirmed
+			&& Source->QueryMovementInputRequest(Successor, Request, Error) == EGGYGOMovementInputRequestQueryResult::NotHeld)) { return false; }
+		Source->InputKey(FInputKeyEventArgs(nullptr, Device, EKeys::W, IE_Pressed, 1.0f, false, FPlatformTime::Cycles64()));
+		if (!Probe.Test.TestTrue(TEXT("release then new press creates only the successor's qualified request"),
+			Facts.Num() == 4 && Facts[3].Kind == EGGYGOMovementInputFactKind::RequestStarted
+			&& Facts[3].StartProof == EGGYGOMovementInputStartProof::ReleasedThenPhysicalPress
+			&& Source->QueryMovementInputRequest(Successor, Request, Error) == EGGYGOMovementInputRequestQueryResult::Held
+			&& Request == Facts[3].Request && Request.Session == Successor && Request.RequestSerial != 0)) { return false; }
+		const FGGYGOMovementInputRequestIdentity OriginalRequest = Request;
+		Source->EndMovementInputSession(Probe.Session, TEXT("StaleEndWhileSuccessorHeld"));
+		if (!Probe.Test.TestTrue(TEXT("End(old) cannot clear a live successor request or publish another terminal fact"),
+			Facts.Num() == 4 && Source->QueryMovementInputRequest(Successor, Request, Error) == EGGYGOMovementInputRequestQueryResult::Held
+			&& Request == OriginalRequest)) { return false; }
+		Source->EndMovementInputSession(Successor, TEXT("NativeBirthSuccessorCompleted"));
+		return Probe.Test.TestTrue(TEXT("only the successor's own End invalidates its exact request once"),
+			Facts.Num() == 5 && Facts[4].Kind == EGGYGOMovementInputFactKind::SessionInvalidated
+			&& Facts[4].Request == OriginalRequest
+			&& Source->QueryMovementInputRequest(Successor, Request, Error) == EGGYGOMovementInputRequestQueryResult::Unavailable);
+	}
+
 	class FWaitForNativeMovementOriginRebuild : public IAutomationLatentCommand
 	{
 	public:
@@ -1054,40 +1196,176 @@ namespace
 
 		virtual bool Update() override
 		{
+			if (Stage != EStage::OriginalSource) { return UpdateHeroRebuild(); }
 			if (!Probe->CheckCold(TEXT("waiting for actual first rebuild notification")))
 			{
-				Probe->Cleanup();
-				return true;
+				return Finish();
 			}
 			AGGYGOInputTestPawn* Pawn = Probe->Fixture.GetPawn();
 			UGGYGOInputTestHeroComponent* Observer = IsValid(Pawn) ? Pawn->GetHeroForTest() : nullptr;
 			if (!IsValid(Observer) || !Observer->IsObservingNativeMappingRebuildForTest())
 			{
 				Probe->Test.AddError(TEXT("[Input.NativeBirthTest] Original native rebuild observer/route lost; no successor is adopted."));
-				Probe->Cleanup();
-				return true;
+				return Finish();
 			}
 			if (Observer->GetNativeMappingRebuildCountForTest() == 0)
 			{
 				if (FPlatformTime::Seconds() < Deadline) { return false; }
 				Probe->Test.AddError(TEXT("[Input.NativeBirthTest] 10-second timeout awaiting the original engine mapping rebuild notification; no real rebuild frame arrived. No immediate rebuild, manual Tick/Broadcast or qualification substitution is permitted."));
-				Probe->Cleanup();
-				return true;
+				return Finish();
 			}
 			if (Observer->GetFirstNativeMappingRebuildTimeForTest() > Deadline)
 			{
 				Probe->Test.AddError(TEXT("[Input.NativeBirthTest] Original first rebuild notification arrived after the 10-second deadline; late readiness cannot turn the timeout into success."));
-				Probe->Cleanup();
-				return true;
+				return Finish();
 			}
-			Probe->RunDigitalAssertions();
+			// 先验证已编译的共享 IMC；不能借后续新 IMC 的 Add／Remove 请求让缺失的安装请求假通过。
+			if (!Probe->RunDigitalAssertions() || !RunNativeMovementSuccessorAssertions(*Probe)
+				|| !BeginHeroInstallation(true))
+			{
+				return Finish();
+			}
+			Stage = EStage::SharedHeroMapping;
+			return false;
+		}
+
+	private:
+		bool Finish()
+		{
+			// 先归还日志观察，再清理夹具；后续清理不属于这项负例。
+			ExpectedFreshProof.Reset();
 			Probe->Cleanup();
 			return true;
 		}
 
-	private:
+		enum class EStage : uint8 { OriginalSource, FirstHeroMapping, SharedHeroMapping };
+
+		bool BeginHeroInstallation(bool bUseAlreadyAppliedMapping)
+		{
+			AGGYGOInputTestPawn* Pawn = Probe->Fixture.GetPawn();
+			UEnhancedInputLocalPlayerSubsystem* Subsystem = Probe->Fixture.GetInputSubsystem();
+			UGGYGOCharacterMovementComponent* Movement = Pawn ? Cast<UGGYGOCharacterMovementComponent>(Pawn->GetCharacterMovement()) : nullptr;
+			if (!Probe->Test.TestTrue(TEXT("Hero installation retains the native fixture's original input and CMC"),
+				IsValid(Pawn) && IsValid(Subsystem) && IsValid(Movement)
+				&& Subsystem->GetPlayerInput() == Probe->OriginalProducer.Get())) { return false; }
+			if (!bUseAlreadyAppliedMapping)
+			{
+				FreshMapping.Reset(NewObject<UGGYGOInputTestMappingContext>(Probe->Fixture.GetGameInstance(), NAME_None, RF_Transient));
+				for (const FKey& Key : { EKeys::W, EKeys::A, EKeys::S, EKeys::D })
+				{
+					FreshMapping->MapKey(Probe->Fixture.GetMoveAction(), Key);
+				}
+			}
+			const UInputMappingContext* Mapping = bUseAlreadyAppliedMapping ? Probe->Fixture.GetMappingContext() : FreshMapping.Get();
+			if (!Probe->Test.TestEqual(TEXT("first and shared IMC cases have their real pre-installation state"),
+				Subsystem->HasMappingContext(Mapping), bUseAlreadyAppliedMapping)) { return false; }
+			UGGYGOInputTestHeroComponent* Hero = Pawn->GetHeroForTest();
+			// 每次安装独立观察下一次真实通知，保留实际到达时间，不能以晚到回调抹掉超时。
+			Hero->StopObservingNativeMappingRebuildForTest();
+			if (!Probe->Test.TestTrue(TEXT("observe the same original subsystem for this Hero installation"),
+				Hero->ObserveNativeMappingRebuildForTest(Subsystem))) { return false; }
+			BeforeRebuildCount = Hero->GetNativeMappingRebuildCountForTest();
+			BeforeBindingSerial = Movement->GetMovementInputBindingSerial();
+			Hero->ConfigureMappingForTest(Mapping, 0);
+			if (!bUseAlreadyAppliedMapping)
+			{
+				ExpectedFreshProof = MakeUnique<FScopedExpectedMovementProof>(*Probe, false, TEXT("HeroInputReleased"));
+			}
+			HeroDeadline = FPlatformTime::Seconds() + 10.0;
+			Hero->InitializePlayerInput(Pawn->GetInputComponentForTest());
+			return Probe->Test.TestTrue(TEXT("Hero installation registers its IMC and defers compilation/binding to the real engine frame"),
+				Subsystem->HasMappingContext(Mapping) && Hero->GetNativeMappingRebuildCountForTest() == BeforeRebuildCount
+				&& Movement->GetMovementInputBindingSerial() == BeforeBindingSerial);
+		}
+
+		bool CheckAttachedHero(FGGYGOMovementOwnerSyncScopeId& OutScope)
+		{
+			UGGYGOCharacterMovementComponent* Movement = Cast<UGGYGOCharacterMovementComponent>(Probe->Fixture.GetPawn()->GetCharacterMovement());
+			FString Error;
+			if (!Probe->Test.TestTrue(TEXT("actual native rebuild allocates exactly one original CMC binding"),
+				Movement->GetMovementInputBindingSerial() == BeforeBindingSerial + 1
+				&& Movement->GetMovementOwnerSyncScope(OutScope, Error))) { return false; }
+			FGGYGOQualifiedMovementIntent Intent;
+			const EGGYGOQualifiedMovementIntentQueryResult Query = Movement->QueryQualifiedMovementIntent(OutScope, Intent, Error);
+			return Probe->Test.TestTrue(TEXT("public CMC query confirms real Source Attach without inventing a Held grant"),
+				Query == EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof || Query == EGGYGOQualifiedMovementIntentQueryResult::NotHeld);
+		}
+
+		bool UpdateHeroRebuild()
+		{
+			AGGYGOInputTestPawn* Pawn = Probe->Fixture.GetPawn();
+			UGGYGOInputTestHeroComponent* Hero = IsValid(Pawn) ? Pawn->GetHeroForTest() : nullptr;
+			if (!IsValid(Hero) || !Hero->IsObservingNativeMappingRebuildForTest())
+			{
+				Probe->Test.AddError(TEXT("Hero regression lost its original native rebuild observer."));
+				return Finish();
+			}
+			const bool bExpired = FPlatformTime::Seconds() >= HeroDeadline;
+			if (bExpired || Hero->GetNativeMappingRebuildCountForTest() > BeforeRebuildCount)
+			{
+				if (!Probe->Test.TestTrue(TEXT("each Hero installation receives one actual rebuild before its own 10-second deadline"),
+					Hero->GetNativeMappingRebuildCountForTest() == BeforeRebuildCount + 1
+					&& Hero->GetFirstNativeMappingRebuildTimeForTest() <= HeroDeadline))
+				{
+					return Finish();
+				}
+				FGGYGOMovementOwnerSyncScopeId CurrentScope;
+				if (!CheckAttachedHero(CurrentScope)) { return Finish(); }
+				ExpectedFreshProof.Reset();
+				UGGYGOInputComponent* Input = Pawn->GetInputComponentForTest();
+				UGGYGOCharacterMovementComponent* Movement = Cast<UGGYGOCharacterMovementComponent>(Pawn->GetCharacterMovement());
+				UEnhancedInputLocalPlayerSubsystem* Subsystem = Probe->Fixture.GetInputSubsystem();
+				if (Stage == EStage::SharedHeroMapping)
+				{
+					for (const TUniquePtr<FEnhancedInputActionEventBinding>& Binding : Input->GetActionEventBindings())
+					{
+						if (Binding->GetAction() == Probe->Fixture.GetMoveAction() && Binding->GetTriggerEvent() == ETriggerEvent::Triggered)
+						{
+							OldMoveBindings.Add(Binding->Clone());
+						}
+					}
+					if (!Probe->Test.TestEqual(TEXT("clone exactly the original Hero movement callback before replacement"), OldMoveBindings.Num(), 1))
+					{ return Finish(); }
+					Hero->ReleasePlayerInput();
+					if (!Probe->Test.TestTrue(TEXT("shared Hero release preserves the independent registered IMC holder"),
+						Subsystem->HasMappingContext(Probe->Fixture.GetMappingContext())))
+					{ return Finish(); }
+					if (!BeginHeroInstallation(false)) { return Finish(); }
+					Stage = EStage::FirstHeroMapping;
+					return false;
+				}
+				const uint64 CurrentBindingSerial = Movement->GetMovementInputBindingSerial();
+				const FInputActionInstance Instance(Probe->Fixture.GetMoveAction());
+				for (const TUniquePtr<FEnhancedInputActionEventBinding>& OldBinding : OldMoveBindings) { OldBinding->Execute(Instance); }
+				Probe->OriginalProducer->EndMovementInputSession(Probe->Session, TEXT("OldEndAfterHeroSuccessorAttached"));
+				FGGYGOMovementOwnerSyncScopeId AfterOldCallbacks;
+				FString Error;
+				if (!Probe->Test.TestTrue(TEXT("old movement callback and End(old) preserve the attached Hero successor"),
+					Movement->GetMovementInputBindingSerial() == CurrentBindingSerial
+					&& Movement->GetMovementOwnerSyncScope(AfterOldCallbacks, Error)
+					&& AfterOldCallbacks == CurrentScope) || !CheckAttachedHero(AfterOldCallbacks))
+				{ return Finish(); }
+				Hero->ReleasePlayerInput();
+				FGGYGOQualifiedMovementIntent Intent;
+				Probe->Test.TestTrue(TEXT("current Hero release retires its binding and leaves the other IMC holder intact"),
+					Movement->GetMovementInputBindingSerial() == CurrentBindingSerial + 1
+					&& Movement->QueryQualifiedMovementIntent(CurrentScope, Intent, Error) == EGGYGOQualifiedMovementIntentQueryResult::Unavailable
+					&& !Subsystem->HasMappingContext(FreshMapping.Get())
+					&& Subsystem->HasMappingContext(Probe->Fixture.GetMappingContext()));
+				return Finish();
+			}
+			return false;
+		}
+
 		TSharedRef<FNativeMovementOriginProbe> Probe;
 		double Deadline;
+		double HeroDeadline = 0.0;
+		int32 BeforeRebuildCount = 0;
+		uint64 BeforeBindingSerial = 0;
+		EStage Stage = EStage::OriginalSource;
+		TStrongObjectPtr<UGGYGOInputTestMappingContext> FreshMapping;
+		TArray<TUniquePtr<FEnhancedInputActionEventBinding>> OldMoveBindings;
+		TUniquePtr<FScopedExpectedMovementProof> ExpectedFreshProof;
 	};
 
 #if WITH_EDITOR

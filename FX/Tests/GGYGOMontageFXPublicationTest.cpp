@@ -95,7 +95,7 @@ bool FGGYGOMontageFXLeaseTest::RunTest(const FString&)
 	FPublicationWorld Fixture(FGGYGOMontageFXSendTerminal::CreateLambda(
 		[&Sent](const FGGYGOMontageFXTerminal& Terminal) { Sent.Add(Terminal); }));
 	if (!TestTrue(TEXT("独立 World 与 owner 有效"), Fixture.World && Fixture.Owner.IsValid())) { return false; }
-	const TSharedPtr<const void> Source = MakeShared<int32>(1);
+	const FGGYGOFXSourceIdentity Source = FGGYGOFXSourceIdentity::FromAbilityActivation(MakeShared<int32>(1));
 	FGGYGOMontageFXLease First, Next;
 	FString Error;
 	TestTrue(TEXT("第一次实际发布"), Fixture.Owner->Begin(Source, Fixture.Request(), First, Error));
@@ -190,8 +190,8 @@ bool FGGYGOMontageFXRegistrationTest::RunTest(const FString&)
 {
 	FPublicationWorld Fixture;
 	if (!Fixture.World || !Fixture.Owner.IsValid()) { return false; }
-	const TSharedPtr<const void> OldSource = MakeShared<int32>(1);
-	const TSharedPtr<const void> NewSource = MakeShared<int32>(2);
+	const FGGYGOFXSourceIdentity OldSource = FGGYGOFXSourceIdentity::FromAbilityActivation(MakeShared<int32>(1));
+	const FGGYGOFXSourceIdentity NewSource = FGGYGOFXSourceIdentity::FromAbilityActivation(MakeShared<int32>(2));
 	FGGYGOMontageFXLease Old, Current;
 	FString Error;
 	TestTrue(TEXT("原注册发布"), Fixture.Owner->Begin(OldSource, Fixture.Request(), Old, Error));
@@ -204,7 +204,7 @@ bool FGGYGOMontageFXRegistrationTest::RunTest(const FString&)
 	Fixture.Owner->Shutdown(OldRegistration);
 	TestNull(TEXT("旧清理只移除旧注册发布"), Fixture.Snapshot.Find(Old.GetOccurrence()));
 	TestNotNull(TEXT("旧 Shutdown 不清新注册共享 state"), Fixture.Snapshot.Find(Current.GetOccurrence()));
-	TArray<TSharedPtr<const void>> Sources;
+	TArray<FGGYGOFXSourceIdentity> Sources;
 	Fixture.Owner->GetSourceIdentities(Sources);
 	TestEqual(TEXT("只返回仍发布的 source"), Sources.Num(), 1);
 	if (Sources.Num()) { TestTrue(TEXT("新原 source 身份保留"), Sources[0] == NewSource); }

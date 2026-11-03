@@ -1,3 +1,7 @@
+/**
+ * @file GGYGOLocomotionEvaluation.cpp
+ * @brief 原动画源的区间求值、完整曲线身份及配置校验。
+ */
 #include "Character/Data/GGYGOLocomotionEvaluation.h"
 #include "Character/Data/GGYGOAnimationSourceCurveEvaluation.h"
 
@@ -7,6 +11,8 @@
 #include "Animation/AnimCurveCompressionCodec_CompressedRichCurve.h"
 #include "Animation/AnimCurveCompressionCodec_UniformIndexable.h"
 #include "Animation/AnimCurveCompressionCodec_UniformlySampled.h"
+#include "AnimCurveCompressionCodec_ACL.h"
+#include <acl/core/compressed_tracks.h>
 #include "Animation/BlendSpace1D.h"
 #include "Containers/StringConv.h"
 #include "Hash/xxhash.h"
@@ -175,7 +181,7 @@ namespace GGYGOLocomotionSourceEvaluation
 	struct FCanonicalCurveEntry
 	{
 		TArray<uint8> NameUtf8;
-		/** RichCurve/UniformIndexable：压缩轨道号；UniformlySampled：是否常量。 */
+		/** RichCurve/UniformIndexable/ACL：压缩轨道号；UniformlySampled：是否常量。 */
 		uint32 First = 0;
 		/** UniformlySampled：常量或动画样本槽位；其余为 0。 */
 		uint32 Second = 0;
@@ -208,10 +214,10 @@ namespace GGYGOLocomotionSourceEvaluation
 	}
 
 	/**
-	 * 按三种原生解码器的实际读取方式，得到与 FastLess 排列无关的"曲线名 → 缓冲槽位"映射。
+	 * 按精确原生解码器的实际读取方式，得到与 FastLess 排列无关的"曲线名 → 缓冲槽位"映射。
 	 * 数组位置 t 是压缩轨道号（序列化顺序，CurveName[t] 为该轨道名）；CurveIndex 是按进程内 FastLess
 	 * 重建的名称排序置换（FCompressedAnimSequence::RebuildCurveIndexTable）。
-	 * CompressedRichCurve/UniformIndexable：值只取自轨道 CurveIndex[k]、名称取自同一轨道，映射等价于 {CurveName[t], t}，与置换无关。
+	 * CompressedRichCurve/UniformIndexable/ACL：值只取自轨道 CurveIndex[k]、名称取自同一轨道，映射等价于 {CurveName[t], t}，与置换无关。
 	 * UniformlySampled：批量解码按 k 递增的调用次序分配常量/动画样本槽位（BuildLinearUnfiltered 逐个调用），
 	 * 置换本身决定名称拿到哪个槽位，因此按解码器同一规则求出 {名称, 是否常量, 槽位}。
 	 * 未知解码器的读取语义无法证明，明确拒绝。同时要求四条必需曲线各出现一次、置换合法、头部与长度可被解码器读取。
@@ -252,6 +258,35 @@ namespace GGYGOLocomotionSourceEvaluation
 				if (NumSamples <= 0 || Stream.Num() < 8 + int64(sizeof(float)) * NumCurves * NumSamples)
 					return Fail(&OutError, &Sequence, TEXT("SourceIdentity"), TEXT("uniform-indexable curve stream has no samples or is truncated"));
 			}
+			for (int32 Track = 0; Track < NumCurves; ++Track)
+			{
+				FCanonicalCurveEntry& Entry = OutEntries.AddDefaulted_GetRef();
+				Entry.NameUtf8 = ToUtf8(Names[Track].CurveName);
+				Entry.First = static_cast<uint32>(Track);
+			}
+		}
+		else if (CodecClass == UAnimCurveCompressionCodec_ACL::StaticClass())
+		{
+			// SDK 校验会读公共／scalar 头并按内嵌 size 算 hash，先把所有读取界定在原 TArray 内。
+			constexpr uint32 HeaderBytes = static_cast<uint32>(sizeof(acl::acl_impl::raw_buffer_header)
+				+ sizeof(acl::acl_impl::tracks_header) + sizeof(acl::acl_impl::scalar_tracks_header));
+			if (static_cast<uint32>(Stream.Num()) < HeaderBytes
+				|| reinterpret_cast<UPTRINT>(Stream.GetData()) % alignof(acl::compressed_tracks) != 0)
+				return Fail(&OutError, &Sequence, TEXT("SourceIdentity"), TEXT("ACL curve stream header is truncated or unaligned"));
+			const acl::compressed_tracks* Tracks = acl::make_compressed_tracks(Stream.GetData());
+			const uint32 PayloadBytes = Tracks->get_size();
+			if (PayloadBytes < HeaderBytes || PayloadBytes > static_cast<uint32>(Stream.Num()))
+				return Fail(&OutError, &Sequence, TEXT("SourceIdentity"), TEXT("ACL curve stream size exceeds its bounded payload"));
+			if (Tracks->is_valid(true).any()
+				|| Tracks->get_version() != acl::compressed_tracks_version16::latest
+				|| Tracks->get_track_type() != acl::track_type8::float1f
+				|| Tracks->get_num_tracks() != static_cast<uint32>(NumCurves)
+				|| Tracks->get_num_samples_per_track() == 0
+				|| !FMath::IsFinite(Tracks->get_sample_rate()) || Tracks->get_sample_rate() <= 0.0f)
+				return Fail(&OutError, &Sequence, TEXT("SourceIdentity"), TEXT("ACL curve stream is corrupt or disagrees with its original tracks"));
+			// 原 codec 另核压缩失败标记；错误填充产生的默认曲线不能取得有效身份。
+			if (!Codec.ValidateCompressedData(nullptr, Platform))
+				return Fail(&OutError, &Sequence, TEXT("SourceIdentity"), TEXT("ACL codec rejected its compressed curve payload"));
 			for (int32 Track = 0; Track < NumCurves; ++Track)
 			{
 				FCanonicalCurveEntry& Entry = OutEntries.AddDefaulted_GetRef();

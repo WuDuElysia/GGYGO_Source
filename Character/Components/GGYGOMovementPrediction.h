@@ -208,7 +208,7 @@ public:
 	/** 本次 move 的转身入口朝向（度）。位移方向的基准，必须还原。 */
 	float SavedTurnBackEntryYaw = 0.0f;
 
-	/** 本次 move 的反向输入闩状态。影响能否触发下一次转身。 */
+	/** 原段独立信号是否尚未开放再次触发；沿原 move 保存／还原，不从相位推断。 */
 	bool bSavedTurnBackInputLatched = false;
 
 	/** Original local input/result, including a source first issued during this move. */
@@ -221,6 +221,9 @@ public:
 	/** 原 SetMoveFor 的同步身份；PostUpdate/回放/响应不得补写。不是来源认证。 */
 	FGGYGOMovementOwnerSyncScopeId SavedMovementOwnerSyncScope;
 	uint64 SavedMovementOwnerGeneration = 0;
+	/** 原 SetMoveFor 捕获的实际投影基底；重发/回放不能改签当前来源。 */
+	bool bSavedHasCameraProjection = false;
+	float SavedCameraProjectionYaw = 0.0f;
 
 private:
 	/** Original SetMoveFor applicability; a replay snapshot, never request authority or physical Held. */
@@ -252,11 +255,14 @@ public:
 struct FCharacterNetworkMoveData_GGYGO : public FCharacterNetworkMoveData
 {
 	/** 固定 9/137 位扩展，原生 owning actor RPC 提供实际 PC/Connection 身份。 */
-	static constexpr uint8 OwnerSyncWireVersion = 2;
+	static constexpr uint8 OwnerSyncWireVersion = 3;
 	bool bHasMovementOwnerSync = false;
 	uint64 MovementOwnerSyncNonce = 0;
 	uint64 MovementOwnerGeneration = 0;
 	FGGYGOMovementInputSourceCheckpoint MovementInputSourceCheckpoint;
+	/** 与同一 native move/来源检查点运输，只供镜头派生表现，不授移动许可。 */
+	bool bHasCameraProjection = false;
+	float CameraProjectionYaw = 0.0f;
 	EGGYGOLocomotionMotionType LocomotionMotionType = EGGYGOLocomotionMotionType::None;
 	EGGYGOStopMotionType StopMotionType = EGGYGOStopMotionType::None;
 	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;

@@ -8,6 +8,7 @@
 #include "Player/GGYGOLocalPlayer.h"
 
 #include "Components/InputComponent.h"
+#include "CoreGlobals.h"
 #include "EnhancedActionKeyMapping.h"
 #include "EnhancedInputSubsystems.h"
 #include "Engine/LocalPlayer.h"
@@ -16,9 +17,24 @@
 #include "InputAction.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"
+#include "Misc/ScopeExit.h"
 #include "UObject/Class.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMovementInput, Log, All);
+
+/** 只保原评价来源及完成结果；消费方持有时保留，原 Source/Session 仍须在查询时核验。 */
+struct FGGYGOMovementInputEvaluationProof
+{
+	FGGYGOMovementInputSessionIdentity Session;
+	uint64 EvaluationSerial = 0;
+	EGGYGOMovementInputEvaluationState State = EGGYGOMovementInputEvaluationState::Waiting;
+	FString FailureReason;
+};
+
+FGGYGOMovementInputSessionIdentity FGGYGOMovementInputEvaluationToken::GetSourceSession() const
+{
+	return Proof.IsValid() ? Proof->Session : FGGYGOMovementInputSessionIdentity{};
+}
 
 namespace
 {
@@ -638,6 +654,7 @@ bool UGGYGOPlayerInput::BeginMovementInputSession(APawn* Pawn, UInputComponent* 
 	AdoptKnownMovementSources();
 	CurrentSession.Producer = this;
 	CurrentSession.SessionSerial = Serial;
+	InvalidatePendingMovementInputEvaluation(TEXT("原 Session 已切换，旧在途评价不再有效。"));
 	const EGGYGOMovementInputOriginQualification Qualification = ProducerOriginResource->GetQualification(this);
 	if (Qualification == EGGYGOMovementInputOriginQualification::Cold)
 	{
@@ -921,6 +938,15 @@ void UGGYGOPlayerInput::EndMovementInputSession(const FGGYGOMovementInputSession
 	{
 		return;
 	}
+	RetiringMovementInputEvaluationSessionSerial = Session.SessionSerial;
+	InvalidatePendingMovementInputEvaluation(TEXT("原输入 Session 已退役。"));
+	FMovementInputEvaluationEvent OriginalEvaluationObservers = MoveTemp(MovementInputEvaluationObservers);
+	MovementInputEvaluationObservers.Clear();
+	const FString EvaluationEndReason = MakeError(TEXT("原输入 Session 已退役：") + Reason.ToString());
+	ON_SCOPE_EXIT
+	{
+		OriginalEvaluationObservers.Broadcast(EGGYGOMovementInputEvaluationState::Invalidated, EvaluationEndReason);
+	};
 	const FGGYGOMovementInputConsumerBindingId OriginalBinding = ReceiverBinding;
 	const FGGYGOMovementInputFactDelegate OriginalReceiver = FactReceiver;
 	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
@@ -1008,6 +1034,306 @@ EGGYGOMovementInputRequestQueryResult UGGYGOPlayerInput::QueryMovementInputReque
 	OutRequest.Session = OriginalSession;
 	OutRequest.RequestSerial = ActiveRequestSerial;
 	return EResult::Held;
+}
+
+EGGYGOMovementInputRequestQueryResult UGGYGOPlayerInput::QueryMovementInputActionValue(
+	const FGGYGOMovementInputRequestIdentity& OriginalRequest,
+	FVector2D& OutActionValue, FString& OutError) const
+{
+	using EResult = EGGYGOMovementInputRequestQueryResult;
+	OutActionValue = FVector2D::ZeroVector;
+	OutError.Reset();
+	if (!IsInGameThread() || OriginalRequest.RequestSerial == 0)
+	{
+		OutError = MakeError(TEXT("Action 查询需要 GameThread 上原 Source 已发行的非零请求。"));
+		return EResult::Unavailable;
+	}
+	FGGYGOMovementInputRequestIdentity CurrentRequest;
+	const EResult Result = QueryMovementInputRequest(OriginalRequest.Session, CurrentRequest, OutError);
+	if (Result != EResult::Held) { return Result; }
+	if (CurrentRequest != OriginalRequest)
+	{
+		OutError = MakeError(TEXT("Action 查询的原请求已被后继请求替换。"));
+		return EResult::Unavailable;
+	}
+	if (!HasCurrentCompletedMovementInputEvaluation(OutError)) { return EResult::AwaitingPhysicalProof; }
+	return ReadEvaluatedMovementInputActionValue(OutActionValue, OutError);
+}
+
+bool UGGYGOPlayerInput::HasCurrentCompletedMovementInputEvaluation(FString& OutError) const
+{
+	if (bEvaluatingMovementAction || !MovementActionEvaluation.IsSet() || !MovementActionEvaluation->bCompleted
+		|| MovementActionEvaluation->Session != CurrentSession
+		|| RetiringMovementInputEvaluationSessionSerial == CurrentSession.SessionSerial
+		|| MovementActionEvaluation->FrameNumber != GFrameCounter
+		|| MovementActionEvaluation->ObservationRevision != ObservationRevision)
+	{
+		OutError = MakeError(TEXT("原 Session 的 Action 本帧尚未完整评价，或处理后输入已变化；等待原生评价。"));
+		return false;
+	}
+	return true;
+}
+
+EGGYGOMovementInputRequestQueryResult UGGYGOPlayerInput::ReadEvaluatedMovementInputActionValue(
+	FVector2D& OutActionValue, FString& OutError) const
+{
+	using EResult = EGGYGOMovementInputRequestQueryResult;
+	OutActionValue = FVector2D::ZeroVector;
+	const UInputAction* Action = SessionAction.Get(); // 原 Query 已核验该 Action 及其 Axis2D 路由。
+	const FInputActionInstance* Instance = FindActionInstanceData(Action);
+	if (!Instance)
+	{
+		OutError = MakeError(TEXT("原 Session 的 ActionInstance 尚未可读。"));
+		return EResult::AwaitingPhysicalProof;
+	}
+	const FInputActionValue Value = Instance->GetValue();
+	if (Instance->GetSourceAction().Get() != Action || Value.GetValueType() != EInputActionValueType::Axis2D)
+	{
+		OutError = MakeError(TEXT("原 ActionInstance 的来源或 Axis2D 类型不匹配。"));
+		return EResult::Unavailable;
+	}
+	const FVector2D Axis = Value.Get<FVector2D>();
+	if (!FMath::IsFinite(Axis.X) || !FMath::IsFinite(Axis.Y))
+	{
+		OutError = MakeError(TEXT("原 ActionInstance 的 Axis2D 含非有限值。"));
+		return EResult::Unavailable;
+	}
+	OutActionValue = Axis;
+	return EResult::Held;
+}
+
+void UGGYGOPlayerInput::InvalidatePendingMovementInputEvaluation(const TCHAR* Reason)
+{
+	if (ActiveMovementInputEvaluationProof.IsValid()
+		&& ActiveMovementInputEvaluationProof->State == EGGYGOMovementInputEvaluationState::Waiting)
+	{
+		ActiveMovementInputEvaluationProof->State = EGGYGOMovementInputEvaluationState::Invalidated;
+		ActiveMovementInputEvaluationProof->FailureReason = MakeError(Reason);
+	}
+	ActiveMovementInputEvaluationProof.Reset();
+	MovementActionEvaluation.Reset();
+}
+
+bool UGGYGOPlayerInput::CaptureMovementInputEvaluationToken(const FGGYGOMovementInputSessionIdentity& OriginalSession,
+	FGGYGOMovementInputEvaluationToken& OutToken, FString& OutError)
+{
+	OutError.Reset();
+	if (!IsInGameThread() || OutToken.IsSet() || !IsCurrentSession(OriginalSession)
+		|| RetiringMovementInputEvaluationSessionSerial == OriginalSession.SessionSerial
+		|| !bEvaluatingMovementAction || bMovementActionEvaluationInterrupted || !MovementActionEvaluation.IsSet()
+		|| MovementActionEvaluation->Session != OriginalSession || MovementActionEvaluation->EvaluationSerial == 0
+		|| MovementActionEvaluation->FrameNumber != GFrameCounter
+		|| MovementActionEvaluation->ObservationRevision != ObservationRevision)
+	{
+		OutError = MakeError(TEXT("只能把原 Session 在途自然评价捕获到空 Token；不采用完成后的 latest 评价。"));
+		return false;
+	}
+	if (!ValidateCurrentRoute(OutError)) { return false; }
+	if (!ActiveMovementInputEvaluationProof.IsValid())
+	{
+		ActiveMovementInputEvaluationProof = MakeShared<FGGYGOMovementInputEvaluationProof>();
+		ActiveMovementInputEvaluationProof->Session = OriginalSession;
+		ActiveMovementInputEvaluationProof->EvaluationSerial = MovementActionEvaluation->EvaluationSerial;
+	}
+	OutToken.Proof = ActiveMovementInputEvaluationProof;
+	return true;
+}
+
+EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::ValidateMovementInputEvaluationToken(
+	const FGGYGOMovementInputEvaluationToken& OriginalToken, UGGYGOPlayerInput*& OutProducer, FString& OutError)
+{
+	using EState = EGGYGOMovementInputEvaluationState;
+	OutProducer = nullptr;
+	OutError.Reset();
+	if (!IsInGameThread() || !OriginalToken.Proof.IsValid())
+	{
+		OutError = TEXT("[Input.Evaluation] 原 edge 没有可查询的评价 Proof，或查询不在 GameThread。");
+		return EState::Invalidated;
+	}
+	const auto& Proof = OriginalToken.Proof;
+	if (Proof->State == EState::Invalidated)
+	{
+		OutError = Proof->FailureReason;
+		return EState::Invalidated;
+	}
+	UGGYGOPlayerInput* Producer = Cast<UGGYGOPlayerInput>(Proof->Session.Producer.Get());
+	if (!Producer || !Producer->IsCurrentSession(Proof->Session)
+		|| Producer->RetiringMovementInputEvaluationSessionSerial == Proof->Session.SessionSerial)
+	{
+		OutError = TEXT("[Input.Evaluation] 原 Producer/Session 已退役，不能借用后继来源。");
+		return EState::Invalidated;
+	}
+	if (!Producer->ValidateCurrentRoute(OutError)) { return EState::Invalidated; }
+	if (Proof->State == EState::Waiting
+		&& (!Producer->bEvaluatingMovementAction || Producer->bMovementActionEvaluationInterrupted
+			|| Producer->ActiveMovementInputEvaluationProof != Proof || !Producer->MovementActionEvaluation.IsSet()
+			|| Producer->MovementActionEvaluation->EvaluationSerial != Proof->EvaluationSerial))
+	{
+		OutError = Producer->MakeError(TEXT("原 edge 的评价在完整返回前已被中断。"));
+		return EState::Invalidated;
+	}
+	OutProducer = Producer;
+	return Proof->State;
+}
+
+EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::QueryMovementInputEvaluationToken(
+	const FGGYGOMovementInputEvaluationToken& OriginalToken, FString& OutError)
+{
+	UGGYGOPlayerInput* Producer = nullptr;
+	return ValidateMovementInputEvaluationToken(OriginalToken, Producer, OutError);
+}
+
+EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::QueryStepStartInputFact(
+	const FGGYGOMovementInputEvaluationToken& OriginalEdgeToken, FGGYGOMovementInputStepFact& OutFact, FString& OutError)
+{
+	using EState = EGGYGOMovementInputEvaluationState;
+	OutFact = {};
+	UGGYGOPlayerInput* Producer = nullptr;
+	EGGYGOMovementInputRequestQueryResult InputState;
+	const EState Readiness = ValidateStepStartInputReadiness(OriginalEdgeToken, Producer, InputState, OutError);
+	if (Readiness != EState::Completed) { return Readiness; }
+	FVector2D Axis = FVector2D::ZeroVector;
+	if (InputState == EGGYGOMovementInputRequestQueryResult::Held)
+	{
+		const auto ValueResult = Producer->ReadEvaluatedMovementInputActionValue(Axis, OutError);
+		if (ValueResult == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof) { return EState::Waiting; }
+		if (ValueResult != EGGYGOMovementInputRequestQueryResult::Held) { return EState::Invalidated; }
+	}
+	// 原路由已核原 PC；Yaw 在真正准入查询时读取，不属于 edge 完成快照。
+	const float ControlYaw = Producer->GetOuterAPlayerController()->GetControlRotation().Yaw;
+	if (!FMath::IsFinite(ControlYaw))
+	{
+		OutError = Producer->MakeError(TEXT("真正段首的原 Controller Yaw 含非有限值。"));
+		return EState::Invalidated;
+	}
+	OutFact.SourceSessionSerial = OriginalEdgeToken.Proof->Session.SessionSerial;
+	OutFact.OriginalEdgeEvaluationSerial = OriginalEdgeToken.Proof->EvaluationSerial;
+	OutFact.StepEvaluationSerial = Producer->MovementActionEvaluation->EvaluationSerial;
+	OutFact.InputState = InputState;
+	OutFact.ActionValue = Axis;
+	OutFact.ControlYaw = ControlYaw;
+	return EState::Completed;
+}
+
+EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::ValidateStepStartInputReadiness(
+	const FGGYGOMovementInputEvaluationToken& OriginalEdgeToken, UGGYGOPlayerInput*& OutProducer,
+	EGGYGOMovementInputRequestQueryResult& OutInputState, FString& OutError)
+{
+	using EState = EGGYGOMovementInputEvaluationState;
+	OutInputState = EGGYGOMovementInputRequestQueryResult::Unavailable;
+	const EState EdgeState = ValidateMovementInputEvaluationToken(OriginalEdgeToken, OutProducer, OutError);
+	if (EdgeState != EState::Completed) { return EdgeState; }
+	if (!OutProducer->HasCurrentCompletedMovementInputEvaluation(OutError)) { return EState::Waiting; }
+	FGGYGOMovementInputRequestIdentity CurrentRequest;
+	const auto InputState = OutProducer->QueryMovementInputRequest(OriginalEdgeToken.Proof->Session, CurrentRequest, OutError);
+	if (InputState == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof) { return EState::Waiting; }
+	if (InputState != EGGYGOMovementInputRequestQueryResult::Held
+		&& InputState != EGGYGOMovementInputRequestQueryResult::NotHeld) { return EState::Invalidated; }
+	if (InputState == EGGYGOMovementInputRequestQueryResult::Held)
+	{
+		const auto* Instance = OutProducer->FindActionInstanceData(OutProducer->SessionAction.Get());
+		if (!Instance)
+		{
+			OutError = OutProducer->MakeError(TEXT("原 Session 的 ActionInstance 尚未可读。"));
+			return EState::Waiting;
+		}
+		if (Instance->GetSourceAction().Get() != OutProducer->SessionAction.Get())
+		{
+			OutError = OutProducer->MakeError(TEXT("原 ActionInstance 来源不匹配。"));
+			return EState::Invalidated;
+		}
+	}
+	OutInputState = InputState;
+	return EState::Completed;
+}
+
+EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::QueryStepStartInputReadiness(
+	const FGGYGOMovementInputEvaluationToken& OriginalEdgeToken, FString& OutError)
+{
+	UGGYGOPlayerInput* Producer = nullptr;
+	EGGYGOMovementInputRequestQueryResult InputState;
+	return ValidateStepStartInputReadiness(OriginalEdgeToken, Producer, InputState, OutError);
+}
+
+bool UGGYGOPlayerInput::ValidateStepStartInputFact(const FGGYGOMovementInputEvaluationToken& OriginalEdgeToken,
+	const FGGYGOMovementInputStepFact& Fact, FString& OutError)
+{
+	UGGYGOPlayerInput* Producer = nullptr;
+	EGGYGOMovementInputRequestQueryResult InputState;
+	if (ValidateStepStartInputReadiness(OriginalEdgeToken, Producer, InputState, OutError)
+		!= EGGYGOMovementInputEvaluationState::Completed)
+	{
+		return false;
+	}
+	if (Fact.SourceSessionSerial != OriginalEdgeToken.Proof->Session.SessionSerial
+		|| Fact.OriginalEdgeEvaluationSerial != OriginalEdgeToken.Proof->EvaluationSerial
+		|| Fact.StepEvaluationSerial != Producer->MovementActionEvaluation->EvaluationSerial || Fact.InputState != InputState)
+	{
+		OutError = Producer->MakeError(TEXT("已取段首事实的原来源、评价或输入状态已变化。"));
+		return false;
+	}
+	FVector2D Axis = FVector2D::ZeroVector;
+	if (InputState == EGGYGOMovementInputRequestQueryResult::Held
+		&& Producer->ReadEvaluatedMovementInputActionValue(Axis, OutError) != EGGYGOMovementInputRequestQueryResult::Held)
+	{
+		return false;
+	}
+	const float ControlYaw = Producer->GetOuterAPlayerController()->GetControlRotation().Yaw;
+	if (!FMath::IsFinite(ControlYaw) || Fact.ActionValue != Axis || Fact.ControlYaw != ControlYaw)
+	{
+		OutError = TEXT("[Input.Evaluation] 已取段首事实的原评价/值/Yaw 已变化；不重采替换该请求。");
+		return false;
+	}
+	return true;
+}
+
+bool UGGYGOPlayerInput::SubscribeMovementInputEvaluation(const FGGYGOMovementInputEvaluationToken& OriginalToken,
+	FGGYGOMovementInputEvaluationDelegate Observer, FDelegateHandle& OutHandle, FString& OutError)
+{
+	UGGYGOPlayerInput* Producer = nullptr;
+	if (ValidateMovementInputEvaluationToken(OriginalToken, Producer, OutError)
+		== EGGYGOMovementInputEvaluationState::Invalidated) { return false; }
+	if (OutHandle.IsValid() || !Observer.IsBound())
+	{
+		OutError = Producer->MakeError(TEXT("评价订阅需要空 handle 和有效原回调。"));
+		return false;
+	}
+	const FGGYGOMovementInputEvaluationDelegate OriginalObserver = Observer;
+	// 同 Session 可同时有旧 Completed edge 和当前 Pending edge；通知分别核各自 Proof。
+	OutHandle = Producer->MovementInputEvaluationObservers.Add(
+		FGGYGOMovementInputEvaluationDelegate::CreateLambda(
+			[OriginalToken, Observer = MoveTemp(Observer)](EGGYGOMovementInputEvaluationState State, const FString& Diagnostic)
+			{
+				FString ProofError;
+				if (QueryMovementInputEvaluationToken(OriginalToken, ProofError)
+					== EGGYGOMovementInputEvaluationState::Invalidated)
+				{
+					Observer.ExecuteIfBound(EGGYGOMovementInputEvaluationState::Invalidated, ProofError);
+					return;
+				}
+				Observer.ExecuteIfBound(State, Diagnostic);
+			}));
+	FString ReplayError;
+	const auto State = QueryStepStartInputReadiness(OriginalToken, ReplayError);
+	if (State != EGGYGOMovementInputEvaluationState::Waiting)
+	{
+		// 回放可能退订/销毁原资源；此后不再写调用方输出或访问 Producer。
+		OriginalObserver.ExecuteIfBound(State, ReplayError);
+	}
+	return true;
+}
+
+void UGGYGOPlayerInput::UnsubscribeMovementInputEvaluation(const FGGYGOMovementInputEvaluationToken& OriginalToken,
+	FDelegateHandle& Handle)
+{
+	const FDelegateHandle OriginalHandle = Handle;
+	Handle.Reset();
+	if (!IsInGameThread() || !OriginalHandle.IsValid() || !OriginalToken.Proof.IsValid()) { return; }
+	UGGYGOPlayerInput* Producer = Cast<UGGYGOPlayerInput>(OriginalToken.Proof->Session.Producer.Get());
+	if (Producer && Producer->IsCurrentSession(OriginalToken.Proof->Session))
+	{
+		Producer->MovementInputEvaluationObservers.Remove(OriginalHandle);
+	}
 }
 
 UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysicalInput(const FInputKeyEventArgs& Params)
@@ -1282,6 +1608,8 @@ void UGGYGOPlayerInput::UpdateRequestFromSource(const FPhysicalObservation& Obse
 
 bool UGGYGOPlayerInput::InputKey(const FInputKeyEventArgs& Params)
 {
+	InvalidatePendingMovementInputEvaluation(TEXT("原评价完成前出现新的 InputKey；不把后继输入补到旧 edge。"));
+	if (bEvaluatingMovementAction) { bMovementActionEvaluationInterrupted = true; }
 	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
 	const FString OriginalProducerPath = GetPathName();
 	const FGGYGOMovementInputSessionIdentity OriginalSession = CurrentSession;
@@ -1315,6 +1643,7 @@ bool UGGYGOPlayerInput::InputKey(const FInputKeyEventArgs& Params)
 
 void UGGYGOPlayerInput::FlushPressedKeys()
 {
+	InvalidatePendingMovementInputEvaluation(TEXT("原输入已 Flush，评价来源不再连续。"));
 	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
 	const bool bWasInsideFlush = bInsideFlush;
 	bInsideFlush = true;
@@ -1339,7 +1668,17 @@ void UGGYGOPlayerInput::FlushPressedKeys()
 void UGGYGOPlayerInput::EvaluateInputDelegates(const TArray<UInputComponent*>& InputComponentStack,
 	float DeltaTime, bool bGamePaused, const TArray<TPair<FKey, FKeyState*>>& KeysWithEvents)
 {
+	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
 	const FGGYGOMovementInputSessionIdentity OriginalSession = CurrentSession;
+	const uint64 EvaluationFrame = GFrameCounter;
+	const uint64 EvaluationObservationRevision = ObservationRevision;
+	const bool bWasEvaluating = bEvaluatingMovementAction;
+	// 嵌套评价会改写同一 ActionInstance；外层返栈不能把它认证为外层原始结果。
+	bMovementActionEvaluationInterrupted = bWasEvaluating;
+	bEvaluatingMovementAction = true;
+	InvalidatePendingMovementInputEvaluation(TEXT("后继或嵌套原生评价开始，旧在途评价未完成。"));
+	uint64 EvaluationSerial = 0;
+	bool bCanReserveEvaluation = false;
 	FString Error;
 	if (IsCurrentSession(OriginalSession))
 	{
@@ -1352,8 +1691,80 @@ void UGGYGOPlayerInput::EvaluateInputDelegates(const TArray<UInputComponent*>& I
 			ReportOnce(TEXT("RouteInvalidated"), Error);
 			EndMovementInputSession(OriginalSession, TEXT("RouteInvalidated"));
 		}
+		else
+		{
+			bCanReserveEvaluation = !bWasEvaluating
+				&& RetiringMovementInputEvaluationSessionSerial != OriginalSession.SessionSerial;
+		}
 	}
+	if (bCanReserveEvaluation && AllocateSerial(LastMovementInputEvaluationSerial, EvaluationSerial))
+	{
+		// 先预留身份，原 Action 回调只捕获这个 Pending token；完成仍由返栈核验提交。
+		MovementActionEvaluation = FMovementActionEvaluation{
+			OriginalSession, EvaluationFrame, EvaluationObservationRevision, EvaluationSerial, false};
+	}
+	if (!OriginalProducer.IsValid()) { return; }
 	Super::EvaluateInputDelegates(InputComponentStack, DeltaTime, bGamePaused, KeysWithEvents);
+	UGGYGOPlayerInput* Producer = OriginalProducer.Get();
+	if (!Producer) { return; }
+	Producer->bEvaluatingMovementAction = bWasEvaluating;
+	if (bWasEvaluating || Producer->bMovementActionEvaluationInterrupted
+		|| !Producer->IsCurrentSession(OriginalSession) || GFrameCounter != EvaluationFrame
+		|| Producer->ObservationRevision != EvaluationObservationRevision
+		|| Producer->RetiringMovementInputEvaluationSessionSerial == OriginalSession.SessionSerial
+		|| !Producer->MovementActionEvaluation.IsSet() || EvaluationSerial == 0
+		|| Producer->MovementActionEvaluation->EvaluationSerial != EvaluationSerial
+		|| !Producer->ValidateCurrentRoute(Error))
+	{
+		if (Producer->MovementActionEvaluation.IsSet()
+			&& Producer->MovementActionEvaluation->EvaluationSerial == EvaluationSerial)
+		{
+			Producer->InvalidatePendingMovementInputEvaluation(TEXT("原评价返栈身份已变化，不能完成旧 edge。"));
+		}
+		if (!bWasEvaluating && Producer->IsCurrentSession(OriginalSession)
+			&& Producer->RetiringMovementInputEvaluationSessionSerial != OriginalSession.SessionSerial)
+		{
+			const FString Diagnostic = Error.IsEmpty()
+				? Producer->MakeError(TEXT("本轮原评价未完整可用；原 edge 失效或等待后续自然评价。")) : Error;
+			const FMovementInputEvaluationEvent Observers = Producer->MovementInputEvaluationObservers;
+			Observers.Broadcast(EGGYGOMovementInputEvaluationState::Waiting, Diagnostic);
+		}
+		return;
+	}
+	Producer->MovementActionEvaluation->bCompleted = true;
+	if (Producer->ActiveMovementInputEvaluationProof.IsValid())
+	{
+		Producer->ActiveMovementInputEvaluationProof->State = EGGYGOMovementInputEvaluationState::Completed;
+		Producer->ActiveMovementInputEvaluationProof.Reset();
+	}
+	// 完成通知可重入并退役 Source；所有写入先提交，回调只由消费者重新核自己的原段。
+	const FMovementInputEvaluationEvent Observers = Producer->MovementInputEvaluationObservers;
+	if (UE_LOG_ACTIVE(LogGGYGOMovementInput, Verbose))
+	{
+		// 这是原评价真正完成后的观察；入口帧与完成帧分别取证，不由 CMC/Finalize 推回。
+		const uint64 CompletedFrame = GFrameCounter;
+		const APlayerController* Controller = Producer->GetOuterAPlayerController();
+		const FString WorldPath = GetPathNameSafe(Controller->GetWorld());
+		const FString ControllerPath = GetPathNameSafe(Controller);
+		const FString PawnPath = GetPathNameSafe(Producer->SessionPawn.Get());
+		const FString ProducerPath = Producer->GetPathName();
+		const FString ActionPath = GetPathNameSafe(Producer->SessionAction.Get());
+		FVector2D Axis;
+		FString ValueDiagnostic;
+		const bool bValueReadable = Producer->ReadEvaluatedMovementInputActionValue(Axis, ValueDiagnostic)
+			== EGGYGOMovementInputRequestQueryResult::Held;
+		const FString ActionValue = bValueReadable
+			? FString::Printf(TEXT("(X=%.17g,Y=%.17g)"), Axis.X, Axis.Y) : FString(TEXT("Unavailable"));
+		// 日志 sink 也可外调；从此只用局部纯值及原 observer 快照，不再访问 Producer。
+		UE_LOG(LogGGYGOMovementInput, Verbose,
+			TEXT("[Input.MovementEvaluation] Phase=Completed World='%s' PC='%s' Pawn='%s' PlayerInput='%s' Action='%s' SessionSerial=%llu EvaluationSerial=%llu EntryFrame=%llu CompletedFrame=%llu ObservationRevision=%llu ValueState=%s ActionValue='%s' ValueDiagnostic='%s'"),
+			*WorldPath, *ControllerPath, *PawnPath, *ProducerPath, *ActionPath,
+			static_cast<unsigned long long>(OriginalSession.SessionSerial), static_cast<unsigned long long>(EvaluationSerial),
+			static_cast<unsigned long long>(EvaluationFrame), static_cast<unsigned long long>(CompletedFrame),
+			static_cast<unsigned long long>(EvaluationObservationRevision), bValueReadable ? TEXT("Readable") : TEXT("Unavailable"),
+			*ActionValue, *ValueDiagnostic);
+	}
+	Observers.Broadcast(EGGYGOMovementInputEvaluationState::Completed, FString());
 }
 
 void UGGYGOPlayerInput::EvaluateBlockedInputComponent(UInputComponent* Component)

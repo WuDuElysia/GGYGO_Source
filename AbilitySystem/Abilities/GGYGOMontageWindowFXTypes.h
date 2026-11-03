@@ -3,6 +3,7 @@
 
 #include "CoreMinimal.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
+#include "FX/GGYGOFXFieldSettings.h"
 #include "FX/Tasks/GGYGOAbilityTask_PlayNiagaraEffect.h"
 #include "GameplayTagContainer.h"
 #include "GGYGOMontageWindowFXTypes.generated.h"
@@ -20,7 +21,7 @@ enum class EGGYGOComboFXMode : uint8
 	MontageWindow
 };
 
-/** 段的表现配置；窗口来自 Montage，Niagara 组件及尾粒子释放由 FX Task 执行。 */
+/** 段的表现配置；同一作者窗和原 Task 驱动完整独立单元，各单元保留远端发布身份。 */
 USTRUCT(BlueprintType)
 struct GGYGO_API FGGYGOComboStepFX
 {
@@ -28,8 +29,15 @@ struct GGYGO_API FGGYGOComboStepFX
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX")
 	EGGYGOComboFXMode Mode = EGGYGOComboFXMode::Disabled;
+	/** 原资产的单 System 模式；与非空 SystemUnits 互斥，保留序列化身份。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX")
 	TObjectPtr<UNiagaraSystem> System = nullptr;
+	/** 仅供原单 System 模式；独立单元分别填写自己的场材质合同。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX|Field")
+	FGGYGOFXFieldSettings FieldSettings;
+	/** 完整有序制作单元；每项独立编译及登记场材质，共用本窗口和退出策略。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX")
+	TArray<FGGYGONiagaraEffectUnit> SystemUnits;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX", meta = (Categories = "Event.Montage"))
 	FGameplayTag BeginEventTag;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX", meta = (Categories = "Event.Montage"))

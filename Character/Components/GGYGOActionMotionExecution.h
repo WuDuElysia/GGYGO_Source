@@ -17,6 +17,8 @@ class UAnimInstance;
 struct FRootMotionSource;
 struct FRootMotionSource_GGYGOActionCurve;
 struct FGGYGOQualifiedMovementIntent;
+struct FGGYGOActionMotionStartFacing;
+struct FGGYGOMovementOwnerSyncScopeId;
 
 enum class EGGYGOActionMotionReleaseReason : uint8
 {
@@ -73,6 +75,12 @@ private:
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, int32& OutHandle, FString& OutError);
+	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
+		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
+		float TranslationScale, const FGGYGOActionMotionStartFacing& Facing,
+		int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError);
+	bool RebaseMontageActionMotion(const FGGYGOMovementOwnerSyncScopeId& OriginalScope,
+		int32 OriginalHandle, const FQuat& EntryActorRotation, FString& OutError);
 	bool ValidateMontageActionRuntime(const FRootMotionSource_GGYGOActionCurve& Source,
 		float SimulationTime, FString& OutError) const;
 	bool NotifyMontageActionNaturalBlendOut(int32 OriginalHandle, int32 OriginalMontageInstanceId, FString& OutError);

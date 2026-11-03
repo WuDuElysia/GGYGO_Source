@@ -193,6 +193,18 @@ void UGGYGOMovementInputOriginResource::NotifyControllerChanged(APlayerControlle
 		ReportOnce(TEXT("StaleControllerNotification"), TEXT("Notification no longer matches the native LocalPlayer controller; successor is retained."));
 		return;
 	}
+	// UE 客户端在正式复制 PC 到达前直接安装 Authority 占位 PC，不经过 SetPlayer／InitInputSystem。
+	// 只允许尚未开启过真实创建的原生暂态等待；不登记 Producer，也不恢复已退役的资格。
+	if (QualificationStage == EInitialQualificationStage::Available && LastCreationSerial == 0
+		&& IsControllerCurrent(Controller) && Controller->GetNetMode() == NM_Client
+		&& Controller->GetLocalRole() == ROLE_Authority && Controller->PlayerInput == nullptr)
+	{
+		UE_LOG(LogGGYGOMovementInputOrigin, Verbose,
+			TEXT("[Input.MovementOrigin] Frame=%llu Resource=%s Player=%s Controller=%s Reason=NativeClientPlaceholderAwaitingFirstBirth"),
+			static_cast<unsigned long long>(GFrameCounter), *GetPathNameSafe(this),
+			*GetPathNameSafe(OriginalPlayer.Get()), *GetPathNameSafe(Controller));
+		return;
+	}
 	if (CreationScope.Ticket.CreationSerial != 0 && CreationScope.Controller.Get() == Controller
 		&& IsControllerCurrent(Controller))
 	{

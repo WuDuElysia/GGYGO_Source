@@ -18,6 +18,14 @@ enum class EGGYGOActionInterruptionMode : uint8
 	Disabled
 };
 
+/** 真正起段时的基础方向策略；同段重放只复用原段接受值，不重新执行本策略。 */
+UENUM(BlueprintType)
+enum class EGGYGOComboStepFacingPolicy : uint8
+{
+	CurrentFacing,
+	QualifiedInput
+};
+
 /** 每段一个 Main→End Montage；同一 CMC 资源执行完整自然轨迹。
  *  攻击接续点与移动打断点是两个不同名的作者 Notify，各自开门、各自消费；Section 不隐式开门。 */
 USTRUCT(BlueprintType)
@@ -37,6 +45,11 @@ struct GGYGO_API FGGYGOComboStep
 	/** 原动画厘米位移的显式倍率；Avatar 实际缩放由 CMC 仅应用一次。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion", meta = (ClampMin = "0.001"))
 	float MotionTranslationScale = 1.0f;
+	/** CMC 在原播放成功后的动作准入点一次采样／执行；动作自身的源 Yaw 仍完整保留。
+	 * QualifiedInput 中真实无方向保持当前朝向，未评价／未就绪不是无方向。
+	 * 默认 CurrentFacing 保留既有资产行为，角色作者显式选择逐段输入方向。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Motion")
+	EGGYGOComboStepFacingPolicy StartFacingPolicy = EGGYGOComboStepFacingPolicy::CurrentFacing;
 	/** 已过攻击接续点后一次真实新攻击的接续目标；INDEX_NONE 显式关闭攻击接续。
 	 *  可回前段，但无新请求不自动推进或循环。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
@@ -71,6 +84,10 @@ struct GGYGO_API FGGYGOComboStep
 	/** 本段唯一运行查询配置；空/非法配置明确失败，不从历史字段补齐。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo")
 	FGGYGOMeleeTraceShape TraceShape;
+	/** 真实命中成立后发送的本段 Cue；None 显式不发送，不从 GA 历史字段补齐。
+	 *  声音、参数及组合表现由对应 Cue 资产配置，不作为 Main 开始时的技能声。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|Hit", meta = (Categories = "GameplayCue.Hit"))
+	FGameplayTag HitCueTag;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Combo|FX")
 	FGGYGOComboStepFX FX;
 	/** 保留旧资产/Struct Pin 的成员身份和序列化数据；不参与运行，须显式配置 TraceShape。

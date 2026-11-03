@@ -10,6 +10,8 @@
 #include "InputAction.h"
 #include "Misc/AutomationTest.h"
 #include "Misc/ScopeExit.h"
+#include "UObject/Package.h"
+#include "UObject/StrongObjectPtr.h"
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOLocomotionSteeringTest,
 	"GGYGO.Movement.Locomotion.Steering.NativeInterval",
@@ -21,6 +23,7 @@ bool FGGYGOLocomotionSteeringTest::RunTest(const FString& Parameters)
 	Set->bUseCurveDrivenSpeed = false; // Explicit fixed-speed fixture, not missing-curve fallback.
 	Set->bEnableLocomotionSteering = true;
 	Set->WalkToRunHoldSeconds = 60.0f;
+	Set->WalkRunBlendInterpSpeed = 2.0f; // 本夹具明确配置有限步态混合速率。
 	Set->SteeringMinYawRate = 90.0f;
 	Set->SteeringMaxYawRate = 360.0f;
 	FString Error;
@@ -56,7 +59,15 @@ bool FGGYGOLocomotionSteeringTest::RunTest(const FString& Parameters)
 		.CreateNavigation(false).CreateAISystem(false).ShouldSimulatePhysics(false).SetTransactional(false);
 	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
 	if (!TestNotNull(TEXT("Native steering world"), World)) return false;
-	ON_SCOPE_EXIT { World->DestroyWorld(false); };
+	const TStrongObjectPtr<UPackage> TestPackage(World->GetPackage());
+	ON_SCOPE_EXIT
+	{
+		const FString WorldPath = World->GetPathName();
+		World->DestroyWorld(false);
+		TestPackage->SetDirtyFlag(false); // 仅归还本次 CreateWorld 自建的原 Package。
+		AddInfo(FString::Printf(TEXT("自建 World 已归还：World='%s', Package='%s', DirtyAfter=%d"),
+			*WorldPath, *TestPackage->GetPathName(), TestPackage->IsDirty()));
+	};
 	AGGYGOLocomotionTestCharacter* Character = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
 	if (!TestNotNull(TEXT("Original native character"), Character)) return false;
 	UGGYGOLocomotionTestMovementComponent* Move = Cast<UGGYGOLocomotionTestMovementComponent>(Character->GetCharacterMovement());
@@ -139,6 +150,55 @@ bool FGGYGOLocomotionSteeringTest::RunTest(const FString& Parameters)
 		&& Completed.CompletedIntervalSerial > BeforeTurn.CompletedIntervalSerial
 		&& FMath::IsNearlyEqual(Completed.NativeDeltaSeconds, 0.05f)
 		&& Completed.ActualSignedYawRate > 0.0f && Completed.ActualSignedVelocityYawRate > 0.0f);
+	// 同一持续请求中，先真实 WD 跑稳，再切 WA；输入、速度与胶囊各自记录，允许合法滞后。
+	Move->RequestRunOnNextMove();
+	constexpr float DirectionDelta = 0.05f;
+	float NativeTime = 0.1f;
+	for (int32 Step = 0; Step < 24; ++Step)
+	{
+		const float BeforeAlpha = Move->GetWalkRunBlendAlpha();
+		Move->MoveAutonomous(NativeTime, DirectionDelta, 0, FVector(2048.0, 2048.0, 0.0));
+		NativeTime += DirectionDelta;
+		const float Alpha = Move->GetWalkRunBlendAlpha();
+		if (!TestTrue(TEXT("持续 WD 升 Run 复用连续 Alpha"), Alpha >= BeforeAlpha
+			&& Alpha - BeforeAlpha <= Set->WalkRunBlendInterpSpeed * DirectionDelta + 1.e-4f)) return false;
+	}
+	if (!TestTrue(TEXT("WD→WA 前为真实持续 Run"), Move->IsMovingOnGround() && Move->GetResolvedGait() == EGGYGOGait::Run
+		&& Move->GetWalkRunBlendAlpha() == 1.0f && Move->Velocity.X > 0.0 && Move->Velocity.Y > 0.0)) return false;
+	for (int32 Step = 0; Step < 6; ++Step)
+	{
+		const FVector BeforeVelocity = Move->Velocity;
+		const float BeforeYaw = Character->GetActorRotation().Yaw;
+		Move->MoveAutonomous(NativeTime, DirectionDelta, 0, FVector(2048.0, -2048.0, 0.0));
+		NativeTime += DirectionDelta;
+		const FVector ActualAcceleration = Move->GetCurrentAcceleration();
+		const float IntentError = FMath::FindDeltaAngleDegrees(BeforeVelocity.Rotation().Yaw, ActualAcceleration.Rotation().Yaw);
+		const float CapsuleError = FMath::FindDeltaAngleDegrees(BeforeYaw, Move->Velocity.Rotation().Yaw);
+		float VelocityBudget = 0.0f, CapsuleBudget = 0.0f;
+		if (!EvaluateAngularBudget(*Set, IntentError, Move->GetWalkRunBlendAlpha(), DirectionDelta, VelocityBudget, Error)
+			|| !EvaluateAngularBudget(*Set, CapsuleError, Move->GetWalkRunBlendAlpha(), DirectionDelta, CapsuleBudget, Error))
+		{ AddError(Error); return false; }
+		const float VelocityStep = FMath::Abs(FMath::FindDeltaAngleDegrees(BeforeVelocity.Rotation().Yaw, Move->Velocity.Rotation().Yaw));
+		const float CapsuleStep = FMath::Abs(FMath::FindDeltaAngleDegrees(BeforeYaw, Character->GetActorRotation().Yaw));
+		const auto DirectionCompleted = Move->GetLocomotionSteeringSnapshot();
+		if (!TestTrue(FString::Printf(TEXT("WD→WA 原生角步长 Step=%d Velocity=%.9g/%.9g Capsule=%.9g/%.9g Input=%s VelocityNow=%s CapsuleYaw=%.9g Status=%d Diagnostic='%s'"),
+			Step, VelocityStep, VelocityBudget, CapsuleStep, CapsuleBudget, *ActualAcceleration.ToString(), *Move->Velocity.ToString(),
+			Character->GetActorRotation().Yaw, static_cast<int32>(DirectionCompleted.Status), *DirectionCompleted.Diagnostic),
+			DirectionCompleted.Status == EGGYGOLocomotionSteeringStatus::Valid && ActualAcceleration.X > 0.0 && ActualAcceleration.Y < 0.0
+				&& VelocityStep <= VelocityBudget + 1.e-3f && CapsuleStep <= CapsuleBudget + 1.e-3f)) return false;
+		if (Step == 0 && !TestTrue(TEXT("WA 已提交时实际速度与胶囊仍通过有限角速度转向"), VelocityStep < 90.0f && CapsuleStep < 90.0f
+			&& FMath::Abs(FMath::FindDeltaAngleDegrees(Character->GetActorRotation().Yaw, ActualAcceleration.Rotation().Yaw)) > 1.0f)) return false;
+	}
+	for (int32 Step = 0; Step < 11; ++Step)
+	{
+		const float BeforeAlpha = Move->GetWalkRunBlendAlpha();
+		Move->MoveAutonomous(NativeTime, DirectionDelta, GGYGOMovementPrediction::ForceWalkFlag, FVector(2048.0, -2048.0, 0.0));
+		NativeTime += DirectionDelta;
+		const float Alpha = Move->GetWalkRunBlendAlpha();
+		if (!TestTrue(TEXT("Run→Walk 同一输入请求连续混合"), Move->GetResolvedGait() == EGGYGOGait::Walk && Alpha <= BeforeAlpha
+			&& BeforeAlpha - Alpha <= Set->WalkRunBlendInterpSpeed * DirectionDelta + 1.e-4f)) return false;
+	}
+	if (!TestEqual(TEXT("有限步态混合真实到达 Walk 端点"), Move->GetWalkRunBlendAlpha(), 0.0f)) return false;
 	if (!Emit(EGGYGOMovementInputFactKind::RequestReleased, 1)) return false;
 	TestTrue(TEXT("Released control cannot keep the old turn effect valid"),
 		Move->GetLocomotionSteeringSnapshot().Status == EGGYGOLocomotionSteeringStatus::NotApplicable);

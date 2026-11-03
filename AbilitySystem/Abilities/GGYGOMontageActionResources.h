@@ -47,6 +47,10 @@ struct GGYGO_API FGGYGOMontageActionResources
 	bool MatchesFailure(const FGGYGOMontageTaskFailureFact& Fact) const;
 	bool ReadOriginalSnapshot(FGGYGOMontageSectionSnapshot& OutSnapshot, FString& OutError) const;
 	bool BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot, FString& OutError);
+	/** 将原段的朝向请求交给 CMC，不读取输入或保存方向策略。
+	 * OutEntryActorRotation须为独立调用栈值；仅成功后由 GA 重核原段并保存。 */
+	bool BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot,
+		const FGGYGOActionMotionStartFacing& StartFacing, FQuat& OutEntryActorRotation, FString& OutError);
 	bool ObserveMotion(FGGYGOActionMotionFailureDelegate Failure,
 		FGGYGOActionMotionCompletionDelegate Completion, TFunctionRef<bool()> IsCurrent, FString& OutError);
 	bool AcceptNaturalBlendOut(FString& OutError);
@@ -72,15 +76,15 @@ struct GGYGO_API FGGYGOMontageActionResources
 private:
 	TStrongObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> TaskOwner;
 	TStrongObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect> FXTaskOwner;
-	/** 只持原发行者和原 lease；发布状态归 FX owner，终结不查当前 ActorInfo。 */
+	/** 同一作者窗逐单元持有原 lease；发布状态归 FX owner，终结不查当前 ActorInfo。 */
 	TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> FXPublicationOwner;
-	FGGYGOMontageFXLease FXPublicationLease;
+	TArray<FGGYGOMontageFXLease> FXPublicationLeases;
 	/** Task 签发的本地请求身份；许可及原生资源事实只由 FX 写入。 */
 	FGGYGOMontageFXLocalStartTicket FXLocalStartTicket;
 	/** 首次真实关闭的原因，用于发布外调重入时归还尚未接纳的原 lease。 */
 	TOptional<EGGYGOMontageFXCloseReason> FXTerminalReason;
 	bool PublishFXWindow(UGGYGOGameplayAbility* Owner, UGGYGOAbilitySystemComponent* Issuer, AActor* Avatar,
-		const FGGYGOMontageWindowFact& Fact, const FTransform& PlaybackTransform,
+		const FGGYGOMontageWindowFact& Fact, const TArray<FGGYGONiagaraEffectUnit>& Units, const FTransform& PlaybackTransform,
 		TFunctionRef<bool()> IsCurrent, FString& OutError);
 	bool TryActivateFXLocalTask(TFunctionRef<bool()> IsCurrent, FString& OutError);
 	/** 本 holder 安装的确切弱对象＋函数绑定；清理不移除其它订阅。 */

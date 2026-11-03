@@ -1,6 +1,6 @@
 /**
  * @file GGYGOMovementPrediction.cpp
- * @brief Native saved-move capture, replay and unchanged Movement wire serialization.
+ * @brief 原生 SavedMove 捕获、重放及 Movement 同包序列化。
  */
 #include "Character/Components/GGYGOMovementPrediction.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
@@ -309,6 +309,8 @@ bool FGGYGOMovementInputSourceCheckpoint::Serialize(FArchive& Ar, FString* OutEr
 void FSavedMove_GGYGO::Clear()
 {
 	Super::Clear();
+	bSavedHasCameraProjection = false;
+	SavedCameraProjectionYaw = 0.0f;
 	SavedMovementOwnerSyncScope = {};
 	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
@@ -345,6 +347,8 @@ void FSavedMove_GGYGO::Clear()
 void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector const& NewAccel, FNetworkPredictionData_Client_Character& ClientData)
 {
 	Super::SetMoveFor(C, InDeltaTime, NewAccel, ClientData);
+	bSavedHasCameraProjection = false;
+	SavedCameraProjectionYaw = 0.0f;
 	SavedMovementOwnerSyncScope = {};
 	SavedMovementOwnerGeneration = 0;
 	SavedMovementInputSourceCheckpoint = {};
@@ -355,6 +359,7 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 
 	if (const UGGYGOCharacterMovementComponent* MoveComp = C ? Cast<UGGYGOCharacterMovementComponent>(C->GetCharacterMovement()) : nullptr)
 	{
+		bSavedHasCameraProjection = MoveComp->CaptureLocomotionInputProjectionForNativeMove(SavedCameraProjectionYaw);
 		const auto& Context = MoveComp->MovementOwnerSyncContext;
 		if (MoveComp->IsMovementOwnerSyncContextCurrent(Context))
 		{
@@ -363,6 +368,16 @@ void FSavedMove_GGYGO::SetMoveFor(ACharacter* C, float InDeltaTime, FVector cons
 			SavedMovementOwnerGeneration = Context->Notice.GetServerOwnerGeneration();
 		}
 		SavedMovementInputSourceCheckpoint = MoveComp->MovementInputSourceCheckpoint;
+		if (bSavedHasCameraProjection)
+		{
+			UE_LOG(LogGGYGOMovementPrediction, Verbose,
+				TEXT("[Movement.CameraProjectionCaptured] CMC='%s' Pawn='%s' Frame=%llu ClientTimeStamp=%.9g Nonce=%llu OwnerGeneration=%llu Binding=%llu Session=%llu ProjectionYaw=%.9g"),
+				*MoveComp->GetPathName(), *GetPathNameSafe(C), static_cast<unsigned long long>(GFrameCounter), TimeStamp,
+				static_cast<unsigned long long>(SavedMovementOwnerSyncScope.GetResponseNonce()),
+				static_cast<unsigned long long>(SavedMovementOwnerGeneration),
+				static_cast<unsigned long long>(SavedMovementInputSourceCheckpoint.BindingSerial),
+				static_cast<unsigned long long>(SavedMovementInputSourceCheckpoint.SessionSerial), SavedCameraProjectionYaw);
+		}
 		SavedLocomotionSourceBinding = MoveComp->LocomotionSourceBinding;
 		SavedMovementInputRequest.Binding = MoveComp->MovementInputBinding;
 		SavedMovementInputRequest.Request = MoveComp->MovementInputRequest;
@@ -507,6 +522,8 @@ void FSavedMove_GGYGO::PrepMoveFor(ACharacter* C)
 bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* InCharacter, float MaxDelta) const
 {
 	const FSavedMove_GGYGO* NewGGYGOMove = static_cast<const FSavedMove_GGYGO*>(NewMove.Get());
+	if (NewGGYGOMove && (NewGGYGOMove->bSavedHasCameraProjection != bSavedHasCameraProjection
+		|| (bSavedHasCameraProjection && NewGGYGOMove->SavedCameraProjectionYaw != SavedCameraProjectionYaw))) return false;
 	if (NewGGYGOMove && NewGGYGOMove->SavedLocomotionSourceBinding != SavedLocomotionSourceBinding) return false;
 	if (NewGGYGOMove && (NewGGYGOMove->SavedMovementOwnerSyncScope != SavedMovementOwnerSyncScope
 		|| NewGGYGOMove->SavedMovementOwnerGeneration != SavedMovementOwnerGeneration)) return false;
@@ -541,7 +558,8 @@ bool FSavedMove_GGYGO::CanCombineWith(const FSavedMovePtr& NewMove, ACharacter* 
 
 	// 转身期间不合并。这段的位移方向由曲线逐帧给出，合并会丢掉中间帧的方向变化，
 	// 服务器重演出的轨迹与客户端不同。
-	if (NewGGYGOMove && NewGGYGOMove->SavedTurnBackPhase != SavedTurnBackPhase)
+	if (NewGGYGOMove && (NewGGYGOMove->SavedTurnBackPhase != SavedTurnBackPhase
+		|| NewGGYGOMove->bSavedTurnBackInputLatched != bSavedTurnBackInputLatched))
 	{
 		return false;
 	}
@@ -566,6 +584,8 @@ bool FSavedMove_GGYGO::IsImportantMove(const FSavedMovePtr& LastAckedMovePtr) co
 	if (!LastAckedMovePtr.IsValid()) return true;
 	const FSavedMove_GGYGO& LastAcked = static_cast<const FSavedMove_GGYGO&>(*LastAckedMovePtr);
 	return SavedMovementInputSourceCheckpoint != LastAcked.SavedMovementInputSourceCheckpoint
+		|| bSavedHasCameraProjection != LastAcked.bSavedHasCameraProjection
+		|| (bSavedHasCameraProjection && SavedCameraProjectionYaw != LastAcked.SavedCameraProjectionYaw)
 		|| SavedMovementOwnerSyncScope != LastAcked.SavedMovementOwnerSyncScope
 		|| SavedMovementOwnerGeneration != LastAcked.SavedMovementOwnerGeneration
 		|| SavedMovementInputRequest.Binding != LastAcked.SavedMovementInputRequest.Binding
@@ -626,6 +646,18 @@ void FCharacterNetworkMoveData_GGYGO::ClientFillNetworkMoveData(
 	// export an unadmitted start as execution provenance. Real terminal facts may still retire it.
 	MovementInputSourceCheckpoint = GGYGOMove.SavedMovementInputRequest.bExecutionEligible || bOriginalTerminal
 		? Captured : FGGYGOMovementInputSourceCheckpoint{};
+	bHasCameraProjection = bHasMovementOwnerSync && GGYGOMove.SavedMovementInputRequest.bExecutionEligible
+		&& MovementInputSourceCheckpoint.bPresent && GGYGOMove.bSavedHasCameraProjection;
+	CameraProjectionYaw = bHasCameraProjection ? GGYGOMove.SavedCameraProjectionYaw : 0.0f;
+	if (bHasCameraProjection)
+	{
+		UE_LOG(LogGGYGOMovementPrediction, Verbose,
+			TEXT("[Movement.CameraProjectionSent] ClientTimeStamp=%.9g MoveType=%u Nonce=%llu OwnerGeneration=%llu Binding=%llu Session=%llu ProjectionYaw=%.9g"),
+			TimeStamp, static_cast<uint32>(MoveType), static_cast<unsigned long long>(MovementOwnerSyncNonce),
+			static_cast<unsigned long long>(MovementOwnerGeneration),
+			static_cast<unsigned long long>(MovementInputSourceCheckpoint.BindingSerial),
+			static_cast<unsigned long long>(MovementInputSourceCheckpoint.SessionSerial), CameraProjectionYaw);
+	}
 	LocomotionMotionType = GGYGOMove.NetworkLocomotionMotionType;
 	StopMotionType = GGYGOMove.NetworkStopMotionType;
 	TurnBackPhase = GGYGOMove.NetworkTurnBackPhase;
@@ -660,6 +692,22 @@ bool FCharacterNetworkMoveData_GGYGO::Serialize(
 	Ar.SerializeBits(&StopValue, 2);
 	Ar.SerializeBits(&TurnBackValue, 2);
 	Ar.SerializeBits(&LocomotionMotionSequence, 16);
+	uint8 ProjectionPresent = bHasCameraProjection ? 1 : 0;
+	Ar.SerializeBits(&ProjectionPresent, 1);
+	if (Ar.IsLoading())
+	{
+		bHasCameraProjection = ProjectionPresent != 0;
+		CameraProjectionYaw = 0.0f;
+	}
+	if (bHasCameraProjection) Ar << CameraProjectionYaw;
+	if (bHasCameraProjection && (!bHasMovementOwnerSync || !MovementInputSourceCheckpoint.bPresent
+		|| !FMath::IsFinite(CameraProjectionYaw)))
+	{
+		UE_LOG(LogGGYGOMovementPrediction, Error,
+			TEXT("Movement camera projection rejected: CMC='%s', 原投影缺少同包 owner/checkpoint 或 Yaw 非有限。"),
+			*CharacterMovement.GetPathName());
+		return false;
+	}
 
 	if (Ar.IsLoading())
 	{

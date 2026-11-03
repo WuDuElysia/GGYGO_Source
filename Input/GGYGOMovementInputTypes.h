@@ -5,6 +5,8 @@
 #include "UObject/WeakObjectPtrTemplates.h"
 
 class UObject;
+class UGGYGOPlayerInput;
+struct FGGYGOMovementInputEvaluationProof;
 
 /** 原 PlayerInput 发行的会话身份值；序列 0 未分配，弱引用不延长来源生命期。 */
 struct FGGYGOMovementInputSessionIdentity
@@ -54,6 +56,43 @@ enum class EGGYGOMovementInputRequestQueryResult : uint8
 	/** Original assembly is live, but observation/press/release proof is not sufficient. */
 	AwaitingPhysicalProof
 };
+
+/** 原评价是否真正完成；完成只证明 edge 来源，不授移动或能力执行许可。 */
+enum class EGGYGOMovementInputEvaluationState : uint8
+{
+	Invalidated = 0,
+	Waiting,
+	Completed
+};
+
+/** 原 edge 持有的只读完成凭据；内容由 Input 私有，副本延长凭据而非 UObject 的寿命。 */
+struct GGYGO_API FGGYGOMovementInputEvaluationToken
+{
+	bool IsSet() const { return Proof.IsValid(); }
+	/** 弱来源身份不授有效性；仍须查询原 Proof，并核消费方的 Avatar/PlayerInput。 */
+	FGGYGOMovementInputSessionIdentity GetSourceSession() const;
+	bool operator==(const FGGYGOMovementInputEvaluationToken& Other) const { return Proof == Other.Proof; }
+	bool operator!=(const FGGYGOMovementInputEvaluationToken& Other) const { return !(*this == Other); }
+
+private:
+	friend class UGGYGOPlayerInput;
+	TSharedPtr<const FGGYGOMovementInputEvaluationProof> Proof;
+};
+
+/** 一次真实段首的输入值；原 edge 与段首评价分开，网络不传本地 Proof 或弱 UObject。 */
+struct GGYGO_API FGGYGOMovementInputStepFact
+{
+	uint64 SourceSessionSerial = 0;
+	uint64 OriginalEdgeEvaluationSerial = 0;
+	uint64 StepEvaluationSerial = 0;
+	EGGYGOMovementInputRequestQueryResult InputState = EGGYGOMovementInputRequestQueryResult::Unavailable;
+	FVector2D ActionValue = FVector2D::ZeroVector;
+	float ControlYaw = 0.0f;
+};
+
+/** 只通知原自然评价完成或来源退役；消费者在自己的段首资源中重新查询事实。 */
+DECLARE_DELEGATE_TwoParams(FGGYGOMovementInputEvaluationDelegate,
+	EGGYGOMovementInputEvaluationState, const FString&);
 
 /** CMC 发行的消费绑定身份；原来源会话也是绑定身份的一部分。 */
 struct FGGYGOMovementInputConsumerBindingId

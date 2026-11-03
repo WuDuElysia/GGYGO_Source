@@ -11,6 +11,7 @@
 
 #include "CoreMinimal.h"
 #include "Character/Data/GGYGOMovementTypes.h"
+#include "Character/Data/GGYGOLocomotionSteeringTypes.h"
 #include "Engine/NetSerialization.h"
 
 #include "GGYGORemoteMotionPoseTypes.generated.h"
@@ -88,6 +89,12 @@ struct GGYGO_API FGGYGORemoteMotionPoseRecord
 	UPROPERTY() FVector_NetQuantize100 SampleLocation = FVector::ZeroVector;
 	/** 网络上按 16 位分量压缩。 */
 	UPROPERTY() FRotator SampleRotation = FRotator::ZeroRotator;
+	/** 独立 camera facet，随同一 native 样本认证，不授单 Sequence 时间或本地执行权。 */
+	UPROPERTY() uint8 CameraTurnStatusCode = static_cast<uint8>(EGGYGOLocomotionSteeringStatus::NotApplicable);
+	UPROPERTY() float CameraControlYawDeltaDegrees = 0.0f;
+	UPROPERTY() float CameraTurnDemandDegrees = 0.0f;
+	UPROPERTY() EGGYGOGait Gait = EGGYGOGait::None;
+	UPROPERTY() float WalkRunBlendAlpha = 0.0f;
 
 	bool NetSerialize(FArchive& Ar, UPackageMap* Map, bool& bOutSuccess);
 	/** 除发布序号外全部相等；发布端据此不为同一事实伪发新记录。 */
@@ -189,5 +196,11 @@ struct GGYGO_API FGGYGORemoteMotionPoseSnapshot
 	uint32 PublicationSerial = 0;
 	float NativeSampleKey = 0.0f;
 	uint64 AcceptedLocalFrame = 0;
+	EGGYGOLocomotionSteeringStatus CameraTurnStatus = EGGYGOLocomotionSteeringStatus::Initial;
+	float CameraControlYawDeltaDegrees = 0.0f;
+	float CameraTurnDemandDegrees = 0.0f;
+	EGGYGOGait CameraTurnGait = EGGYGOGait::None;
+	float CameraTurnWalkRunBlendAlpha = 0.0f;
+	FString CameraTurnDiagnostic;
 	FString Diagnostic;
 };

@@ -52,7 +52,8 @@ namespace GGYGOLocomotionEvaluation
 	 * ConfigurationDigest：资产类与路径、MotionType/RouteKey/Loop/RateScale/PlayLength。
 	 * CurveContentDigest：与评估器同一原生选路（FAnimExtractContext 默认平台数据）取实际被解码的数据——
 	 * 压缩有效时为解码器类、按该解码器实际读取规则求出并按名称 UTF-8 字节序排序的"名称→槽位"映射
-	 * （不受进程内 FName 排序置换影响；仅支持三种原生解码器，其余明确失败）与原样 CompressedCurveByteStream；
+	 * （不受进程内 FName 排序置换影响；支持 CompressedRichCurve／UniformIndexable／UniformlySampled／ACL 的精确原生类，
+	 * 其余明确失败）与原样 CompressedCurveByteStream；
 	 * 同时要求四条必需曲线在所选压缩表中各出现一次、置换合法、头部与长度可被解码器读取；
 	 * 编辑器压缩未就绪时为 DataModel 四条必需曲线的完整 RichCurve 编码。两种都不可得时失败。
 	 * 不缓存；压缩完成、资产编辑都会改变结果，调用方须在每个需要认证的点重算。

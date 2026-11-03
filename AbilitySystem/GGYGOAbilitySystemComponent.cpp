@@ -10,10 +10,14 @@
 #include "AbilitySystem/Groups/GGYGOAbilityGroupConfig.h"
 #include "AbilitySystem/Private/GGYGOAvatarBindingProtocol.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
+#include "AbilitySystem/Tasks/GGYGOAbilityTask_WaitComboInput.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
+#include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "System/GGYGOGameplayTags.h"
+#include "Input/GGYGOPlayerInput.h"
 
 #include "Animation/AnimInstance.h"
+#include "CoreGlobals.h"
 #include "GameFramework/MovementComponent.h"
 #include "GameFramework/PlayerController.h"
 #include "GameplayEffect.h"
@@ -21,6 +25,7 @@
 
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
+#include "Engine/NetConnection.h"
 #include "Misc/ScopeExit.h"
 #include "Net/UnrealNetwork.h"
 #include "GameFramework/Pawn.h"
@@ -29,6 +34,163 @@
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOAbilitySystemComponent)
 
 UE_DEFINE_GAMEPLAY_TAG(TAG_GGYGO_Gameplay_AbilityInputBlocked, "Gameplay.AbilityInputBlocked");
+
+struct FGGYGOAbilityInitialInputRoute::FRouteProof
+{
+	enum class EState : uint8 { Pending, Submitted, Unavailable, ConsumedUnavailable };
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+	FGGYGOAbilityActivationHandle Activation;
+	FGameplayAbilitySpecHandle Spec;
+	FPredictionKey ActivationKey;
+	bool bPredictingOwner = false;
+	EState State = EState::Pending;
+	TWeakPtr<FAbilityReplicatedDataCache> CancellationCache;
+};
+
+bool FGGYGOAbilityInitialInputRoute::HasSubmittedInitial() const
+{
+	return Proof.IsValid() && Proof->State == FRouteProof::EState::Submitted;
+}
+
+void FGGYGOAbilityInitialInputRoute::NotifyInitialUnavailable() const
+{
+	const FGGYGOAbilityInitialInputRoute Original = *this;
+	if (UGGYGOAbilitySystemComponent* ASC = Original.Proof.IsValid() ? Original.Proof->ASC.Get() : nullptr)
+		ASC->NotifyInitialInputUnavailable(Original);
+}
+
+/** 原请求身份不可变；EntryFact 是该请求唯一的一次提交记录，不是输入或能力状态。 */
+struct FGGYGOAbilityStepInputRequest::FRequestProof
+{
+	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
+	TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
+	TWeakObjectPtr<UGGYGOAbilityTask_WaitComboInput> Task;
+	TWeakObjectPtr<APawn> Avatar;
+	TWeakObjectPtr<APlayerController> Controller;
+	TWeakObjectPtr<UNetConnection> Connection;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
+	TWeakObjectPtr<UWorld> World;
+	FGGYGOAbilityActivationHandle Activation;
+	FGGYGOAvatarBindingContext BindingContext;
+	FGameplayAbilitySpecHandle Spec;
+	FPredictionKey ActivationKey;
+	FGGYGOMovementInputEvaluationToken Edge;
+	EGGYGOAbilityStepInputKind Kind = EGGYGOAbilityStepInputKind::Initial;
+	int32 SourceStep = INDEX_NONE;
+	int32 RequestId = 0;
+	bool bRemote = false;
+	TSharedPtr<const FGGYGOMovementInputStepFact> EntryFact;
+	FGGYGOMovementOwnerSyncScopeId EntryScope;
+	uint64 EntryFrame = 0;
+};
+
+bool FGGYGOAbilityStepInputRequest::HasSubmittedEntryFact() const { return Proof.IsValid() && Proof->EntryFact.IsValid(); }
+bool FGGYGOAbilityStepInputRequest::IsRemote() const { return Proof.IsValid() && Proof->bRemote; }
+EGGYGOAbilityStepInputKind FGGYGOAbilityStepInputRequest::GetKind() const
+{ return Proof.IsValid() ? Proof->Kind : EGGYGOAbilityStepInputKind::Initial; }
+int32 FGGYGOAbilityStepInputRequest::GetSourceStep() const { return Proof.IsValid() ? Proof->SourceStep : INDEX_NONE; }
+int32 FGGYGOAbilityStepInputRequest::GetRequestId() const { return Proof.IsValid() ? Proof->RequestId : INDEX_NONE; }
+FGGYGOMovementInputEvaluationToken FGGYGOAbilityStepInputRequest::GetOriginalEdgeToken() const
+{
+	return Proof.IsValid() ? Proof->Edge : FGGYGOMovementInputEvaluationToken{};
+}
+
+bool FGGYGOAbilityStepInputRequest::IsCurrentFor(const UGGYGOCharacterMovementComponent* OriginalMovement,
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope, FString& OutError) const
+{
+	OutError.Reset();
+	const auto Original = Proof;
+	UGGYGOAbilitySystemComponent* ASC = Original.IsValid() ? Original->ASC.Get() : nullptr;
+	if (!ASC) { OutError = TEXT("原步骤输入请求或 ASC 已失效。"); return false; }
+	if (!ASC->CheckStepInputRequestCurrent(*this, OutError)) return false;
+	FGGYGOMovementOwnerSyncScopeId CurrentScope;
+	if (!OriginalMovement || Original->Movement.Get() != OriginalMovement
+		|| !OriginalMovement->GetMovementOwnerSyncScope(CurrentScope, OutError)
+		|| CurrentScope != OriginalScope
+		|| (Original->EntryScope.IsSet() && Original->EntryScope != OriginalScope))
+	{
+		OutError = TEXT("原步骤输入请求与 CMC/Scope 不匹配。");
+		return false;
+	}
+	return true;
+}
+
+EGGYGOMovementInputEvaluationState FGGYGOAbilityStepInputRequest::QueryStepStartInputReadiness(FString& OutError) const
+{
+	OutError.Reset();
+	UGGYGOAbilitySystemComponent* ASC = Proof.IsValid() ? Proof->ASC.Get() : nullptr;
+	if (!ASC) { OutError = TEXT("原步骤输入请求或 ASC 已失效。"); return EGGYGOMovementInputEvaluationState::Invalidated; }
+	if (!ASC->CheckStepInputRequestCurrent(*this, OutError)) return EGGYGOMovementInputEvaluationState::Invalidated;
+	if (Proof->EntryFact.IsValid()) return EGGYGOMovementInputEvaluationState::Completed;
+	if (Proof->bRemote) { OutError = TEXT("远端没有原 owned 事实。"); return EGGYGOMovementInputEvaluationState::Invalidated; }
+	return UGGYGOPlayerInput::QueryStepStartInputReadiness(Proof->Edge, OutError);
+}
+
+EGGYGOMovementInputEvaluationState FGGYGOAbilityStepInputRequest::QueryStepStartInputFact(
+	FGGYGOMovementInputStepFact& OutFact, FString& OutError) const
+{
+	OutFact = {};
+	OutError.Reset();
+	const auto Original = Proof;
+	UGGYGOAbilitySystemComponent* ASC = Original.IsValid() ? Original->ASC.Get() : nullptr;
+	if (!ASC) { OutError = TEXT("原步骤输入请求或 ASC 已失效。"); return EGGYGOMovementInputEvaluationState::Invalidated; }
+	if (Original->EntryFact.IsValid())
+	{
+		if (!ValidateStepStartInputFact(*Original->EntryFact, OutError))
+			return EGGYGOMovementInputEvaluationState::Invalidated;
+		OutFact = *Original->EntryFact;
+		return EGGYGOMovementInputEvaluationState::Completed;
+	}
+	if (!ASC->CheckStepInputRequestCurrent(*this, OutError))
+		return EGGYGOMovementInputEvaluationState::Invalidated;
+	if (Original->bRemote)
+	{
+		OutError = TEXT("远端步骤请求没有原 owned 入站事实。");
+		return EGGYGOMovementInputEvaluationState::Invalidated;
+	}
+	return UGGYGOPlayerInput::QueryStepStartInputFact(Original->Edge, OutFact, OutError);
+}
+
+bool FGGYGOAbilityStepInputRequest::SubmitStepStartInputFact(
+	const FGGYGOMovementInputStepFact& Fact, FString& OutError) const
+{
+	OutError.Reset();
+	const FGGYGOAbilityStepInputRequest Original = *this;
+	UGGYGOAbilityTask_WaitComboInput* Task = Original.Proof.IsValid() ? Original.Proof->Task.Get() : nullptr;
+	if (!Task || Original.IsRemote()) { OutError = TEXT("缺少原本地输入 Task，不能提交步骤事实。"); return false; }
+	return Task->SubmitEntryFact(Original, Fact, OutError);
+}
+
+bool FGGYGOAbilityStepInputRequest::ValidateStepStartInputFact(
+	const FGGYGOMovementInputStepFact& Fact, FString& OutError) const
+{
+	OutError.Reset();
+	const auto Original = Proof;
+	UGGYGOAbilitySystemComponent* ASC = Original.IsValid() ? Original->ASC.Get() : nullptr;
+	if (!ASC) { OutError = TEXT("原步骤输入请求或 ASC 已失效。"); return false; }
+	if (!ASC->CheckStepInputRequestCurrent(*this, OutError)) return false;
+	if (Original->EntryFact.IsValid())
+	{
+		const auto& Stored = *Original->EntryFact;
+		if (Stored.SourceSessionSerial != Fact.SourceSessionSerial
+			|| Stored.OriginalEdgeEvaluationSerial != Fact.OriginalEdgeEvaluationSerial
+			|| Stored.StepEvaluationSerial != Fact.StepEvaluationSerial || Stored.InputState != Fact.InputState
+			|| Stored.ActionValue != Fact.ActionValue || Stored.ControlYaw != Fact.ControlYaw)
+		{ OutError = TEXT("已提交步骤事实不可替换。"); return false; }
+		if (!Original->bRemote && (Original->EntryFrame != GFrameCounter
+			|| UGGYGOPlayerInput::QueryMovementInputEvaluationToken(Original->Edge, OutError)
+				!= EGGYGOMovementInputEvaluationState::Completed))
+		{
+			if (OutError.IsEmpty()) OutError = TEXT("已提交本地事实不能跨入场帧或原输入 Session 重用。");
+			return false;
+		}
+		return true;
+	}
+	else if (Original->bRemote) { OutError = TEXT("远端缺少原接收封装。"); return false; }
+	// 尚未提交的本地候选才查 Input；封存后只核原 owned 资源和同一事实。
+	return UGGYGOPlayerInput::ValidateStepStartInputFact(Original->Edge, Fact, OutError);
+}
 
 namespace
 {
@@ -698,6 +860,48 @@ void UGGYGOAbilitySystemComponent::MulticastMontageFXTerminal_Implementation(con
 	if (UGGYGOMontageFXPublicationOwner* Owner = MontageFXState.LocalOwner) { Owner->ReceiveTerminal(Terminal); }
 }
 
+bool UGGYGOAbilitySystemComponent::IsLocomotionFXAvatarCurrent(
+	const UGGYGOCharacterMovementComponent* OriginalMovement,
+	const FGGYGOAvatarBindingContext& OriginalBinding,
+	const AActor* OriginalAvatar, const USkeletalMeshComponent* OriginalMesh) const
+{
+	if (!IsInGameThread()) { return false; }
+	const UWorld* World = GetWorld();
+	if (!IsRegistered() || !IsOwnerActorAuthoritative()
+		|| !World || World->bIsTearingDown || !IsValid(OriginalMovement) || OriginalMovement->IsBeingDestroyed()
+		|| !IsValid(OriginalAvatar) || OriginalAvatar->IsActorBeingDestroyed()
+		|| !IsValid(OriginalMesh) || OriginalMesh->IsBeingDestroyed()
+		|| OriginalMovement->GetOwner() != OriginalAvatar || OriginalMesh->GetOwner() != OriginalAvatar
+		|| OriginalMovement->GetWorld() != World || OriginalMesh->GetWorld() != World)
+	{
+		return false;
+	}
+	EGGYGOAvatarBindingReason Reason;
+	if (CheckAvatarBindingContext(OriginalBinding, Reason) != EGGYGOAvatarBindingOutcome::Succeeded)
+	{
+		return false;
+	}
+	const FGameplayAbilityActorInfo* ActorInfo = AbilityActorInfo.Get();
+	return ActorInfo && ActorInfo->AbilitySystemComponent.Get() == this
+		&& ActorInfo->AvatarActor.Get() == OriginalAvatar
+		&& ActorInfo->MovementComponent.Get() == OriginalMovement
+		&& ActorInfo->SkeletalMeshComponent.Get() == OriginalMesh;
+}
+
+bool UGGYGOAbilitySystemComponent::IsLocomotionFXSourceCurrent(const FGGYGOFXSourceIdentity& Source) const
+{
+	const FGGYGOLocomotionSourceProof& Proof = Source.GetLocomotionSourceProof();
+	const FGameplayAbilityActorInfo* ActorInfo = AbilityActorInfo.Get();
+	UGGYGOCharacterMovementComponent* Movement = Source.GetOriginalMovement();
+	if (!ActorInfo || !IsLocomotionFXAvatarCurrent(Movement, Source.GetAvatarBindingContext(),
+		ActorInfo->AvatarActor.Get(), ActorInfo->SkeletalMeshComponent.Get()))
+	{
+		return false;
+	}
+	FString Diagnostic;
+	return Movement->IsLocomotionSourceProofCurrent(Proof, Diagnostic);
+}
+
 bool UGGYGOAbilitySystemComponent::TryPublishMontageFX(UGGYGOGameplayAbility* OriginalAbility,
 	const FGGYGOAbilityActivationHandle& OriginalActivation,
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask, const FGGYGOMontageWindowFact& BeginFact,
@@ -720,7 +924,67 @@ bool UGGYGOAbilitySystemComponent::TryPublishMontageFX(UGGYGOGameplayAbility* Or
 	}
 	FGGYGOMontageFXRecord Record = Request;
 	Record.BeginServerTime = BeginFact.DispatchWorldTimeSeconds;
-	return MontageFXPublicationOwner->Begin(OriginalActivation.GetResourceIdentity(), Record, OutLease, OutDiagnostic);
+	return MontageFXPublicationOwner->Begin(
+		FGGYGOFXSourceIdentity::FromAbilityActivation(OriginalActivation.GetResourceIdentity()),
+		Record, OutLease, OutDiagnostic);
+}
+
+bool UGGYGOAbilitySystemComponent::TryPublishLocomotionFX(
+	UGGYGOCharacterMovementComponent* OriginalMovement,
+	const FGGYGOMotionExecutionSnapshot& CompletedInterval, const FGGYGOMontageFXRecord& Request,
+	FGGYGOMontageFXLease& OutLease, FString& OutDiagnostic)
+{
+	OutLease = {};
+	OutDiagnostic.Reset();
+	if (!IsInGameThread() || !IsRegistered() || !IsOwnerActorAuthoritative()
+		|| !IsValid(OriginalMovement) || OriginalMovement->IsBeingDestroyed() || !MontageFXPublicationOwner)
+	{
+		OutDiagnostic = TEXT("Locomotion FX 发布缺少已注册的权威原 ASC/CMC/发行者。");
+		return false;
+	}
+	const FGGYGOAvatarBindingContext OriginalBinding = GetAvatarBindingContext();
+	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> OriginalPublisher(MontageFXPublicationOwner.Get());
+	FGGYGOLocomotionSourceProof Proof;
+	if (!OriginalMovement->TryGetLocomotionSourceProof(CompletedInterval, Proof, OutDiagnostic))
+	{
+		OutDiagnostic = FString::Printf(TEXT("Locomotion FX 无法认证原 CMC [%s] 的完成区间：%s"),
+			*GetPathNameSafe(OriginalMovement), *OutDiagnostic);
+		return false;
+	}
+	UWorld* CompletionWorld = nullptr;
+	double CompletionWorldTime = 0.;
+	if (!OriginalMovement->TryGetLocomotionCompletionWorldTime(Proof,
+		CompletedInterval.CompletedIntervalSerial, CompletedInterval.CompletedFrame,
+		CompletionWorld, CompletionWorldTime, OutDiagnostic))
+	{
+		OutDiagnostic = FString::Printf(TEXT("Locomotion FX 无法认证原 CMC [%s] 的 producer 事件时间：%s"),
+			*GetPathNameSafe(OriginalMovement), *OutDiagnostic);
+		return false;
+	}
+	if (!IsValid(CompletionWorld) || CompletionWorld != GetWorld()
+		|| !FMath::IsFinite(CompletionWorldTime) || CompletionWorldTime < 0.
+		|| CompletionWorldTime > CompletionWorld->GetTimeSeconds())
+	{
+		OutDiagnostic = FString::Printf(
+			TEXT("Locomotion FX 原 producer 事件 World/时间无效：ASC=%s World=%s Begin=%.17g。"),
+			*GetPathNameSafe(this), *GetPathNameSafe(CompletionWorld), CompletionWorldTime);
+		return false;
+	}
+	if (!IsLocomotionFXAvatarCurrent(OriginalMovement, OriginalBinding, Request.Avatar.Get(), Request.Mesh.Get())
+		|| !OriginalPublisher.IsValid() || MontageFXPublicationOwner.Get() != OriginalPublisher.Get())
+	{
+		OutDiagnostic = FString::Printf(
+			TEXT("Locomotion FX 原绑定或 Avatar/Movement/Mesh/发行者已变化：ASC=%s CMC=%s Avatar=%s Mesh=%s。"),
+			*GetPathNameSafe(this), *GetPathNameSafe(OriginalMovement),
+			*GetPathNameSafe(Request.Avatar.Get()), *GetPathNameSafe(Request.Mesh.Get()));
+		return false;
+	}
+	FGGYGOMontageFXRecord Record = Request;
+	// 原生 producer 完成事件时间；不是连续 cue 边界映射，也不取本调用的接收时刻。
+	Record.BeginServerTime = CompletionWorldTime;
+	return OriginalPublisher->Begin(
+		FGGYGOFXSourceIdentity::FromLocomotion(Proof, OriginalBinding),
+		Record, OutLease, OutDiagnostic);
 }
 
 void UGGYGOAbilitySystemComponent::PrepareMontageFXRetirements(
@@ -732,7 +996,7 @@ void UGGYGOAbilitySystemComponent::PrepareMontageFXRetirements(
 	{
 		if (Original.HasActivation())
 		{
-			Owner->PrepareCloseSource(Original.GetResourceIdentity(),
+			Owner->PrepareCloseSource(FGGYGOFXSourceIdentity::FromAbilityActivation(Original.GetResourceIdentity()),
 				EGGYGOMontageFXCloseReason::Abort, OutObligations);
 		}
 	}
@@ -758,11 +1022,23 @@ void UGGYGOAbilitySystemComponent::PrepareInvalidMontageFXSources(
 {
 	UGGYGOMontageFXPublicationOwner* Owner = MontageFXState.LocalOwner.Get();
 	if (!Owner) { return; }
-	TArray<TSharedPtr<const void>> Sources;
+	TArray<FGGYGOFXSourceIdentity> Sources;
 	Owner->GetSourceIdentities(Sources);
 	for (const auto& Source : Sources)
 	{
-		if (!UGGYGOGameplayAbility::IsPublicationSourceCurrent(this, Source))
+		bool bCurrent = false;
+		switch (Source.GetKind())
+		{
+		case EGGYGOFXSourceKind::AbilityActivation:
+			bCurrent = UGGYGOGameplayAbility::IsPublicationSourceCurrent(this, Source.GetAbilityActivationProof());
+			break;
+		case EGGYGOFXSourceKind::Locomotion:
+			bCurrent = IsLocomotionFXSourceCurrent(Source);
+			break;
+		case EGGYGOFXSourceKind::Invalid:
+			break;
+		}
+		if (!bCurrent)
 		{
 			Owner->PrepareCloseSource(Source, EGGYGOMontageFXCloseReason::Abort, OutObligations);
 		}
@@ -1753,6 +2029,18 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInpu
 	const FGameplayTag& InputTag, const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline)
 {
 	check(IsInGameThread());
+	// 普通调用不采新方向；既有 ID 复核只搬它自己首次记录的来源。
+	const FAbilityInputRequestRecord* Existing = FindAbilityInputRequest(PreviousIdentity);
+	const FGGYGOMovementInputEvaluationToken Original = Existing
+		? Existing->Request.OriginalEvaluationToken : FGGYGOMovementInputEvaluationToken{};
+	return ReceiveAbilityInputRequest(InputTag, PreviousIdentity, OriginalDeadline, Original);
+}
+
+FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInputRequest(
+	const FGameplayTag& InputTag, const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline,
+	const FGGYGOMovementInputEvaluationToken& OriginalEvaluationToken)
+{
+	check(IsInGameThread());
 	using EOutcome = EGGYGOAbilityInputRequestOutcome;
 	using EReason = EGGYGOAbilityInputRequestReason;
 	const auto Fail = [&](EOutcome Outcome, EReason Reason)
@@ -1771,7 +2059,8 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInpu
 		if (PreviousIdentity.InputRevision != AbilityInputRevision) { return Fail(EOutcome::Stale, EReason::WrongRevision); }
 		const FAbilityInputRequestRecord* Existing = FindAbilityInputRequest(PreviousIdentity);
 		if (!Existing) { return Fail(EOutcome::Stale, EReason::UnknownRequest); }
-		if (Existing->Request.InputTag != InputTag || Existing->Request.OriginalDeadline != OriginalDeadline)
+		if (Existing->Request.InputTag != InputTag || Existing->Request.OriginalDeadline != OriginalDeadline
+			|| !(Existing->Request.OriginalEvaluationToken == OriginalEvaluationToken))
 			{ return Fail(EOutcome::Rejected, EReason::RequestMismatch); }
 		if (!Existing->bHeld) { return Fail(EOutcome::Stale, EReason::RequestEnded); }
 		if (HasMatchingGameplayTag(TAG_GGYGO_Gameplay_AbilityInputBlocked)) { return Fail(EOutcome::Rejected, EReason::InputBlocked); }
@@ -1788,6 +2077,7 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInpu
 	FAbilityInputRequestRecord Record;
 	Record.Request.InputTag = InputTag;
 	Record.Request.OriginalDeadline = OriginalDeadline;
+	Record.Request.OriginalEvaluationToken = OriginalEvaluationToken;
 	Record.OwnerActor = Owner;
 	Record.AvatarActor = Avatar;
 	Record.World = World;
@@ -1813,6 +2103,7 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInpu
 			Edge.Handle = Handle;
 			Edge.InputRevision = AbilityInputRevision;
 			Edge.bPressed = true;
+			Edge.OriginalEvaluationToken = OriginalEvaluationToken;
 			Edge.OwnerActor = Owner;
 			Edge.AvatarActor = Avatar;
 			Edge.World = World;
@@ -1835,6 +2126,365 @@ FGGYGOAbilityInputRequestResult UGGYGOAbilitySystemComponent::ReceiveAbilityInpu
 	}
 	RebuildAbilityInputHeldHandles();
 	return FGGYGOAbilityInputRequestResult{EOutcome::Accepted, EReason::None, Identity};
+}
+
+FGGYGOAbilityInitialInputRoute UGGYGOAbilitySystemComponent::CaptureInitialInputRoute(
+	UGGYGOGameplayAbility* Ability, const FGGYGOAbilityActivationHandle& Original, FString& OutError)
+{
+	OutError.Reset();
+	FGGYGOAbilityInitialInputRoute Route;
+	if (!IsInGameThread() || !IsValid(this) || !IsValid(Ability)
+		|| Ability->GetAbilitySystemComponentFromActorInfo() != this || !Original.HasActivation()
+		|| !Ability->ValidateCurrentControlledActivation(true, true,
+			UGGYGOGameplayAbility::EControlledActivationValidationPurpose::Termination).HasSameActivation(Original))
+	{ OutError = TEXT("Initial 取消路由缺少原 ASC/激活来源。"); return Route; }
+	InitialInputRoutes.RemoveAll([](const auto& Weak) { return !Weak.IsValid(); });
+	for (const auto& Weak : InitialInputRoutes)
+	{
+		const auto Existing = Weak.Pin();
+		if (Existing.IsValid() && Existing->Ability.Get() == Ability && Existing->Activation.HasSameActivation(Original))
+		{ Route.Proof = Existing; return Route; }
+	}
+	Route.Proof = MakeShared<FGGYGOAbilityInitialInputRoute::FRouteProof>();
+	Route.Proof->ASC = this; Route.Proof->Ability = Ability; Route.Proof->Activation = Original;
+	Route.Proof->Spec = Ability->GetCurrentAbilitySpecHandle();
+	Route.Proof->ActivationKey = Ability->GetCurrentActivationInfo().GetActivationPredictionKey();
+	Route.Proof->bPredictingOwner = Ability->IsPredictingClient()
+		&& Ability->GetNetExecutionPolicy() == EGameplayAbilityNetExecutionPolicy::LocalPredicted;
+	InitialInputRoutes.Add(Route.Proof);
+	return Route;
+}
+
+bool UGGYGOAbilitySystemComponent::CheckInitialInputRoute(const FGGYGOAbilityInitialInputRoute& Route, FString& OutError) const
+{
+	OutError.Reset();
+	if (!IsInGameThread()) { OutError = TEXT("Initial 路由只能在 GameThread 核验。"); return false; }
+	const auto Origin = Route.Proof;
+	UGGYGOGameplayAbility* Ability = Origin.IsValid() ? Origin->Ability.Get() : nullptr;
+	if (!Origin.IsValid() || Origin->ASC.Get() != this || !IsValid(Ability)
+		|| Ability->GetCurrentAbilitySpecHandle() != Origin->Spec
+		|| Ability->GetCurrentActivationInfo().GetActivationPredictionKey() != Origin->ActivationKey)
+	{ OutError = TEXT("Initial 路由不再属于原活动实例/激活；不借后继发送或消费。"); return false; }
+	const bool bLiveOriginal = Ability->ValidateCurrentControlledActivation(true, true,
+		UGGYGOGameplayAbility::EControlledActivationValidationPurpose::Termination).HasSameActivation(Origin->Activation);
+	// Busy 禁止新的业务准入；原 Cleanup 只读已经保存的同一原生清理身份。
+	const bool bOriginalCleanup = Ability->IsControlledActivationTerminationBusy()
+		&& Ability->NativeCleanupActivation.HasSameActivation(Origin->Activation)
+		&& (!Ability->CurrentControlledActivation.HasActivation()
+			|| Ability->CurrentControlledActivation.HasSameActivation(Origin->Activation));
+	if (!bLiveOriginal && !bOriginalCleanup)
+	{ OutError = TEXT("Initial 路由既非原活动来源，也非本原 Cleanup；不向后继归还。"); return false; }
+	return true;
+}
+
+FGGYGOAbilityInitialInputRoute UGGYGOAbilitySystemComponent::FindInitialInputRoute(
+	FGameplayAbilitySpecHandle Spec, FPredictionKey Key) const
+{
+	FGGYGOAbilityInitialInputRoute Result;
+	for (const auto& Weak : InitialInputRoutes)
+	{
+		FGGYGOAbilityInitialInputRoute Candidate;
+		Candidate.Proof = Weak.Pin();
+		FString Error;
+		if (Candidate.HasRoute() && Candidate.Proof->Spec == Spec && Candidate.Proof->ActivationKey == Key
+			&& CheckInitialInputRoute(Candidate, Error))
+		{
+			if (Result.HasRoute()) return {};
+			Result = Candidate;
+		}
+	}
+	return Result;
+}
+
+void UGGYGOAbilitySystemComponent::NotifyInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route)
+{
+	const auto Origin = Route.Proof;
+	if (!Origin.IsValid() || !Origin->bPredictingOwner
+		|| Origin->State != FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Pending) return;
+	FString Error;
+	if (!CheckInitialInputRoute(Route, Error))
+	{ UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("InitialUnavailable 原路由发送拒绝：%s"), *Error); return; }
+	FScopedPredictionWindow Prediction(this, true);
+	if (!CheckInitialInputRoute(Route, Error)
+		|| Origin->State != FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Pending) return;
+	Origin->State = FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Unavailable;
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[AbilitySystem.OwnedStepInput] Boundary=InitialUnavailableSend ASC='%s' Spec=%s ActivationKey=%s ScopedKey=%s"),
+		*GetPathName(), *Origin->Spec.ToString(), *Origin->ActivationKey.ToString(), *ScopedPredictionKey.ToString());
+	ServerSetReplicatedTargetDataCancelled(Origin->Spec, Origin->ActivationKey, ScopedPredictionKey);
+}
+
+bool UGGYGOAbilitySystemComponent::ConsumeInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route,
+	const FGGYGOAbilityActivationHandle& Original)
+{
+	const auto Origin = Route.Proof;
+	FString Error;
+	if (!Origin.IsValid() || Origin->bPredictingOwner || !Origin->Activation.HasSameActivation(Original)
+		|| Origin->State != FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Unavailable
+		|| !CheckInitialInputRoute(Route, Error)) return false;
+	const auto Cached = AbilityTargetDataMap.Find(FGameplayAbilitySpecHandleAndPredictionKey(Origin->Spec, Origin->ActivationKey));
+	if (!Cached.IsValid() || Cached != Origin->CancellationCache.Pin() || !Cached->bTargetCancelled) return false;
+	Origin->State = FGGYGOAbilityInitialInputRoute::FRouteProof::EState::ConsumedUnavailable;
+	ConsumeClientReplicatedTargetData(Origin->Spec, Origin->ActivationKey);
+	return true;
+}
+
+void UGGYGOAbilitySystemComponent::ServerSetReplicatedTargetDataCancelled_Implementation(
+	FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey, FPredictionKey CurrentPredictionKey)
+{
+	auto Route = FindInitialInputRoute(AbilityHandle, AbilityOriginalPredictionKey);
+	if (!Route.HasRoute())
+	{
+		Super::ServerSetReplicatedTargetDataCancelled_Implementation(AbilityHandle, AbilityOriginalPredictionKey, CurrentPredictionKey);
+		return;
+	}
+	DispatchInitialInputUnavailable(Route, CurrentPredictionKey, TEXT("InitialUnavailableRPC"));
+}
+
+void UGGYGOAbilitySystemComponent::DispatchInitialInputUnavailable(const FGGYGOAbilityInitialInputRoute& Route,
+	FPredictionKey CurrentPredictionKey, const TCHAR* Boundary)
+{
+	const auto Origin = Route.Proof;
+	FString Error;
+	if (!CheckInitialInputRoute(Route, Error)) return;
+	if (Origin->State != FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Pending) return;
+	// 已提交 Initial 不进 native Reset；普通取消政策及已起段权限保持原样。
+	if (!GetOwnerActor() || !GetOwnerActor()->HasAuthority() || !GetOwner() || !GetOwner()->GetNetConnection()) return;
+	AbilityTargetDataCancelledDelegate(Origin->Spec, Origin->ActivationKey);
+	Origin->CancellationCache = AbilityTargetDataMap.Find(FGameplayAbilitySpecHandleAndPredictionKey(Origin->Spec, Origin->ActivationKey));
+	Origin->State = FGGYGOAbilityInitialInputRoute::FRouteProof::EState::Unavailable;
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[AbilitySystem.OwnedStepInput] Boundary=%s ASC='%s' Spec=%s ActivationKey=%s"),
+		Boundary, *GetPathName(), *Origin->Spec.ToString(), *Origin->ActivationKey.ToString());
+	Super::ServerSetReplicatedTargetDataCancelled_Implementation(Origin->Spec, Origin->ActivationKey, CurrentPredictionKey);
+}
+
+FGGYGOAbilityStepInputRequest UGGYGOAbilitySystemComponent::MakeStepInputRequest(
+	UGGYGOGameplayAbility* Ability, UGGYGOAbilityTask_WaitComboInput* Task,
+	EGGYGOAbilityStepInputKind Kind, int32 SourceStep, int32 RequestId, bool bRemote, FString& OutError)
+{
+	OutError.Reset();
+	FGGYGOAbilityStepInputRequest Result;
+	if (!IsInGameThread()) { OutError = TEXT("步骤输入来源只能在 GameThread 捕获。"); return Result; }
+	APawn* Avatar = Cast<APawn>(GetAvatarActor());
+	APlayerController* PC = Avatar ? Cast<APlayerController>(Avatar->GetController()) : nullptr;
+	UGGYGOCharacterMovementComponent* Movement = Avatar ? Cast<UGGYGOCharacterMovementComponent>(Avatar->GetMovementComponent()) : nullptr;
+	const auto Context = GetAvatarBindingContext();
+	EGGYGOAvatarBindingReason BindingReason;
+	const auto Activation = IsValid(Ability) ? Ability->CaptureCurrentActivation() : FGGYGOAbilityActivationHandle{};
+	if (!IsValid(this) || !IsValid(Ability) || !Ability->IsActive()
+		|| Ability->GetAbilitySystemComponentFromActorInfo() != this || !Activation.HasActivation()
+		|| !IsValid(Avatar) || !IsValid(PC) || PC->GetPawn() != Avatar || !IsValid(Movement)
+		|| Movement->GetOwner() != Avatar
+		|| Avatar->GetWorld() != GetWorld()
+		|| CheckAvatarBindingContext(Context, BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded
+		|| (bRemote ? (!Avatar->HasAuthority() || Avatar->IsLocallyControlled()
+			|| !PC->GetNetConnection() || !GetOwner() || GetOwner()->GetNetConnection() != PC->GetNetConnection())
+			: !Avatar->IsLocallyControlled()))
+	{
+		OutError = TEXT("步骤输入缺少原 owned ASC/活动激活/Avatar/Controller/绑定来源。");
+		return Result;
+	}
+	FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Ability->GetCurrentAbilitySpecHandle());
+	if (!Spec || !Spec->IsActive() || !Spec->GetAbilityInstances().Contains(Ability))
+	{ OutError = TEXT("步骤输入的原 Spec/活动实例不匹配。"); return Result; }
+	Result.Proof = MakeShared<FGGYGOAbilityStepInputRequest::FRequestProof>();
+	auto& Proof = *Result.Proof;
+	Proof.ASC = this; Proof.Ability = Ability; Proof.Task = Task; Proof.Avatar = Avatar;
+	Proof.Controller = PC; Proof.Connection = PC->GetNetConnection(); Proof.Movement = Movement; Proof.World = GetWorld();
+	Proof.Activation = Activation; Proof.BindingContext = Context;
+	Proof.Spec = Ability->GetCurrentAbilitySpecHandle();
+	Proof.ActivationKey = Ability->GetCurrentActivationInfo().GetActivationPredictionKey();
+	Proof.Kind = Kind; Proof.SourceStep = SourceStep; Proof.RequestId = RequestId; Proof.bRemote = bRemote;
+	return Result;
+}
+
+FGGYGOAbilityStepInputRequest UGGYGOAbilitySystemComponent::CaptureStepInputRequest(
+	UGGYGOAbilityTask_WaitComboInput* Task, UGGYGOGameplayAbility* Ability,
+	EGGYGOAbilityStepInputKind Kind, int32 SourceStep, int32 RequestId, FString& OutError)
+{
+	OutError.Reset();
+	const FStepInputDispatch* Dispatch = ActiveStepInputDispatch;
+	if (!IsValid(Task) || !IsValid(Ability) || !Dispatch || Dispatch->Spec != Ability->GetCurrentAbilitySpecHandle()
+		|| Dispatch->bInitial != (Kind == EGGYGOAbilityStepInputKind::Initial)
+		|| Dispatch->InputRevision != AbilityInputRevision
+		|| (Kind == EGGYGOAbilityStepInputKind::Continue && !Dispatch->bDelivering) || Dispatch->bClaimed
+		|| !Dispatch->OriginalEvaluationToken.IsSet())
+	{ OutError = TEXT("步骤请求没有本次原 Process dispatch 的真实 edge 来源。"); return {}; }
+	const auto Edge = Dispatch->OriginalEvaluationToken;
+	bool bOriginalRequestCurrent = false;
+	for (const auto& Entry : AbilityInputRequests)
+	{
+		const auto& Record = Entry.Value;
+		if (Record.Request.OriginalEvaluationToken == Edge
+			&& IsAbilityInputRequestCurrent(Record.Request, Dispatch->Spec, false, false, false))
+		{ bOriginalRequestCurrent = true; break; }
+	}
+	if (!bOriginalRequestCurrent)
+	{ OutError = TEXT("原 Press 来源已退休，不能借仍有效的输入评价重建请求。"); return {}; }
+	Dispatch->bClaimed = true;
+	if (UGGYGOPlayerInput::QueryMovementInputEvaluationToken(Edge, OutError) == EGGYGOMovementInputEvaluationState::Invalidated)
+		return {};
+	FGGYGOAbilityStepInputRequest Result = MakeStepInputRequest(Ability, Task, Kind, SourceStep, RequestId, false, OutError);
+	if (!Result.HasRequest()) return Result;
+	const auto Session = Edge.GetSourceSession();
+	if (!Session.Producer.IsValid() || Session.SessionSerial == 0
+		|| Result.Proof->Controller->PlayerInput != Session.Producer.Get())
+	{ OutError = TEXT("原 edge Producer/Session 与该 ASC 的 Controller 不匹配。"); return {}; }
+	Result.Proof->Edge = Edge;
+	return Result;
+}
+
+bool UGGYGOAbilitySystemComponent::CheckStepInputRequestCurrent(
+	const FGGYGOAbilityStepInputRequest& Request, FString& OutError) const
+{
+	OutError.Reset();
+	if (!IsInGameThread()) { OutError = TEXT("步骤输入来源只能在 GameThread 核验。"); return false; }
+	const auto Original = Request.Proof;
+	UGGYGOGameplayAbility* Ability = Original.IsValid() ? Original->Ability.Get() : nullptr;
+	APawn* Avatar = Original.IsValid() ? Original->Avatar.Get() : nullptr;
+	APlayerController* PC = Original.IsValid() ? Original->Controller.Get() : nullptr;
+	EGGYGOAvatarBindingReason Reason;
+	const FGameplayAbilitySpec* Spec = Original.IsValid() ? FindAbilitySpecFromHandle(Original->Spec) : nullptr;
+	if (!IsValid(this) || !Original.IsValid() || Original->ASC.Get() != this
+		|| !IsValid(Ability) || !Ability->IsActive() || !Spec || !Spec->IsActive()
+		|| !Spec->GetAbilityInstances().Contains(Ability)
+		|| !Ability->CaptureCurrentActivation().HasSameActivation(Original->Activation)
+		|| Ability->GetCurrentAbilitySpecHandle() != Original->Spec
+		|| Ability->GetCurrentActivationInfo().GetActivationPredictionKey() != Original->ActivationKey
+		|| GetAvatarActor() != Avatar || !IsValid(Avatar) || !IsValid(PC)
+		|| Avatar->GetController() != PC || PC->GetPawn() != Avatar
+		|| Avatar->GetMovementComponent() != Original->Movement.Get() || !Original->Movement.IsValid()
+		|| !Original->World.IsValid() || GetWorld() != Original->World.Get()
+		|| CheckAvatarBindingContext(Original->BindingContext, Reason) != EGGYGOAvatarBindingOutcome::Succeeded
+		|| (Original->bRemote ? (!Avatar->HasAuthority() || Avatar->IsLocallyControlled()
+				|| !Original->Connection.IsValid() || PC->GetNetConnection() != Original->Connection.Get()
+				|| !GetOwner() || GetOwner()->GetNetConnection() != Original->Connection.Get())
+			: (!Avatar->IsLocallyControlled() || !Original->Task.IsValid()
+				|| !Original->Task->IsActive()
+				|| Original->Edge.GetSourceSession().Producer.Get() != PC->PlayerInput)))
+	{
+		OutError = TEXT("原步骤输入的激活/owned 端点/绑定来源已失效。");
+		return false;
+	}
+	return true;
+}
+
+bool UGGYGOAbilitySystemComponent::CheckStepInputRequestForTask(const FGGYGOAbilityStepInputRequest& Request,
+	const UGameplayAbility* Ability, const FGGYGOAbilityActivationHandle& Activation, FString& OutError) const
+{
+	if (!CheckStepInputRequestCurrent(Request, OutError)) return false;
+	if (Request.Proof->Ability.Get() != Ability || !Request.Proof->Activation.HasSameActivation(Activation))
+	{ OutError = TEXT("owned 请求不属于该 Task 创建时的原活动实例/激活。"); return false; }
+	return true;
+}
+
+bool UGGYGOAbilitySystemComponent::CommitStepInputFact(UGGYGOAbilityTask_WaitComboInput* Task,
+	const FGGYGOAbilityStepInputRequest& Request, const FGGYGOMovementInputStepFact& Fact,
+	const FGGYGOAbilityInitialInputRoute& Route, FString& OutError)
+{
+	if (!CheckStepInputRequestCurrent(Request, OutError)) return false;
+	const auto Original = Request.Proof;
+	if (!CheckInitialInputRoute(Route, OutError)) return false;
+	if (Route.Proof->Ability != Original->Ability
+		|| !Route.Proof->Activation.HasSameActivation(Original->Activation))
+	{ OutError = TEXT("步骤事实与 Initial 路由不属于同一原激活。"); return false; }
+	using EInitial = FGGYGOAbilityInitialInputRoute::FRouteProof::EState;
+	const bool bInitial = Original->Kind == EGGYGOAbilityStepInputKind::Initial;
+	if (Route.Proof->State != (bInitial ? EInitial::Pending : EInitial::Submitted))
+	{ OutError = TEXT("Initial 已不可提供，或 Continue 没有原已提交 Initial。"); return false; }
+	if (Original->bRemote || Original->Task.Get() != Task || Original->EntryFact.IsValid())
+	{ OutError = TEXT("原步骤事实已提交或不属于该本地 Task。"); return false; }
+	FGGYGOAbilityStepInputTargetData Shape;
+	Shape.Kind = Original->Kind; Shape.SourceStep = Original->SourceStep; Shape.RequestId = Original->RequestId; Shape.StepFact = Fact;
+	if (!Shape.HasValidFields() || !UGGYGOPlayerInput::ValidateStepStartInputFact(Original->Edge, Fact, OutError))
+	{ if (OutError.IsEmpty()) OutError = TEXT("原步骤事实字段不合法。"); return false; }
+	FGGYGOMovementOwnerSyncScopeId Scope;
+	if (!Original->Movement->GetMovementOwnerSyncScope(Scope, OutError)) return false;
+	Original->EntryScope = Scope;
+	Original->EntryFrame = GFrameCounter;
+	Original->EntryFact = MakeShared<const FGGYGOMovementInputStepFact>(Fact);
+	if (bInitial) Route.Proof->State = EInitial::Submitted;
+	return true;
+}
+
+FGGYGOAbilityStepInputRequest UGGYGOAbilitySystemComponent::WrapRemoteStepInputRequest(
+	FGameplayAbilitySpecHandle SpecHandle, FPredictionKey ActivationKey, EGGYGOAbilityStepInputKind Kind,
+	int32 SourceStep, int32 RequestId, const FGGYGOMovementInputStepFact& Fact, FString& OutError)
+{
+	FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(SpecHandle);
+	if (!Spec || !Spec->IsActive()) { OutError = TEXT("远端步骤的原 Spec 已不活动。"); return {}; }
+	UGGYGOGameplayAbility* MatchingAbility = nullptr;
+	for (UGameplayAbility* Instance : Spec->GetAbilityInstances())
+	{
+		UGGYGOGameplayAbility* Ability = Cast<UGGYGOGameplayAbility>(Instance);
+		if (!Ability || !Ability->IsActive() || Ability->GetCurrentAbilitySpecHandle() != SpecHandle
+			|| Ability->GetCurrentActivationInfo().GetActivationPredictionKey() != ActivationKey) continue;
+		if (MatchingAbility) { OutError = TEXT("远端 Spec/激活预测键不能唯一定位活动实例。"); return {}; }
+		MatchingAbility = Ability;
+	}
+	if (!MatchingAbility) { OutError = TEXT("远端步骤没有匹配的原活动实例/激活预测键。"); return {}; }
+	const auto Route = FindInitialInputRoute(SpecHandle, ActivationKey);
+	using EInitial = FGGYGOAbilityInitialInputRoute::FRouteProof::EState;
+	if (!Route.HasRoute() || Route.Proof->State != (Kind == EGGYGOAbilityStepInputKind::Initial
+		? EInitial::Pending : EInitial::Submitted))
+	{ OutError = TEXT("远端没有原 Initial 路由，或该 Initial 已终止/尚未提交。"); return {}; }
+	auto Request = MakeStepInputRequest(MatchingAbility, nullptr, Kind, SourceStep, RequestId, true, OutError);
+	if (!Request.HasRequest()) return {};
+	// 入站只认证输入来源。Scope 若尚未建立，由 GA/CMC 的真实准入明确等待或拒绝，不能丢掉唯一 Initial。
+	FString ScopeError;
+	Request.Proof->Movement->GetMovementOwnerSyncScope(Request.Proof->EntryScope, ScopeError);
+	Request.Proof->EntryFact = MakeShared<const FGGYGOMovementInputStepFact>(Fact);
+	if (Kind == EGGYGOAbilityStepInputKind::Initial) Route.Proof->State = EInitial::Submitted;
+	return Request;
+}
+
+void UGGYGOAbilitySystemComponent::ServerSetReplicatedTargetData_Implementation(
+	FGameplayAbilitySpecHandle AbilityHandle, FPredictionKey AbilityOriginalPredictionKey,
+	const FGameplayAbilityTargetDataHandle& TargetData, FGameplayTag ApplicationTag, FPredictionKey CurrentPredictionKey)
+{
+	const FGameplayAbilityTargetData* First = TargetData.Get(0);
+	if (!First || First->GetScriptStruct() != FGGYGOAbilityStepInputTargetData::StaticStruct())
+	{
+		Super::ServerSetReplicatedTargetData_Implementation(AbilityHandle, AbilityOriginalPredictionKey,
+			TargetData, ApplicationTag, CurrentPredictionKey);
+		return;
+	}
+	const auto Raw = *static_cast<const FGGYGOAbilityStepInputTargetData*>(First);
+	FString Error;
+	if (TargetData.Num() != 1 || ApplicationTag.IsValid() || !Raw.HasValidFields())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("OwnedStepInput 入站字段拒绝：ASC=%s Spec=%s ActivationKey=%s Num=%d Tag=%s Kind=%u SourceStep=%d Request=%d。"),
+			*GetPathName(), *AbilityHandle.ToString(), *AbilityOriginalPredictionKey.ToString(), TargetData.Num(),
+			*ApplicationTag.ToString(), static_cast<uint32>(Raw.Kind), Raw.SourceStep, Raw.RequestId);
+		return;
+	}
+	auto Request = WrapRemoteStepInputRequest(AbilityHandle, AbilityOriginalPredictionKey,
+		Raw.Kind, Raw.SourceStep, Raw.RequestId, Raw.StepFact, Error);
+	if (!Request.HasRequest())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("OwnedStepInput 入站来源拒绝：ASC=%s Spec=%s ActivationKey=%s Kind=%u Request=%d 原因=%s。"),
+			*GetPathName(), *AbilityHandle.ToString(), *AbilityOriginalPredictionKey.ToString(), static_cast<uint32>(Raw.Kind), Raw.RequestId, *Error);
+		if (Raw.Kind == EGGYGOAbilityStepInputKind::Initial)
+		{
+			const auto Pending = FindInitialInputRoute(AbilityHandle, AbilityOriginalPredictionKey);
+			if (Pending.HasRoute()) DispatchInitialInputUnavailable(Pending, CurrentPredictionKey, TEXT("InitialSourceRejected"));
+		}
+		return;
+	}
+	auto* Owned = new FGGYGOAbilityStepInputTargetData(Raw);
+	Owned->OwnedRequest = Request;
+	const FGameplayAbilityTargetDataHandle OwnedData(Owned);
+	UE_LOG(LogGGYGOAbilitySystem, Display,
+		TEXT("[AbilitySystem.OwnedStepInput] Boundary=RPCImplementation ASC='%s' World='%s' Spec=%s ActivationKey=%s ScopedKey=%s Kind=%u SourceStep=%d Request=%d Edge=%llu Entry=%llu Frame=%llu"),
+		*GetPathName(), *GetPathNameSafe(GetWorld()), *AbilityHandle.ToString(), *AbilityOriginalPredictionKey.ToString(),
+		*CurrentPredictionKey.ToString(), static_cast<uint32>(Raw.Kind), Raw.SourceStep, Raw.RequestId,
+		static_cast<unsigned long long>(Raw.StepFact.OriginalEdgeEvaluationSerial),
+		static_cast<unsigned long long>(Raw.StepFact.StepEvaluationSerial), static_cast<unsigned long long>(GFrameCounter));
+	Super::ServerSetReplicatedTargetData_Implementation(AbilityHandle, AbilityOriginalPredictionKey,
+		OwnedData, ApplicationTag, CurrentPredictionKey);
 }
 
 void UGGYGOAbilitySystemComponent::ClientCorrectAbilityState_Implementation(FGameplayAbilitySpecHandle AbilityHandle,
@@ -2140,7 +2790,8 @@ void UGGYGOAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGa
 		}
 	};
 	const auto TryOnce = [&](FGameplayAbilitySpecHandle Handle, EAbilityActivationInputOrigin Kind,
-		const TArray<FGGYGOAbilityInputRetryRequest>& Sources)
+		const TArray<FGGYGOAbilityInputRetryRequest>& Sources,
+		const FGGYGOMovementInputEvaluationToken& OriginalPressToken = FGGYGOMovementInputEvaluationToken{})
 	{
 		if (!CanContinue() || Attempted.Contains(Handle) || HasSupersedingInput(Handle)) { return; }
 		const FGameplayAbilitySpec* Spec = FindAbilitySpecFromHandle(Handle);
@@ -2173,6 +2824,25 @@ void UGGYGOAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGa
 		}
 		bool bActivated = false;
 		{
+			FGGYGOMovementInputEvaluationToken Token = OriginalPressToken;
+			if (!Token.IsSet() && Kind != EAbilityActivationInputOrigin::InitialPress)
+			{
+				// 重试只搬原来源；不同评价的多个来源不能猜成某一个真按下。
+				bool bFirstSource = true;
+				for (const auto& Source : CurrentSources)
+				{
+					if (bFirstSource) { Token = Source.OriginalEvaluationToken; bFirstSource = false; }
+					else if (!(Token == Source.OriginalEvaluationToken)) { Token = {}; break; }
+				}
+			}
+			const FStepInputDispatch Dispatch{Handle, Token, true, ProcessingRevision};
+			const FStepInputDispatch* PreviousDispatch = ActiveStepInputDispatch;
+			ActiveStepInputDispatch = &Dispatch;
+			ON_SCOPE_EXIT
+			{
+				if (OriginalASC.IsValid() && ActiveStepInputDispatch == &Dispatch)
+					ActiveStepInputDispatch = PreviousDispatch;
+			};
 			FScopedAbilityInputActivation InputScope(this, Handle, Origin);
 			bActivated = TryActivateAbilityWithTerminationBoundary(Handle).bNativeAccepted;
 		}
@@ -2200,11 +2870,19 @@ void UGGYGOAbilitySystemComponent::ProcessAbilityInput(float DeltaTime, bool bGa
 			Spec->InputPressed = true;
 			if (Spec->IsActive())
 			{
+				const FStepInputDispatch Dispatch{Edge.Handle, Edge.OriginalEvaluationToken, false, ProcessingRevision};
+				const FStepInputDispatch* PreviousDispatch = ActiveStepInputDispatch;
+				ActiveStepInputDispatch = &Dispatch;
+				ON_SCOPE_EXIT
+				{
+					if (OriginalASC.IsValid() && ActiveStepInputDispatch == &Dispatch)
+						ActiveStepInputDispatch = PreviousDispatch;
+				};
 				AbilitySpecInputPressed(*Spec); // Real aggregate first edge, never retry.
 			}
 			else
 			{
-				TryOnce(Edge.Handle, EAbilityActivationInputOrigin::InitialPress, InitialSourcesByEdge[EdgeIndex]);
+				TryOnce(Edge.Handle, EAbilityActivationInputOrigin::InitialPress, InitialSourcesByEdge[EdgeIndex], Edge.OriginalEvaluationToken);
 			}
 		}
 		else
@@ -2270,6 +2948,10 @@ void UGGYGOAbilitySystemComponent::ClearAbilityInput()
 
 void UGGYGOAbilitySystemComponent::AbilitySpecInputPressed(FGameplayAbilitySpec& Spec)
 {
+	const FStepInputDispatch* OriginalDispatch = ActiveStepInputDispatch;
+	const bool bOriginalNativeEntry = OriginalDispatch && !OriginalDispatch->bInitial
+		&& OriginalDispatch->Spec == Spec.Handle && !OriginalDispatch->bNativePressEntered;
+	if (bOriginalNativeEntry) OriginalDispatch->bNativePressEntered = true;
 	Super::AbilitySpecInputPressed(Spec);
 
 	// 不用 bReplicateInputDirectly，改走 replicated event，
@@ -2282,6 +2964,20 @@ void UGGYGOAbilitySystemComponent::AbilitySpecInputPressed(FGameplayAbilitySpec&
 		FPredictionKey OriginalPredictionKey = Instance ? Instance->GetCurrentActivationInfo().GetActivationPredictionKey() : Spec.ActivationInfo.GetActivationPredictionKey();
 		PRAGMA_ENABLE_DEPRECATION_WARNINGS
 
+		FStepInputDispatch Delivery;
+		const FStepInputDispatch* PreviousDispatch = ActiveStepInputDispatch;
+		if (bOriginalNativeEntry && OriginalDispatch == PreviousDispatch && !OriginalDispatch->bDelivering)
+		{
+			Delivery = *OriginalDispatch;
+			Delivery.bDelivering = true;
+			ActiveStepInputDispatch = &Delivery;
+		}
+		const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC(this);
+		ON_SCOPE_EXIT
+		{
+			if (OriginalASC.IsValid() && ActiveStepInputDispatch == &Delivery)
+				ActiveStepInputDispatch = PreviousDispatch;
+		};
 		InvokeReplicatedEvent(EAbilityGenericReplicatedEvent::InputPressed, Spec.Handle, OriginalPredictionKey);
 	}
 }
@@ -3274,7 +3970,7 @@ bool UGGYGOAbilitySystemComponent::InvalidateAvatarBinding(
 	if (!OutRetirements)
 	{
 		const auto* Publication = MontageFXPublicationOwner ? MontageFXPublicationOwner.Get() : MontageFXState.LocalOwner.Get();
-		TArray<TSharedPtr<const void>> Sources;
+		TArray<FGGYGOFXSourceIdentity> Sources;
 		if (Publication) { Publication->GetSourceIdentities(Sources); }
 		if (!Sources.IsEmpty())
 		{

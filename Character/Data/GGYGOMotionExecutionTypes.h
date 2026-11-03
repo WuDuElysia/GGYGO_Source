@@ -13,6 +13,7 @@
 
 class ACharacter;
 class USceneComponent;
+class UWorld;
 class UGGYGOCharacterMovementComponent;
 struct FRootMotionSource;
 struct FGGYGOActionMotionResource;
@@ -69,6 +70,10 @@ struct GGYGO_API FGGYGOMotionExecutionSnapshot
 	EGGYGOTurnBackPhase TurnBackPhase = EGGYGOTurnBackPhase::None;
 	uint64 CompletedIntervalSerial = 0;
 	uint64 CompletedFrame = 0;
+	/** 原完成区间生产点的 World 事件采样；不是 cue 内部连续时间映射。不可由接收端补 Now。 */
+	bool bHasCompletionWorldTime = false;
+	TWeakObjectPtr<UWorld> CompletionWorld;
+	double CompletionWorldTimeSeconds = 0.0;
 	float NativeDeltaSeconds = 0.0f;
 	/** 只有原 RMS 区间具有绝对 native source 坐标；普通 CMC 不伪造 RMS 时钟。 */
 	bool bHasNativeSourceInterval = false;
@@ -98,3 +103,44 @@ struct GGYGO_API FGGYGOMotionExecutionSnapshot
 	EGGYGOMotionExecutionEndReason EndReason = EGGYGOMotionExecutionEndReason::None;
 	FString Diagnostic;
 };
+
+/**
+ * 原 CMC 签出的只读来源观察值；不延长 Origin、资产或输入请求寿命。
+ * 历史相等只供关闭原资源；活源资格须回原 issuer 调用 IsLocomotionSourceProofCurrent。
+ */
+class GGYGO_API FGGYGOLocomotionSourceProof
+{
+public:
+	/** 观察身份存在；原 Origin 过期后仍可为 true，不代表当前许可。 */
+	bool IsSet() const { return Observer.IsValid() && !Issuer.IsExplicitlyNull(); }
+	/** 原 issuer 仍可取得时返回它；不得在失效后改取新 Character 的 CMC。 */
+	UGGYGOCharacterMovementComponent* GetIssuer() const;
+	/** 默认空不相等；原 weak 控制块随共享观察值保留，过期来源仍能精确清理。 */
+	bool IsSameSource(const FGGYGOLocomotionSourceProof& Other) const;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Issuer;
+	TSharedPtr<const TWeakPtr<const FGGYGOCurveRootMotionOrigin>> Observer;
+};
+
+/**
+ * 原来源真实退休的同步事实。不能用它给新来源入场，也不将 NA、RMS 归还或等待转为结束。
+ * FinalInterval 仅在原源有真实自然末区间时提供，消费者先对原已拥有来源去重消费，再正常关闭。
+ * 事件值仅供同步消费；资源持有者保存 SourceProof，按原来源幂等清理。
+ */
+struct GGYGO_API FGGYGOLocomotionSourceRetirementFact
+{
+	FGGYGOLocomotionSourceProof SourceProof;
+	EGGYGOMotionExecutionEndReason EndReason = EGGYGOMotionExecutionEndReason::None;
+	FName Cause;
+	FString Diagnostic;
+	bool bHasFinalInterval = false;
+	FGGYGOMotionExecutionSnapshot FinalInterval;
+private:
+	friend class UGGYGOCharacterMovementComponent;
+	/** 保证同步派发期间原 weak 来源可观察；不作为消费者的长期资源。 */
+	TSharedPtr<const FGGYGOCurveRootMotionOrigin> OriginalOrigin;
+};
+
+DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOLocomotionSourceRetiredDelegate,
+	const FGGYGOLocomotionSourceRetirementFact&);

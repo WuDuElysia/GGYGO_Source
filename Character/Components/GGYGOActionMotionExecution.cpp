@@ -14,6 +14,27 @@
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOActionMotion, Log, All);
 
+namespace
+{
+bool ResolveActionActorRotation(const FGGYGOActionMotionSourceBinding& Binding,
+	EGGYGOMotionRotationMode RotationMode, float Position, const FQuat& EntryRotation,
+	FQuat& OutRotation, FString& OutError)
+{
+	OutRotation = EntryRotation;
+	if (RotationMode == EGGYGOMotionRotationMode::TranslationOnly || Position == Binding.MontageStartSeconds) return true;
+	FGGYGOActionMotionEvaluationResult Evaluation;
+	if (!GGYGOActionMotionEvaluation::EvaluateInterval(Binding, Binding.MontageStartSeconds, Position,
+		RotationMode, Evaluation, OutError)) return false;
+	OutRotation = EntryRotation * FRotator(0.0f, Evaluation.YawDeltaDegrees, 0.0f).Quaternion();
+	if (OutRotation.ContainsNaN() || !OutRotation.IsNormalized())
+	{
+		OutError = TEXT("原基础方向与累计源 Yaw 无法生成有效胶囊朝向。");
+		return false;
+	}
+	return true;
+}
+}
+
 const FName& FGGYGOActionMotionExecution::SourceName()
 {
 	static const FName Name(TEXT("GGYGO.ActionCurve"));
@@ -66,8 +87,22 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
 	int32& OutHandle, FString& OutError)
 {
+	FQuat EntryRotation;
+	return BeginMontageActionMotion(OriginalSource, OriginalMontageInstanceId, MontagePositionSeconds,
+		EffectiveMontagePlayRate, TranslationScale, FGGYGOActionMotionStartFacing{}, OutHandle, EntryRotation, OutError);
+}
+
+bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
+	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
+	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
+	const FGGYGOActionMotionStartFacing& Facing, int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError)
+{
 	OutHandle = INDEX_NONE;
+	OutEntryActorRotation = FQuat::Identity;
 	OutError.Reset();
+	const FGGYGOActionMotionStartFacing OriginalFacing = Facing;
+	const bool bUsesOwnedInputRequest = OriginalFacing.Mode != EGGYGOActionMotionStartFacingMode::ReplayBasis
+		&& OriginalFacing.InputRequest.HasRequest();
 	const auto Reject = [this, &OriginalSource, &OutError](const FString& Reason)
 	{
 		OutError = FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Montage='%s' Slot='%s' Section='%s' Reason='%s'"),
@@ -101,6 +136,12 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 		return Reject(Error.IsEmpty() ? TEXT("original source binding is missing") : Error);
 	if (RotationMode == EGGYGOMotionRotationMode::SourceYaw && Movement.CharacterOwner->bUseControllerRotationYaw)
 		return Reject(TEXT("source Yaw requires bUseControllerRotationYaw=false on the original Character; Controller cannot overwrite CMC rotation"));
+	const bool bUpdatesFacing = OriginalFacing.Mode != EGGYGOActionMotionStartFacingMode::CurrentFacing;
+	if (bUpdatesFacing && (Movement.CharacterOwner->bUseControllerRotationYaw
+		|| !IsValid(Movement.UpdatedComponent) || Movement.UpdatedComponent != Movement.CharacterOwner->GetRootComponent()
+		|| (Movement.bMotionExecutionIntervalOpen && Movement.bHasPendingMotionExecution
+			&& Movement.PendingMotionExecution.bHasNativeSourceInterval)))
+		return Reject(TEXT("段首转向需要 CMC 独占原根组件朝向，且不能改写已选定的 native 旋转区间。"));
 	if (!FMath::IsFinite(MontagePositionSeconds) || MontagePositionSeconds < OriginalSource->MontageStartSeconds
 		|| MontagePositionSeconds >= OriginalSource->MontageEndSeconds
 		|| !FMath::IsFinite(EffectiveMontagePlayRate) || EffectiveMontagePlayRate <= 0.0f
@@ -121,7 +162,49 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 			EffectiveMontagePlayRate, UE_KINDA_SMALL_NUMBER) || Movement.CharacterOwner->IsPlayingRootMotion())
 		return Reject(TEXT("original Montage/instance/section/position/rate is not current or native animation RootMotion is active"));
 	const float Duration = (OriginalSource->MontageEndSeconds - MontagePositionSeconds) / EffectiveMontagePlayRate;
-	const FQuat Rotation = Movement.CharacterOwner->GetActorQuat();
+	const TWeakObjectPtr<USkeletalMeshComponent> OriginalMesh(Mesh);
+	const TWeakObjectPtr<UAnimInstance> OriginalAnim(Anim);
+	const TWeakObjectPtr<USceneComponent> OriginalComponent(Movement.UpdatedComponent.Get());
+	FGGYGOActionMotionStartInputProof InputProof;
+	FQuat Rotation;
+	if (!Movement.ResolveActionMotionStartFacing(OriginalFacing, Rotation, InputProof, Error))
+	{
+		if (!WeakSelf.IsValid()) { OutError = Error; return false; }
+		return Reject(Error);
+	}
+	if (bUsesOwnedInputRequest)
+	{
+		// 原 owned 提交可同步回调；重取原实例，不能沿用提交前借用的 Montage 指针。
+		Self = WeakSelf.Get();
+		if (!Self || Self->IsBeingDestroyed() || !OriginalCharacter.IsValid()
+			|| Self->CharacterOwner != OriginalCharacter.Get() || Self->MovementOwnerSyncContext != OriginalOwnerContext
+			|| Self->ActionMotionExecution.NextActionMotionHandle != OriginalNextHandle
+			|| Self->ActionMotionExecution.HasActiveActionMotion() || !OriginalComponent.IsValid()
+			|| Self->UpdatedComponent != OriginalComponent.Get() || !OriginalMesh.IsValid() || !OriginalAnim.IsValid()
+			|| Self->CharacterOwner->GetMesh() != OriginalMesh.Get() || OriginalMesh->GetAnimInstance() != OriginalAnim.Get())
+		{
+			OutError = TEXT("[Movement.ActionMotion] 段首可靠提交返栈后原动作槽/Scope/Mesh/实例上下文已改变。");
+			return false;
+		}
+		Mesh = OriginalMesh.Get();
+		Anim = OriginalAnim.Get();
+		Instance = Anim->GetMontageInstanceForID(OriginalMontageInstanceId);
+		InitialSection = Instance ? OriginalSource->FindSection(Instance->GetCurrentSection()) : nullptr;
+		if (!Instance || Instance->Montage != OriginalSource->Montage.Get() || !Instance->IsActive() || !Instance->IsPlaying()
+			|| !InitialSection || MontagePositionSeconds < InitialSection->MontageStartSeconds
+			|| MontagePositionSeconds >= InitialSection->MontageEndSeconds
+			|| !FMath::IsNearlyEqual(Instance->GetPosition(), MontagePositionSeconds, UE_KINDA_SMALL_NUMBER)
+			|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() <= 0.0f
+			|| !FMath::IsNearlyEqual(Instance->GetPlayRate() * OriginalSource->MontageRateScale,
+				EffectiveMontagePlayRate, UE_KINDA_SMALL_NUMBER) || Self->CharacterOwner->IsPlayingRootMotion())
+		{
+			return Reject(Error.IsEmpty() ? TEXT("段首提交后原实例/位置/倍率已改变。") : Error);
+		}
+	}
+	FQuat ActorRotation = Rotation;
+	if (OriginalFacing.Mode == EGGYGOActionMotionStartFacingMode::ReplayBasis
+		&& !ResolveActionActorRotation(*OriginalSource, RotationMode, MontagePositionSeconds, Rotation, ActorRotation, Error))
+		return Reject(Error.IsEmpty() ? TEXT("同段重放无法恢复原 basis 与已走源 Yaw。") : Error);
 	const FVector Scale = Mesh->GetComponentScale() * TranslationScale; // Original avatar/Actor scale once; Actor basis, no Mesh rotation.
 	if (!FMath::IsFinite(Duration) || Duration <= 0.0f || Rotation.ContainsNaN()
 		|| !Rotation.IsNormalized() || Scale.ContainsNaN())
@@ -161,8 +244,157 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	ActiveActionMotionHandle = Resource->Handle;
 	ActionMotionSourceID = Id;
 	++NextActionMotionHandle;
-	Movement.SuspendLocomotionForAction();
 	OutHandle = Resource->Handle;
+	Movement.SuspendLocomotionForAction();
+	Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || !OriginalCharacter.IsValid()
+		|| Self->CharacterOwner != OriginalCharacter.Get() || Self->MovementOwnerSyncContext != OriginalOwnerContext
+		|| !OriginalComponent.IsValid() || Self->UpdatedComponent != OriginalComponent.Get()
+		|| Self->ActionMotionExecution.ActiveMontageActionResource != Resource
+		|| Self->ActionMotionExecution.ActiveActionMotionHandle != Resource->Handle
+		|| Self->GetRootMotionSourceByID(Id) != Source || Source->EntryActorRotation != Rotation
+		|| Source->bExplicitlyCancelled || Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval))
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原 Locomotion 收尾返栈后动作/组件/Scope已失效。");
+		return false;
+	}
+	if (bUpdatesFacing)
+	{
+		Movement.MoveUpdatedComponent(FVector::ZeroVector, ActorRotation, false);
+		Self = WeakSelf.Get();
+		if (!Self || Self->IsBeingDestroyed() || !OriginalCharacter.IsValid()
+			|| Self->CharacterOwner != OriginalCharacter.Get() || Self->MovementOwnerSyncContext != OriginalOwnerContext
+			|| !OriginalComponent.IsValid() || Self->UpdatedComponent != OriginalComponent.Get()
+			|| Self->ActionMotionExecution.ActiveMontageActionResource != Resource
+			|| Self->ActionMotionExecution.ActiveActionMotionHandle != Resource->Handle
+			|| Self->GetRootMotionSourceByID(Id) != Source || Source->EntryActorRotation != Rotation || Source->bExplicitlyCancelled
+			|| Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval))
+		{
+			OutError = TEXT("[Movement.ActionMotion] 段首旋转返栈后原 Scope/组件/动作资源已失效，不能继续旧请求。");
+			return false;
+		}
+		if (!Self->ValidateMontageActionRuntime(*Source, 0.0f, Error))
+		{
+			OutError = Error;
+			Self->ActionMotionExecution.FailMontageActionMotion(Resource, OutError);
+			return false;
+		}
+		if (!OriginalComponent->GetComponentQuat().Equals(ActorRotation, UE_KINDA_SMALL_NUMBER))
+		{
+			OutError = FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Handle=%d 原胶囊未接受段首方向。"),
+				*Movement.GetPathName(), Resource->Handle);
+			FailMontageActionMotion(Resource, OutError);
+			return false;
+		}
+	}
+	OutEntryActorRotation = Rotation;
+	if (bUsesOwnedInputRequest)
+	{
+		UE_LOG(LogGGYGOActionMotion, Display,
+			TEXT("[Movement.ActionStartBasis] CMC='%s' Montage='%s' Handle=%d NativeId=%u Instance=%d Request=%d Session=%llu EdgeEvaluation=%llu StepEvaluation=%llu Entry=%s"),
+			*Movement.GetPathName(), *GetPathNameSafe(OriginalSource->Montage.Get()), Resource->Handle, static_cast<uint32>(Id),
+			OriginalMontageInstanceId, InputProof.Request.GetRequestId(),
+			static_cast<unsigned long long>(InputProof.Fact.SourceSessionSerial),
+			static_cast<unsigned long long>(InputProof.Fact.OriginalEdgeEvaluationSerial),
+			static_cast<unsigned long long>(InputProof.Fact.StepEvaluationSerial), *Rotation.ToString());
+	}
+	return true;
+}
+
+bool FGGYGOActionMotionExecution::RebaseMontageActionMotion(
+	const FGGYGOMovementOwnerSyncScopeId& OriginalScope, int32 OriginalHandle,
+	const FQuat& EntryActorRotation, FString& OutError)
+{
+	OutError.Reset();
+	const auto Resource = ActiveMontageActionResource;
+	const FQuat AcceptedBasis = EntryActorRotation;
+	if (!IsInGameThread() || !IsValid(Movement.CharacterOwner) || Movement.IsBeingDestroyed()
+		|| (!Movement.CharacterOwner->HasAuthority() && (Movement.CharacterOwner->GetLocalRole() != ROLE_AutonomousProxy
+			|| !Movement.CharacterOwner->IsLocallyControlled()))
+		|| Movement.CharacterOwner->bClientUpdating
+		|| (Movement.bMotionExecutionIntervalOpen && Movement.bHasPendingMotionExecution
+			&& Movement.PendingMotionExecution.bHasNativeSourceInterval)
+		|| !Resource.IsValid() || Resource->Handle != OriginalHandle || ActiveActionMotionHandle != OriginalHandle
+		|| !OriginalScope.IsSet() || !Movement.IsMovementOwnerSyncContextCurrent(Movement.MovementOwnerSyncContext)
+		|| OriginalScope != Movement.MovementOwnerSyncContext->Scope
+		|| AcceptedBasis.ContainsNaN() || !AcceptedBasis.IsNormalized()
+		|| Movement.CharacterOwner->bUseControllerRotationYaw || !IsValid(Movement.UpdatedComponent)
+		|| Movement.UpdatedComponent != Movement.CharacterOwner->GetRootComponent())
+	{
+		OutError = FString::Printf(TEXT("[Movement.ActionMotion] CMC='%s' Handle=%d 原位重基的资源/Scope/基底或原生旋转窗口无效。"),
+			*Movement.GetPathName(), OriginalHandle);
+		return false;
+	}
+	const auto NativeSource = Movement.GetRootMotionSourceByID(ActionMotionSourceID);
+	if (!NativeSource.IsValid() || NativeSource->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct())
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基找不到原 native RMS。");
+		return false;
+	}
+	const auto Source = StaticCastSharedPtr<FRootMotionSource_GGYGOActionCurve>(NativeSource);
+	if (Source->OriginalResource != Resource || Source->SourceMode != EGGYGOActionCurveSourceMode::OriginalMontage
+		|| Source->bExplicitlyCancelled || !Source->OriginalBinding.IsValid())
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基不能使用其它动作或已取消的 RMS。");
+		return false;
+	}
+	// 在原基底下保留胶囊已经执行的姿态，只替换基底；不把 Prepared 末端当成已消费进度。
+	const FQuat PreviousBasis = Source->EntryActorRotation;
+	const FQuat CurrentActorRotation = Movement.UpdatedComponent->GetComponentQuat();
+	if (PreviousBasis.ContainsNaN() || !PreviousBasis.IsNormalized()
+		|| CurrentActorRotation.ContainsNaN() || !CurrentActorRotation.IsNormalized())
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基缺少有效的原基底/实际胶囊姿态。");
+		return false;
+	}
+	const FQuat BasisDelta = AcceptedBasis * PreviousBasis.Inverse();
+	const FQuat ActorRotation = BasisDelta * CurrentActorRotation;
+	if (ActorRotation.ContainsNaN() || !ActorRotation.IsNormalized())
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基无法保持已执行的源 Yaw。");
+		return false;
+	}
+	const bool bHasPreparedInterval = Source->PreparedNativeEndSeconds > Source->PreparedNativeStartSeconds;
+	const FTransform PreparedTransform = Source->RootMotionParams.GetRootMotionTransform();
+	if (bHasPreparedInterval && PreparedTransform.ContainsNaN())
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基遇到无效的原 native 变换。");
+		return false;
+	}
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(&Movement);
+	const TWeakObjectPtr<USceneComponent> OriginalComponent(Movement.UpdatedComponent.Get());
+	const auto OriginalContext = Movement.MovementOwnerSyncContext;
+	if (bHasPreparedInterval)
+	{
+		const FQuat LocalYaw = FRotator(0.0f, Source->PreparedYawDeltaDegrees, 0.0f).Quaternion();
+		Source->RootMotionParams.Set(FTransform(AcceptedBasis * LocalYaw * AcceptedBasis.Inverse(),
+			BasisDelta.RotateVector(PreparedTransform.GetTranslation())));
+	}
+	Source->EntryActorRotation = AcceptedBasis;
+	Movement.MoveUpdatedComponent(FVector::ZeroVector, ActorRotation, false);
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	if (!Self || Self->IsBeingDestroyed() || Self->MovementOwnerSyncContext != OriginalContext
+		|| !OriginalComponent.IsValid() || Self->UpdatedComponent != OriginalComponent.Get()
+		|| Self->ActionMotionExecution.ActiveMontageActionResource != Resource
+		|| Self->ActionMotionExecution.ActiveActionMotionHandle != OriginalHandle
+		|| Self->GetRootMotionSourceByID(Self->ActionMotionExecution.ActionMotionSourceID) != NativeSource
+		|| Source->EntryActorRotation != AcceptedBasis || Source->bExplicitlyCancelled
+		|| Source->Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval))
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原位重基返栈后原动作/组件/Scope已失效。");
+		return false;
+	}
+	if (!OriginalComponent->GetComponentQuat().Equals(ActorRotation, UE_KINDA_SMALL_NUMBER))
+	{
+		OutError = TEXT("[Movement.ActionMotion] 原胶囊未接受同段基础方向纠正。");
+		FailMontageActionMotion(Resource, OutError);
+		return false;
+	}
+	if (!Self->ValidateMontageActionRuntime(*Source, 0.0f, OutError))
+	{
+		Self->ActionMotionExecution.FailMontageActionMotion(Resource, OutError);
+		return false;
+	}
 	return true;
 }
 

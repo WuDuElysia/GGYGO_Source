@@ -107,6 +107,16 @@ bool FGGYGORemoteMotionPoseRecord::NetSerialize(FArchive& Ar, UPackageMap* Map, 
 		Ar << SequenceEndSeconds;
 		bValid = bValid && bMotionValid && bPhaseValid;
 	}
+	Ar << CameraTurnStatusCode;
+	Ar << CameraControlYawDeltaDegrees;
+	Ar << CameraTurnDemandDegrees;
+	const bool bGaitValid = SerializeEnum(Ar, Gait);
+	Ar << WalkRunBlendAlpha;
+	bValid = bValid && bGaitValid
+		&& CameraTurnStatusCode <= static_cast<uint8>(EGGYGOLocomotionSteeringStatus::Invalid)
+		&& FMath::IsFinite(CameraControlYawDeltaDegrees) && FMath::Abs(CameraControlYawDeltaDegrees) <= 180.0f
+		&& FMath::IsFinite(CameraTurnDemandDegrees) && FMath::Abs(CameraTurnDemandDegrees) <= 180.0f
+		&& FMath::IsFinite(WalkRunBlendAlpha) && WalkRunBlendAlpha >= 0.0f && WalkRunBlendAlpha <= 1.0f;
 	if (Ar.IsLoading())
 	{
 		bValid = bValid && FMath::IsFinite(NativeSampleKey) && FMath::IsFinite(SequenceStartSeconds)
@@ -124,7 +134,10 @@ bool FGGYGORemoteMotionPoseRecord::HasSameContent(const FGGYGORemoteMotionPoseRe
 		&& CurveContentKind == Other.CurveContentKind && MotionType == Other.MotionType && TurnBackPhase == Other.TurnBackPhase
 		&& SequenceStartSeconds == Other.SequenceStartSeconds && SequenceEndSeconds == Other.SequenceEndSeconds
 		&& bRelativeTransform == Other.bRelativeTransform && SampleLocation == Other.SampleLocation
-		&& SampleRotation == Other.SampleRotation;
+		&& SampleRotation == Other.SampleRotation && CameraTurnStatusCode == Other.CameraTurnStatusCode
+		&& CameraControlYawDeltaDegrees == Other.CameraControlYawDeltaDegrees
+		&& CameraTurnDemandDegrees == Other.CameraTurnDemandDegrees && Gait == Other.Gait
+		&& WalkRunBlendAlpha == Other.WalkRunBlendAlpha;
 }
 
 bool UGGYGOCharacterMovementComponent::FRemoteMotionPoseSegmentKey::Matches(const FGGYGOMotionExecutionSnapshot& Snapshot) const
@@ -276,6 +289,15 @@ void UGGYGOCharacterMovementComponent::FinalizeRemoteMotionPosePublication()
 		Record.SampleRotation = LastUpdateRotation.Rotator();
 	}
 
+	if (Candidate.Steering.CompletedIntervalSerial != 0
+		&& Candidate.Steering.CompletedFrame == Snapshot.CompletedFrame)
+	{
+		Record.CameraTurnStatusCode = static_cast<uint8>(Candidate.Steering.CameraTurnStatus);
+		Record.CameraControlYawDeltaDegrees = Candidate.Steering.CameraControlYawDeltaDegrees;
+		Record.CameraTurnDemandDegrees = Candidate.Steering.CameraTurnDemandDegrees;
+		Record.Gait = Candidate.Steering.CameraTurnGait;
+		Record.WalkRunBlendAlpha = Candidate.Steering.CameraTurnWalkRunBlendAlpha;
+	}
 	const bool bSingleSequence = Snapshot.SourceKind == EGGYGOMotionExecutionSource::Locomotion
 		&& Snapshot.bHasSingleSequenceTime && Snapshot.OriginalSequence.IsValid() && Snapshot.OriginalLocomotionBinding.IsValid();
 	if (bSingleSequence && Snapshot.Status == EGGYGOMotionExecutionStatus::Valid)
@@ -850,11 +872,15 @@ FGGYGORemoteMotionPoseSnapshot UGGYGOCharacterMovementComponent::GetRemoteMotion
 	{
 		Result.Status = EGGYGORemoteMotionPoseStatus::Invalid;
 		Result.Diagnostic = TEXT("[Movement.RemoteMotionPose] capture requires the game thread");
+		Result.CameraTurnStatus = EGGYGOLocomotionSteeringStatus::Invalid;
+		Result.CameraTurnDiagnostic = Result.Diagnostic;
 		return Result;
 	}
 	if (!IsRemoteMotionPoseConsumer())
 	{
 		Result.Status = EGGYGORemoteMotionPoseStatus::NotRemote;
+		Result.CameraTurnStatus = EGGYGOLocomotionSteeringStatus::NotApplicable;
+		Result.CameraTurnDiagnostic = TEXT("[Movement.RemoteCameraTurn] 本地执行角色使用其原完成区间。");
 		return Result;
 	}
 	if (!RemoteMotionPoseConsumerIdentity.IsSet() || !(*RemoteMotionPoseConsumerIdentity == CaptureRemoteMotionPoseOwnerIdentity()))
@@ -862,6 +888,7 @@ FGGYGORemoteMotionPoseSnapshot UGGYGOCharacterMovementComponent::GetRemoteMotion
 		// 身份换代后的清理在原生 Tick/接收入口完成；查询不沿用旧身份下的任何事实。
 		Result.Status = EGGYGORemoteMotionPoseStatus::Initial;
 		Result.Diagnostic = TEXT("[Movement.RemoteMotionPose] observer identity changed; previous facts are retired");
+		Result.CameraTurnDiagnostic = Result.Diagnostic;
 		return Result;
 	}
 	Result.WaitReason = RemoteMotionPoseWaitReason;
@@ -870,6 +897,8 @@ FGGYGORemoteMotionPoseSnapshot UGGYGOCharacterMovementComponent::GetRemoteMotion
 	{
 		Result.Status = RemoteMotionPosePending.IsSet() || RemoteMotionPoseWaitReason != EGGYGORemoteMotionPoseWaitReason::None
 			? EGGYGORemoteMotionPoseStatus::Awaiting : EGGYGORemoteMotionPoseStatus::Initial;
+		Result.CameraTurnDiagnostic = Result.Diagnostic.IsEmpty()
+			? TEXT("[Movement.RemoteCameraTurn] 等待原发布记录与 native 样本配对。") : Result.Diagnostic;
 		return Result;
 	}
 	const FRemoteMotionPoseAccepted& Accepted = *RemoteMotionPoseAccepted;
@@ -880,6 +909,29 @@ FGGYGORemoteMotionPoseSnapshot UGGYGOCharacterMovementComponent::GetRemoteMotion
 	Result.NativeSampleKey = Record.NativeSampleKey;
 	Result.AcceptedLocalFrame = Accepted.AcceptedFrame;
 	Result.Closure = Record.Closure;
+	const bool bCameraCurrentSample = Record.bKeyed && Accepted.MatchedEventSerial != 0
+		&& Accepted.MatchedEventSerial == RemoteMotionPoseNativeSample.EventSerial;
+	if (Record.Kind == EGGYGORemoteMotionPoseKind::Invalid)
+	{
+		Result.CameraTurnStatus = EGGYGOLocomotionSteeringStatus::Invalid;
+		Result.CameraTurnDiagnostic = FString::Printf(TEXT("[Movement.RemoteCameraTurn] 原发布记录失效：%s"), LexRemoteReason(Record.Reason));
+	}
+	else if (!bCameraCurrentSample)
+	{
+		Result.CameraTurnStatus = EGGYGOLocomotionSteeringStatus::Initial;
+		Result.CameraTurnDiagnostic = TEXT("[Movement.RemoteCameraTurn] 等待原记录与最新 native 呈现样本配对。");
+	}
+	else
+	{
+		Result.CameraTurnStatus = static_cast<EGGYGOLocomotionSteeringStatus>(Record.CameraTurnStatusCode);
+		Result.CameraControlYawDeltaDegrees = Record.CameraControlYawDeltaDegrees;
+		Result.CameraTurnDemandDegrees = Record.CameraTurnDemandDegrees;
+		Result.CameraTurnGait = Record.Gait;
+		Result.CameraTurnWalkRunBlendAlpha = Record.WalkRunBlendAlpha;
+		if (Result.CameraTurnStatus != EGGYGOLocomotionSteeringStatus::Valid)
+			Result.CameraTurnDiagnostic = FString::Printf(TEXT("[Movement.RemoteCameraTurn] 原 camera 状态=%u，Publisher=%u Publication=%u NativeKey=%.9g。"),
+				static_cast<uint32>(Record.CameraTurnStatusCode), Record.PublisherEpoch, Record.PublicationSerial, Record.NativeSampleKey);
+	}
 	switch (Record.Kind)
 	{
 	case EGGYGORemoteMotionPoseKind::Sample:

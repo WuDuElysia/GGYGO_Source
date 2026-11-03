@@ -1,17 +1,18 @@
-/** @file GGYGOAbilityTask_PlayNiagaraEffect.cpp @brief 单个 Niagara 资源的 GAS 生命周期与原生尾部交接。 */
+/** @file GGYGOAbilityTask_PlayNiagaraEffect.cpp @brief 独立 Niagara 单元组合的 GAS 生命周期与原生尾部交接。 */
 #include "FX/Tasks/GGYGOAbilityTask_PlayNiagaraEffect.h"
 
 #include "FX/GGYGOMontageFXPublication.h"
+#include "FX/Components/GGYGOFXNiagaraComponent.h"
 #include "Abilities/GameplayAbility.h"
 #include "AbilitySystemComponent.h"
 #include "Components/SceneComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/WorldSettings.h"
 #include "Misc/App.h"
 #include "NiagaraComponent.h"
 #include "NiagaraEmitter.h"
-#include "NiagaraFunctionLibrary.h"
 #include "NiagaraScript.h"
 #include "NiagaraSystem.h"
 #include "UObject/StrongObjectPtr.h"
@@ -116,12 +117,22 @@ FString DescribeNiagaraScripts(const UNiagaraSystem* System)
 UGGYGOAbilityTask_PlayNiagaraEffect* UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffect(
 	UGameplayAbility* OwningAbility, FName TaskInstanceName, UNiagaraSystem* System,
 	EGGYGONiagaraEffectSpace Space, USceneComponent* AttachComponent, FName SocketName,
-	const FTransform& Transform)
+	const FTransform& Transform, const FGGYGOFXFieldSettings& FieldSettings)
+{
+	FGGYGONiagaraEffectUnit Unit;
+	Unit.System = System;
+	Unit.FieldSettings = FieldSettings;
+	return PlayNiagaraEffects(OwningAbility, TaskInstanceName, {Unit}, Space, AttachComponent, SocketName, Transform);
+}
+
+UGGYGOAbilityTask_PlayNiagaraEffect* UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffects(
+	UGameplayAbility* OwningAbility, FName TaskInstanceName, const TArray<FGGYGONiagaraEffectUnit>& Units,
+	EGGYGONiagaraEffectSpace Space, USceneComponent* AttachComponent, FName SocketName, const FTransform& Transform)
 {
 	if (!IsValid(OwningAbility) || !OwningAbility->IsActive())
 	{
-		UE_LOG(LogGGYGOFXTask, Error, TEXT("[FX.Task] Ability='%s' System='%s': an active owning Ability is required."),
-			*GetPathNameSafe(OwningAbility), *GetPathNameSafe(System));
+		UE_LOG(LogGGYGOFXTask, Error, TEXT("[FX.Task] Ability='%s' Units=%d: an active owning Ability is required."),
+			*GetPathNameSafe(OwningAbility), Units.Num());
 		return nullptr;
 	}
 	UAbilitySystemComponent* const Issuer = OwningAbility->GetAbilitySystemComponentFromActorInfo();
@@ -143,7 +154,7 @@ UGGYGOAbilityTask_PlayNiagaraEffect* UGGYGOAbilityTask_PlayNiagaraEffect::PlayNi
 	Task->OriginalIssuer = Issuer;
 	Task->OriginalAvatar = Avatar;
 	Task->OriginalWorld = Avatar->GetWorld();
-	Task->RequestedSystem = System;
+	Task->RequestedUnits = Units;
 	Task->RequestedSpace = Space;
 	Task->RequestedAttachComponent = AttachComponent;
 	Task->RequestedSocketName = SocketName;
@@ -188,6 +199,29 @@ bool UGGYGOAbilityTask_PlayNiagaraEffect::IsStopModeValid(EGGYGONiagaraEffectSto
 	return Mode == EGGYGONiagaraEffectStopMode::DestroyImmediately
 		|| Mode == EGGYGONiagaraEffectStopMode::DeactivateKeepAttached
 		|| Mode == EGGYGONiagaraEffectStopMode::DeactivateDetachKeepWorld;
+}
+
+bool UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfigurations(const TArray<FGGYGONiagaraEffectUnit>& Units,
+	EGGYGONiagaraEffectSpace Space, const FTransform& Transform, FString& OutFailureReason)
+{
+	OutFailureReason.Reset();
+	if (Units.IsEmpty())
+	{
+		OutFailureReason = TEXT("Niagara composition requires at least one explicit System unit.");
+		return false;
+	}
+	for (int32 Index = 0; Index < Units.Num(); ++Index)
+	{
+		const FGGYGONiagaraEffectUnit& Unit = Units[Index];
+		if (!ValidateConfiguration(Unit.System, Space, Transform, OutFailureReason)
+			|| !Unit.FieldSettings.ValidateConfiguration(OutFailureReason))
+		{
+			OutFailureReason = FString::Printf(TEXT("Unit[%d] '%s': %s"), Index,
+				*GetPathNameSafe(Unit.System), *OutFailureReason);
+			return false;
+		}
+	}
+	return true;
 }
 
 bool UGGYGOAbilityTask_PlayNiagaraEffect::ValidateCompiledSystem(UNiagaraSystem* System, FString& OutError)
@@ -292,7 +326,7 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 {
 	if (IsFinished() || StartResult != EGGYGONiagaraEffectStartResult::NotRequested) { return; }
 	FString FailureReason;
-	if (!ValidateConfiguration(RequestedSystem, RequestedSpace, RequestedTransform, FailureReason))
+	if (!ValidateConfigurations(RequestedUnits, RequestedSpace, RequestedTransform, FailureReason))
 	{
 		FailAndEndTask(FailureReason);
 		return;
@@ -334,80 +368,122 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 	const TWeakObjectPtr<ThisClass> OriginalTask(this);
 	const TWeakObjectPtr<AActor> ActivationAvatar(Avatar);
 	const TWeakObjectPtr<UWorld> ActivationWorld(World);
-	// Ready 会完成原生加载，并包含编译与 PSO 的合法暂态；无效编译结果须独立拒绝。
-	const bool bSystemReady = RequestedSystem->IsReadyToRun();
-	const bool bSystemValid = RequestedSystem->IsValid();
-	const bool bCompilationPending = HasPendingNiagaraCompilation(RequestedSystem);
-	ThisClass* LiveTask = OriginalTask.Get(true);
-	if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return; }
-	if (!bSystemReady || !bSystemValid)
+	// 全部单元先准备并注册，再按原顺序激活；同一资源门只登记一个 cap/ticket。
+	TArray<TStrongObjectPtr<UGGYGOFXNiagaraComponent>> CreatedComponents;
+	CreatedComponents.Reserve(RequestedUnits.Num());
+	AActor* const NativeOwner = RequestedSpace == EGGYGONiagaraEffectSpace::World
+		? static_cast<AActor*>(World->GetWorldSettings()) : AttachComponent->GetOwner();
+	UObject* const Outer = NativeOwner ? static_cast<UObject*>(NativeOwner) : static_cast<UObject*>(World);
+	for (const FGGYGONiagaraEffectUnit& Unit : RequestedUnits)
 	{
-		UE_LOG(LogGGYGOFXTask, Display, TEXT("[FX.Task.Readiness] Task='%s' System='%s' Ready=%d Valid=%d OutstandingCompilation=%d %s"),
-			*GetPathName(), *RequestedSystem->GetPathName(), bSystemReady, bSystemValid, bCompilationPending,
-			*DescribeNiagaraScripts(RequestedSystem));
-	}
-	if (!bCompilationPending && (!bSystemValid || !DoSystemScriptAttributesMatch(RequestedSystem)))
-	{
-		FailAndEndTask(FString::Printf(TEXT("Required Niagara System has invalid scripts, enabled emitters or mismatched System VM attributes: %s"),
-			*DescribeNiagaraScripts(RequestedSystem)));
-		return;
-	}
+		UNiagaraSystem* const System = Unit.System;
+		// Ready 会完成原生加载，并包含编译与 PSO 的合法暂态；无效编译结果须独立拒绝。
+		const bool bSystemReady = System->IsReadyToRun();
+		const bool bSystemValid = System->IsValid();
+		const bool bCompilationPending = HasPendingNiagaraCompilation(System);
+		ThisClass* LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return; }
+		if (!bSystemReady || !bSystemValid)
+		{
+			UE_LOG(LogGGYGOFXTask, Display, TEXT("[FX.Task.Readiness] Task='%s' System='%s' Ready=%d Valid=%d OutstandingCompilation=%d %s"),
+				*LiveTask->GetPathName(), *System->GetPathName(), bSystemReady, bSystemValid, bCompilationPending,
+				*DescribeNiagaraScripts(System));
+		}
+		if (!bCompilationPending && (!bSystemValid || !DoSystemScriptAttributesMatch(System)))
+		{
+			LiveTask->FailAndEndTask(FString::Printf(TEXT("Required Niagara System has invalid scripts, enabled emitters or mismatched System VM attributes: %s"),
+				*DescribeNiagaraScripts(System)));
+			return;
+		}
 #if WITH_EDITOR
-	// 原生组件负责等待与激活；这里只观察真实编译结果，避免最终失败变成无限等待。
-	SystemCompiledHandle = RequestedSystem->OnSystemCompiled().AddUObject(this, &ThisClass::HandleSystemCompiled);
+		// 原生组件负责等待与激活；这里只观察真实编译结果，避免最终失败变成无限等待。
+		if (!LiveTask->SystemCompiledHandles.Contains(System))
+		{
+			LiveTask->SystemCompiledHandles.Add(System, System->OnSystemCompiled().AddUObject(LiveTask, &ThisClass::HandleSystemCompiled));
+		}
 #endif
+		CreatedComponents.Emplace(NewObject<UGGYGOFXNiagaraComponent>(Outer, NAME_None, RF_Transient));
+		UGGYGOFXNiagaraComponent* const CreatedComponent = CreatedComponents.Last().Get();
+		LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+		{
+			if (IsValid(CreatedComponent)) { CreatedComponent->DestroyComponent(); }
+			return;
+		}
+		if (!IsValid(CreatedComponent))
+		{
+			LiveTask->FailAndEndTask(TEXT("Native Niagara spawn returned no component."));
+			return;
+		}
+		LiveTask->OwnedComponents.Add(CreatedComponent);
+		if (LiveTask->ResourceOwner) { LiveTask->ResourceOwner->SetLocalOwnership(LiveTask->LocalCapability, true); }
+		CreatedComponent->OnSystemFinished.AddDynamic(LiveTask, &ThisClass::HandleSystemFinished);
+		CreatedComponent->OnEffectFailed.AddUObject(LiveTask, &ThisClass::HandleEffectFailed);
+		if (!CreatedComponent->ConfigureField(Unit.FieldSettings, FailureReason))
+		{ LiveTask->FailAndEndTask(FailureReason); return; }
+		if (!CreatedComponent->ConfigureSceneLightingSource(ActivationAvatar.Get(), FailureReason))
+		{ LiveTask->FailAndEndTask(FailureReason); return; }
+		CreatedComponent->SetAutoDestroy(false);
+		CreatedComponent->bAllowAnyoneToDestroyMe = true;
+		CreatedComponent->SetVisibleInRayTracing(false);
+#if WITH_EDITORONLY_DATA
+		CreatedComponent->bWaitForCompilationOnActivate = GIsAutomationTesting;
+#endif
+		CreatedComponent->SetAsset(System);
+		LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || !LiveTask->OwnedComponents.Contains(CreatedComponent)) { return; }
+		if (!IsValid(CreatedComponent) || !ActivationWorld.IsValid() || World->bIsTearingDown
+			|| !ActivationAvatar.IsValid() || !IsValid(LiveTask->Ability) || !LiveTask->Ability->IsActive()
+			|| LiveTask->Ability->GetAvatarActorFromActorInfo() != ActivationAvatar.Get())
+		{ LiveTask->FailAndEndTask(TEXT("设置 Niagara 资产时原 FX 作用域已变化。")); return; }
+		if (LiveTask->RequestedSpace == EGGYGONiagaraEffectSpace::World)
+		{
+			CreatedComponent->SetAbsolute(true, true, true);
+			CreatedComponent->SetWorldTransform(LiveTask->RequestedTransform);
+		}
+		else
+		{
+			CreatedComponent->SetupAttachment(AttachComponent, LiveTask->RequestedSocketName);
+			CreatedComponent->SetRelativeTransform(LiveTask->RequestedTransform);
+		}
+		CreatedComponent->RegisterComponentWithWorld(World);
+		LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || !LiveTask->OwnedComponents.Contains(CreatedComponent)) { return; }
+		if (!IsValid(LiveTask->Ability) || !LiveTask->Ability->IsActive()
+			|| !ActivationAvatar.IsValid() || LiveTask->Ability->GetAvatarActorFromActorInfo() != ActivationAvatar.Get()
+			|| !ActivationWorld.IsValid() || ActivationWorld->bIsTearingDown
+			|| !CreatedComponent->IsRegistered() || CreatedComponent->GetWorld() != ActivationWorld.Get())
+		{
+			LiveTask->FailAndEndTask(TEXT("Original Ability/Avatar or component registration changed during native spawn."));
+			return;
+		}
+	}
 
-	// 不池化、不按当前视野提前裁剪、注册期间不激活；原生激活前先持有准确组件并绑定完成委托。
-	UNiagaraComponent* CreatedComponent = RequestedSpace == EGGYGONiagaraEffectSpace::World
-		? UNiagaraFunctionLibrary::SpawnSystemAtLocation(World, RequestedSystem,
-			RequestedTransform.GetLocation(), RequestedTransform.Rotator(), RequestedTransform.GetScale3D(),
-			false, false, ENCPoolMethod::None, false)
-		: UNiagaraFunctionLibrary::SpawnSystemAttached(RequestedSystem, AttachComponent, RequestedSocketName,
-			RequestedTransform.GetLocation(), RequestedTransform.Rotator(), RequestedTransform.GetScale3D(),
-			EAttachLocation::KeepRelativeOffset, false, ENCPoolMethod::None, false, false);
-	TStrongObjectPtr<UNiagaraComponent> OriginalComponent(CreatedComponent);
-	LiveTask = OriginalTask.Get(true);
-	if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
+	// 强持原组件快照；同步完成可摘除 OwnedComponents，不会使后续单元迭代失效。
+	for (const TStrongObjectPtr<UGGYGOFXNiagaraComponent>& OriginalComponent : CreatedComponents)
 	{
-		// 注册可能同步结束原 Task，返栈首次取得的准确资源仍须立即销毁。
-		if (IsValid(CreatedComponent)) { CreatedComponent->DestroyComponent(); }
-		return;
-	}
-	if (!IsValid(CreatedComponent))
-	{
-		LiveTask->FailAndEndTask(TEXT("Native Niagara spawn returned no component."));
-		return;
-	}
-	LiveTask->OwnedComponent = CreatedComponent;
-	if (LiveTask->ResourceOwner) { LiveTask->ResourceOwner->SetLocalOwnership(LiveTask->LocalCapability, true); }
-	CreatedComponent->OnSystemFinished.AddDynamic(LiveTask, &ThisClass::HandleSystemFinished);
-	if (!IsValid(LiveTask->Ability) || !LiveTask->Ability->IsActive()
-		|| !ActivationAvatar.IsValid() || LiveTask->Ability->GetAvatarActorFromActorInfo() != ActivationAvatar.Get()
-		|| !ActivationWorld.IsValid() || ActivationWorld->bIsTearingDown
-		|| !CreatedComponent->IsRegistered() || CreatedComponent->GetWorld() != ActivationWorld.Get())
-	{
-		LiveTask->FailAndEndTask(TEXT("Original Ability/Avatar or component registration changed during native spawn."));
-		return;
-	}
-
-	// Activate 可能同步完成并结束 Task，先记录这次原生调用。合法编译／PSO 延迟仍是请求已发出；
-	// 不以 IsActive 或首粒子反推启动请求事实。
-	LiveTask->StartResult = EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested;
-	CreatedComponent->Activate(true);
-	LiveTask = OriginalTask.Get(true);
-	if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| LiveTask->OwnedComponent != CreatedComponent) { return; }
-	// 原生 Activate 可同步收束编译；失败也必须沿原 Task 传播，不能发布 OnSpawned。
-	if (!HasPendingNiagaraCompilation(LiveTask->RequestedSystem)
-		&& (!LiveTask->RequestedSystem->IsValid() || !DoSystemScriptAttributesMatch(LiveTask->RequestedSystem)))
-	{
-		LiveTask->FailAndEndTask(FString::Printf(TEXT("Niagara compilation produced an invalid System or mismatched System VM attributes during native activation: %s"),
-			*DescribeNiagaraScripts(LiveTask->RequestedSystem)));
-		return;
-	}
-	if (LiveTask->ShouldBroadcastAbilityTaskDelegates())
-	{
-		LiveTask->OnSpawned.Broadcast(LiveTask, CreatedComponent);
+		ThisClass* LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return; }
+		UGGYGOFXNiagaraComponent* const CreatedComponent = OriginalComponent.Get();
+		if (!LiveTask->OwnedComponents.Contains(CreatedComponent)) { continue; }
+		if (!IsValid(CreatedComponent) || !ActivationWorld.IsValid() || ActivationWorld->bIsTearingDown
+			|| !ActivationAvatar.IsValid() || !IsValid(LiveTask->Ability) || !LiveTask->Ability->IsActive()
+			|| LiveTask->Ability->GetAvatarActorFromActorInfo() != ActivationAvatar.Get())
+		{ LiveTask->FailAndEndTask(TEXT("激活组合单元前原 FX 作用域或组件已失效。")); return; }
+		// 合法编译／PSO 等待仍是请求已发出；不以 IsActive 或首粒子反推启动事实。
+		LiveTask->StartResult = EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested;
+		CreatedComponent->Activate(true);
+		LiveTask = OriginalTask.Get(true);
+		if (!LiveTask || LiveTask->IsFinished() || LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return; }
+		if (!LiveTask->OwnedComponents.Contains(CreatedComponent)) { continue; }
+		const FString RuntimeFailure = CreatedComponent->GetEffectFailure();
+		if (!RuntimeFailure.IsEmpty()) { LiveTask->FailAndEndTask(RuntimeFailure); return; }
+		UNiagaraSystem* const System = CreatedComponent->GetAsset();
+		// Activate 可同步收束编译；失败必须沿原 Task 传播，不能发布 OnSpawned。
+		if (!ValidateCompiledSystem(System, FailureReason))
+		{ LiveTask->FailAndEndTask(FailureReason); return; }
+		if (LiveTask->ShouldBroadcastAbilityTaskDelegates())
+		{ LiveTask->OnSpawned.Broadcast(LiveTask, CreatedComponent); }
 	}
 }
 
@@ -418,10 +494,10 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::FailAndEndTask(const FString& Reason)
 	{
 		StartResult = EGGYGONiagaraEffectStartResult::Failed;
 	}
-	UE_LOG(LogGGYGOFXTask, Error, TEXT("[FX.Task] Task='%s' Ability='%s' Avatar='%s' System='%s': %s"),
+	UE_LOG(LogGGYGOFXTask, Error, TEXT("[FX.Task] Task='%s' Ability='%s' Avatar='%s' Units=%d: %s"),
 		*GetPathName(), *GetPathNameSafe(Ability),
 		*GetPathNameSafe(IsValid(Ability) ? Ability->GetAvatarActorFromActorInfo() : nullptr),
-		*GetPathNameSafe(RequestedSystem), *Reason);
+		RequestedUnits.Num(), *Reason);
 	const TWeakObjectPtr<ThisClass> OriginalTask(this);
 	if (ShouldBroadcastAbilityTaskDelegates()) { OnFailed.Broadcast(this, Reason); }
 	if (ThisClass* LiveTask = OriginalTask.Get(true))
@@ -430,13 +506,28 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::FailAndEndTask(const FString& Reason)
 	}
 }
 
-UNiagaraComponent* UGGYGOAbilityTask_PlayNiagaraEffect::ReleaseOwnedComponent()
+TArray<TStrongObjectPtr<UNiagaraComponent>> UGGYGOAbilityTask_PlayNiagaraEffect::ReleaseOwnedComponents()
 {
-	UNiagaraComponent* Component = OwnedComponent;
-	OwnedComponent = nullptr;
+	TArray<TStrongObjectPtr<UNiagaraComponent>> Originals;
+	Originals.Reserve(OwnedComponents.Num());
+	for (UNiagaraComponent* Component : OwnedComponents) { Originals.Emplace(Component); }
+	OwnedComponents.Reset();
+	for (const TStrongObjectPtr<UNiagaraComponent>& Component : Originals) { UnbindOwnedComponent(Component.Get()); }
 	if (ResourceOwner) { ResourceOwner->SetLocalOwnership(LocalCapability, false); }
+	return Originals;
+}
+
+void UGGYGOAbilityTask_PlayNiagaraEffect::UnbindOwnedComponent(UNiagaraComponent* Component)
+{
 	if (IsValid(Component)) { Component->OnSystemFinished.RemoveDynamic(this, &ThisClass::HandleSystemFinished); }
-	return Component;
+	if (UGGYGOFXNiagaraComponent* EffectComponent = Cast<UGGYGOFXNiagaraComponent>(Component))
+	{ EffectComponent->OnEffectFailed.RemoveAll(this); }
+}
+
+void UGGYGOAbilityTask_PlayNiagaraEffect::HandleEffectFailed(
+	UGGYGOFXNiagaraComponent* Component, const FString& Reason)
+{
+	if (OwnedComponents.Contains(Component) && !IsFinished()) { FailAndEndTask(Reason); }
 }
 
 void UGGYGOAbilityTask_PlayNiagaraEffect::StopEffect(EGGYGONiagaraEffectStopMode Mode)
@@ -477,12 +568,19 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::StopNative(EGGYGONiagaraEffectStopMode
 		return;
 	}
 	const TWeakObjectPtr<ThisClass> OriginalTask(this);
-	TStrongObjectPtr<UNiagaraComponent> OriginalComponent(ReleaseOwnedComponent());
-	StopComponent(OriginalComponent.Get(), Mode, [OriginalTask]()
+	const auto IsOriginalOwnerAlive = [OriginalTask]()
 	{
 		const ThisClass* Task = OriginalTask.Get();
 		return Task && !Task->IsFinished() && !Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
-	});
+	};
+	// 整组先退所有权及委托，再逐项转交尾部；外调关闭原 Task 后，其余未交出的资源仍须销毁。
+	const TArray<TStrongObjectPtr<UNiagaraComponent>> OriginalComponents = ReleaseOwnedComponents();
+	for (const TStrongObjectPtr<UNiagaraComponent>& Component : OriginalComponents)
+	{
+		if (!IsOriginalOwnerAlive())
+		{ if (IsValid(Component.Get())) { Component->DestroyComponent(); } continue; }
+		StopComponent(Component.Get(), Mode, IsOriginalOwnerAlive);
+	}
 	if (ThisClass* LiveTask = OriginalTask.Get(true))
 	{
 		if (!LiveTask->IsFinished() && !LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { LiveTask->EndTask(); }
@@ -491,7 +589,25 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::StopNative(EGGYGONiagaraEffectStopMode
 
 void UGGYGOAbilityTask_PlayNiagaraEffect::HandleSystemFinished(UNiagaraComponent* Component)
 {
-	if (Component == OwnedComponent && !IsFinished()) { EndTask(); }
+	if (!OwnedComponents.Contains(Component) || IsFinished()) { return; }
+	if (const auto* Original = Cast<UGGYGOFXNiagaraComponent>(Component))
+	{
+		const FString Failure = Original->GetEffectFailure();
+		if (!Failure.IsEmpty()) { FailAndEndTask(Failure); return; }
+	}
+	const TWeakObjectPtr<ThisClass> OriginalTask(this);
+	const TStrongObjectPtr<UNiagaraComponent> OriginalComponent(Component);
+	OwnedComponents.RemoveSingle(Component);
+	UnbindOwnedComponent(Component);
+	if (ResourceOwner) { ResourceOwner->SetLocalOwnership(LocalCapability, !OwnedComponents.IsEmpty()); }
+	// 此事实只来自仍 owned 的原生完成回调；Stop/取消已先退订，不会冒签自然完成。
+	OnUnitNaturallyCompleted.Broadcast(this, Component);
+	if (IsValid(OriginalComponent.Get())) { OriginalComponent->DestroyComponent(); }
+	if (ThisClass* LiveTask = OriginalTask.Get(true))
+	{
+		if (!LiveTask->IsFinished() && !LiveTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
+			&& LiveTask->OwnedComponents.IsEmpty()) { LiveTask->EndTask(); }
+	}
 }
 
 void UGGYGOAbilityTask_PlayNiagaraEffect::HandleOriginalAvatarEndPlay(AActor* Actor, EEndPlayReason::Type)
@@ -503,7 +619,7 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::HandleOriginalAvatarEndPlay(AActor* Ac
 #if WITH_EDITOR
 void UGGYGOAbilityTask_PlayNiagaraEffect::HandleSystemCompiled(UNiagaraSystem* System)
 {
-	if (IsFinished() || System != RequestedSystem || HasPendingNiagaraCompilation(System)) { return; }
+	if (IsFinished() || !SystemCompiledHandles.Contains(System) || HasPendingNiagaraCompilation(System)) { return; }
 	if (!System->IsValid() || !DoSystemScriptAttributesMatch(System))
 	{
 		FailAndEndTask(FString::Printf(TEXT("Niagara compilation completed with an invalid System or mismatched System VM attributes: %s"),
@@ -531,15 +647,16 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::DestroyNative(bool AbilityEnded)
 	if (AActor* Avatar = OriginalAvatar.Get(true))
 	{ Avatar->OnEndPlay.RemoveDynamic(this, &ThisClass::HandleOriginalAvatarEndPlay); }
 #if WITH_EDITOR
-	if (SystemCompiledHandle.IsValid())
+	for (const auto& Entry : SystemCompiledHandles)
 	{
-		if (IsValid(RequestedSystem)) { RequestedSystem->OnSystemCompiled().Remove(SystemCompiledHandle); }
-		SystemCompiledHandle.Reset();
+		if (IsValid(Entry.Key)) { Entry.Key->OnSystemCompiled().Remove(Entry.Value); }
 	}
+	SystemCompiledHandles.Reset();
 #endif
 	// 外调销毁组件前先摘除持有和委托。递归 EndTask 使用 UAbilityTask 原生销毁保护，
 	// 旧清理栈不能触及后继资源。
-	TStrongObjectPtr<UNiagaraComponent> OriginalComponent(ReleaseOwnedComponent());
-	if (IsValid(OriginalComponent.Get())) { OriginalComponent->DestroyComponent(); }
+	const TArray<TStrongObjectPtr<UNiagaraComponent>> OriginalComponents = ReleaseOwnedComponents();
+	for (const TStrongObjectPtr<UNiagaraComponent>& Component : OriginalComponents)
+	{ if (IsValid(Component.Get())) { Component->DestroyComponent(); } }
 	Super::OnDestroy(AbilityEnded);
 }

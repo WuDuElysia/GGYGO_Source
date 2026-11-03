@@ -2,6 +2,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "AbilitySystem/GGYGOAvatarBindingTypes.h"
 #include "FX/Tasks/GGYGOAbilityTask_PlayNiagaraEffect.h"
 #include "UObject/Interface.h"
 #include "GGYGOMontageFXPublication.generated.h"
@@ -15,8 +16,36 @@ class AController;
 class UWorld;
 class AGGYGOCharacterBase;
 class UNiagaraComponent;
+class UGGYGOCharacterMovementComponent;
+class UGGYGOLocomotionFXComponent;
+class FGGYGOLocomotionSourceProof;
 struct FGGYGOMontageFXLeaseState;
 struct FGGYGOMontageFXLocalCapability;
+
+/** 本机来源描述。只封装原模块已认证的证明，不签执行权，也不复制到网络。 */
+enum class EGGYGOFXSourceKind : uint8 { Invalid, AbilityActivation, Locomotion };
+
+class GGYGO_API FGGYGOFXSourceIdentity
+{
+public:
+	static FGGYGOFXSourceIdentity FromAbilityActivation(const TSharedPtr<const void>& OriginalProof);
+	static FGGYGOFXSourceIdentity FromLocomotion(const FGGYGOLocomotionSourceProof& OriginalProof,
+		const FGGYGOAvatarBindingContext& OriginalContext);
+	bool IsSet() const;
+	EGGYGOFXSourceKind GetKind() const { return Kind; }
+	const TSharedPtr<const void>& GetAbilityActivationProof() const { return ActivationProof; }
+	/** 调用者先按 GetKind 分派；这里不把空证明解释为合法来源。 */
+	const FGGYGOLocomotionSourceProof& GetLocomotionSourceProof() const;
+	UGGYGOCharacterMovementComponent* GetOriginalMovement() const;
+	const FGGYGOAvatarBindingContext& GetAvatarBindingContext() const { return BindingContext; }
+	bool HasSameSource(const FGGYGOFXSourceIdentity& Other) const;
+	bool operator==(const FGGYGOFXSourceIdentity& Other) const { return HasSameSource(Other); }
+private:
+	EGGYGOFXSourceKind Kind = EGGYGOFXSourceKind::Invalid;
+	TSharedPtr<const void> ActivationProof;
+	TSharedPtr<const FGGYGOLocomotionSourceProof> LocomotionProof;
+	FGGYGOAvatarBindingContext BindingContext;
+};
 
 UENUM()
 enum class EGGYGOMontageFXCloseReason : uint8 { Normal, Abort };
@@ -31,6 +60,7 @@ struct GGYGO_API FGGYGOMontageFXRecord
 	UPROPERTY() TObjectPtr<AActor> Avatar = nullptr;
 	UPROPERTY() TObjectPtr<USkeletalMeshComponent> Mesh = nullptr;
 	UPROPERTY() TObjectPtr<UNiagaraSystem> System = nullptr;
+	UPROPERTY() FGGYGOFXFieldSettings FieldSettings;
 	UPROPERTY() EGGYGONiagaraEffectSpace Space = EGGYGONiagaraEffectSpace::Unspecified;
 	UPROPERTY() FName SocketName;
 	/** World 已在真实 Begin 组合；Attached 是原 Mesh/socket 的相对变换。 */
@@ -229,7 +259,7 @@ public:
 	virtual UGGYGOMontageFXPublicationOwner* GetMontageFXPublicationOwner() = 0;
 };
 
-/** GA 仍是业务来源。本对象只拥有复制派生数据、原资源能力及当前客户端实例。无 Tick。 */
+/** 原 GA/运动 owner 保持业务来源。本对象只拥有表现派生数据、资源能力及客户端实例，无 Tick。 */
 UCLASS()
 class GGYGO_API UGGYGOMontageFXPublicationOwner : public UObject
 {
@@ -245,15 +275,16 @@ public:
 	/** State 地址属于同一原 ASC，持续至 Shutdown；调用前 ASC 应已安装强引用 owner。 */
 	void Initialize(UAbilitySystemComponent* OriginalIssuer, FGGYGOMontageFXState& State,
 		FGGYGOMontageFXSendTerminal SendTerminal);
-	bool Begin(const TSharedPtr<const void>& OriginalSourceIdentity, const FGGYGOMontageFXRecord& Request,
+	/** Request 的 BeginServerTime 必须来自已认证的原生事件采样；不重写为接收时刻。 */
+	bool Begin(const FGGYGOFXSourceIdentity& OriginalSource, const FGGYGOMontageFXRecord& Request,
 		FGGYGOMontageFXLease& OutLease, FString& OutError);
 	EGGYGOMontageFXCloseResult PrepareClose(const FGGYGOMontageFXLease& Lease,
 		EGGYGOMontageFXCloseReason Reason, FGGYGOMontageFXCloseObligation& OutObligation);
-	/** 纯数据匹配既有 activation 的同一共享 identity；不调用 predicate/虚函数。 */
-	void PrepareCloseSource(const TSharedPtr<const void>& OriginalSourceIdentity,
+	/** 按原种类与 owner 证明的历史身份匹配；不调用 Current 谓词或虚函数。 */
+	void PrepareCloseSource(const FGGYGOFXSourceIdentity& OriginalSource,
 		EGGYGOMontageFXCloseReason Reason, TArray<FGGYGOMontageFXCloseObligation>& OutObligations);
-	/** 只复制尚未关闭的原 source identity，供原 ASC 在安全出口查询自身证明。 */
-	void GetSourceIdentities(TArray<TSharedPtr<const void>>& OutIdentities) const;
+	/** 复制全部未关闭来源；生产者分类与撤绑均消费同一 typed 描述。 */
+	void GetSourceIdentities(TArray<FGGYGOFXSourceIdentity>& OutIdentities) const;
 	bool DispatchClose(FGGYGOMontageFXCloseObligation&& Obligation);
 	void ReceiveState();
 	void ReceiveTerminal(const FGGYGOMontageFXTerminal& Terminal);
@@ -268,10 +299,15 @@ public:
 #endif
 private:
 	friend class UGGYGOAbilityTask_PlayNiagaraEffect;
+	friend class UGGYGOLocomotionFXComponent;
+	friend class UGGYGORemoteMontageFXComponent;
 	friend class FGGYGOMontageFXResourceFactsTest;
 	/** 工厂在返回 Task 前登记；Task 是资源事实唯一写端，订阅者不以弱空代替归还。 */
 	TSharedPtr<FGGYGOMontageFXLocalCapability> RegisterLocalTask(
 		UGGYGOAbilityTask_PlayNiagaraEffect* Task, AActor* Avatar, UWorld* World, FString& OutError);
+	TSharedPtr<FGGYGOMontageFXLocalCapability> RegisterLocalProducer(UObject* Producer,
+		EGGYGOFXSourceKind Kind, AActor* Avatar, UWorld* World, FSimpleDelegate Shutdown, FString& OutError,
+		const FGGYGOFXSourceIdentity& Source = FGGYGOFXSourceIdentity());
 	void BeginLocalOperation(const TSharedPtr<FGGYGOMontageFXLocalCapability>& Capability);
 	void EndLocalOperation(const TSharedPtr<FGGYGOMontageFXLocalCapability>& Capability);
 	void SetLocalOwnership(const TSharedPtr<FGGYGOMontageFXLocalCapability>& Capability, bool bOwned);
@@ -282,6 +318,7 @@ private:
 		FGGYGOMontageFXLocalStartTicket& OutTicket, FString& OutError);
 	bool ObserveLocalStart(const FGGYGOMontageFXLocalStartTicket& Ticket,
 		FGGYGOMontageFXLocalStartReadyDelegate Callback);
+	bool ObserveLocalProducerStart(const FGGYGOMontageFXLocalStartTicket& Ticket, FSimpleDelegate Callback);
 	EGGYGOMontageFXPermitResult ConsumeLocalStart(const FGGYGOMontageFXLocalStartTicket& Ticket);
 	void CancelLocalStart(const FGGYGOMontageFXLocalStartTicket& Ticket);
 	bool HasLocalPermit(const FGGYGOMontageFXLocalStartTicket& Ticket) const;

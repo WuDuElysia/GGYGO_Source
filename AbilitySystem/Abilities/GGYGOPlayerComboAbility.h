@@ -3,6 +3,7 @@
 
 #include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "AbilitySystem/Abilities/GGYGOComboTypes.h"
+#include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Components/SkinnedMeshComponent.h"
 #include "GGYGOPlayerComboAbility.generated.h"
@@ -75,6 +76,7 @@ class GGYGO_API UGGYGOPlayerComboAbility : public UGGYGOGameplayAbility
 	GENERATED_BODY()
 	struct FAuthorPointGate;
 	struct FStepMotionResources;
+	struct FStepEntryAttempt;
 public:
 	UGGYGOPlayerComboAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	/** ASC 只向匹配本次激活预测键的实例转发服务器纠正。 */
@@ -122,7 +124,9 @@ protected:
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 	bool IsStepPlayable(int32 Index) const;
-	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f, int32 SourceRequestId = 0);
+	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f, int32 SourceRequestId = 0,
+		bool bCorrectionReplay = false, const FQuat* ReplayEntryActorRotation = nullptr,
+		TSharedPtr<FStepEntryAttempt> EntryAttempt = {});
 	void OpenTraceWindow(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageWindowDeclaration& Declaration);
 	void ReleaseTraceWindow(const FGGYGOAbilityActivationHandle& Original);
 	void RejectRequest(const FGGYGOAbilityActivationHandle& Original, int32 RequestId);
@@ -133,6 +137,12 @@ protected:
 		const UGGYGOAbilityTask_PlayMontageAndWaitForEvent* ExpectedTask) const;
 	bool IsMotionResourceCurrent(const TSharedPtr<FStepMotionResources>& Resource) const;
 	bool InitializeStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
+	/** 原 press/激活身份与尚未执行的入场尝试；等待只恢复同一请求，不重评攻击门。 */
+	bool IsStepEntryCurrent(const TSharedPtr<FStepEntryAttempt>& Attempt) const;
+	void ResumeStepEntry(const TSharedPtr<FStepEntryAttempt>& Attempt);
+	void FailStepEntry(const TSharedPtr<FStepEntryAttempt>& Attempt, const FString& Diagnostic);
+	void ReleaseStepEntry(const TSharedPtr<FStepEntryAttempt>& Attempt);
+	void ReleasePendingStepEntries();
 	void HandleMontageSection(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageSectionFact& Fact);
 	void HandleMontageNotify(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageNotifyFact& Fact);
 	/** 只开攻击接续门；不查询、订阅或取消 CMC 移动。 */
@@ -144,7 +154,10 @@ protected:
 	void TryCompleteStepMotion(const TSharedPtr<FStepMotionResources>& Resource);
 	void FailStepMotion(const TSharedPtr<FStepMotionResources>& Resource, const FString& Reason);
 	void ReleaseStepMotion(EGGYGOActionMotionReleaseReason Reason);
-	void HandleInputPressed(const FGGYGOAbilityActivationHandle& Original, int32 SourceStep, int32 RequestId);
+	void HandleStepInputRequest(const FGGYGOAbilityActivationHandle& Original, const FGGYGOAbilityStepInputRequest& Request);
+	/** 只接原 Task 已认证的 Initial 不可提供通知；已接受动作保持原取消权限。 */
+	void HandleInitialInputUnavailable(const FGGYGOAbilityActivationHandle& Original,
+		const UGGYGOAbilityTask_WaitComboInput* OriginalInputTask);
 	void HandleMontageWindow(const TSharedPtr<FStepMotionResources>& Resource, const FGGYGOMontageWindowFact& Fact);
 	void HandleMontageCompleted(const TSharedPtr<FStepMotionResources>& Resource);
 	void HandleMontageInterrupted(const FGGYGOAbilityActivationHandle& Original, FGameplayTag EventTag, FGameplayEventData EventData);
@@ -153,7 +166,8 @@ protected:
 		const FGGYGOMeleeTraceWindowHandle& OriginalWindow, AActor* HitActor, const FHitResult& HitResult);
 	void CorrectPredictedStepForActivation(const FGGYGOAbilityActivationHandle& Original,
 		int32 Revision, int32 RequestId, int32 ServerStep, float Position,
-		bool bWindowOpen, bool bWindowClosed, bool bAccepted);
+		bool bWindowOpen, bool bWindowClosed, bool bAccepted,
+		int32 ServerStepRequestId = INDEX_NONE, const FQuat* EntryActorRotation = nullptr);
 
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	TArray<FGGYGOComboStep> ComboSteps;
@@ -171,7 +185,10 @@ protected:
 	 *  命中期间必需GE无效或载荷构造失败时，中止原激活且不发送该命中的Cue。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo")
 	bool bUseSharedDamageEffectWhenUnset = false;
-	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo", meta = (Categories = "GameplayCue.Hit"))
+	/** 保留既有资产和蓝图读取引脚的历史存值，仅供作者显式迁移。
+	 *  运行只读取 ComboSteps[i].HitCueTag，本字段不选择、补齐或追加命中 Cue。 */
+	UPROPERTY(VisibleDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Combo|Migration",
+		meta = (Categories = "GameplayCue.Hit", DisplayName = "历史命中 Cue（仅迁移）"))
 	FGameplayTag HitCueTag;
 
 private:
@@ -205,8 +222,12 @@ private:
 	TObjectPtr<USkeletalMeshComponent> ActiveMesh;
 	/** Copies of issuer-owned identity and our resources, never another activation/end state machine. */
 	FGGYGOAbilityActivationHandle ResourceActivation;
+	/** ASC 签发的原 Initial 运输路由；Initialize 早取，原终止清理一次归还。 */
+	FGGYGOAbilityInitialInputRoute InitialInputRoute;
 	/** 本段原 CMC 资源、来源及 FX 请求/退出事实；不复制引擎运行状态或时钟。 */
 	TSharedPtr<FStepMotionResources> StepMotionResources;
+	/** 原请求各自拥有完成订阅；门资格只取 press 一次，段退役即撤销，不作为接续缓冲。 */
+	TArray<TSharedPtr<FStepEntryAttempt>> StepEntryAttempts;
 	FDelegateHandle InputCallbackRegistration;
 	FGGYGOMeleeTraceWindowHandle TraceWindow;
 	FDelegateHandle TraceHitSubscription;

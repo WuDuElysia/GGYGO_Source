@@ -110,6 +110,17 @@ bool UGGYGOLocalPlayer::GetProjectionData(FViewport* Viewport, FSceneViewProject
 	AGGYGOPlayerCameraManager* const CameraManager = Cast<AGGYGOPlayerCameraManager>(ActualManager);
 	if (!CameraManager)
 	{
+		// SpawnPlayActor 的 Client 分支直接安装配置的占位 PC，尚未经过 SetPlayer／输入初始化。
+		// 原 LP／PC／PCM 关联已核验；正式 HandleClientPlayer 会先改为 AutonomousProxy 并绑定连接。
+		const bool bAwaitingReplicatedController = World->GetNetMode() == NM_Client
+			&& Controller->GetClass() == PendingLevelPlayerControllerClass.Get()
+			&& Controller->GetLocalRole() == ROLE_Authority && Controller->HasAnyFlags(RF_Transient)
+			&& Controller->NetConnection == nullptr && Controller->PlayerInput == nullptr;
+		if (bAwaitingReplicatedController)
+		{
+			// 只等待真实复制 PC；不生成投影，也不消耗正式配置错误的一次诊断。
+			return false;
+		}
 		return RejectAssociation(TEXT("BeforeSuper"), TEXT("WrongCameraManagerClass"));
 	}
 	if (!CameraManager->HasConfirmedNativeCameraView())

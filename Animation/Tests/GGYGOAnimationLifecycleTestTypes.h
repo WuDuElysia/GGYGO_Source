@@ -71,11 +71,19 @@ public:
 	void InvokeNativeUpdateAnimation(float DeltaSeconds) { NativeUpdateAnimation(DeltaSeconds); }
 
 	void SeedDirtyRuntimeStateForTest();
-	/** Captured consumer input: Valid maps immediately; DeltaSeconds only drives NotApplicable recovery. Does not exercise or impersonate the CMC getter. */
-	void InvokeWalkRunLeanForTest(const FGGYGOAnimationStateFrame& InFrame, float DeltaSeconds)
+	/** 只注入已捕获目标输入，不冒充 CMC Getter 或图内显示角。 */
+	void InvokeWalkRunLeanForTest(const FGGYGOAnimationStateFrame& InFrame)
 	{
 		AnimationState = InFrame;
-		UpdateWalkRunLeanPresentation(DeltaSeconds);
+		UpdateWalkRunLeanTarget();
+	}
+
+	/** 消费端值测试：宿主上下文仍由真实 Native 生命周期捕获，注入值不证明网络或节点求值。 */
+	void SetCapturedMotionPoseForTest(const FGGYGOAnimationStateFrame& InFrame,
+		const FGGYGOAnimationRemotePoseFrame& InRemoteFrame = {})
+	{
+		AnimationState = InFrame;
+		RemoteMotionPose = InRemoteFrame;
 	}
 
 	const FZZZAnimSnapshot& GetSnapshotForTest() const { return Snap; }

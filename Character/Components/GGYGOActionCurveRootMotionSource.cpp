@@ -34,7 +34,7 @@ bool FRootMotionSource_GGYGOActionCurve::Matches(const FRootMotionSource* Other)
 		return OriginalBinding.IsValid() && Typed->OriginalBinding.IsValid()
 			&& OriginalBinding->HasSameConfiguration(*Typed->OriginalBinding)
 			&& RotationMode == Typed->RotationMode && MontageStartSeconds == Typed->MontageStartSeconds && PlayRate == Typed->PlayRate
-			&& Duration == Typed->Duration && EntryActorRotation == Typed->EntryActorRotation
+			&& Duration == Typed->Duration
 			&& TranslationScale == Typed->TranslationScale;
 	}
 	return TranslationCurve == Typed->TranslationCurve && EntryMeshRotation.Equals(Typed->EntryMeshRotation)
@@ -46,14 +46,19 @@ bool FRootMotionSource_GGYGOActionCurve::MatchesAndHasSameState(const FRootMotio
 {
 	if (!FRootMotionSource::MatchesAndHasSameState(Other)) return false;
 	const auto* Typed = static_cast<const FRootMotionSource_GGYGOActionCurve*>(Other);
-	return bCompletionRequested == Typed->bCompletionRequested && bExplicitlyCancelled == Typed->bExplicitlyCancelled;
+	return bCompletionRequested == Typed->bCompletionRequested && bExplicitlyCancelled == Typed->bExplicitlyCancelled
+		&& (SourceMode != EGGYGOActionCurveSourceMode::OriginalMontage || EntryActorRotation == Typed->EntryActorRotation);
 }
 
 bool FRootMotionSource_GGYGOActionCurve::UpdateStateFrom(const FRootMotionSource* Other, bool bMarkForSimulatedCatchup)
 {
 	if (!Other || !Matches(Other)) return false;
-	if (!FRootMotionSource::UpdateStateFrom(Other, bMarkForSimulatedCatchup)) return false;
 	const auto* Typed = static_cast<const FRootMotionSource_GGYGOActionCurve*>(Other);
+	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage
+		&& (Typed->EntryActorRotation.ContainsNaN() || !Typed->EntryActorRotation.IsNormalized())) return false;
+	if (!FRootMotionSource::UpdateStateFrom(Other, bMarkForSimulatedCatchup)) return false;
+	// 基底是同一原 RMS 的可纠正状态，不作另一个动作身份；原生复制/回放继续沿原时钟。
+	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage) EntryActorRotation = Typed->EntryActorRotation;
 	bCompletionRequested = Typed->bCompletionRequested;
 	bExplicitlyCancelled |= Typed->bExplicitlyCancelled;
 	// Keep the recipient's original local identity. An imported source cannot adopt a current Montage.

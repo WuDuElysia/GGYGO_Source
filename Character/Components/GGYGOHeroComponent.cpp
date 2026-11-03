@@ -16,6 +16,7 @@
 #include "System/GGYGOGameplayTags.h"
 
 #include "Components/GameFrameworkComponentManager.h"
+#include "CoreGlobals.h"
 #include "EnhancedInputSubsystems.h"
 #include "EnhancedPlayerInput.h"
 #include "Engine/LocalPlayer.h"
@@ -79,8 +80,9 @@ struct UGGYGOHeroComponent::FAbilityActionBinding
 
 struct UGGYGOHeroComponent::FAbilityInputObservation
 {
-	FAbilityInputObservation(const TSharedPtr<FAbilityActionBinding>& InBinding, double InDeadline)
-		: Binding(InBinding), Session(InBinding->Session), Request{InBinding->InputTag, {}, InDeadline}
+	FAbilityInputObservation(const TSharedPtr<FAbilityActionBinding>& InBinding, double InDeadline,
+		const FGGYGOMovementInputEvaluationToken& InEvaluationToken)
+		: Binding(InBinding), Session(InBinding->Session), Request{InBinding->InputTag, {}, InDeadline, InEvaluationToken}
 	{
 	}
 
@@ -209,6 +211,23 @@ struct FGGYGOHeroMovementInputScope
 
 namespace GGYGOHeroMovementInput
 {
+	// 只观察现有边界；不登记状态、不请求重建，也不驱动 Source／CMC 装配。
+	// OwnedMappings 是本次归还凭据数；MappingApplied 不读取引擎内部注册计数。
+	static void TraceLifecycle(const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope, const TCHAR* Phase,
+		int32 OwnedMappings = INDEX_NONE, const UInputMappingContext* Mapping = nullptr, FName Reason = NAME_None)
+	{
+		if (!Scope.IsValid() || !UE_LOG_ACTIVE(LogGGYGOAbilitySystem, Verbose)) { return; }
+		UEnhancedInputLocalPlayerSubsystem* Subsystem = Scope->Subsystem.Get();
+		const int32 MappingApplied = Mapping && Subsystem ? static_cast<int32>(Subsystem->HasMappingContext(Mapping)) : INDEX_NONE;
+		UE_LOG(LogGGYGOAbilitySystem, Verbose,
+			TEXT("[Input/Hero MovementLifecycle] Frame=%llu Phase=%s %s Retired=%d OwnedMappings=%d ExpectedOwnedMappings=%d Session=%llu Binding=%llu Mapping='%s' MappingApplied=%d Reason=%s"),
+			static_cast<unsigned long long>(GFrameCounter), Phase, *Scope->DiagnosticContext, Scope->bRetired,
+			OwnedMappings, Scope->ExpectedMappingRegistrationCount,
+			static_cast<unsigned long long>(Scope->Session.SessionSerial),
+			static_cast<unsigned long long>(Scope->Binding.ConsumerBindingSerial),
+			*GetPathNameSafe(Mapping), MappingApplied, *Reason.ToString());
+	}
+
 	static void Report(const TSharedPtr<FGGYGOHeroMovementInputScope>& Scope, FName Reason, const FString& Detail)
 	{
 		if (!Scope.IsValid() || Scope->ReportedReasons.Contains(Reason)) { return; }
@@ -270,6 +289,7 @@ namespace GGYGOHeroMovementInput
 		if (!Scope.IsValid()) { return; }
 		const FGGYGOMovementInputSessionIdentity OriginalSession = Scope->Session;
 		const FGGYGOMovementInputConsumerBindingId OriginalBinding = Scope->Binding;
+		TraceLifecycle(Scope, TEXT("AssemblyResourcesReleased"), INDEX_NONE, nullptr, Reason);
 		Scope->Session = {};
 		Scope->Binding = {};
 		ReleaseOwnerSyncSubscription(Scope, Reason);
@@ -320,6 +340,10 @@ void UGGYGOHeroMovementMappingObserver::OnMappingsRebuilt()
 {
 	const TSharedPtr<FGGYGOHeroMovementInputScope> Scope = OriginalScope;
 	const TWeakObjectPtr<UGGYGOHeroComponent> Hero = OriginalHero;
+	UE_LOG(LogGGYGOAbilitySystem, Verbose,
+		TEXT("[Input/Hero MovementLifecycle] Frame=%llu Phase=NativeRebuildNotification Observer='%s' Hero='%s' Subsystem='%s' ScopeAlive=%d"),
+		static_cast<unsigned long long>(GFrameCounter), *GetPathNameSafe(this),
+		*GetPathNameSafe(Hero.Get()), *GetPathNameSafe(OriginalSubsystem.Get()), Scope.IsValid());
 	if (Scope.IsValid())
 	{
 		if (UGGYGOHeroComponent* Original = Hero.Get()) { Original->HandleMovementMappingsRebuilt(Scope); }
@@ -790,6 +814,7 @@ void UGGYGOHeroComponent::InitializePlayerInputBindings(UInputComponent* PlayerI
 	OriginalMovementScope->Observer = MovementMappingObserver.Get();
 	// Install the original registration before Add. Only actual native rebuilt notification begins Source.
 	MovementMappingObserver->Initialize(this, Subsystem, OriginalMovementScope);
+	GGYGOHeroMovementInput::TraceLifecycle(OriginalMovementScope, TEXT("ObserverInstalled"), OriginalSession->Mappings.Num());
 	const TWeakObjectPtr<UGGYGOHeroComponent> MovementHero(this);
 	OriginalSession->BindHandles.Add(GGYGOIC->BindActionInstanceLambda(MoveAction, ETriggerEvent::Triggered,
 		[MovementHero, OriginalMovementScope](const FInputActionInstance& Instance)
@@ -855,7 +880,9 @@ void UGGYGOHeroComponent::InitializePlayerInputBindings(UInputComponent* PlayerI
 		FPlayerInputSession::FRegisteredMapping& Registered = OriginalSession->Mappings.AddDefaulted_GetRef();
 		Registered.MappingContext = Mapping;
 		Registered.RegisteredPriority = RegistrationPriority;
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalMovementScope, TEXT("BeforeMappingAdd"), OriginalSession->Mappings.Num(), Mapping);
 		Subsystem->AddMappingContext(Mapping, RegistrationPriority);
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalMovementScope, TEXT("AfterMappingAdd"), OriginalSession->Mappings.Num(), WeakMapping.Get());
 		if (PlayerInputSession != OriginalSession || OriginalSession->bRetired || InputSessionGeneration != SessionGeneration)
 		{
 			return;
@@ -869,7 +896,12 @@ void UGGYGOHeroComponent::InitializePlayerInputBindings(UInputComponent* PlayerI
 		ReleasePlayerInput();
 		return;
 	}
+	// 已有 CountRegistrations 项的 Add 只增加引用；完整登记后统一请求本代正常延迟编译。
+	// 保留默认按键忽略规则，由引擎真实通知继续唯一的 Source／CMC 装配。
+	Subsystem->RequestRebuildControlMappings();
+	GGYGOHeroMovementInput::TraceLifecycle(OriginalMovementScope, TEXT("RebuildRequested"), OriginalSession->Mappings.Num());
 	// Input may precede Ready; the exact typed Ready notice later associates this existing session.
+	GGYGOHeroMovementInput::TraceLifecycle(OriginalMovementScope, TEXT("InstallationComplete"), OriginalSession->Mappings.Num());
 	AssociateReadyAbilitySystemWithInput();
 }
 
@@ -978,14 +1010,27 @@ bool UGGYGOHeroComponent::IsMovementInputScopeCurrent(const TSharedPtr<FGGYGOHer
 
 void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope)
 {
-	if (!IsMovementInputScopeCurrent(OriginalScope)) { return; }
+	if (!IsMovementInputScopeCurrent(OriginalScope))
+	{
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("RebuildScopeNotCurrent"),
+			PlayerInputSession.IsValid() ? PlayerInputSession->Mappings.Num() : INDEX_NONE);
+		return;
+	}
 	// A real rebuild can occur inside an Added callback; wait for all of this scope's actual Add registrations.
-	if (PlayerInputSession->Mappings.Num() != OriginalScope->ExpectedMappingRegistrationCount) { return; }
+	if (PlayerInputSession->Mappings.Num() != OriginalScope->ExpectedMappingRegistrationCount)
+	{
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("RebuildMappingsPending"), PlayerInputSession->Mappings.Num());
+		return;
+	}
 	const TWeakObjectPtr<UGGYGOHeroComponent> OriginalHero(this);
 	GGYGOHeroMovementInput::ReleaseResources(OriginalScope, TEXT("NativeMappingsRebuilt"));
 	UGGYGOHeroComponent* Hero = OriginalHero.Get();
 	if (!Hero || !Hero->IsMovementInputScopeCurrent(OriginalScope)
-		|| OriginalScope->Session.SessionSerial != 0 || OriginalScope->Binding.ConsumerBindingSerial != 0) { return; }
+		|| OriginalScope->Session.SessionSerial != 0 || OriginalScope->Binding.ConsumerBindingSerial != 0)
+	{
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("RebuildCleanupChangedAssembly"));
+		return;
+	}
 	OriginalScope->ReportedReasons.Reset();
 	const TWeakObjectPtr<UGGYGOPlayerInput> Source = OriginalScope->Source;
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> Consumer = OriginalScope->Consumer;
@@ -1017,6 +1062,7 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 	}
 	// Own the prepared token immediately, including reentry from CMC Bind; no receiver exists yet.
 	OriginalScope->Session = Session;
+	GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("SourceBeginAccepted"));
 	FGGYGOMovementInputConsumerBindingId Binding;
 	if (!Consumer.IsValid() || !Consumer->BindMovementInputSession(Session, ExpectedConsumerSerial, Binding, Error))
 	{
@@ -1042,6 +1088,7 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 		return;
 	}
 	OriginalScope->Binding = Binding; // Both original resources precede Attach's synchronous replay.
+	GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("ConsumerBindAccepted"));
 	const TWeakPtr<FGGYGOHeroMovementInputScope> WeakScope(OriginalScope);
 	const auto IsOriginalAssemblyCurrent = [OriginalHero, WeakScope, Session, Binding]()
 	{
@@ -1212,6 +1259,7 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 			{
 				if (Fact.Kind == EGGYGOMovementInputFactKind::SessionInvalidated)
 				{
+					GGYGOHeroMovementInput::TraceLifecycle(Scope, TEXT("FactSessionInvalidated"), INDEX_NONE, nullptr, Fact.Reason);
 					Scope->Session = {};
 					Scope->Binding = {};
 					GGYGOHeroMovementInput::ReleaseOwnerSyncSubscription(Scope, Fact.Reason);
@@ -1248,6 +1296,10 @@ void UGGYGOHeroComponent::HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOH
 		{
 			GGYGOHeroMovementInput::ReleaseResources(Source, Session, Consumer, Binding, TEXT("AttachInterrupted"));
 		}
+	}
+	else
+	{
+		GGYGOHeroMovementInput::TraceLifecycle(OriginalScope, TEXT("AttachReturned"));
 	}
 }
 
@@ -1297,9 +1349,21 @@ void UGGYGOHeroComponent::Input_Move(const FInputActionInstance& Instance,
 	if (!Controller) { return; }
 	// Same native camera-relative value projection; Source facts already identify the CMC request.
 	const FRotator YawOnlyRotation(0.0f, Controller->GetControlRotation().Yaw, 0.0f);
+	FGGYGOMovementInputEvaluationToken ProjectionEvaluation;
+	FString ProjectionSourceError;
+	const bool bProjectionSourceCaptured = OriginalScope->Source->CaptureMovementInputEvaluationToken(
+		Session, ProjectionEvaluation, ProjectionSourceError);
 	const FRotationMatrix RotationBasis(YawOnlyRotation);
 	Pawn->AddMovementInput(RotationBasis.GetUnitAxis(EAxis::X) * Value.Y);
 	Pawn->AddMovementInput(RotationBasis.GetUnitAxis(EAxis::Y) * Value.X);
+	// 只交这次真实投影的来源与 Yaw；记录不代表移动已执行，也不改变原 Add 的许可。
+	const bool bProjectionRecorded = OriginalScope->Consumer->RecordLocomotionInputProjection(
+		Binding, Request, ProjectionEvaluation, static_cast<float>(YawOnlyRotation.Yaw), Error);
+	if (!bProjectionSourceCaptured || !bProjectionRecorded)
+	{
+		GGYGOHeroMovementInput::Report(OriginalScope, TEXT("LocomotionInputProjectionUnavailable"),
+			bProjectionSourceCaptured ? Error : ProjectionSourceError);
+	}
 }
 
 void UGGYGOHeroComponent::Input_ForceWalkPressed()
@@ -1434,12 +1498,22 @@ void UGGYGOHeroComponent::Input_AbilityActionTriggered(const FInputActionInstanc
 	const bool bFirstTrigger = !Binding->Observation;
 	if (bFirstTrigger)
 	{
+		FGGYGOMovementInputEvaluationToken EvaluationToken;
+		const TSharedPtr<FGGYGOHeroMovementInputScope> MovementScope = MovementInputScope;
+		if (IsMovementInputScopeCurrent(MovementScope))
+		{
+			FString EvaluationError;
+			MovementScope->Source->CaptureMovementInputEvaluationToken(
+				MovementScope->Session, EvaluationToken, EvaluationError);
+		}
+		// 缺源保留未分配 Token；需要方向的消费者明确拒绝，普通能力不新增移动前置。
 		const double Window = static_cast<double>(InputBufferWindow);
 		const double Deadline = Now + Window;
 		const bool bValidDeadline = World && FMath::IsFinite(Now) && Now >= 0.0
 			&& FMath::IsFinite(Window) && Window >= 0.0 && FMath::IsFinite(Deadline);
 		const TSharedPtr<FAbilityInputObservation> Observation = MakeShared<FAbilityInputObservation>(
-			Binding, bValidDeadline ? Deadline : UGGYGOAbilitySystemComponent::NoAbilityInputRetryDeadline);
+			Binding, bValidDeadline ? Deadline : UGGYGOAbilitySystemComponent::NoAbilityInputRetryDeadline,
+			EvaluationToken);
 		Binding->Observation = Observation;
 		Binding->Session.Pin()->Observations.Add(Observation);
 		// The original observation is installed even on failure; later Ready/Triggered cannot issue it.
@@ -1483,7 +1557,7 @@ void UGGYGOHeroComponent::Input_AbilityActionTriggered(const FInputActionInstanc
 	const FGGYGOAbilityInputRequestIdentity PreviousIdentity = Original->Request.Identity;
 	const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
 	const FGGYGOAbilityInputRequestResult Result = ExpectedASC->ReceiveAbilityInputRequest(
-		Original->Request.InputTag, PreviousIdentity, Original->Request.OriginalDeadline);
+		Original->Request.InputTag, PreviousIdentity, Original->Request.OriginalDeadline, Original->Request.OriginalEvaluationToken);
 	UGGYGOHeroComponent* OriginalHero = WeakHero.Get();
 	if (!OriginalHero || !OriginalHero->IsAbilityActionBindingCurrent(Binding)
 		|| Binding->Observation != Original || Original->bInvalidated || Original->bActionEnded

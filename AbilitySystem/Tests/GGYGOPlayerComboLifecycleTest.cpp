@@ -704,7 +704,7 @@ struct FGGYGOPlayerComboLifecycleFixture
 	{
 		Ability->DamageEffect = EffectClass;
 		Ability->bUseSharedDamageEffectWhenUnset = false;
-		Ability->HitCueTag = CueTag;
+		for (FGGYGOComboStep& Step : Ability->ComboSteps) { Step.HitCueTag = CueTag; }
 	}
 	bool CaptureNativeTaskLedgerForRuntimeTest(TArray<UGameplayTask*>& OutTasks) const
 	{
@@ -3172,8 +3172,11 @@ namespace
 			if (!IsProductionChainCurrent()) { Fail(TEXT("原生产链在真实 FX 帧观察中改变。")); return; }
 			if (Stage == EStage::FXReady)
 			{
-				if (!FXSystem.IsValid()) { Fail(TEXT("原 FX System 在原生启动等待中失效。")); return; }
-				if (!FXSystem->IsReadyToRun()) { return; }
+				for (const FFXUnitObservation& Unit : FXUnits)
+				{
+					if (!Unit.System.IsValid()) { Fail(TEXT("原 FX 单元在原生启动等待中失效。")); return; }
+					if (!Unit.System->IsReadyToRun()) { return; }
+				}
 				if (FXReadyFrame == MAX_uint64)
 				{
 					FXReadyFrame = GFrameCounter; FXReadyWorldSeconds = World->GetTimeSeconds(); return;
@@ -3269,8 +3272,7 @@ namespace
 			FString Error;
 			if (!FGGYGOPlayerComboLifecycleFixture::ReadProductionFirstStep(Ability.Get(), Step)
 				|| !Ability->ValidateComboConfiguration(Error)
-				|| Step.FX.Mode != EGGYGOComboFXMode::MontageWindow || !Step.FX.System
-				|| Step.FX.System->GetPathName() != TEXT("/Game/Characters/Player/Pyrios/FX/Skill/NS_Eff_Pyrois_Attack_Normal_01_01_Trail.NS_Eff_Pyrois_Attack_Normal_01_01_Trail")
+				|| Step.FX.Mode != EGGYGOComboFXMode::MontageWindow
 				|| Step.FX.BeginEventTag != GGYGOGameplayTags::Event_Montage_FXWindowBegin
 				|| Step.FX.EndEventTag != GGYGOGameplayTags::Event_Montage_FXWindowEnd
 				|| Step.FX.Space != EGGYGONiagaraEffectSpace::Attached || !Step.FX.SocketName.IsNone()
@@ -3278,21 +3280,47 @@ namespace
 				|| Step.FX.NormalStopMode != EGGYGONiagaraEffectStopMode::DeactivateDetachKeepWorld
 				|| Step.FX.AbortStopMode != EGGYGONiagaraEffectStopMode::DestroyImmediately)
 			{
-				Fail(TEXT("formal Normal01 seven-color FX configuration is not installed: ") + Error); return false;
+				Fail(TEXT("生产首段完整 FX 配置未安装：") + Error); return false;
 			}
-			FXSystem = Step.FX.System.Get();
-			for (const FAnimNotifyEvent& Event : Step.Montage->Notifies)
+			TArray<FGGYGONiagaraEffectUnit> Units = Step.FX.SystemUnits;
+			if (Units.IsEmpty())
 			{
-				const auto* Notify = Cast<UGGYGOAnimNotifyState_GameplayEventWindow>(Event.NotifyStateClass.Get());
-				if (Notify && Notify->GetBeginEventTag() == Step.FX.BeginEventTag && Notify->GetEndEventTag() == Step.FX.EndEventTag)
+				FGGYGONiagaraEffectUnit Unit;
+				Unit.System = Step.FX.System;
+				Unit.FieldSettings = Step.FX.FieldSettings;
+				Units.Add(MoveTemp(Unit));
+			}
+			TSet<UNiagaraSystem*> Systems;
+			for (const FGGYGONiagaraEffectUnit& Unit : Units)
+			{
+				if (!IsValid(Unit.System) || Unit.System->GetEmitterHandles().IsEmpty() || Systems.Contains(Unit.System))
 				{
-					FXWindowBegin = Event.GetTime(); FXWindowEnd = Event.GetTime() + Event.GetDuration();
+					Fail(TEXT("生产 FX 单元缺少真实 emitter 或重复使用同一 System 身份。")); return false;
 				}
+				Systems.Add(Unit.System);
+				FFXUnitObservation& Observation = FXUnits.AddDefaulted_GetRef();
+				Observation.System = Unit.System.Get();
+				Observation.EmitterCount = Unit.System->GetEmitterHandles().Num();
 			}
-			if (!FMath::IsNearlyEqual(FXWindowBegin, 0.05f) || !FMath::IsNearlyEqual(FXWindowEnd, 0.217f))
+			const int32 MainIndex = Step.Montage->GetSectionIndex(Step.MainSection);
+			const int32 EndIndex = Step.Montage->GetSectionIndex(Step.EndSection);
+			if (MainIndex == INDEX_NONE || EndIndex == INDEX_NONE)
 			{
-				Fail(TEXT("formal FX project-test window differs from the selected .05-.217 seconds")); return false;
+				Fail(TEXT("生产 FX 探针缺少原 Main／End Section。")); return false;
 			}
+			const float MainBegin = Step.Montage->GetAnimCompositeSection(MainIndex).GetTime();
+			const float MainEnd = Step.Montage->GetAnimCompositeSection(EndIndex).GetTime();
+			FGGYGOMontageWindowDeclaration Declaration;
+			if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowDeclaration(
+				Step.Montage, Step.FX.BeginEventTag, Step.FX.EndEventTag, MainBegin, MainEnd, Declaration, Error)
+				|| !Declaration.bQueued || !Declaration.bNoMergeOnConcurrentPlay
+				|| !FMath::IsNearlyEqual(Declaration.BeginSeconds, MainBegin)
+				|| !FMath::IsNearlyEqual(Declaration.EndSeconds, MainEnd))
+			{
+				Fail(TEXT("生产 FX 原作者窗未完整覆盖真实 Main 或缺少 Queued／NoMerge：") + Error); return false;
+			}
+			FXWindowBegin = Declaration.BeginSeconds;
+			FXWindowEnd = Declaration.EndSeconds;
 			FXEventTags.AddTag(Step.FX.BeginEventTag); FXEventTags.AddTag(Step.FX.EndEventTag);
 			FXEventHandle = ASC->AddGameplayEventTagContainerDelegate(FXEventTags,
 				FGameplayEventTagMulticastDelegate::FDelegate::CreateLambda([this](FGameplayTag Tag, const FGameplayEventData* Data)
@@ -3339,57 +3367,119 @@ namespace
 			}
 			return Matches == 1;
 		}
-		bool FXComponentRetired() const
+		bool FXComponentsRetired() const
 		{
-			UNiagaraComponent* Component = FXComponent.Get(true);
-			return !Component || (Component->IsBeingDestroyed() && !Component->IsRegistered());
+			return !FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit) { return !Unit.IsRetired(); });
+		}
+		bool FXSimulationsCaptured() const
+		{
+			return !FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit) { return !Unit.bSimulationCaptured; });
+		}
+		bool FXComponentsAttached() const
+		{
+			return !FXUnits.ContainsByPredicate([this](const FFXUnitObservation& Unit)
+			{
+				if (Unit.NaturalCompletionCount == 1) { return !Unit.IsRetired(); }
+				return !Unit.Component.IsValid() || Unit.Component->GetAttachParent() != Mesh.Get()
+					|| Unit.Component->GetWorld() != World.Get();
+			});
+		}
+		bool FXAllNaturallyCompleted() const
+		{
+			return !FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit)
+			{
+				return Unit.NaturalCompletionCount != 1 || !Unit.IsRetired();
+			});
+		}
+		bool FXNaturalExitsObserved() const
+		{
+			return !FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit)
+			{
+				return Unit.NaturalCompletionCount != 1 && !Unit.bDetached;
+			});
+		}
+		void ObserveFXNaturalCompletion(UGGYGOAbilityTask_PlayNiagaraEffect* Sender, UNiagaraComponent* Component)
+		{
+			if (Sender != FXTask.Get()) { return; }
+			for (FFXUnitObservation& Unit : FXUnits)
+			{
+				if (Component && Unit.Component.Get(true) == Component)
+				{
+					++Unit.NaturalCompletionCount;
+					return;
+				}
+			}
+			bFXUnknownNaturalCompletion = true;
 		}
 		void ObserveFX()
 		{
 			if (bFXVerified || bFailed) { return; }
+			if (bFXUnknownNaturalCompletion || FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit)
+				{ return Unit.NaturalCompletionCount > 1; }))
+			{
+				Fail(TEXT("组合 Task 的原自然完成事实重复或不属于已观察单元。")); return;
+			}
 			const int32 Begins = FXBeginCounts.FindRef(InstanceId), Ends = FXEndCounts.FindRef(InstanceId);
 			if (Begins > 1 || Ends > 1) { Fail(TEXT("original native FX window duplicated Begin/End")); return; }
 			if (!bFXCaptured)
 			{
 				TInlineComponentArray<UNiagaraComponent*> Components(Character.Get());
-				UNiagaraComponent* Found = nullptr;
-				for (UNiagaraComponent* Component : Components)
+				for (FFXUnitObservation& Unit : FXUnits)
 				{
-					if (!IsValid(Component) || Component->GetAsset() != FXSystem.Get()) { continue; }
-					if (Found) { Fail(TEXT("multiple components of the selected NS in the original Pawn")); return; }
-					Found = Component;
-				}
-				if (!Found) { return; }
-				if (Begins != 1 || Ends != 0 || Found->GetAttachParent() != Mesh.Get() || Found->GetWorld() != World.Get())
-				{
-					Fail(TEXT("seven-color component was not observed inside its real original attached FX window")); return;
+					UNiagaraComponent* Found = nullptr;
+					for (UNiagaraComponent* Component : Components)
+					{
+						if (!IsValid(Component) || Component->GetAsset() != Unit.System.Get()) { continue; }
+						if (Found) { Fail(TEXT("原 Pawn 中同一 FX 单元出现重复组件。")); return; }
+						Found = Component;
+					}
+					if (!Found)
+					{
+						const auto* OriginalFXTask = FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get());
+						if (Ends != 0 || (OriginalFXTask && OriginalFXTask->GetState() == EGameplayTaskState::Finished))
+						{
+							Fail(TEXT("原 FX 单元在取得完整组件观测前已结束，不能据此签发动态覆盖：") + GetPathNameSafe(Unit.System.Get()));
+						}
+						return;
+					}
+					if (Begins != 1 || Ends != 0 || Found->GetAttachParent() != Mesh.Get() || Found->GetWorld() != World.Get())
+					{
+						Fail(TEXT("FX 单元未在真实原 Attached 作者窗内被观察到。")); return;
+					}
+					Unit.Component = Found;
 				}
 				auto* Task = FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get());
 				if (!Task || Task->GetStartResult() != EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested)
 				{
 					Fail(TEXT("original component has no accepted original FX Task request")); return;
 				}
-				FXTask.Reset(Task); FXComponent = Found; bFXCaptured = true;
+				FXTask.Reset(Task);
+				FXNaturalCompletionHandle = Task->OnUnitNaturallyCompleted.AddLambda(
+					[this](UGGYGOAbilityTask_PlayNiagaraEffect* Sender, UNiagaraComponent* Component)
+					{ ObserveFXNaturalCompletion(Sender, Component); });
+				bFXCaptured = true;
 			}
-			UNiagaraComponent* Component = FXComponent.Get();
-			if (Component && !bFXParticles)
+			for (FFXUnitObservation& Unit : FXUnits)
 			{
+				UNiagaraComponent* Component = Unit.Component.Get();
+				if (!Component || (Unit.bSimulationCaptured && bFXParticles)) { continue; }
 				const auto NiagaraController = Component->GetSystemInstanceController();
 				if (NiagaraController.IsValid() && NiagaraController->IsValid()
 					&& !NiagaraController->IsPendingSpawn() && !NiagaraController->IsComplete() && NiagaraController->GetAge() > 0.0f)
 				{
-					if (!FXCache.Get()) { FXCache.Reset(NewObject<UNiagaraSimCache>(GetTransientPackage())); }
+					if (!Unit.Cache.Get()) { Unit.Cache.Reset(NewObject<UNiagaraSimCache>(GetTransientPackage())); }
 					FNiagaraSimCacheCreateParameters Parameters;
 					Parameters.bAllowDataInterfaceCaching = false;
 					UNiagaraSimCache* Captured = nullptr;
 					// The exported capture validates the original simulation and current data
 					// through Niagara's native BeginWrite/WriteFrame before accepting a frame.
-					if (!UNiagaraSimCacheFunctionLibrary::CaptureNiagaraSimCacheImmediate(FXCache.Get(), Parameters, Component, Captured, false)
-						|| Captured != FXCache.Get() || Captured->GetSystem() != FXSystem.Get() || Captured->GetNumFrames() != 1
-						|| Captured->GetNumEmitters() != 7)
+					if (!UNiagaraSimCacheFunctionLibrary::CaptureNiagaraSimCacheImmediate(Unit.Cache.Get(), Parameters, Component, Captured, false)
+						|| Captured != Unit.Cache.Get() || Captured->GetSystem() != Unit.System.Get() || Captured->GetNumFrames() != 1
+						|| Captured->GetNumEmitters() != Unit.EmitterCount)
 					{
 						Fail(TEXT("native non-advancing particle capture failed; it cannot stand in for zero particles")); return;
 					}
+					Unit.bSimulationCaptured = true;
 					int32 Particles = 0;
 					for (int32 Emitter = 0; Emitter < Captured->GetNumEmitters(); ++Emitter)
 					{
@@ -3405,9 +3495,10 @@ namespace
 			}
 			if (FXProbe == EComboFXProbe::WindowCancel && !bFXRestarted)
 			{
-				if (!bFXParticles) { return; }
+				if (!bFXParticles || !FXSimulationsCaptured()) { return; }
 				FGGYGOMontageSectionSnapshot Snapshot;
-				if (Ends != 0 || !ReadOriginalPlayback(Snapshot) || Snapshot.PositionSeconds >= FXWindowEnd || !Component)
+				if (Ends != 0 || !ReadOriginalPlayback(Snapshot) || Snapshot.PositionSeconds >= FXWindowEnd
+					|| !FXComponentsAttached() || FXComponentsRetired() || !FXTask.Get() || FXTask->GetState() == EGameplayTaskState::Finished)
 				{
 					Fail(TEXT("particle-bearing FX cancellation missed the real author window")); return;
 				}
@@ -3415,27 +3506,35 @@ namespace
 			}
 			if (FXProbe == EComboFXProbe::WindowCancel && bFXRestarted && Begins == 1 && Ends == 0
 				&& FXCancelledEndFrame != MAX_uint64
-				&& (!Component || !FXTask.Get() || FXTask->GetState() == EGameplayTaskState::Finished
-					|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) != FXTask.Get()
-					|| Component->GetAttachParent() != Mesh.Get()))
+				&& (!FXComponentsAttached() || !FXTask.Get()
+					|| (FXTask->GetState() == EGameplayTaskState::Finished && !FXAllNaturallyCompleted())
+					|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) != FXTask.Get()))
 			{
 				Fail(TEXT("old native FX End retired or detached the exact successor resource before its real authored End")); return;
 			}
-			if (Ends == 1 && Component && !bFXDetached)
+			if (Ends == 1)
 			{
-				const auto NiagaraController = Component->GetSystemInstanceController();
-				if (Component->GetAttachParent() || FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get())
-					|| !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished
-					|| !NiagaraController.IsValid() || !NiagaraController->IsValid()
-					|| NiagaraController->GetRequestedExecutionState() != ENiagaraExecutionState::Inactive)
+				for (FFXUnitObservation& Unit : FXUnits)
 				{
-					Fail(TEXT("real author End did not detach the exact original tail and request native inactive state")); return;
+					if (Unit.NaturalCompletionCount == 1 && Unit.IsRetired()) { continue; }
+					UNiagaraComponent* Component = Unit.Component.Get();
+					if (!Component || Unit.bDetached) { continue; }
+					const auto NiagaraController = Component->GetSystemInstanceController();
+					if (Component->GetAttachParent() || FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get())
+						|| !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished
+						|| !NiagaraController.IsValid() || !NiagaraController->IsValid()
+						|| NiagaraController->GetRequestedExecutionState() != ENiagaraExecutionState::Inactive)
+					{
+						Fail(TEXT("真实作者 End 未将原单元尾部脱离挂点并请求原生 Inactive。")); return;
+					}
+					Unit.bDetached = true;
+					bFXDetached = true;
 				}
-				bFXDetached = true;
 			}
-			if (FXComponentRetired())
+			if (FXComponentsRetired())
 			{
-				if (Begins != 1 || Ends != 1 || !bFXParticles || !bFXDetached || !FXTask.Get()
+				if (Begins != 1 || Ends != 1 || !bFXParticles || !FXSimulationsCaptured() || !bFXDetached
+					|| !FXNaturalExitsObserved() || !FXTask.Get()
 					|| FXTask->GetState() != EGameplayTaskState::Finished)
 				{
 					Fail(TEXT("original tail retired without observed particles, authored End and native detach/inactive facts")); return;
@@ -3452,8 +3551,14 @@ namespace
 						static_cast<unsigned long long>(FXRestartBeginFrame), static_cast<unsigned long long>(FXCancelledEndFrame), FXCancelledInstanceId, InstanceId));
 				}
 				bFXVerified = true;
-				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Begin=1 End=1 TailDetached=1 ActualComponentRetired=1 OldEventsRejected=%d."),
-					static_cast<uint32>(FXProbe), InstanceId, FXRejectedOldEvents));
+				int32 NaturalCompletedUnits = 0, TailDetachedUnits = 0;
+				for (const FFXUnitObservation& Unit : FXUnits)
+				{
+					NaturalCompletedUnits += Unit.NaturalCompletionCount == 1 ? 1 : 0;
+					TailDetachedUnits += Unit.bDetached ? 1 : 0;
+				}
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Begin=1 End=1 TailDetached=1 ActualComponentRetired=1 OldEventsRejected=%d Units=%d NaturalCompletedUnits=%d TailDetachedUnits=%d."),
+					static_cast<uint32>(FXProbe), InstanceId, FXRejectedOldEvents, FXUnits.Num(), NaturalCompletedUnits, TailDetachedUnits));
 			}
 		}
 		void CancelFXOriginal()
@@ -3472,7 +3577,7 @@ namespace
 				|| !Completion.GetOriginal().GetOriginalActivation().HasSameActivation(FXCancelledActivation)
 				|| Ability->IsActive() || !bResourcesRestoredAtEnd || !ResourcesRestored()
 				|| FXInputObservationTick.IsTickFunctionRegistered()
-				|| (bFXCaptured && (!FXComponentRetired() || !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished)))
+				|| (bFXCaptured && (!FXComponentsRetired() || !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished)))
 			{
 				Fail(TEXT("native FX cancellation did not retire the exact original GA/Task/component resources")); return;
 			}
@@ -3483,8 +3588,14 @@ namespace
 			bResourcesRestoredAtEnd = false; bEndSnapshotAvailable = false; bStoppedAtEnd = false;
 			// Repeat the real same-Montage attack after both pre-window and active-window cancellation.
 			// Key submission alone is not a same-frame activation or native notify overlap proof.
-			FXTask.Reset(); FXComponent.Reset(); FXCache.Reset();
-			bFXCaptured = false; bFXParticles = false; bFXDetached = false;
+			if (FXTask.Get()) { FXTask->OnUnitNaturallyCompleted.Remove(FXNaturalCompletionHandle); }
+			FXNaturalCompletionHandle.Reset(); FXTask.Reset();
+			for (FFXUnitObservation& Unit : FXUnits)
+			{
+				Unit.Component.Reset(); Unit.Cache.Reset(); Unit.bSimulationCaptured = false; Unit.bDetached = false;
+				Unit.NaturalCompletionCount = 0;
+			}
+			bFXCaptured = false; bFXParticles = false; bFXDetached = false; bFXUnknownNaturalCompletion = false;
 			bFXRestarted = true; Stage = EStage::Main; Deadline = FPlatformTime::Seconds() + 3.0;
 			if (!InstallFXInputObservation()) { return; }
 			bAttackDown = true; SendNativeKey(AttackKey, true);
@@ -3681,7 +3792,9 @@ namespace
 				}
 				if (FXProbe == EComboFXProbe::EarlyCancelRestart && !bFXRestarted)
 				{
-					if (Snapshot.PositionSeconds >= FXWindowBegin || FXBeginCounts.FindRef(InstanceId) != 0
+					// Main 可以从零开始；同位置尚未发生原生 Begin 与已发生 Begin 是不同事实。
+					if (Snapshot.PositionSeconds > FXWindowBegin || FXBeginCounts.FindRef(InstanceId) != 0
+						|| HasOriginalActiveFXNotify(InstanceId)
 						|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()))
 					{
 						Fail(TEXT("early FX cancellation was not observed before the real author Begin")); return;
@@ -4518,7 +4631,9 @@ namespace
 				if (FXEventHandle.IsValid()) { ASC->RemoveGameplayEventTagContainerDelegate(FXEventTags, FXEventHandle); }
 			}
 			EndHandle.Reset(); CompletedHandle.Reset();
-			FXEventHandle.Reset(); FXEventTags.Reset(); FXTask.Reset(); FXCache.Reset(); FXComponent.Reset();
+			FXEventHandle.Reset(); FXEventTags.Reset();
+			if (FXTask.Get()) { FXTask->OnUnitNaturallyCompleted.Remove(FXNaturalCompletionHandle); }
+			FXNaturalCompletionHandle.Reset(); FXTask.Reset(); FXUnits.Reset();
 			ReplacedTask.Reset(); MontageTask.Reset(); InputTask.Reset(); // Observation roots never survive this finite smoke.
 			if (!FSlateApplication::IsInitialized()) { return; }
 			FSlateApplication& Slate = FSlateApplication::Get();
@@ -4633,10 +4748,24 @@ namespace
 		uint64 FXReadyFrame = MAX_uint64;
 		float FXReadyWorldSeconds = 0.0f;
 		FDelegateHandle WindowDeactivatedHandle;
-		TWeakObjectPtr<UNiagaraSystem> FXSystem;
-		TWeakObjectPtr<UNiagaraComponent> FXComponent;
+		struct FFXUnitObservation
+		{
+			TWeakObjectPtr<UNiagaraSystem> System;
+			TWeakObjectPtr<UNiagaraComponent> Component;
+			TStrongObjectPtr<UNiagaraSimCache> Cache;
+			int32 EmitterCount = 0;
+			int32 NaturalCompletionCount = 0;
+			bool bSimulationCaptured = false;
+			bool bDetached = false;
+			bool IsRetired() const
+			{
+				UNiagaraComponent* Original = Component.Get(true);
+				return !Original || (Original->IsBeingDestroyed() && !Original->IsRegistered());
+			}
+		};
+		TArray<FFXUnitObservation> FXUnits;
 		TStrongObjectPtr<UGGYGOAbilityTask_PlayNiagaraEffect> FXTask;
-		TStrongObjectPtr<UNiagaraSimCache> FXCache;
+		FDelegateHandle FXNaturalCompletionHandle;
 		FGameplayTagContainer FXEventTags;
 		FDelegateHandle FXEventHandle;
 		TMap<int32, int32> FXBeginCounts, FXEndCounts;
@@ -4646,6 +4775,7 @@ namespace
 		uint64 FXRestartBeginFrame = MAX_uint64, FXCancelledEndFrame = MAX_uint64;
 		float FXWindowBegin = 0.0f, FXWindowEnd = 0.0f;
 		bool bFXCaptured = false, bFXParticles = false, bFXDetached = false, bFXVerified = false, bFXRestarted = false;
+		bool bFXUnknownNaturalCompletion = false;
 		bool bFXCancelledWithActiveNotify = false, bFXNativePlaybackOverlap = false;
 		int32 TargetStep = 0, ExpectedStep = 0, ReplacedStep = INDEX_NONE, ReplacedInstanceId = INDEX_NONE, MainAttackRequest = 0;
 		int32 NaturalInputRequestId = 0;
