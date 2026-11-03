@@ -46,7 +46,8 @@ public:
 	double DrawActionWeight(double TotalWeight);
 	void RecordActionSelection(const TArray<FGGYGOBossActionDefinition>& Actions, FGameplayTag SelectedActionTag);
 
-	/** 输入为 BT 已通过目标与 GAS 准入的候选；全耗尽只恢复这些候选，再抽签并记录一次。 */
+	/** 输入为 BT 已通过目标与 GAS 准入的候选；全耗尽只恢复这些候选，再抽签并记录一次。
+	 *  ActionSet 须来自 BossState 已采纳并整表校验的 Definition，这里不复验。 */
 	const FGGYGOBossActionDefinition* SelectAction(const UGGYGOBossActionSet* ActionSet,
 		const TArray<FGameplayTag>& EligibleActionTags);
 

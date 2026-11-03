@@ -78,7 +78,58 @@ public:
 		OnRep_Poise(OldValue);
 	}
 
+	/** 按原生复制写入整份 Base/Current 后调用对应 OnRep。 */
+	void SimulateReplicatedAttribute(const FGameplayAttribute& Attribute, const FGameplayAttributeData& NewValue)
+	{
+		FGameplayAttributeData* Data = Attribute.GetGameplayAttributeDataChecked(this);
+		const FGameplayAttributeData OldValue = *Data;
+		*Data = NewValue;
+		if (Attribute == GetHealthAttribute()) { OnRep_Health(OldValue); }
+		else if (Attribute == GetMaxHealthAttribute()) { OnRep_MaxHealth(OldValue); }
+		else if (Attribute == GetPoiseAttribute()) { OnRep_Poise(OldValue); }
+		else if (Attribute == GetMaxPoiseAttribute()) { OnRep_MaxPoise(OldValue); }
+	}
+
 private:
 	bool bOverrideMessageWorld = false;
 	TWeakObjectPtr<UWorld> MessageWorldOverride;
+};
+
+/**
+ * 复现对照用：Lyra 的 HealthSet 结算方式，仅存在于测试。
+ *
+ * 服务器在 PostGameplayEffectExecute 中按 GE 精确幅度广播；客户端 OnRep 以 Old／New 广播、
+ * Magnitude 取 New-Old；MaxHealth 下降时权威端压低 Health。为保持修复清单决定 #2，
+ * Current 写入同样经 GGYGOAttributeBase 反算，Base 不做可见范围 Clamp。
+ * 不使用父类的 Modifier／RepNotify／NetReceive 分类帧。
+ */
+UCLASS(Transient)
+class UGGYGOHealthReproLyraSet : public UGGYGOHealthSet
+{
+	GENERATED_BODY()
+
+public:
+	void BeginTestNetReceive() { PreNetReceive(); }
+	void EndTestNetReceive() { PostNetReceive(); }
+	/** Lyra 的 OnRep：先走原生复制入口，再按 Old／New 广播。 */
+	void SimulateReplicatedAttribute(const FGameplayAttribute& Attribute, const FGameplayAttributeData& NewValue);
+
+protected:
+	virtual bool PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data) override;
+	virtual void PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data) override;
+	virtual void PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const override;
+	virtual void PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue) override;
+	virtual void PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue) override;
+	virtual void OnAttributeAggregatorCreated(const FGameplayAttribute& Attribute, FAggregator* NewAggregator) const override;
+	virtual void PreNetReceive() override;
+	virtual void PostNetReceive() override;
+
+private:
+	void WriteCurrent(const FGameplayAttribute& Attribute, float DesiredCurrent);
+	void Publish(const FGameplayTag& Verb, const FGameplayEffectSpec& Spec, float Magnitude);
+	float HealthBefore = 0.0f;
+	float MaxHealthBefore = 0.0f;
+	float PoiseBefore = 0.0f;
+	bool bLyraOutOfHealth = false;
+	bool bLyraPoiseBroken = false;
 };

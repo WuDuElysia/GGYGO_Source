@@ -71,6 +71,7 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_Networking, "Ability.ActivateFail.Networking");
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_ActivationGroup, "Ability.ActivateFail.ActivationGroup");
 	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_ActivationGroupQueued, "Ability.ActivateFail.ActivationGroupQueued");
+	UE_DEFINE_GAMEPLAY_TAG(Ability_ActivateFail_SwitchReturnPending, "Ability.ActivateFail.SwitchReturnPending");
 
 	// ===== 五、State =====
 	UE_DEFINE_GAMEPLAY_TAG(State_Idle, "State.Idle");
@@ -89,6 +90,8 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(State_Dead, "State.Dead");
 	UE_DEFINE_GAMEPLAY_TAG(State_PoiseBreak, "State.PoiseBreak");
 	UE_DEFINE_GAMEPLAY_TAG(State_Interacting, "State.Interacting");
+	UE_DEFINE_GAMEPLAY_TAG(State_OffField, "State.OffField");
+	UE_DEFINE_GAMEPLAY_TAG(State_SwitchReturnPending, "State.SwitchReturnPending");
 	UE_DEFINE_GAMEPLAY_TAG(State_Boss, "State.Boss");
 	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Form, "State.Boss.Form");
 	UE_DEFINE_GAMEPLAY_TAG(State_Boss_Form_Default, "State.Boss.Form.Default");
@@ -134,6 +137,8 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_FXWindowEnd, "Event.Montage.FXWindowEnd");
 	UE_DEFINE_GAMEPLAY_TAG(Event_Montage_CancelPoint, "Event.Montage.CancelPoint");
 	UE_DEFINE_GAMEPLAY_TAG(Event_HitConfirm, "Event.HitConfirm");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Squad_SwitchIn, "Event.Squad.SwitchIn");
+	UE_DEFINE_GAMEPLAY_TAG(Event_Squad_SwitchOut, "Event.Squad.SwitchOut");
 
 	// ===== 十、GameplayCue =====
 	UE_DEFINE_GAMEPLAY_TAG(GameplayCue_Hit_Flesh, "GameplayCue.Hit.Flesh");

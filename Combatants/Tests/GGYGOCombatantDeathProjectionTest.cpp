@@ -25,7 +25,7 @@ AGGYGOCombatantDeathProjectionTestPawn::AGGYGOCombatantDeathProjectionTestPawn(
 #if WITH_DEV_AUTOMATION_TESTS
 namespace
 {
-	// Retained cleanup inputs come only from actual production commits and local installation.
+	// 清理输入只来自真实的原生 ActorInfo 写入与 PawnExtension 就绪资源。
 	struct FDeathProjectionBinding
 	{
 		TWeakObjectPtr<AGGYGOCombatantDeathProjectionTestPawn> Owner;
@@ -33,7 +33,6 @@ namespace
 		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
 		TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
 		FGGYGOPawnASCResourceHandle Resource;
-		FGGYGOAvatarBindingContext Context;
 	};
 
 	bool AreOriginalEndpointsCurrent(const FDeathProjectionBinding& Binding)
@@ -92,76 +91,17 @@ namespace
 				return false;
 			}
 			const int32 BindingIndex = Bindings.Add(Binding);
-			FGGYGOAvatarBindingRequest Request;
-			Request.Kind = EGGYGOAvatarBindingKind::Init;
-			Request.OwnerActor = Owner;
-			Request.AvatarActor = Avatar;
-			Request.IsRequestContextCurrent = IsOriginalCallerCurrent;
-			FGGYGOAvatarBindingPublicationReceipt Receipt;
-			const FGGYGOAvatarBindingResult Commit = ASC->TryBootstrapAvatarActorInfoTransaction(Request, Receipt);
-			if (Commit.bCommitted)
-			{
-				Binding.Context = Commit.CommittedContext;
-				Bindings[BindingIndex].Context = Binding.Context;
-			}
-			if (!Test.TestTrue(TEXT("binding real native Bootstrap commit"),
-				Commit.Outcome == EGGYGOAvatarBindingOutcome::Succeeded && Commit.bCommitted
-				&& Binding.Context.HasIssuedContext())) { return false; }
-			const FGGYGOPawnASCLocalResult Installed = Binding.Extension->InstallLocalAbilitySystemResources(
-				ASC, Avatar, Binding.Context);
-			Binding.Resource = Installed.Resource;
+			// 与宿主 BindAvatar 相同的两步：原生 InitAbilityActorInfo，再由 PawnExtension 广播就绪。
+			ASC->InitAbilityActorInfo(Owner, Avatar);
+			const bool bBound = Binding.Extension->HandleAbilitySystemBound(ASC);
+			Binding.Resource = Binding.Extension->GetCurrentLocalAbilitySystemResource();
 			Bindings[BindingIndex].Resource = Binding.Resource;
-			if (!Test.TestTrue(TEXT("binding real original Extension H"),
-				Installed.Outcome == EGGYGOPawnASCLocalOutcome::Succeeded && Binding.Resource.HasResource()
+			if (!Test.TestTrue(TEXT("binding real ActorInfo and ready Extension resource"),
+				bBound && ASC->GetOwnerActor() == Owner && ASC->GetAvatarActor() == Avatar
+				&& Binding.Resource.HasResource()
 				&& Binding.Resource.GetIdentity().ASC.HasSameIndexAndSerialNumber(Binding.ASC)
 				&& Binding.Resource.GetIdentity().Pawn.HasSameIndexAndSerialNumber(TWeakObjectPtr<APawn>(Avatar))
-				&& Binding.Resource.GetIdentity().Binding.HasSameIdentity(Binding.Context.Binding))
-				|| !Test.TestFalse(TEXT("binding installation alone is not Ready"),
-					Binding.Extension->IsLocalAbilitySystemResourceReady(Binding.Resource))) { return false; }
-
-			int32 NoticeCount = 0;
-			bool bReadyAccepted = false;
-			const FDelegateHandle Bridge = ASC->OnAvatarBindingNotice().AddLambda(
-				[this, Binding, Receipt, &NoticeCount, &bReadyAccepted](
-					const FGGYGOAvatarBindingPublicationReceipt& DeliveredReceipt,
-					const FGGYGOAvatarBindingNotice& Notice)
-				{
-					++NoticeCount;
-					if (!Test.TestTrue(TEXT("binding actual original Initialized Dispatching"),
-						AreOriginalEndpointsCurrent(Binding)
-						&& Notice.Kind == EGGYGOAvatarBindingNoticeKind::Initialized
-						&& Notice.After.HasSameContext(Binding.Context)
-						&& Notice.OwnerActor.Get() == Binding.Owner.Get()
-						&& Notice.AvatarActor.Get() == Binding.Avatar.Get()
-						&& Binding.ASC->IsAvatarBindingNoticeDispatching(Receipt)
-						&& Binding.ASC->IsAvatarBindingNoticeDispatching(DeliveredReceipt))) { return; }
-					const FGGYGOPawnASCLocalResult Ready =
-						Binding.Extension->NotifyLocalResourcesReady(Binding.Resource, DeliveredReceipt);
-					bReadyAccepted = Test.TestTrue(TEXT("binding real H Ready from delivered Receipt"),
-						Ready.Outcome == EGGYGOPawnASCLocalOutcome::Succeeded
-						&& Ready.Resource.HasSameResource(Binding.Resource)
-						&& Binding.Extension->IsLocalAbilitySystemResourceReady(Binding.Resource));
-				});
-			ON_SCOPE_EXIT
-			{
-				if (UGGYGOAbilitySystemComponent* OriginalASC = Binding.ASC.Get())
-				{
-					OriginalASC->OnAvatarBindingNotice().Remove(Bridge);
-				}
-			};
-			if (!Test.TestTrue(TEXT("binding original ASC bridge token"), Bridge.IsValid())) { return false; }
-			const auto IsOriginalPublicationCurrent = [Binding]()
-			{
-				return AreOriginalEndpointsCurrent(Binding)
-					&& Binding.Extension->IsLocalAbilitySystemResourceInstalled(Binding.Resource);
-			};
-			const FGGYGOAvatarBindingResult Published =
-				ASC->PublishAvatarBindingNotice(Receipt, IsOriginalPublicationCurrent);
-			if (!Test.TestTrue(TEXT("binding real native Publish completed"),
-				Published.Outcome == EGGYGOAvatarBindingOutcome::Succeeded && Published.bCommitted
-				&& Published.CommittedContext.HasSameContext(Binding.Context))
-				|| !Test.TestEqual(TEXT("binding exactly one original notice"), NoticeCount, 1)
-				|| !Test.TestTrue(TEXT("binding original Ready bridge accepted"), bReadyAccepted)) { return false; }
+				&& Binding.Extension->IsLocalAbilitySystemResourceReady(Binding.Resource))) { return false; }
 			OutBinding = Binding;
 			return true;
 		}
@@ -176,39 +116,12 @@ namespace
 				FString Error;
 				const bool bHealthReleased = Binding.Avatar->GetHealthForTest()->UninitializeFromLocalAbilitySystemResource(
 					Binding.Resource, Error);
-				Test.TestTrue(FString::Printf(TEXT("cleanup original Health H: %s"), *Error), bHealthReleased);
-				const FGGYGOPawnASCLocalResult Withdrawn =
-					Binding.Extension->WithdrawLocalAbilitySystemResources(Binding.Resource);
-				if (!Test.TestTrue(TEXT("cleanup exact original H withdrawal"),
-					Withdrawn.Outcome == EGGYGOPawnASCLocalOutcome::Succeeded
-					&& Withdrawn.Resource.HasSameResource(Binding.Resource))) { return; }
-				const FGGYGOPawnASCLocalResult Released =
-					Binding.Extension->NotifyLocalResourcesReleased(Binding.Resource);
-				if (!Test.TestTrue(TEXT("cleanup exact original H Released"),
-					Released.Outcome == EGGYGOPawnASCLocalOutcome::Succeeded
-					&& Released.Resource.HasSameResource(Binding.Resource))) { return; }
+				Test.TestTrue(FString::Printf(TEXT("cleanup original Health resource: %s"), *Error), bHealthReleased);
+				Binding.Extension->HandleAbilitySystemReleased();
+				Test.TestFalse(TEXT("cleanup releases the original Extension resource"),
+					Binding.Extension->IsLocalAbilitySystemResourceReady(Binding.Resource));
 			}
-			if (!Binding.Context.HasIssuedContext()) { return; }
-			FGGYGOAvatarBindingRequest Clear;
-			Clear.Kind = EGGYGOAvatarBindingKind::Clear;
-			Clear.ExpectedContext = Binding.Context;
-			Clear.ClearMode = EGGYGOAvatarBindingClearMode::PreserveOwner;
-			Clear.IsRequestContextCurrent = [Binding]() { return AreOriginalEndpointsCurrent(Binding); };
-			FGGYGOAvatarBindingPublicationReceipt Receipt;
-			const FGGYGOAvatarBindingResult Cleared = ASC->TryExecuteAvatarActorInfoTransaction(Clear, Receipt);
-			if (!Test.TestTrue(TEXT("cleanup exact original Context native Clear"),
-				Cleared.Outcome == EGGYGOAvatarBindingOutcome::Succeeded && Cleared.bCommitted)) { return; }
-			const auto IsClearPublicationCurrent = [Binding, Context = Cleared.CommittedContext]()
-			{
-				EGGYGOAvatarBindingReason Reason;
-				return AreOriginalEndpointsCurrent(Binding)
-					&& Binding.ASC->GetOwnerActor() == Binding.Owner.Get()
-					&& Binding.ASC->GetAvatarActor() == nullptr
-					&& Binding.ASC->CheckAvatarBindingContext(Context, Reason) == EGGYGOAvatarBindingOutcome::Succeeded;
-			};
-			const FGGYGOAvatarBindingResult Published = ASC->PublishAvatarBindingNotice(Receipt, IsClearPublicationCurrent);
-			Test.TestTrue(TEXT("cleanup actual original Clear publication"),
-				Published.Outcome == EGGYGOAvatarBindingOutcome::Succeeded && Published.bCommitted);
+			ASC->InitAbilityActorInfo(Binding.Owner.Get(), nullptr);
 		}
 
 		~FCombatantDeathTestWorld()
@@ -263,7 +176,7 @@ bool FGGYGOCombatantDeathProjectionStateTest::RunTest(const FString& Parameters)
 	}
 	FString HealthError;
 	const bool bHealthInitialized = Health->InitializeWithLocalAbilitySystemResource(
-		Binding.Extension.Get(), Binding.Resource, Binding.Context, HealthError);
+		Binding.Extension.Get(), Binding.Resource, HealthError);
 	if (!TestTrue(FString::Printf(TEXT("Health initializes with original Ready H: %s"), *HealthError),
 		bHealthInitialized)) { return false; }
 
@@ -324,7 +237,7 @@ bool FGGYGOCombatantDeathProjectionBindingTest::RunTest(const FString& Parameter
 	}
 	FString HealthError;
 	const bool bLateHealthInitialized = LateHealth->InitializeWithLocalAbilitySystemResource(
-		LateBinding.Extension.Get(), LateBinding.Resource, LateBinding.Context, HealthError);
+		LateBinding.Extension.Get(), LateBinding.Resource, HealthError);
 	if (!TestTrue(FString::Printf(TEXT("late Health initializes with original Ready H: %s"), *HealthError),
 		bLateHealthInitialized)) { return false; }
 	TestEqual(TEXT("late binding replays Dying state"), LateASC->GetTagCount(GGYGOGameplayTags::State_Dying), 1);
@@ -354,10 +267,9 @@ bool FGGYGOCombatantDeathProjectionBindingTest::RunTest(const FString& Parameter
 		MismatchedASC->GetOwnerActor() == MismatchedOwner && MismatchedASC->GetAvatarActor() == OtherAvatar)
 		|| !TestTrue(TEXT("identity rejection uses published Ready OtherAvatar H"),
 			OtherBinding.Resource.HasResource()
-			&& OtherBinding.Extension->IsLocalAbilitySystemResourceReady(OtherBinding.Resource)
-			&& MismatchedASC->IsAvatarBindingPublicationContextCurrent(OtherBinding.Context))) { return false; }
+			&& OtherBinding.Extension->IsLocalAbilitySystemResourceReady(OtherBinding.Resource))) { return false; }
 	const bool bMismatchedHealthInitialized = MismatchedHealth->InitializeWithLocalAbilitySystemResource(
-		OtherBinding.Extension.Get(), OtherBinding.Resource, OtherBinding.Context, HealthError);
+		OtherBinding.Extension.Get(), OtherBinding.Resource, HealthError);
 	if (!TestFalse(TEXT("non-owner Health rejects real OtherAvatar H"), bMismatchedHealthInitialized)
 		|| !TestTrue(FString::Printf(TEXT("non-owner Health reports exact identity rejection: %s"), *HealthError),
 			HealthError.Contains(TEXT("Reason='OwnerOrExtensionMismatch'")))) { return false; }

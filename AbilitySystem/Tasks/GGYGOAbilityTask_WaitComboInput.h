@@ -23,7 +23,7 @@ struct GGYGO_API FGGYGOAbilityStepInputTargetData : public FGameplayAbilityTarge
 	bool HasValidFields() const;
 private:
 	FGGYGOAbilityStepInputRequest OwnedRequest;
-	friend class UGGYGOAbilitySystemComponent;
+	friend class FGGYGOAbilityStepInputRouter;
 	friend class UGGYGOAbilityTask_WaitComboInput;
 };
 

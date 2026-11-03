@@ -1,4 +1,4 @@
-/** @file BTTask_GGYGOActivateAbility.h @brief 请求被选动作并精确等待原 Activation 终止完成 */
+/** @file BTTask_GGYGOActivateAbility.h @brief 请求被选动作，并等待该 Spec 这次激活的原生结束 */
 #pragma once
 
 #include "BehaviorTree/BTTaskNode.h"
@@ -8,7 +8,7 @@
 #include "BTTask_GGYGOActivateAbility.generated.h"
 
 class UGGYGOAbilitySystemComponent;
-class FGGYGOAbilityTerminationCompletedNotice;
+struct FAbilityEndedData;
 
 UCLASS(meta = (DisplayName = "GGYGO Activate Boss Ability"))
 class GGYGO_API UBTTask_GGYGOActivateAbility : public UBTTaskNode
@@ -28,13 +28,12 @@ protected:
 
 private:
 	struct FAbilityWait;
-	// Only this execution's subscription and copied provenance; GAS owns lifecycle/completion.
+	// 只保存本次执行的订阅与 Spec；激活与结束由 GAS 拥有。
 	TSharedPtr<FAbilityWait> ActiveWait;
 	// Non-owning last wait detects local replacement after detachment; it is not native BT provenance.
 	TWeakPtr<FAbilityWait> LastWait;
 
 	bool IsWaitCurrent(const TSharedPtr<FAbilityWait>& Wait) const;
-	void HandleTerminationCompleted(const FGGYGOAbilityTerminationCompletedNotice& Notice,
-		const TSharedPtr<FAbilityWait>& Wait);
+	void HandleAbilityEnded(const FAbilityEndedData& Data, const TSharedPtr<FAbilityWait>& Wait);
 	void CleanupBinding(TSharedPtr<FAbilityWait> Wait);
 };

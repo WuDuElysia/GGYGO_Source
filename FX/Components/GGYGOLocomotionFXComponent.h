@@ -8,7 +8,7 @@
 #include "GGYGOLocomotionFXComponent.generated.h"
 
 class UAnimSequence;
-struct FGGYGOPawnASCLocalNotice;
+struct FGGYGOPawnASCNotice;
 
 /** 作者声明的原 Sequence 窗口；所有时间均为原片坐标，不重复应用 RateScale。 */
 USTRUCT(BlueprintType)
@@ -67,7 +67,7 @@ private:
 	bool OwnsConsumer(const TSharedPtr<FConsumer>& Original) const;
 	bool IsOriginalConsumer(const TSharedPtr<FConsumer>& Original) const;
 	bool ValidateCues(FString& OutError) const;
-	void ConsumeNotice(const TSharedPtr<FConsumer>& Original, const FGGYGOPawnASCLocalNotice& Notice);
+	void ConsumeNotice(const TSharedPtr<FConsumer>& Original, const FGGYGOPawnASCNotice& Notice);
 	void ConsumeInterval(const TSharedPtr<FConsumer>& Original,
 		const FGGYGOMotionExecutionSnapshot& Interval, bool bAllowNewSource,
 		const FGGYGOLocomotionSourceProof* RetiredSource = nullptr);

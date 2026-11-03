@@ -1,6 +1,11 @@
 #include "AbilitySystem/Tests/GGYGOHealthMessageTestTypes.h"
 
+#include "AbilitySystem/Attributes/GGYGOAttributeBaseCalculation.h"
 #include "Engine/Engine.h"
+#include "GameplayEffectExtension.h"
+#include "HAL/FileManager.h"
+#include "Misc/FileHelper.h"
+#include "Misc/Paths.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
 #include "GameFramework/GameplayMessageSubsystem.h"
@@ -36,6 +41,177 @@ void UGGYGOHealthMessageRepNotifyTestSet::ClearMessageWorldOverride()
 {
 	bOverrideMessageWorld = false;
 	MessageWorldOverride.Reset();
+}
+
+void UGGYGOHealthReproLyraSet::SimulateReplicatedAttribute(const FGameplayAttribute& Attribute, const FGameplayAttributeData& NewValue)
+{
+	FGameplayAttributeData* Data = Attribute.GetGameplayAttributeDataChecked(this);
+	const FGameplayAttributeData OldValue = *Data;
+	*Data = NewValue;
+	// 与 GAMEPLAYATTRIBUTE_REPNOTIFY 相同的原生入口；子类不能访问父类私有属性成员。
+	GetOwningAbilitySystemComponentChecked()->SetBaseAttributeValueFromReplication(Attribute, *Data, OldValue);
+	const float Old = OldValue.GetCurrentValue();
+	const float Current = Attribute.GetGameplayAttributeDataChecked(this)->GetCurrentValue();
+	if (Attribute == GetHealthAttribute())
+	{
+		OnHealthChanged.Broadcast(nullptr, nullptr, nullptr, Current - Old, Old, Current);
+		if (!bLyraOutOfHealth && Current <= 0.0f) { OnOutOfHealth.Broadcast(nullptr, nullptr, nullptr, Current - Old, Old, Current); }
+		bLyraOutOfHealth = Current <= 0.0f;
+	}
+	else if (Attribute == GetMaxHealthAttribute())
+	{
+		OnMaxHealthChanged.Broadcast(nullptr, nullptr, nullptr, Current - Old, Old, Current);
+	}
+	else if (Attribute == GetPoiseAttribute())
+	{
+		OnPoiseChanged.Broadcast(nullptr, nullptr, nullptr, Current - Old, Old, Current);
+		if (!bLyraPoiseBroken && Current <= 0.0f) { OnPoiseBroken.Broadcast(nullptr, nullptr, nullptr, Current - Old, Old, Current); }
+		bLyraPoiseBroken = Current <= 0.0f;
+	}
+}
+
+bool UGGYGOHealthReproLyraSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& Data)
+{
+	if (!UGGYGOAttributeSet::PreGameplayEffectExecute(Data)) { return false; }
+	const bool bSelfDestruct = Data.EffectSpec.GetDynamicAssetTags().HasTagExact(GGYGOGameplayTags::Gameplay_Damage_SelfDestruct);
+	if ((Data.EvaluatedData.Attribute == GetDamageAttribute() || Data.EvaluatedData.Attribute == GetPoiseDamageAttribute())
+		&& Data.EvaluatedData.Magnitude > 0.0f && !bSelfDestruct
+		&& Data.Target.HasMatchingGameplayTag(GGYGOGameplayTags::Gameplay_Damage_Immunity))
+	{
+		Data.EvaluatedData.Magnitude = 0.0f;
+		return false;
+	}
+	HealthBefore = GetHealth();
+	MaxHealthBefore = GetMaxHealth();
+	PoiseBefore = GetPoise();
+	return true;
+}
+
+void UGGYGOHealthReproLyraSet::PostGameplayEffectExecute(const FGameplayEffectModCallbackData& Data)
+{
+	UGGYGOAttributeSet::PostGameplayEffectExecute(Data);
+	const FGameplayEffectContextHandle& Context = Data.EffectSpec.GetEffectContext();
+	AActor* Instigator = Context.GetOriginalInstigator();
+	AActor* Causer = Context.GetEffectCauser();
+	const float Magnitude = Data.EvaluatedData.Magnitude;
+	if (Data.EvaluatedData.Attribute == GetDamageAttribute())
+	{
+		if (Magnitude > 0.0f) { Publish(GGYGOGameplayTags::Message_Damage, Data.EffectSpec, Magnitude); }
+		const float Desired = FMath::Clamp(GetHealth() - GetDamage(), 0.0f, GetMaxHealth());
+		SetDamage(0.0f);
+		WriteCurrent(GetHealthAttribute(), Desired);
+	}
+	else if (Data.EvaluatedData.Attribute == GetHealingAttribute())
+	{
+		const float Desired = FMath::Clamp(GetHealth() + GetHealing(), 0.0f, GetMaxHealth());
+		SetHealing(0.0f);
+		WriteCurrent(GetHealthAttribute(), Desired);
+	}
+	else if (Data.EvaluatedData.Attribute == GetPoiseDamageAttribute())
+	{
+		const float Desired = FMath::Clamp(GetPoise() - GetPoiseDamage(), 0.0f, GetMaxPoise());
+		SetPoiseDamage(0.0f);
+		WriteCurrent(GetPoiseAttribute(), Desired);
+	}
+	if (GetHealth() != HealthBefore)
+	{
+		OnHealthChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Magnitude, HealthBefore, GetHealth());
+	}
+	if (GetHealth() <= 0.0f && !bLyraOutOfHealth)
+	{
+		OnOutOfHealth.Broadcast(Instigator, Causer, &Data.EffectSpec, Magnitude, HealthBefore, GetHealth());
+	}
+	bLyraOutOfHealth = GetHealth() <= 0.0f;
+	if (GetMaxHealth() != MaxHealthBefore)
+	{
+		OnMaxHealthChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Magnitude, MaxHealthBefore, GetMaxHealth());
+	}
+	if (GetPoise() != PoiseBefore)
+	{
+		OnPoiseChanged.Broadcast(Instigator, Causer, &Data.EffectSpec, Magnitude, PoiseBefore, GetPoise());
+	}
+	if (GetPoise() <= 0.0f && !bLyraPoiseBroken)
+	{
+		OnPoiseBroken.Broadcast(Instigator, Causer, &Data.EffectSpec, Magnitude, PoiseBefore, GetPoise());
+		Publish(GGYGOGameplayTags::Message_PoiseBreak, Data.EffectSpec, Magnitude);
+	}
+	bLyraPoiseBroken = GetPoise() <= 0.0f;
+}
+
+void UGGYGOHealthReproLyraSet::PreAttributeBaseChange(const FGameplayAttribute& Attribute, float& NewValue) const
+{
+	UGGYGOAttributeSet::PreAttributeBaseChange(Attribute, NewValue);
+	if (Attribute != GetHealthAttribute() && Attribute != GetPoiseAttribute()) { ClampAttribute(Attribute, NewValue); }
+}
+
+void UGGYGOHealthReproLyraSet::PreAttributeChange(const FGameplayAttribute& Attribute, float& NewValue)
+{
+	UGGYGOAttributeSet::PreAttributeChange(Attribute, NewValue);
+	ClampAttribute(Attribute, NewValue);
+}
+
+void UGGYGOHealthReproLyraSet::PostAttributeChange(const FGameplayAttribute& Attribute, float OldValue, float NewValue)
+{
+	UGGYGOAttributeSet::PostAttributeChange(Attribute, OldValue, NewValue);
+	const UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent();
+	const bool bAuthority = ASC && ASC->IsOwnerActorAuthoritative();
+	// Lyra 以 Override Mod 压低 Health，经其 PostGameplayEffectExecute 广播一次；这里无 GE 来源。
+	if (bAuthority && Attribute == GetMaxHealthAttribute() && GetHealth() > NewValue)
+	{
+		const float Before = GetHealth();
+		WriteCurrent(GetHealthAttribute(), NewValue);
+		OnHealthChanged.Broadcast(nullptr, nullptr, nullptr, GetHealth() - Before, Before, GetHealth());
+	}
+	if (bAuthority && Attribute == GetMaxPoiseAttribute() && GetPoise() > NewValue)
+	{
+		const float Before = GetPoise();
+		WriteCurrent(GetPoiseAttribute(), NewValue);
+		OnPoiseChanged.Broadcast(nullptr, nullptr, nullptr, GetPoise() - Before, Before, GetPoise());
+	}
+	if (bLyraOutOfHealth && GetHealth() > 0.0f) { bLyraOutOfHealth = false; }
+	if (bLyraPoiseBroken && GetPoise() > 0.0f) { bLyraPoiseBroken = false; }
+}
+
+void UGGYGOHealthReproLyraSet::OnAttributeAggregatorCreated(const FGameplayAttribute& Attribute, FAggregator* NewAggregator) const
+{
+	UGGYGOAttributeSet::OnAttributeAggregatorCreated(Attribute, NewAggregator);
+}
+
+void UGGYGOHealthReproLyraSet::PreNetReceive()
+{
+	UGGYGOAttributeSet::PreNetReceive();
+}
+
+void UGGYGOHealthReproLyraSet::PostNetReceive()
+{
+	UGGYGOAttributeSet::PostNetReceive();
+}
+
+void UGGYGOHealthReproLyraSet::WriteCurrent(const FGameplayAttribute& Attribute, float DesiredCurrent)
+{
+	UAbilitySystemComponent* ASC = GetOwningAbilitySystemComponent();
+	const FGGYGOAttributeBaseCalculationResult Calculation = GGYGOAttributeBase::CalculateBaseForCurrent(
+		ASC, this, Attribute, ASC ? ASC->GetNumericAttribute(Attribute) : 0.0f, DesiredCurrent);
+	if (Calculation.Outcome == EGGYGOAttributeBaseCalculationOutcome::Ready)
+	{
+		ASC->SetNumericAttributeBase(Attribute, Calculation.CalculatedBase);
+	}
+}
+
+void UGGYGOHealthReproLyraSet::Publish(const FGameplayTag& Verb, const FGameplayEffectSpec& Spec, float Magnitude)
+{
+	UWorld* World = GetWorld();
+	UGameInstance* GameInstance = World ? World->GetGameInstance() : nullptr;
+	UGameplayMessageSubsystem* Router = GameInstance ? UGameInstance::GetSubsystem<UGameplayMessageSubsystem>(GameInstance) : nullptr;
+	if (!Router) { return; }
+	FGGYGOVerbMessage Message;
+	Message.Verb = Verb;
+	Message.Instigator = Spec.GetEffectContext().GetEffectCauser();
+	Message.Target = GetOwningActor();
+	if (const FGameplayTagContainer* Tags = Spec.CapturedSourceTags.GetAggregatedTags()) { Message.InstigatorTags = *Tags; }
+	if (const FGameplayTagContainer* Tags = Spec.CapturedTargetTags.GetAggregatedTags()) { Message.TargetTags = *Tags; }
+	Message.Magnitude = Magnitude;
+	Router->BroadcastMessage(Verb, Message);
 }
 
 #if WITH_DEV_AUTOMATION_TESTS
@@ -1829,8 +2005,8 @@ bool FGGYGOHealthMessageCurrentValueSettlementTest::RunTest(const FString& Param
 	const FActiveGameplayEffectHandle Override = ApplyPersistentNumericModifiers(Fixture, Rejected,
 		{{ UGGYGOHealthSet::GetHealthAttribute(), EGameplayModOp::Override, 50.0f }});
 	TestTrue(TEXT("Noninvertible effect remains real and active"), Override.IsValid());
-	const FGGYGOAttributeBaseCalculationResult RejectCalculation = Rejected.ASC->TryCalculateNumericAttributeBaseForCurrentValue(
-		Rejected.HealthSet, UGGYGOHealthSet::GetHealthAttribute(), 50.0f, 40.0f);
+	const FGGYGOAttributeBaseCalculationResult RejectCalculation = GGYGOAttributeBase::CalculateBaseForCurrent(
+		Rejected.ASC, Rejected.HealthSet, UGGYGOHealthSet::GetHealthAttribute(), 50.0f, 40.0f);
 	TestTrue(TEXT("Override has an explicit rejection"), RejectCalculation.Outcome == EGGYGOAttributeBaseCalculationOutcome::Rejected
 		&& RejectCalculation.Reason == EGGYGOAttributeBaseCalculationReason::NonInvertibleChannel);
 	AddExpectedErrorPlain(TEXT("[Messages][HealthSet] MetaRejected"), EAutomationExpectedErrorFlags::Contains, 1);
@@ -1942,6 +2118,197 @@ bool FGGYGOHealthMessageClientMaxNetReceiveTest::RunTest(const FString& Paramete
 	TestEqual(TEXT("A later empty receive cannot replay Health request"), HealthChanges, 1);
 	TestEqual(TEXT("A later empty receive cannot replay Poise request"), PoiseChanges, 3);
 	Target.Actor->SetTestNetRole(ROLE_Authority);
+	return true;
+}
+
+namespace GGYGOHealthRepro
+{
+	using FStep = TFunction<void(FGGYGOHealthMessageTestFixture&, UGGYGOAbilitySystemComponent*, AActor* /*Source*/)>;
+
+	struct FScenario
+	{
+		const TCHAR* Name;
+		FStep Setup; // 服务器与客户端在复制前共有的状态，权威端施加，不记录。
+		FStep Act;   // 只在服务器执行，记录服务器回调，再把结果属性复制给客户端。
+	};
+
+	void ApplyInstant(FGGYGOHealthMessageTestFixture& Fixture, UGGYGOAbilitySystemComponent* ASC, AActor* Source,
+		const FGameplayAttribute& Attribute, float Magnitude)
+	{
+		UGameplayEffect* Effect = Fixture.CreateEffect({{ Attribute, EGameplayModOp::Additive, Magnitude }});
+		FGameplayEffectContextHandle Context = ASC->MakeEffectContext();
+		Context.AddInstigator(Source, Source);
+		ASC->ApplyGameplayEffectSpecToSelf(FGameplayEffectSpec(Effect, Context, 1.0f));
+	}
+
+	void ApplyPersistent(FGGYGOHealthMessageTestFixture& Fixture, UGGYGOAbilitySystemComponent* ASC, AActor* Source,
+		const FGameplayAttribute& Attribute, float Magnitude)
+	{
+		UGameplayEffect* Effect = Fixture.CreateEffect({{ Attribute, EGameplayModOp::Additive, Magnitude }},
+			EGameplayEffectDurationType::Infinite);
+		FGameplayEffectContextHandle Context = ASC->MakeEffectContext();
+		Context.AddInstigator(Source, Source);
+		ASC->ApplyGameplayEffectSpecToSelf(FGameplayEffectSpec(Effect, Context, 1.0f));
+	}
+
+	TArray<FScenario> MakeScenarios()
+	{
+		using Set = UGGYGOHealthSet;
+		const FStep None = [](FGGYGOHealthMessageTestFixture&, UGGYGOAbilitySystemComponent*, AActor*) {};
+		TArray<FScenario> Result;
+		Result.Add({ TEXT("Damage"), None, [](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetDamageAttribute(), 10.0f); } });
+		Result.Add({ TEXT("Heal"), [](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetDamageAttribute(), 30.0f); },
+			[](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetHealingAttribute(), 20.0f); } });
+		Result.Add({ TEXT("PoiseBreak"), None, [](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetPoiseDamageAttribute(), 120.0f); } });
+		Result.Add({ TEXT("Lethal"), None, [](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetDamageAttribute(), 150.0f); } });
+		Result.Add({ TEXT("MaxHealthDrop"), None, [](auto& F, auto* ASC, AActor* S) { ApplyPersistent(F, ASC, S, Set::GetMaxHealthAttribute(), -40.0f); } });
+		Result.Add({ TEXT("PersistentCurrent"), [](auto& F, auto* ASC, AActor* S) { ApplyPersistent(F, ASC, S, Set::GetHealthAttribute(), -20.0f); },
+			[](auto& F, auto* ASC, AActor* S) { ApplyInstant(F, ASC, S, Set::GetDamageAttribute(), 10.0f); } });
+		return Result;
+	}
+
+	/** 一侧 HealthSet 的消费方可见结果：事件种类、Old、New、Magnitude、来源是否存在、次数（行数）。 */
+	void Record(FGGYGOHealthMessageTestFixture& Fixture, UGGYGOHealthSet* Set, const TCHAR* Side, TArray<FString>& Lines)
+	{
+		const auto Bind = [&Fixture, &Lines, Side](FGGYGOAttributeEvent& Event, const TCHAR* Kind)
+		{
+			Fixture.TrackAttributeDelegate(Event, Event.AddLambda(
+				[&Lines, Side, Kind](AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float Old, float New)
+				{
+					Lines.Add(FString::Printf(TEXT("%s %s Old=%g New=%g Mag=%g Instigator=%d Causer=%d Spec=%d"),
+						Side, Kind, Old, New, Magnitude, Instigator != nullptr, Causer != nullptr, Spec != nullptr));
+				}));
+		};
+		Bind(Set->OnHealthChanged, TEXT("HealthChanged"));
+		Bind(Set->OnMaxHealthChanged, TEXT("MaxHealthChanged"));
+		Bind(Set->OnOutOfHealth, TEXT("OutOfHealth"));
+		Bind(Set->OnPoiseChanged, TEXT("PoiseChanged"));
+		Bind(Set->OnPoiseBroken, TEXT("PoiseBroken"));
+	}
+
+	template <typename SetType>
+	bool Run(FAutomationTestBase& Test, const FScenario& Scenario, TArray<FString>& OutLines)
+	{
+		FGGYGOHealthMessageTestFixture Fixture;
+		if (!Test.TestTrue(TEXT("Repro fixture initializes"), Fixture.Initialize())) { return false; }
+		const auto Create = [&Fixture]()
+		{
+			FGGYGOHealthMessageCombatant Combatant;
+			Combatant.Actor = Fixture.World->SpawnActor<AGGYGOHealthMessageTestActor>();
+			Fixture.Actors.Add(Combatant.Actor);
+			Combatant.ASC = Combatant.Actor->GetProjectAbilitySystemComponent();
+			Combatant.ASC->InitAbilityActorInfo(Combatant.Actor, Combatant.Actor);
+			SetType* Set = NewObject<SetType>(Combatant.Actor);
+			Combatant.ASC->AddAttributeSetSubobject(Set);
+			return TPair<FGGYGOHealthMessageCombatant, SetType*>(Combatant, Set);
+		};
+		const auto [Server, ServerSet] = Create();
+		const auto [Client, ClientSet] = Create();
+		AActor* Source = Fixture.CreateCauser();
+		if (!Test.TestTrue(TEXT("Repro combatants exist"), Server.ASC && Client.ASC && ServerSet && ClientSet && Source)) { return false; }
+		Scenario.Setup(Fixture, Server.ASC, Source);
+		Scenario.Setup(Fixture, Client.ASC, Source);
+		Client.Actor->SetTestNetRole(ROLE_SimulatedProxy);
+		Record(Fixture, ServerSet, TEXT("Server"), OutLines);
+		Record(Fixture, ClientSet, TEXT("Client"), OutLines);
+		const TArray<FGameplayTag> Verbs = { GGYGOGameplayTags::Message_Damage, GGYGOGameplayTags::Message_PoiseBreak };
+		for (const FGameplayTag& Verb : Verbs)
+		{
+			Fixture.Listen(Verb, [&OutLines](FGameplayTag Channel, const FGGYGOVerbMessage& Message)
+			{
+				OutLines.Add(FString::Printf(TEXT("Server Message %s Mag=%g Instigator=%d"),
+					*Channel.ToString(), Message.Magnitude, Message.Instigator != nullptr));
+			});
+		}
+		Scenario.Act(Fixture, Server.ASC, Source);
+		// 与原生接收同序：一次 NetReceive 内按属性声明顺序复制有变化的值。
+		ClientSet->BeginTestNetReceive();
+		const TArray<FGameplayAttribute> Replicated = { UGGYGOHealthSet::GetHealthAttribute(), UGGYGOHealthSet::GetMaxHealthAttribute(),
+			UGGYGOHealthSet::GetPoiseAttribute(), UGGYGOHealthSet::GetMaxPoiseAttribute() };
+		for (const FGameplayAttribute& Attribute : Replicated)
+		{
+			const FGameplayAttributeData ServerData = *Attribute.GetGameplayAttributeDataChecked(ServerSet);
+			const FGameplayAttributeData& ClientData = *Attribute.GetGameplayAttributeDataChecked(ClientSet);
+			if (ServerData.GetBaseValue() != ClientData.GetBaseValue() || ServerData.GetCurrentValue() != ClientData.GetCurrentValue())
+			{
+				ClientSet->SimulateReplicatedAttribute(Attribute, ServerData);
+			}
+		}
+		ClientSet->EndTestNetReceive();
+		OutLines.Add(FString::Printf(TEXT("Final Server Health=%g MaxHealth=%g Poise=%g; Client Health=%g MaxHealth=%g Poise=%g"),
+			ServerSet->GetHealth(), ServerSet->GetMaxHealth(), ServerSet->GetPoise(),
+			ClientSet->GetHealth(), ClientSet->GetMaxHealth(), ClientSet->GetPoise()));
+		Client.Actor->SetTestNetRole(ROLE_Authority);
+		return true;
+	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOHealthReproCurrentVersusLyraTest,
+	"GGYGO.AbilitySystem.HealthRepro.CurrentVersusLyra",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOHealthReproCurrentVersusLyraTest::RunTest(const FString& Parameters)
+{
+	// 同场景下现行实现与 Lyra 做法的消费方可见结果。断言现行实现的结果；Lyra 结果只写日志，
+	// 作为保留分类帧的依据（唯一差异见 HealthSet.h 文件头）。
+	const FString Directory = FPaths::ProjectSavedDir() / TEXT("Kiro/abilitysystem-healthset-repnotify");
+	IFileManager::Get().MakeDirectory(*Directory, true);
+	const TMap<FString, TArray<FString>> Expected = {
+		{ TEXT("Damage"), {
+			TEXT("Server Message Message.Damage Mag=10 Instigator=1"),
+			TEXT("Server HealthChanged Old=100 New=90 Mag=10 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Client HealthChanged Old=100 New=90 Mag=-10 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=90 MaxHealth=100 Poise=100; Client Health=90 MaxHealth=100 Poise=100") } },
+		{ TEXT("Heal"), {
+			TEXT("Server HealthChanged Old=70 New=90 Mag=20 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Client HealthChanged Old=70 New=90 Mag=20 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=90 MaxHealth=100 Poise=100; Client Health=90 MaxHealth=100 Poise=100") } },
+		{ TEXT("PoiseBreak"), {
+			TEXT("Server PoiseChanged Old=100 New=0 Mag=120 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Server PoiseBroken Old=100 New=0 Mag=120 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Server Message Message.PoiseBreak Mag=120 Instigator=1"),
+			TEXT("Client PoiseChanged Old=100 New=0 Mag=-100 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Client PoiseBroken Old=100 New=0 Mag=-100 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=100 MaxHealth=100 Poise=0; Client Health=100 MaxHealth=100 Poise=0") } },
+		{ TEXT("Lethal"), {
+			TEXT("Server Message Message.Damage Mag=150 Instigator=1"),
+			TEXT("Server HealthChanged Old=100 New=0 Mag=150 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Server OutOfHealth Old=100 New=0 Mag=150 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Client HealthChanged Old=100 New=0 Mag=-100 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Client OutOfHealth Old=100 New=0 Mag=-100 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=0 MaxHealth=100 Poise=100; Client Health=0 MaxHealth=100 Poise=100") } },
+		{ TEXT("MaxHealthDrop"), {
+			TEXT("Server HealthChanged Old=100 New=60 Mag=-40 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Server MaxHealthChanged Old=100 New=60 Mag=-40 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Client HealthChanged Old=100 New=60 Mag=-40 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Client MaxHealthChanged Old=100 New=60 Mag=-40 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=60 MaxHealth=60 Poise=100; Client Health=60 MaxHealth=60 Poise=100") } },
+		{ TEXT("PersistentCurrent"), {
+			TEXT("Server Message Message.Damage Mag=10 Instigator=1"),
+			TEXT("Server HealthChanged Old=80 New=70 Mag=10 Instigator=1 Causer=1 Spec=1"),
+			TEXT("Client HealthChanged Old=80 New=70 Mag=-10 Instigator=0 Causer=0 Spec=0"),
+			TEXT("Final Server Health=70 MaxHealth=100 Poise=100; Client Health=70 MaxHealth=100 Poise=100") } } };
+	TArray<FString> Summary;
+	for (const GGYGOHealthRepro::FScenario& Scenario : GGYGOHealthRepro::MakeScenarios())
+	{
+		TArray<FString> Current;
+		TArray<FString> Lyra;
+		if (!GGYGOHealthRepro::Run<UGGYGOHealthMessageRepNotifyTestSet>(*this, Scenario, Current)
+			|| !GGYGOHealthRepro::Run<UGGYGOHealthReproLyraSet>(*this, Scenario, Lyra)) { return false; }
+		const TArray<FString>* ExpectedLines = Expected.Find(Scenario.Name);
+		TestTrue(FString::Printf(TEXT("%s: current implementation keeps its observable results"), Scenario.Name),
+			ExpectedLines && *ExpectedLines == Current);
+		const bool bEqual = Current == Lyra;
+		Summary.Add(FString::Printf(TEXT("%s %s"), Scenario.Name, bEqual ? TEXT("Equal") : TEXT("Differs")));
+		FString Log = FString::Printf(TEXT("== %s\n-- Current\n%s\n-- Lyra\n%s\n"), Scenario.Name,
+			*FString::Join(Current, TEXT("\n")), *FString::Join(Lyra, TEXT("\n")));
+		FFileHelper::SaveStringToFile(Log, *(Directory / FString::Printf(TEXT("repro_%s.log"), Scenario.Name)),
+			FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+		AddInfo(Log);
+	}
+	FFileHelper::SaveStringToFile(FString::Join(Summary, TEXT("\n")) + TEXT("\n"), *(Directory / TEXT("repro_summary.log")),
+		FFileHelper::EEncodingOptions::ForceUTF8WithoutBOM);
+	AddInfo(FString::Join(Summary, TEXT("; ")));
 	return true;
 }
 

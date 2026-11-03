@@ -1,5 +1,5 @@
 // Copyright Epic Games, Inc. All Rights Reserved.
-
+/** @file GGYGOMontageGuardAnimInstance.h @brief 识别本次原生 Montage 播放所创建实例的返栈屏障，以及动作姿态契约提供者。 */
 #pragma once
 
 #include "CoreMinimal.h"
@@ -10,9 +10,9 @@
 #include "GGYGOMontageGuardAnimInstance.generated.h"
 
 /**
- * Native montage return barrier. Owns only a game-thread chain of borrowed caller scopes.
- * Engine montage instances and GAS playback state remain owned by their existing executors.
- * The project AnimInstance inheritance and ASC callers are intentionally not connected in A2.
+ * 原生 Montage 播放的返栈屏障：只持有 GameThread 上借用的调用方作用域链，用来识别本次调用创建的实例。
+ * 引擎 Montage 实例与 GAS 播放状态仍归各自原执行者所有。
+ * 项目 AnimInstance 基类 UGGYGOAnimInstanceBase 继承本类；ASC 播放入口和 Montage Task 通过它取得本次实例身份及动作姿态契约。
  */
 UCLASS(Abstract, BlueprintType, Blueprintable)
 class GGYGO_API UGGYGOMontageGuardAnimInstance : public UAnimInstance

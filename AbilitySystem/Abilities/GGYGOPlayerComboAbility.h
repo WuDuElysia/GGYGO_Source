@@ -53,7 +53,6 @@ struct GGYGO_API FGGYGOPlayerComboObservationFacts
 	bool bMotionCompleted = false;
 	bool bCleanupObserved = false;
 	bool bCleanupCancelled = false;
-	EGGYGOAbilityTerminationRequestKind CleanupKind = EGGYGOAbilityTerminationRequestKind::None;
 	FString DrainDiagnostic;
 };
 
@@ -77,6 +76,9 @@ class GGYGO_API UGGYGOPlayerComboAbility : public UGGYGOGameplayAbility
 	struct FAuthorPointGate;
 	struct FStepMotionResources;
 	struct FStepEntryAttempt;
+	struct FPreparedComboStep;
+	struct FPreparedComboConfiguration;
+	struct FStepStartInputs;
 public:
 	UGGYGOPlayerComboAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 	/** ASC 只向匹配本次激活预测键的实例转发服务器纠正。 */
@@ -123,7 +125,13 @@ protected:
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
+	/** 移除时若原生 End 未能执行清理（如 ScopeLock 期间），按 Abort 归还本段仍持有的 FX lease。 */
+	virtual void OnRemoveAbility(const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilitySpec& Spec) override;
+	/** 运行期改动作者配置（段、伤害 GE 或所引用 Montage）的子类须在改动后调用：丢弃本授予期的预备配置，
+	 *  下次准入重新解析。进行中的激活继续使用 Body 取得的快照。 */
+	void InvalidatePreparedConfiguration() { PreparedConfiguration.Reset(); }
 	bool IsStepPlayable(int32 Index) const;
+	/** 起一段：ReadStepStartInputs → ReleaseCurrentStep → BeginStep；静态段数据只读本次激活的预备配置。 */
 	bool StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position = 0.0f, int32 SourceRequestId = 0,
 		bool bCorrectionReplay = false, const FQuat* ReplayEntryActorRotation = nullptr,
 		TSharedPtr<FStepEntryAttempt> EntryAttempt = {});
@@ -193,9 +201,26 @@ protected:
 
 private:
 	friend struct FGGYGOPlayerComboLifecycleFixture;
-	/** 验证本次选择的GE依赖，可输出同一次解析的成功结果；成功时空结果仅用于显式无GE模式。
-	 *  不加载、重试、缓存或记录激活状态；失败清空输出。 */
+	/** 验证当前选择的GE依赖，可输出同一次解析的成功结果；成功时空结果仅用于显式无GE模式。
+	 *  不加载、重试或记录激活状态；失败清空输出。 */
 	bool ValidateDamageEffectDependency(FString& OutError, TSubclassOf<UGameplayEffect>* OutResolvedEffect = nullptr) const;
+	/** 按当前作者配置解析全部段的静态声明，不含伤害 GE；不读写缓存。
+	 *  ValidateComboConfiguration 与 FindOrPrepareConfiguration 共用；失败返回空并写诊断。 */
+	TSharedPtr<FPreparedComboConfiguration> PrepareComboSteps(FString& OutError) const;
+	/** 返回本授予期的预备配置（段声明＋伤害 GE／模式）；实例首次准入时解析，只缓存成功结果，
+	 *  CDO 查询每次解析不缓存。失败返回空并写诊断，bOutDamageFailure 区分 GE 依赖失败与段配置失败。 */
+	TSharedPtr<const FPreparedComboConfiguration> FindOrPrepareConfiguration(FString& OutError,
+		bool* bOutDamageFailure = nullptr) const;
+	/** 起段第一步：核对入场尝试及只在运行期变化的输入（预备段、纠正 basis、Mesh/Trace/CMC）。
+	 *  失败时已按原分支请求结束或取消。 */
+	bool ReadStepStartInputs(const FGGYGOAbilityActivationHandle& Original, int32 Index, int32 SourceRequestId,
+		bool bCorrectionReplay, const FQuat* ReplayEntryActorRotation,
+		const TSharedPtr<FStepEntryAttempt>& EntryAttempt, FStepStartInputs& OutInputs);
+	/** 起段第二步：释放旧段 Trace、FX 与位移；外调改变原激活或段时返回 false。 */
+	bool ReleaseCurrentStep(const FGGYGOAbilityActivationHandle& Original);
+	/** 起段第三步：签发段令牌，创建并配置原 Task，Ready 后初始化位移并挂 Watchdog。 */
+	bool BeginStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position, int32 SourceRequestId,
+		bool bCorrectionReplay, const TSharedPtr<FStepEntryAttempt>& EntryAttempt, const FStepStartInputs& Inputs);
 	/** 只消费公共 Task 已认证的本段窗口；粒子完成不授予段或能力完成权限。 */
 	void HandleStepFXWindow(const TSharedPtr<FStepMotionResources>& Resource,
 		const FGGYGOMontageWindowFact& Fact);
@@ -224,6 +249,11 @@ private:
 	FGGYGOAbilityActivationHandle ResourceActivation;
 	/** ASC 签发的原 Initial 运输路由；Initialize 早取，原终止清理一次归还。 */
 	FGGYGOAbilityInitialInputRoute InitialInputRoute;
+	/** 授予期预备配置，只由 FindOrPrepareConfiguration 写入。来源为作者配置，实例随授予创建、随移除销毁；
+	 *  InvalidatePreparedConfiguration 或必需 GE 类卸载／被新版本替换时失效。不保存运行状态。 */
+	mutable TSharedPtr<const FPreparedComboConfiguration> PreparedConfiguration;
+	/** 本次激活 Body 取得的预备配置快照；终止清理释放。缓存失效不影响进行中的激活。 */
+	TSharedPtr<const FPreparedComboConfiguration> PreparedActivation;
 	/** 本段原 CMC 资源、来源及 FX 请求/退出事实；不复制引擎运行状态或时钟。 */
 	TSharedPtr<FStepMotionResources> StepMotionResources;
 	/** 原请求各自拥有完成订阅；门资格只取 press 一次，段退役即撤销，不作为接续缓冲。 */

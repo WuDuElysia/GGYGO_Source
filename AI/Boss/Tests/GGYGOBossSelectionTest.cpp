@@ -6,10 +6,14 @@
 #if WITH_DEV_AUTOMATION_TESTS
 
 #include "AI/Boss/GGYGOBossActionSet.h"
+#include "AI/Boss/GGYGOBossDefinition.h"
+#include "AI/Boss/GGYGOBossState.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "Character/Data/GGYGOPawnData.h"
 #include "Engine/Engine.h"
 #include "Engine/World.h"
 #include "Misc/AutomationTest.h"
+#include "NativeGameplayTags.h"
 #include "UObject/StrongObjectPtr.h"
 #include "UObject/Package.h"
 
@@ -217,15 +221,7 @@ bool FGGYGOBossSelectionWeightsTest::RunTest(const FString& Parameters)
 	TestNull(TEXT("全零基础权重不产生选择"), Controller->SelectAction(ZeroSet.Get(),
 		{ GGYGOGameplayTags::BossAction_Attack_Melee }));
 
-	TStrongObjectPtr<UGGYGOBossActionSet> InvalidSet(NewObject<UGGYGOBossActionSet>(GetTransientPackage()));
-	ReplaceActions(InvalidSet.Get(), {
-		MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee, UGGYGOBossSelectionMeleeAbility::StaticClass()),
-		MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee_Ice01, UGGYGOBossSelectionMeleeAbility::StaticClass())
-	});
-	AddExpectedError(TEXT("BossAIController"), EAutomationExpectedErrorFlags::Contains, 1);
-	TestNull(TEXT("一个坏行使整组不参与选择"), Controller->SelectAction(InvalidSet.Get(),
-		{ GGYGOGameplayTags::BossAction_Attack_Melee }));
-
+	// 坏表整组拒绝发生在 BossState 采纳 Definition 时，见 ActionSetValidatedOnAdoption。
 	TStrongObjectPtr<UGGYGOBossActionSet> SingleZeroPenalty(NewObject<UGGYGOBossActionSet>(GetTransientPackage()));
 	FGGYGOBossActionDefinition SingleAction = MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee,
 		UGGYGOBossSelectionMeleeAbility::StaticClass());
@@ -380,6 +376,71 @@ bool FGGYGOBossSelectionWeightsTest::RunTest(const FString& Parameters)
 		}
 		TestTrue(TEXT("同 seed 产生相同选招序列"), First->ActionTag == Second->ActionTag);
 	}
+	return true;
+}
+
+namespace
+{
+	UE_DEFINE_GAMEPLAY_TAG_STATIC(TAG_BossSelectionTestLaterPhase, "State.Boss.Phase.GGYGOTests.Later");
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOBossSelectionAdoptionValidationTest,
+	"GGYGO.BossAI.Selection.ActionSetValidatedOnAdoption",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOBossSelectionAdoptionValidationTest::RunTest(const FString& Parameters)
+{
+	FBossSelectionTestWorld TestWorld;
+	if (!TestNotNull(TEXT("UEngine"), GEngine) || !TestTrue(TEXT("创建含独立 WorldContext 的测试世界"), TestWorld.Initialize()))
+	{
+		return false;
+	}
+
+	TStrongObjectPtr<UGGYGOPawnData> PawnData(NewObject<UGGYGOPawnData>(GetTransientPackage()));
+	TStrongObjectPtr<UGGYGOBossActionSet> InvalidSet(NewObject<UGGYGOBossActionSet>(GetTransientPackage()));
+	ReplaceActions(InvalidSet.Get(), {
+		MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee, UGGYGOBossSelectionMeleeAbility::StaticClass()),
+		MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee_Ice01, UGGYGOBossSelectionMeleeAbility::StaticClass())
+	});
+	TStrongObjectPtr<UGGYGOBossActionSet> ValidSet(NewObject<UGGYGOBossActionSet>(GetTransientPackage()));
+	ReplaceActions(ValidSet.Get(), {
+		MakeAction(GGYGOGameplayTags::BossAction_Attack_Melee, UGGYGOBossSelectionMeleeAbility::StaticClass())
+	});
+	// 坏表放在非初始阶段：采纳时校验全部阶段，不只是当前阶段。
+	const auto MakeDefinition = [&PawnData, &ValidSet](const UGGYGOBossActionSet* LaterPhaseSet)
+	{
+		TStrongObjectPtr<UGGYGOBossDefinition> Definition(NewObject<UGGYGOBossDefinition>(GetTransientPackage()));
+		Definition->InitialFormTag = GGYGOGameplayTags::State_Boss_Form_Default;
+		Definition->InitialPhaseTag = GGYGOGameplayTags::State_Boss_Phase_One;
+		FGGYGOBossFormDefinition& Form = Definition->Forms.AddDefaulted_GetRef();
+		Form.FormTag = Definition->InitialFormTag;
+		Form.AvatarPawnData = PawnData.Get();
+		FGGYGOBossPhaseDefinition& Initial = Definition->Phases.AddDefaulted_GetRef();
+		Initial.PhaseTag = Definition->InitialPhaseTag;
+		Initial.ActionSet = ValidSet.Get();
+		FGGYGOBossPhaseDefinition& Later = Definition->Phases.AddDefaulted_GetRef();
+		Later.PhaseTag = TAG_BossSelectionTestLaterPhase;
+		Later.ActionSet = LaterPhaseSet;
+		return Definition;
+	};
+
+	AGGYGOBossState* State = TestWorld.World->SpawnActor<AGGYGOBossState>();
+	if (!TestNotNull(TEXT("权威 BossState"), State) || !TestTrue(TEXT("测试世界中 BossState 有权威"), State->HasAuthority()))
+	{
+		return false;
+	}
+	const TStrongObjectPtr<UGGYGOBossDefinition> InvalidDefinition = MakeDefinition(InvalidSet.Get());
+	AddExpectedMessagePlain(FString::Printf(TEXT("InitializeFromDefinition: 定义 [%s] 阶段 [%s] 的 ActionSet [%s] 无效："),
+		*InvalidDefinition->GetName(), *TAG_BossSelectionTestLaterPhase.GetTag().ToString(), *InvalidSet->GetName()),
+		ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1);
+	TestFalse(TEXT("任一阶段 ActionSet 有坏行时整份定义不被采纳"), State->InitializeFromDefinition(InvalidDefinition.Get()));
+	TestTrue(TEXT("拒绝采纳不留下定义或阶段/形态标签"), !State->GetBossDefinition()
+		&& !State->GetCurrentPhaseTag().IsValid() && !State->GetCurrentFormTag().IsValid());
+
+	const TStrongObjectPtr<UGGYGOBossDefinition> ValidDefinition = MakeDefinition(ValidSet.Get());
+	TestTrue(TEXT("全部阶段 ActionSet 合法时采纳"), State->InitializeFromDefinition(ValidDefinition.Get()));
+	TestTrue(TEXT("采纳后定义与初始阶段生效"), State->GetBossDefinition() == ValidDefinition.Get()
+		&& State->GetCurrentPhaseTag() == GGYGOGameplayTags::State_Boss_Phase_One);
 	return true;
 }
 

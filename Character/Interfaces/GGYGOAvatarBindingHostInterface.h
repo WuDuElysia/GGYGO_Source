@@ -1,101 +1,11 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "Character/Components/GGYGOPawnExtensionComponent.h"
-#include "Misc/Optional.h"
 #include "UObject/Interface.h"
 
 #include "GGYGOAvatarBindingHostInterface.generated.h"
 
-enum class EGGYGOAvatarBindingHostOperation : uint8
-{
-    Invalid = 0,
-    Initialize,
-    Release,
-    Refresh
-};
-
-enum class EGGYGOAvatarBindingHostReason : uint8
-{
-    None = 0,
-    InvalidRequest,
-    InvalidHost,
-    UnsupportedHost,
-    InvalidASC,
-    InvalidPawn,
-    InvalidExtension,
-    AuthorityDenied,
-    EndpointMismatch,
-    ContextMismatch,
-    ResourceMismatch,
-    ResourceConflict,
-    LifecycleClosed,
-    CallerInvalidated,
-    NativeWriteBusy,
-    NativeStepFailed,
-    LocalStepFailed,
-    PublicationFailed,
-    ReadyNotEstablished
-};
-
-struct GGYGO_API FGGYGOAvatarBindingHostRequest
-{
-    EGGYGOAvatarBindingHostOperation Operation =
-        EGGYGOAvatarBindingHostOperation::Invalid;
-
-    TWeakObjectPtr<AActor> ExpectedHost{};
-    TWeakObjectPtr<UGGYGOAbilitySystemComponent> ExpectedASC{};
-    TWeakObjectPtr<APawn> ExpectedPawn{};
-    TWeakObjectPtr<UGGYGOPawnExtensionComponent> ExpectedExtension{};
-
-    FGGYGOAvatarBindingContext ExpectedContext{};
-    FGGYGOPawnASCResourceHandle ExpectedResource{};
-};
-
-enum class EGGYGOAvatarBindingHostStep : uint8
-{
-    Invalid = 0,
-    ActorInfoInit,
-    ActorInfoClear,
-    ActorInfoRefresh,
-    CancelAbilities,
-    ClearAbilityInput,
-    RemoveGameplayCues,
-    InstallLocalResources,
-    WithdrawLocalResources,
-    NotifyLocalReady,
-    NotifyLocalReleased,
-    PublishNotice
-};
-
-/** Only records an actual ClearAbilityInput return; never grants permission. */
-struct GGYGO_API FGGYGOAvatarBindingHostInputClearHistory
-{
-    FGGYGOAvatarBindingContext OriginalContext{};
-    FGGYGOPawnASCResourceHandle OriginalResource{};
-};
-
-/** One actual returned step. Exactly the matching payload is populated. */
-struct GGYGO_API FGGYGOAvatarBindingHostStepResult
-{
-    EGGYGOAvatarBindingHostStep Step =
-        EGGYGOAvatarBindingHostStep::Invalid;
-
-    TOptional<FGGYGOAvatarBindingResult> ASCResult{};
-    TOptional<FGGYGOPawnASCLocalResult> LocalResult{};
-    TOptional<FGGYGOAvatarBindingHostInputClearHistory> InputClear{};
-};
-
-/** Request-stack history, not a current binding/Ready authority. */
-struct GGYGO_API FGGYGOAvatarBindingHostResult
-{
-    EGGYGOAvatarBindingOutcome Outcome =
-        EGGYGOAvatarBindingOutcome::Rejected;
-    EGGYGOAvatarBindingHostReason Reason =
-        EGGYGOAvatarBindingHostReason::InvalidRequest;
-
-    TArray<FGGYGOAvatarBindingHostStepResult> Steps{};
-};
+class APawn;
 
 UINTERFACE(meta = (CannotImplementInterfaceInBlueprint))
 class GGYGO_API UGGYGOAvatarBindingHostInterface : public UInterface
@@ -103,11 +13,17 @@ class GGYGO_API UGGYGOAvatarBindingHostInterface : public UInterface
     GENERATED_UINTERFACE_BODY()
 };
 
+/**
+ * ASC 宿主（ASC 的组件 Owner）向 Pawn 一侧暴露的唯一入口。
+ *
+ * 绑定由宿主主动发起，Pawn 不请求绑定；Pawn 只在需要立即解除时（死亡后销毁前）请求释放。
+ * 读取宿主的 ASC 用 IAbilitySystemInterface。
+ */
 class GGYGO_API IGGYGOAvatarBindingHostInterface
 {
     GENERATED_IINTERFACE_BODY()
 
 public:
-    virtual FGGYGOAvatarBindingHostResult RequestAvatarBinding(
-        const FGGYGOAvatarBindingHostRequest& Request) = 0;
+    /** 只在 ExpectedAvatar 仍是宿主当前 Avatar 时释放；已被替换的旧 Pawn 不处理。 */
+    virtual void ReleaseAvatarBinding(APawn* ExpectedAvatar) = 0;
 };

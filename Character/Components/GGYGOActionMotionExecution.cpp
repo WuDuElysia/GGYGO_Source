@@ -85,16 +85,6 @@ bool FGGYGOActionMotionExecution::IsMontageActionMovementModeSupported() const
 bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
 	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
-	int32& OutHandle, FString& OutError)
-{
-	FQuat EntryRotation;
-	return BeginMontageActionMotion(OriginalSource, OriginalMontageInstanceId, MontagePositionSeconds,
-		EffectiveMontagePlayRate, TranslationScale, FGGYGOActionMotionStartFacing{}, OutHandle, EntryRotation, OutError);
-}
-
-bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
-	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
-	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
 	const FGGYGOActionMotionStartFacing& Facing, int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError)
 {
 	OutHandle = INDEX_NONE;

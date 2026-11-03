@@ -16,8 +16,8 @@
  * ## 消费方
  * `UGGYGOPawnExtensionComponent` 在 InitState 到达 `DataInitialized` 时
  * 把各字段分发给对应的消费者（ASC、CMC、HeroComponent、CameraComponent）。
- * 分发时机不能提前到 `InitializeAbilitySystem` —— 那个函数由 Pawn 在
- * `PostInitializeComponents` 调用，运行时生成的角色那时还没被 `SetPawnData`。
+ * 分发时机不能提前到 ASC 绑定（宿主的 AttachAvatar）—— 运行时生成的角色
+ * 可能先被绑定、后被 `SetPawnData`。
  */
 #pragma once
 

@@ -924,9 +924,8 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 		if (OuterReentrantTask)
 		{
 			AddExpectedError(FString::Printf(
-				TEXT("MontageTask \\[%s\\].*ASC 未签发成功的原播放资源；Outcome=%d Reason=%d Guard=%d Stage=%d"),
-				*OuterReentrantTask->GetName(), int32(EGGYGOAbilityMontagePlaybackOutcome::Stale),
-				int32(EGGYGOAbilityMontagePlaybackReason::GuardSuperseded), int32(EGGYGOMontagePlayGuardOutcome::Superseded),
+				TEXT("MontageTask \\[%s\\].*ASC 未签发成功的原播放资源；Guard=%d Stage=%d"),
+				*OuterReentrantTask->GetName(), int32(EGGYGOMontagePlayGuardOutcome::Superseded),
 				int32(EGGYGOMontagePlayGuardNativeStage::Returned)), EAutomationExpectedErrorFlags::Contains, 1);
 			OuterReentrantTask->ReadyForActivation();
 		}
@@ -979,8 +978,8 @@ bool FGGYGOMontageTaskLifecycleTest::RunTest(const FString& Parameters)
 		});
 		TestTrue(TEXT("清理夹具原能力真实激活"), ASC->TryActivateAbility(Fixture.AbilityHandle));
 		TestTrue(TEXT("清理夹具原 Task 有原生签发身份"), Started && Started->IsActive()
-			&& Started->OriginalGuardIdentity.CallId != 0
-			&& AnimInstance->IsMontagePlayGuardIdentityCurrent(Started->OriginalGuardIdentity)
+			&& Started->OriginalPlayback.Guard.CallId != 0
+			&& AnimInstance->IsMontagePlayGuardIdentityCurrent(Started->OriginalPlayback.Guard)
 			&& Started->GetTaskMontageInstance());
 		return Started;
 	};
@@ -1671,8 +1670,10 @@ namespace
 		FMontageStartedDiagnosticSnapshot Baseline;
 		Fixture.AbilityB->SetK2ActivateActionForTest([&]()
 		{
-			BDuration = Fixture.ASC->PlayMontageWithGuard(Fixture.AbilityB, Fixture.AbilityB->GetCurrentActivationInfo(),
-				Fixture.MontageB, 1.25f, TEXT("SuccessorStart"), 0.0f, ResultB, nullptr);
+			const FGGYGOAbilityMontagePlaybackResult PlayedB = Fixture.ASC->PlayAbilityMontage(Fixture.AbilityB,
+				Fixture.AbilityB->GetCurrentActivationInfo(), Fixture.MontageB, 1.25f, TEXT("SuccessorStart"), 0.0f);
+			BDuration = PlayedB.Duration;
+			ResultB = PlayedB.Guard;
 			bBPlayReturned = true;
 			if (ResultB.Identity.CreatedInstanceId != INDEX_NONE)
 			{
@@ -1708,8 +1709,10 @@ namespace
 		});
 		Fixture.AbilityA->SetK2ActivateActionForTest([&]()
 		{
-			ADuration = Fixture.ASC->PlayMontageWithGuard(Fixture.AbilityA, Fixture.AbilityA->GetCurrentActivationInfo(),
-				Fixture.MontageA, 0.75f, TEXT("OuterStart"), 0.0f, ResultA, nullptr);
+			const FGGYGOAbilityMontagePlaybackResult PlayedA = Fixture.ASC->PlayAbilityMontage(Fixture.AbilityA,
+				Fixture.AbilityA->GetCurrentActivationInfo(), Fixture.MontageA, 0.75f, TEXT("OuterStart"), 0.0f);
+			ADuration = PlayedA.Duration;
+			ResultA = PlayedA.Guard;
 		});
 		const bool bAActivated = Fixture.ASC->TryActivateAbility(Fixture.HandleA);
 		// Both snapshots use B's typed exact identity; no animation advance or state restoration.

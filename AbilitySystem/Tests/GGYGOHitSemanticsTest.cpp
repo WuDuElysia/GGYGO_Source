@@ -9,6 +9,7 @@
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
 #include "Components/SceneComponent.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
 #include "Engine/HitResult.h"
 #include "Engine/World.h"
 #include "GameplayEffect.h"
@@ -29,11 +30,23 @@ namespace
 	{
 		UEngine* Engine = GEngine;
 		UWorld* World = nullptr;
+		/** 伤害结算会经 GameInstance 的 MessageRouter 发布生命消息；需要结算的专项用真实独立 GI 世界。 */
+		TStrongObjectPtr<UGameInstance> GameInstance;
 
-		FGGYGOHitSemanticsTestWorld()
+		explicit FGGYGOHitSemanticsTestWorld(bool bWithGameInstance = false)
 		{
 			if (!Engine)
 			{
+				return;
+			}
+			if (bWithGameInstance)
+			{
+				GameInstance.Reset(NewObject<UGameInstance>(Engine));
+				if (GameInstance.IsValid())
+				{
+					GameInstance->InitializeStandalone(FName(TEXT("GGYGOHitSemanticsDamageWorld")));
+					World = GameInstance->GetWorld();
+				}
 				return;
 			}
 
@@ -52,7 +65,12 @@ namespace
 			if (World)
 			{
 				UPackage* WorldPackage = World->GetPackage();
+				// Router 随 GI 保留到演员和组件退出，最后再退休 WorldContext。
 				World->DestroyWorld(false);
+				if (GameInstance.IsValid())
+				{
+					GameInstance->Shutdown();
+				}
 				if (Engine)
 				{
 					Engine->DestroyWorldContext(World);
@@ -541,7 +559,7 @@ bool FGGYGOHitDistanceExecutionOriginSnapshotTest::RunTest(const FString& Parame
 {
 	if (!TestTrue(TEXT("距离专项构建包含服务器伤害执行"), WITH_SERVER_CODE != 0)
 		|| !TestNotNull(TEXT("距离专项 GEngine"), GEngine)) { return false; }
-	FGGYGOHitSemanticsTestWorld TestWorld;
+	FGGYGOHitSemanticsTestWorld TestWorld(true);
 	if (!TestNotNull(TEXT("距离专项独立 World"), TestWorld.World)
 		|| !TestNotNull(TEXT("距离专项 WorldContext"), GEngine->GetWorldContextFromWorld(TestWorld.World))) { return false; }
 

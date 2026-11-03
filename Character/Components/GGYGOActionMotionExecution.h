@@ -74,9 +74,6 @@ private:
 	bool IsMontageActionMovementModeSupported() const;
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
-		float TranslationScale, int32& OutHandle, FString& OutError);
-	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
-		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, const FGGYGOActionMotionStartFacing& Facing,
 		int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError);
 	bool RebaseMontageActionMotion(const FGGYGOMovementOwnerSyncScopeId& OriginalScope,

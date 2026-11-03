@@ -91,9 +91,10 @@ enum class EGGYGOMeleeTraceWindowSubscribeResult : uint8
 DECLARE_DELEGATE_ThreeParams(FGGYGOMeleeTraceWindowHitDelegate,
 	const FGGYGOMeleeTraceWindowHandle&, AActor*, const FHitResult&);
 
-/** Legacy 窗口的命中结果。 */
-DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGOMeleeHitSignature, AActor*, HitActor, const FHitResult&, HitResult);
-
+/**
+ * 判定窗口只由持有原 Activation 的原生调用方开关（TryOpenOwnedTraceWindow／CloseOwnedTraceWindow），
+ * 命中只发给该窗口的订阅者；组件不提供无身份的蓝图开窗或全局命中事件。
+ */
 UCLASS(meta = (BlueprintSpawnableComponent))
 class GGYGO_API UGGYGOMeleeTraceComponent : public UActorComponent
 {
@@ -104,32 +105,12 @@ public:
 
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
 
-	/**
-	 * 开启 Legacy 判定窗口；活动 Owned 窗口存在时拒绝，不得无身份接管。
-	 *
-	 * @param InStartSocket 判定线段的起点骨骼（通常是武器根）。
-	 * @param InEndSocket   终点骨骼（通常是武器尖）。
-	 * @param InTraceRadius 扫掠球半径。
-	 *
-	 * 每次开启都会清空已命中记录，所以连招的每一段都能重新命中同一个敌人。
-	 */
-	UFUNCTION(BlueprintCallable, Category = "GGYGO|Combat")
-	void BeginTraceWindow(FName InStartSocket, FName InEndSocket, float InTraceRadius);
-
-	/** 关闭 Legacy 判定窗口；不得关闭活动 Owned 窗口。 */
-	UFUNCTION(BlueprintCallable, Category = "GGYGO|Combat")
-	void EndTraceWindow();
-
 	/** 判定窗口是否开启。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Combat")
 	bool IsTracing() const { return bIsTracing; }
 
-	/** Legacy 命中时广播；Owned 窗口不广播此无身份事件。开窗调用者负责权限。 */
-	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Combat")
-	FGGYGOMeleeHitSignature OnMeleeHit;
-
 	/**
-	 * GameThread 原生开窗，不同步发出命中。
+	 * GameThread 原生开窗，不同步发出命中。每次开窗清空已命中记录，连招每段都能重新命中同一目标。
 	 * 空 ExpectedWindow 只取得空闲窗口；非空只替换本组件活动的同一 Owned 窗口。
 	 * 身份冲突不改窗口。获准替换后配置失败会关闭原窗口，不继续旧业务。
 	 * 先快照 ExpectedWindow，再重置 OutWindow；允许两参数引用同一变量。失败输出为空。
@@ -222,9 +203,6 @@ protected:
 	uint64 WindowSerial = 0;
 
 private:
-	/** 同一窗口的来源，不另建窗口状态或执行链。 */
-	enum class EWindowSource : uint8 { None, Legacy, Owned };
-	EWindowSource WindowSource = EWindowSource::None;
 	/** 仅生命周期清理栈内拒绝重入开窗，不是另一份窗口活动状态。 */
 	bool bClosingForLifecycle = false;
 
@@ -261,8 +239,8 @@ private:
 
 	EGGYGOMeleeTraceWindowOpenResult StartTraceWindow(
 		const FGGYGOMeleeTraceShape& Shape, const USkeletalMeshComponent* ExpectedMainMesh,
-		const USkeletalMesh* ExpectedMeshAsset, EWindowSource Source);
-	/** 生命周期/内部失败的唯一清理入口；公共 Legacy End 不具备此权限。 */
+		const USkeletalMesh* ExpectedMeshAsset);
+	/** 关闭当前窗口的唯一执行入口；外部只能经 CloseOwnedTraceWindow 关闭自己的原窗口。 */
 	void CloseCurrentTraceWindow();
 	bool IsActiveWindow(uint64 Serial) const;
 	void DispatchOwnedWindowHit(const FGGYGOMeleeTraceWindowHandle& Window, AActor* HitActor, const FHitResult& Hit);

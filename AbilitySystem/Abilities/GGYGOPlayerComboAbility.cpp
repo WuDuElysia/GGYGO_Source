@@ -72,43 +72,19 @@ namespace
 		return true;
 	}
 
-	bool ValidateGGYGOComboStepDamage(const FGGYGOComboStep& Step, EGGYGOComboDamageMode Mode, FString& OutError)
-	{
-		if (Mode == EGGYGOComboDamageMode::NoGE) { return true; }
-		if (Mode == EGGYGOComboDamageMode::Multiplier)
-		{
-			if (!FMath::IsFinite(Step.DamageMultiplier) || Step.DamageMultiplier < 0.0f)
-			{
-				OutError = TEXT("ComboDamage: required-multiplier-missing-or-invalid");
-				return false;
-			}
-		}
-		else if (Step.DamageMultiplier != -1.0f || !FMath::IsFinite(Step.Damage) || Step.Damage < 0.0f)
-		{
-			OutError = TEXT("ComboDamage: absolute-mode-requires-explicit-legacy-amount-and-unset-multiplier");
-			return false;
-		}
-		if (!FMath::IsFinite(Step.PoiseDamage) || Step.PoiseDamage < 0.0f)
-		{
-			OutError = TEXT("ComboDamage: invalid-poise-amount");
-			return false;
-		}
-		return true;
-	}
-
-	// 调用方已在取得GE CDO后验证连段数值；这里只核对已选模式与倍率配置的关系。
+	// 段数值的有限／非负已由 PrepareComboSteps 校验；这里只核对GE决定的模式与各段倍率配置的关系，
+	// 成功时输出该模式，命中只读取这一结果。
 	bool ValidateGGYGOComboDamageModes(const TArray<FGGYGOComboStep>& Steps,
-		const UGameplayEffect* Effect, FString& OutError)
+		const UGameplayEffect* Effect, EGGYGOComboDamageMode& OutMode, FString& OutError)
 	{
-		EGGYGOComboDamageMode Mode;
-		if (!ResolveGGYGOComboDamageMode(Effect, Mode, OutError)) { return false; }
+		if (!ResolveGGYGOComboDamageMode(Effect, OutMode, OutError)) { return false; }
 		for (int32 Index = 0; Index < Steps.Num(); ++Index)
 		{
-			if (Mode == EGGYGOComboDamageMode::Multiplier && Steps[Index].DamageMultiplier == -1.0f)
+			if (OutMode == EGGYGOComboDamageMode::Multiplier && Steps[Index].DamageMultiplier == -1.0f)
 			{
 				OutError = TEXT("ComboDamage: required-multiplier-missing-or-invalid");
 			}
-			else if (Mode == EGGYGOComboDamageMode::Absolute && Steps[Index].DamageMultiplier != -1.0f)
+			else if (OutMode == EGGYGOComboDamageMode::Absolute && Steps[Index].DamageMultiplier != -1.0f)
 			{
 				OutError = TEXT("ComboDamage: absolute-mode-requires-explicit-legacy-amount-and-unset-multiplier");
 			}
@@ -346,6 +322,7 @@ struct UGGYGOPlayerComboAbility::FStepMotionResources : FGGYGOMontageActionResou
 	void Release(EGGYGOActionMotionReleaseReason Reason)
 	{
 		Section = ESection::Retired;
+		UnregisterTaskCallbacks();
 		AttackGate.Close();
 		MovementGate.Close();
 		TraceWindowSource = {};
@@ -379,6 +356,47 @@ struct UGGYGOPlayerComboAbility::FStepEntryAttempt
 	int32 TargetStep = INDEX_NONE;
 	bool bGateAccepted = false;
 	EPhase Phase = EPhase::AwaitingInput;
+};
+
+/** 一段的静态声明，来自 PrepareComboSteps 对作者配置的同一次解析；运行期只读。 */
+struct UGGYGOPlayerComboAbility::FPreparedComboStep
+{
+	FGGYGOActionMotionSourceBindingPtr MotionSource;
+	FGGYGOMontageNotifyDeclaration AttackDeclaration;
+	FGGYGOMontageNotifyDeclaration MovementDeclaration;
+	/** 移动门开门下限：当前 Montage Main 真实末端。 */
+	float MovementFloor = 0.0f;
+	FGGYGOMontageFXWindowDeclaration FXWindow;
+	TArray<FGGYGOMontageWindowDeclaration> WindowDeclarations;
+};
+
+/** 授予期预备配置：全部段的静态声明与伤害 GE／模式，来自同一次作者配置解析；只读。
+ *  GE 以弱引用保存，不延长类生命周期；类卸载或被新版本替换（编辑器重编译）即视为失效。 */
+struct UGGYGOPlayerComboAbility::FPreparedComboConfiguration
+{
+	TArray<FPreparedComboStep> Steps;
+	TWeakObjectPtr<UClass> DamageEffect;
+	bool bHasDamageEffect = false;
+	EGGYGOComboDamageMode DamageMode = EGGYGOComboDamageMode::NoGE;
+
+	/** 无 GE 模式恒为 true；必需 GE 须仍是同一个未被替换的类。 */
+	bool IsDamageEffectCurrent() const
+	{
+		const UClass* const Class = DamageEffect.Get();
+		return !bHasDamageEffect || (Class && !Class->HasAnyClassFlags(CLASS_NewerVersionExists));
+	}
+};
+
+/** StartStep 本栈的输入副本，只在三步之间传递。持有预备配置的共享引用，
+ *  外调期间终止清理释放成员也不会让本段读到失效数据。 */
+struct UGGYGOPlayerComboAbility::FStepStartInputs
+{
+	TSharedPtr<const FPreparedComboConfiguration> Prepared;
+	const FPreparedComboStep* PreparedStep = nullptr;
+	FGGYGOComboStep Step;
+	UGGYGOCharacterMovementComponent* Movement = nullptr;
+	FQuat ReplayBasis = FQuat::Identity;
+	bool bHasReplayBasis = false;
 };
 
 bool UGGYGOPlayerComboAbility::IsStepEntryCurrent(const TSharedPtr<FStepEntryAttempt>& Attempt) const
@@ -555,20 +573,28 @@ bool UGGYGOPlayerComboAbility::IsStepPlayable(int32 Index) const
 
 bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) const
 {
+	return PrepareComboSteps(OutError).IsValid();
+}
+
+TSharedPtr<UGGYGOPlayerComboAbility::FPreparedComboConfiguration> UGGYGOPlayerComboAbility::PrepareComboSteps(
+	FString& OutError) const
+{
 	OutError.Reset();
-	if (ComboSteps.IsEmpty()) { OutError = TEXT("ComboSteps 为空。"); return false; }
+	if (ComboSteps.IsEmpty()) { OutError = TEXT("ComboSteps 为空。"); return nullptr; }
 	if (!FMath::IsFinite(MontageCompletionGraceSeconds) || MontageCompletionGraceSeconds < 0.0f)
 	{
 		OutError = TEXT("MontageCompletionGraceSeconds 必须是非负有限秒数。");
-		return false;
+		return nullptr;
 	}
+	const TSharedRef<FPreparedComboConfiguration> Prepared = MakeShared<FPreparedComboConfiguration>();
+	Prepared->Steps.Reserve(ComboSteps.Num());
 	for (int32 Index = 0; Index < ComboSteps.Num(); ++Index)
 	{
 		const FGGYGOComboStep& Step = ComboSteps[Index];
 		if (!IsConfiguredStepFacingPolicy(Step.StartFacingPolicy))
 		{
 			OutError = FString::Printf(TEXT("段 %d 的 StartFacingPolicy 无效，须显式选择 CurrentFacing 或 QualifiedInput。"), Index);
-			return false;
+			return nullptr;
 		}
 		if (Step.Montage && (!Step.Montage->bEnableAutoBlendOut
 			|| !FMath::IsFinite(Step.Montage->BlendOutTriggerTime)
@@ -576,13 +602,13 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 必须启用自然混出，触发时间必须有限，混出时长必须有限且非负。"),
 				Index, *GetPathNameSafe(Step.Montage));
-			return false;
+			return nullptr;
 		}
 		if (Step.MotionSlotName.IsNone() || !FMath::IsFinite(Step.MotionTranslationScale) || Step.MotionTranslationScale <= 0.0f)
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 必须显式配置 MotionSlotName，MotionTranslationScale 必须有限且大于0。"),
 				Index, *GetPathNameSafe(Step.Montage));
-			return false;
+			return nullptr;
 		}
 		if (!IsStepPlayable(Index)
 			|| !FMath::IsFinite(Step.DamageMultiplier)
@@ -592,70 +618,70 @@ bool UGGYGOPlayerComboAbility::ValidateComboConfiguration(FString& OutError) con
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 Montage/Section/速率/伤害无效。"),
 				Index, *GetPathNameSafe(Step.Montage));
-			return false;
+			return nullptr;
 		}
 		FString ShapeError;
 		if (!UGGYGOMeleeTraceComponent::ValidateTraceShapeDefinition(Step.TraceShape, ShapeError))
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 TraceShape 无效：%s；旧 TraceStartSocket/TraceEndSocket/TraceRadius 仅历史存值，不参与运行，请显式配置 TraceShape。"),
 				Index, *GetPathNameSafe(Step.Montage), *ShapeError);
-			return false;
+			return nullptr;
 		}
-		FGGYGOActionMotionSourceBindingPtr Source;
+		FPreparedComboStep PreparedStep;
 		FString MotionError;
 		if (!GGYGOActionMotionSource::BuildSourceBindingRange(Step.Montage, Step.MotionSlotName,
-			Step.MainSection, Step.EndSection, Source, MotionError)
-			|| !GGYGOActionMotionEvaluation::ValidateSource(*Source, MotionError))
+			Step.MainSection, Step.EndSection, PreparedStep.MotionSource, MotionError)
+			|| !GGYGOActionMotionEvaluation::ValidateSource(*PreparedStep.MotionSource, MotionError))
 		{
 			OutError = FString::Printf(TEXT("段 %d 的原动画动作来源无效：%s"), Index, *MotionError);
-			return false;
+			return nullptr;
 		}
-		if (Source->Sections.Num() != 2)
+		const FGGYGOActionMotionSourceBinding& Source = *PreparedStep.MotionSource;
+		if (Source.Sections.Num() != 2)
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 的 Main→End 必须相邻，原生默认路径不能跳过绑定内的 Section。"),
 				Index, *GetPathNameSafe(Step.Montage));
-			return false;
+			return nullptr;
 		}
 		FString FXError;
-		if (!ValidateStepFXConfiguration(Step, Source->MontageStartSeconds, Source->MontageEndSeconds, FXError))
+		if (!ValidateStepFXConfiguration(Step, Source.MontageStartSeconds, Source.MontageEndSeconds, FXError,
+			&PreparedStep.FXWindow))
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] FX [%s] 无效：%s"),
 				Index, *GetPathNameSafe(Step.Montage), *GetPathNameSafe(Step.FX.System), *FXError);
-			return false;
+			return nullptr;
 		}
-		TArray<FGGYGOMontageWindowDeclaration> WindowDeclarations;
 		if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
-			Step.Montage, GetStepWindowTags(Step), Source->MontageStartSeconds, Source->MontageEndSeconds,
-			WindowDeclarations, MotionError))
+			Step.Montage, GetStepWindowTags(Step), Source.MontageStartSeconds, Source.MontageEndSeconds,
+			PreparedStep.WindowDeclarations, MotionError))
 		{
 			OutError = FString::Printf(TEXT("段 %d 原窗口声明无效：%s"), Index, *MotionError);
-			return false;
+			return nullptr;
 		}
-		FGGYGOMontageNotifyDeclaration AttackDeclaration;
-		if (!ResolveStepInterruption(Step, Source->MontageStartSeconds, Source->MontageEndSeconds,
-			AttackDeclaration, MotionError))
+		if (!ResolveStepInterruption(Step, Source.MontageStartSeconds, Source.MontageEndSeconds,
+			PreparedStep.AttackDeclaration, MotionError))
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 攻击接续模式 %d 与通知 [%s] 配置无效：%s"),
 				Index, *GetPathNameSafe(Step.Montage), static_cast<int32>(Step.InterruptionMode),
 				*Step.InterruptionNotifyName.ToString(), *MotionError);
-			return false;
+			return nullptr;
 		}
-		FGGYGOMontageNotifyDeclaration MovementDeclaration;
-		float MovementFloor = 0.0f;
-		if (!ResolveStepMovementInterruption(Step, *Source, MovementDeclaration, MovementFloor, MotionError))
+		if (!ResolveStepMovementInterruption(Step, Source, PreparedStep.MovementDeclaration,
+			PreparedStep.MovementFloor, MotionError))
 		{
 			OutError = FString::Printf(TEXT("段 %d Montage [%s] 移动打断模式 %d 与通知 [%s] 配置无效：%s"),
 				Index, *GetPathNameSafe(Step.Montage), static_cast<int32>(Step.MovementInterruptionMode),
 				*Step.MovementInterruptionNotifyName.ToString(), *MotionError);
-			return false;
+			return nullptr;
 		}
 		if (Step.NextStepIndex != INDEX_NONE && !ComboSteps.IsValidIndex(Step.NextStepIndex))
 		{
 			OutError = FString::Printf(TEXT("段 %d 的 NextStepIndex 必须是有效段或 -1（关闭信号后的攻击接续）。"), Index);
-			return false;
+			return nullptr;
 		}
+		Prepared->Steps.Add(MoveTemp(PreparedStep));
 	}
-	return true;
+	return Prepared;
 }
 
 #if WITH_EDITOR
@@ -672,8 +698,9 @@ EDataValidationResult UGGYGOPlayerComboAbility::IsDataValid(FDataValidationConte
 	}
 	// 编辑器只检查显式GE，不读取共享加载器；CDO可能创建，数值检查放在其返回之后。
 	const UGameplayEffect* Effect = ExplicitClass ? ExplicitClass->GetDefaultObject<UGameplayEffect>() : nullptr;
+	EGGYGOComboDamageMode Mode;
 	if (!ValidateComboConfiguration(Error)
-		|| (ExplicitClass && !ValidateGGYGOComboDamageModes(ComboSteps, Effect, Error)))
+		|| (ExplicitClass && !ValidateGGYGOComboDamageModes(ComboSteps, Effect, Mode, Error)))
 	{
 		Context.AddError(FText::FromString(Error));
 		return EDataValidationResult::Invalid;
@@ -732,6 +759,37 @@ bool UGGYGOPlayerComboAbility::ValidateDamageEffectDependency(FString& OutError,
 	return true;
 }
 
+TSharedPtr<const UGGYGOPlayerComboAbility::FPreparedComboConfiguration> UGGYGOPlayerComboAbility::FindOrPrepareConfiguration(
+	FString& OutError, bool* bOutDamageFailure) const
+{
+	OutError.Reset();
+	if (bOutDamageFailure) { *bOutDamageFailure = false; }
+	if (PreparedConfiguration.IsValid() && PreparedConfiguration->IsDamageEffectCurrent()) { return PreparedConfiguration; }
+	PreparedConfiguration.Reset();
+
+	// 顺序决定拒绝日志分类：GE 依赖 → 段声明 → GE 模式与段倍率。共享 GE 尚未加载时失败不缓存，下次准入重试。
+	TSubclassOf<UGameplayEffect> Effect;
+	if (!ValidateDamageEffectDependency(OutError, &Effect))
+	{
+		if (bOutDamageFailure) { *bOutDamageFailure = true; }
+		return nullptr;
+	}
+	// GetDefaultObject 可能首次创建 CDO；模式检查在其返回后进行。
+	const UGameplayEffect* const Definition = Effect ? Effect->GetDefaultObject<UGameplayEffect>() : nullptr;
+	const TSharedPtr<FPreparedComboConfiguration> Prepared = PrepareComboSteps(OutError);
+	if (!Prepared.IsValid()) { return nullptr; }
+	if (!ValidateGGYGOComboDamageModes(ComboSteps, Definition, Prepared->DamageMode, OutError))
+	{
+		if (bOutDamageFailure) { *bOutDamageFailure = true; }
+		return nullptr;
+	}
+	Prepared->DamageEffect = Effect.Get();
+	Prepared->bHasDamageEffect = Effect.Get() != nullptr;
+	// CDO 被纯查询直接调用，跨授予且不随 PIE 重建；只在授予实例上缓存，避免编辑器改资产后读到旧结果。
+	if (IsInstantiated()) { PreparedConfiguration = Prepared; }
+	return Prepared;
+}
+
 bool UGGYGOPlayerComboAbility::CanActivateAbilityAdditional(FGameplayAbilitySpecHandle Handle,
 	const FGameplayAbilityActorInfo* ActorInfo, const FGameplayTagContainer* SourceTags,
 	const FGameplayTagContainer* TargetTags, FGameplayTagContainer* OptionalRelevantTags) const
@@ -741,30 +799,26 @@ bool UGGYGOPlayerComboAbility::CanActivateAbilityAdditional(FGameplayAbilitySpec
 		return false;
 	}
 	FString Error;
-	TSubclassOf<UGameplayEffect> Effect;
-	if (!ValidateDamageEffectDependency(Error, &Effect)) { return false; }
-	const UGameplayEffect* Definition = Effect ? Effect->GetDefaultObject<UGameplayEffect>() : nullptr;
-	return ValidateComboConfiguration(Error) && ValidateGGYGOComboDamageModes(ComboSteps, Definition, Error);
+	return FindOrPrepareConfiguration(Error).IsValid();
 }
 
 void UGGYGOPlayerComboAbility::NativeOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const
 {
+	// 纯 CanActivate 查询不写日志；只在实际被拒的请求上按失败类别报告一次。
 	FString Error;
-	TSubclassOf<UGameplayEffect> Effect;
-	const bool bDamageDependencyValid = ValidateDamageEffectDependency(Error, &Effect);
-	const UGameplayEffect* Definition = bDamageDependencyValid && Effect
-		? Effect->GetDefaultObject<UGameplayEffect>() : nullptr;
-	if (bDamageDependencyValid && !ValidateComboConfiguration(Error))
+	bool bDamageFailure = false;
+	if (!FindOrPrepareConfiguration(Error, &bDamageFailure).IsValid())
 	{
-		// Pure CanActivate queries never log; report the actual rejected request once.
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时连段配置无效：%s"),
-			*GetPathNameSafe(this), *Error);
-	}
-	else if (!bDamageDependencyValid || !ValidateGGYGOComboDamageModes(ComboSteps, Definition, Error))
-	{
-		// This is an actual failed request; repeated pure CanActivate queries never log.
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时伤害GE依赖无效：%s"),
-			*GetPathNameSafe(this), *Error);
+		if (bDamageFailure)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时伤害GE依赖无效：%s"),
+				*GetPathNameSafe(this), *Error);
+		}
+		else
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 激活失败时连段配置无效：%s"),
+				*GetPathNameSafe(this), *Error);
+		}
 	}
 	Super::NativeOnAbilityFailedToActivate(FailedReason);
 }
@@ -778,6 +832,7 @@ void UGGYGOPlayerComboAbility::InitializeAbilityActivation(const FGGYGOAbilityAc
 		return;
 	}
 	if (ResourceActivation.HasActivation() || InitialInputRoute.HasRoute() || !StepEntryAttempts.IsEmpty()
+		|| PreparedActivation.IsValid()
 		|| StepMotionResources.IsValid() || InputTask || TraceComponent || ActiveMesh || InputCallbackRegistration.IsValid()
 		|| TraceWindow.HasWindow() || TraceHitSubscription.IsValid()
 		|| OriginalWorld.IsValid() || bChangedMeshTick || bAddedMeshPrerequisite)
@@ -822,45 +877,36 @@ void UGGYGOPlayerComboAbility::ActivateAbilityBody(const FGGYGOAbilityActivation
 	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	if (!IsActivationCurrent(Original)) { return; }
 
-	// Blueprint activation is an external callback; revalidate before committing the original.
-	FString DamageDependencyError;
-	TSubclassOf<UGameplayEffect> ConfiguredDamageEffect;
-	if (!ValidateDamageEffectDependency(DamageDependencyError, &ConfiguredDamageEffect))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前拒绝激活：%s"),
-			*GetPathNameSafe(this), *DamageDependencyError);
-		RequestAbilityEnd(Original, true, true);
-		return;
-	}
-	// GetDefaultObject可触发CDO创建；配置数值与模式匹配均在返回后检查。
-	const UGameplayEffect* DamageDefinition = ConfiguredDamageEffect
-		? ConfiguredDamageEffect->GetDefaultObject<UGameplayEffect>() : nullptr;
-	if (!IsActivationCurrent(Original)) { return; }
+	// 准入已解析本授予期配置。段、GE 及其选择字段只能在类默认值编辑，蓝图激活回调改不了，
+	// 所以这里只取快照、不重新校验；之后各段与命中只读该快照，运行期只核对 Mesh/Trace/CMC 等会变化的输入。
 	FString ConfigurationError;
-	if (!ValidateComboConfiguration(ConfigurationError))
+	bool bDamageFailure = false;
+	TSharedPtr<const FPreparedComboConfiguration> Prepared = FindOrPrepareConfiguration(ConfigurationError, &bDamageFailure);
+	if (!Prepared.IsValid())
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前连段配置无效：%s"),
-			*GetPathNameSafe(this), *ConfigurationError);
+		if (bDamageFailure)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前拒绝激活：%s"),
+				*GetPathNameSafe(this), *ConfigurationError);
+		}
+		else
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前连段配置无效：%s"),
+				*GetPathNameSafe(this), *ConfigurationError);
+		}
 		RequestAbilityEnd(Original, true, true);
 		return;
 	}
-
-	if (!ValidateGGYGOComboDamageModes(ComboSteps, DamageDefinition, DamageDependencyError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] 提交前拒绝激活：%s"),
-			*GetPathNameSafe(this), *DamageDependencyError);
-		RequestAbilityEnd(Original, true, true);
-		return;
-	}
+	PreparedActivation = MoveTemp(Prepared);
 
 	ACharacter* Character = GetCharacterFromActorInfo();
 	ActiveMesh = Character ? Character->GetMesh() : nullptr;
 	TraceComponent = Character ? Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() : nullptr;
 	OriginalWorld = GetWorld();
 	if (!Character || !Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement())
-		|| !IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid() || !IsStepPlayable(0))
+		|| !IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid())
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Body rejected: Avatar/Mesh [%s], Trace [%s], World [%s] or first step is invalid."),
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] Body rejected: Avatar/Mesh [%s], Trace [%s] or World [%s] is invalid."),
 			*GetPathNameSafe(this), *GetPathNameSafe(ActiveMesh), *GetPathNameSafe(TraceComponent), *GetPathNameSafe(OriginalWorld.Get()));
 		RequestAbilityEnd(Original, true, true);
 		return;
@@ -971,8 +1017,7 @@ void UGGYGOPlayerComboAbility::ActivateAbilityBody(const FGGYGOAbilityActivation
 
 bool UGGYGOPlayerComboAbility::IsActivationCurrent(const FGGYGOAbilityActivationHandle& Original) const
 {
-	return ResourceActivation.HasSameActivation(Original)
-		&& CaptureCurrentActivation().HasSameActivation(Original);
+	return ResourceActivation.HasSameActivation(Original) && Super::IsActivationCurrent(Original);
 }
 
 bool UGGYGOPlayerComboAbility::IsStepCurrent(const FGGYGOAbilityActivationHandle& Original,
@@ -1481,21 +1526,17 @@ void UGGYGOPlayerComboAbility::BeginMovementInterruption(const TSharedPtr<FStepM
 		OriginalResource->MotionHandle = INDEX_NONE;
 		// The original CMC cancellation precedes this GA's selected End lifecycle rule.
 		const FGGYGOAbilityTerminationResult EndResult = Self->RequestAbilityEnd(OriginalResource->Activation, true, true);
-		switch (EndResult.Outcome)
+		if (EndResult.IsAccepted())
 		{
-		case EGGYGOAbilityTerminationOutcome::Completed:
-		case EGGYGOAbilityTerminationOutcome::Accepted:
-		case EGGYGOAbilityTerminationOutcome::Deferred:
-		case EGGYGOAbilityTerminationOutcome::AlreadyPending:
 			UE_LOG(LogGGYGOAbilitySystem, Display,
-				TEXT("[Combat.PlayerCombo.InterruptionDiagnostics] Boundary=AbilityEndResult %s Outcome=%d Reason=%d"),
-				*OriginalLogContext, static_cast<int32>(EndResult.Outcome), static_cast<int32>(EndResult.Reason));
-			break;
-		default:
+				TEXT("[Combat.PlayerCombo.InterruptionDiagnostics] Boundary=AbilityEndResult %s Outcome=%d"),
+				*OriginalLogContext, static_cast<int32>(EndResult.Outcome));
+		}
+		else
+		{
 			UE_LOG(LogGGYGOAbilitySystem, Error,
-				TEXT("[Combat.PlayerCombo.InterruptionDiagnostics] Boundary=AbilityEndResult %s Outcome=%d Reason=%d; original End request was not accepted"),
-				*OriginalLogContext, static_cast<int32>(EndResult.Outcome), static_cast<int32>(EndResult.Reason));
-			break;
+				TEXT("[Combat.PlayerCombo.InterruptionDiagnostics] Boundary=AbilityEndResult %s Outcome=%d; original End request was not accepted"),
+				*OriginalLogContext, static_cast<int32>(EndResult.Outcome));
 		}
 		// Only local immutable diagnostic data is accessed after the external End request.
 	};
@@ -1532,11 +1573,24 @@ void UGGYGOPlayerComboAbility::ReleaseStepMotion(EGGYGOActionMotionReleaseReason
 	{
 		if (Entry->Phase != FStepEntryAttempt::EPhase::Starting) { ReleaseStepEntry(Entry); }
 	}
-	if (Original.IsValid()) { Original->ClearWatchdog(); Original->Release(Reason); Original->ReleaseTask(false); }
+	if (Original.IsValid()) { Original->Release(Reason); Original->ClearWatchdog(); Original->ReleaseTask(false); }
 }
 
 bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position, int32 SourceRequestId,
 	bool bCorrectionReplay, const FQuat* ReplayEntryActorRotation, TSharedPtr<FStepEntryAttempt> EntryAttempt)
+{
+	FStepStartInputs Inputs;
+	if (!ReadStepStartInputs(Original, Index, SourceRequestId, bCorrectionReplay, ReplayEntryActorRotation,
+		EntryAttempt, Inputs) || !ReleaseCurrentStep(Original))
+	{
+		return false;
+	}
+	return BeginStep(Original, Index, Position, SourceRequestId, bCorrectionReplay, EntryAttempt, Inputs);
+}
+
+bool UGGYGOPlayerComboAbility::ReadStepStartInputs(const FGGYGOAbilityActivationHandle& Original, int32 Index,
+	int32 SourceRequestId, bool bCorrectionReplay, const FQuat* ReplayEntryActorRotation,
+	const TSharedPtr<FStepEntryAttempt>& EntryAttempt, FStepStartInputs& OutInputs)
 {
 	if (!IsActivationCurrent(Original)) { return false; }
 	if (EntryAttempt.IsValid())
@@ -1562,20 +1616,18 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		RequestAbilityEnd(Original, true, true);
 		return false;
 	}
-	if (!IsStepPlayable(Index) || !IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid())
+	// 本段静态声明只来自 Body 取得的预备配置快照；缺失即本次激活未完成准入，不在此重新解析。
+	const TSharedPtr<const FPreparedComboConfiguration> Prepared = PreparedActivation;
+	if (!Prepared.IsValid() || !Prepared->Steps.IsValidIndex(Index) || !ComboSteps.IsValidIndex(Index)
+		|| !IsValid(ActiveMesh) || !IsValid(TraceComponent) || !OriginalWorld.IsValid())
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] StartStep %d rejected: step/Mesh/Trace/original World is invalid."),
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] StartStep %d rejected: prepared step/Mesh/Trace/original World is invalid."),
 			*GetPathNameSafe(this), Index);
 		RequestAbilityCancel(Original, true);
 		return false;
 	}
-	if (StepTokenCounter == MAX_uint64)
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo：段激活令牌已耗尽。"));
-		RequestAbilityCancel(Original, true);
-		return false;
-	}
-	const FGGYGOComboStep Step = ComboSteps[Index];
+	OutInputs.Step = ComboSteps[Index];
+	const FGGYGOComboStep& Step = OutInputs.Step;
 	if (!bCorrectionReplay && Step.StartFacingPolicy == EGGYGOComboStepFacingPolicy::QualifiedInput
 		&& (!EntryAttempt.IsValid() || !EntryAttempt->InputRequest.HasRequest()))
 	{
@@ -1595,55 +1647,26 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		RequestAbilityEnd(Original, true, true);
 		return false;
 	}
-	FGGYGOActionMotionSourceBindingPtr MotionSource;
-	FString MotionError;
-	FGGYGOMontageNotifyDeclaration AttackDeclaration;
 	UGGYGOCharacterMovementComponent* const Movement = Cast<UGGYGOCharacterMovementComponent>(
 		GetCharacterFromActorInfo() ? GetCharacterFromActorInfo()->GetCharacterMovement() : nullptr);
-	if (!Movement || !GGYGOActionMotionSource::BuildSourceBindingRange(Step.Montage, Step.MotionSlotName,
-		Step.MainSection, Step.EndSection, MotionSource, MotionError))
+	if (!Movement)
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Montage [%s] Slot [%s] motion rejected: CMC [%s], %s"),
-			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *Step.MotionSlotName.ToString(), *GetPathNameSafe(Movement), *MotionError);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] step %d Montage [%s] motion rejected: original CMC is unavailable."),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage));
 		RequestAbilityEnd(Original, true, true);
 		return false;
 	}
-	if (!ResolveStepInterruption(Step, MotionSource->MontageStartSeconds, MotionSource->MontageEndSeconds,
-		AttackDeclaration, MotionError))
+	// Socket 与 TraceShape 依赖当前 Mesh 资产，换装后可能变化，所以每段起播时核对。
+	if (Step.FX.Mode == EGGYGOComboFXMode::MontageWindow
+		&& !Step.FX.SocketName.IsNone() && !ActiveMesh->DoesSocketExist(Step.FX.SocketName))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("PlayerCombo [%s] step %d Montage [%s] author point [%s] rejected: %s; position %.9g, bound [%.9g,%.9g)."),
-			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *Step.InterruptionNotifyName.ToString(),
-			*MotionError, AttackDeclaration.TriggerPositionSeconds, MotionSource->MontageStartSeconds, MotionSource->MontageEndSeconds);
-		RequestAbilityEnd(Original, true, true);
-		return false;
-	}
-	FGGYGOMontageNotifyDeclaration MovementDeclaration;
-	float MovementFloor = 0.0f;
-	if (!ResolveStepMovementInterruption(Step, *MotionSource, MovementDeclaration, MovementFloor, MotionError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("PlayerCombo [%s] step %d Montage [%s] movement point [%s] rejected: %s"),
-			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage),
-			*Step.MovementInterruptionNotifyName.ToString(), *MotionError);
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("[Combat.PlayerCombo.FX] Ability='%s' Step=%d Montage='%s' System='%s' Mesh='%s' Socket='%s' configuration rejected: Required original Mesh socket does not exist"),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *GetPathNameSafe(Step.FX.System),
+			*GetPathNameSafe(ActiveMesh), *Step.FX.SocketName.ToString());
 		RequestAbilityEnd(Original, true, true);
 		return false;
 	}
 	FString ShapeError;
-	FGGYGOMontageFXWindowDeclaration FXWindow;
-	FString FXError;
-	if (!ValidateStepFXConfiguration(Step, MotionSource->MontageStartSeconds, MotionSource->MontageEndSeconds,
-		FXError, &FXWindow)
-		|| (Step.FX.Mode == EGGYGOComboFXMode::MontageWindow
-			&& !Step.FX.SocketName.IsNone() && !ActiveMesh->DoesSocketExist(Step.FX.SocketName)))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("[Combat.PlayerCombo.FX] Ability='%s' Step=%d Montage='%s' System='%s' Mesh='%s' Socket='%s' configuration rejected: %s"),
-			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *GetPathNameSafe(Step.FX.System),
-			*GetPathNameSafe(ActiveMesh), *Step.FX.SocketName.ToString(),
-			FXError.IsEmpty() ? TEXT("Required original Mesh socket does not exist") : *FXError);
-		RequestAbilityEnd(Original, true, true);
-		return false;
-	}
 	if (!TraceComponent->ValidateTraceShapeOnCurrentMesh(Step.TraceShape, ActiveMesh.Get(), ShapeError))
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("PlayerCombo [%s] StartStep %d Montage [%s] Trace [%s] Mesh [%s] 的 TraceShape 无效：%s"),
@@ -1652,16 +1675,39 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		RequestAbilityCancel(Original, true);
 		return false;
 	}
-	const TWeakObjectPtr<UWorld> StepWorld = OriginalWorld;
+	OutInputs.Prepared = Prepared;
+	OutInputs.PreparedStep = &Prepared->Steps[Index];
+	OutInputs.Movement = Movement;
+	OutInputs.ReplayBasis = ReplayBasis;
+	OutInputs.bHasReplayBasis = ReplayEntryActorRotation != nullptr;
+	return true;
+}
+
+bool UGGYGOPlayerComboAbility::ReleaseCurrentStep(const FGGYGOAbilityActivationHandle& Original)
+{
 	const uint64 PreviousStepToken = CurrentStepToken;
-	if (StepMotionResources.IsValid()) { StepMotionResources->ClearWatchdog(); }
-	if (!IsActivationCurrent(Original) || CurrentStepToken != PreviousStepToken) { return false; }
+	// 本栈持有旧段资源，FX 外调期间成员被清理也不会释放正在使用的对象。
+	const TSharedPtr<FStepMotionResources> PreviousMotion = StepMotionResources;
+	// 先解绑旧段 Task 回调：之后关闭 Trace、FX 与位移引起的引擎事件不再进入本 GA。
+	if (PreviousMotion.IsValid()) { PreviousMotion->UnregisterTaskCallbacks(); }
+	// 关闭 Trace 只改组件内部状态并析构弱捕获的命中回调，没有外调。
 	ReleaseTraceWindow(Original);
+	// 停止 FX 与关闭发布会执行失败委托，可同步结束原激活。
+	ReleaseStepFX(PreviousMotion, false);
 	if (!IsActivationCurrent(Original) || CurrentStepToken != PreviousStepToken) { return false; }
-	ReleaseStepFX(StepMotionResources, false);
-	if (!IsActivationCurrent(Original) || CurrentStepToken != PreviousStepToken) { return false; }
+	// Watchdog 随位移一并清除；结束原 Task 与 CMC 位移会回调观察者。
 	ReleaseStepMotion(EGGYGOActionMotionReleaseReason::Replaced);
-	if (!IsActivationCurrent(Original) || CurrentStepToken != PreviousStepToken) { return false; }
+	return IsActivationCurrent(Original) && CurrentStepToken == PreviousStepToken;
+}
+
+bool UGGYGOPlayerComboAbility::BeginStep(const FGGYGOAbilityActivationHandle& Original, int32 Index, float Position,
+	int32 SourceRequestId, bool bCorrectionReplay, const TSharedPtr<FStepEntryAttempt>& EntryAttempt,
+	const FStepStartInputs& Inputs)
+{
+	const FGGYGOComboStep& Step = Inputs.Step;
+	const FPreparedComboStep& Prepared = *Inputs.PreparedStep;
+	const TWeakObjectPtr<UWorld> StepWorld = OriginalWorld;
+	FString MotionError;
 	Window.Reset();
 	CurrentStep = Index;
 	CurrentStepRequestId = SourceRequestId;
@@ -1694,10 +1740,10 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		Motion->StartFacing.InputRequest = EntryAttempt->InputRequest;
 		Motion->StartFacing.Scope = EntryAttempt->Scope;
 	}
-	if (bCorrectionReplay && ReplayEntryActorRotation)
+	if (bCorrectionReplay && Inputs.bHasReplayBasis)
 	{
 		Motion->StartFacing.Mode = EGGYGOActionMotionStartFacingMode::ReplayBasis;
-		Motion->StartFacing.EntryActorRotation = ReplayBasis;
+		Motion->StartFacing.EntryActorRotation = Inputs.ReplayBasis;
 	}
 	else
 	{
@@ -1714,23 +1760,23 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		return false;
 	}
 	Motion->FX = Step.FX;
-	Motion->FXWindow = FXWindow;
-	Motion->Movement = Movement;
-	Motion->Source = MoveTemp(MotionSource);
+	Motion->FXWindow = Prepared.FXWindow;
+	Motion->Movement = Inputs.Movement;
+	Motion->Source = Prepared.MotionSource;
 	Motion->TranslationScale = Step.MotionTranslationScale;
 	Motion->EndSection = Step.EndSection;
 	Motion->AttackGate.Mode = Step.InterruptionMode;
 	Motion->AttackGate.NotifyName = Step.InterruptionNotifyName;
-	Motion->AttackGate.TriggerPosition = AttackDeclaration.TriggerPositionSeconds;
-	Motion->AttackGate.AuthoredPosition = AttackDeclaration.AuthoredPositionSeconds;
-	Motion->AttackGate.TriggerTimeOffset = AttackDeclaration.TriggerTimeOffsetSeconds;
-	Motion->AttackGate.OpenFloorPosition = AttackDeclaration.TriggerPositionSeconds;
+	Motion->AttackGate.TriggerPosition = Prepared.AttackDeclaration.TriggerPositionSeconds;
+	Motion->AttackGate.AuthoredPosition = Prepared.AttackDeclaration.AuthoredPositionSeconds;
+	Motion->AttackGate.TriggerTimeOffset = Prepared.AttackDeclaration.TriggerTimeOffsetSeconds;
+	Motion->AttackGate.OpenFloorPosition = Prepared.AttackDeclaration.TriggerPositionSeconds;
 	Motion->MovementGate.Mode = Step.MovementInterruptionMode;
 	Motion->MovementGate.NotifyName = Step.MovementInterruptionNotifyName;
-	Motion->MovementGate.TriggerPosition = MovementDeclaration.TriggerPositionSeconds;
-	Motion->MovementGate.AuthoredPosition = MovementDeclaration.AuthoredPositionSeconds;
-	Motion->MovementGate.TriggerTimeOffset = MovementDeclaration.TriggerTimeOffsetSeconds;
-	Motion->MovementGate.OpenFloorPosition = MovementFloor;
+	Motion->MovementGate.TriggerPosition = Prepared.MovementDeclaration.TriggerPositionSeconds;
+	Motion->MovementGate.AuthoredPosition = Prepared.MovementDeclaration.AuthoredPositionSeconds;
+	Motion->MovementGate.TriggerTimeOffset = Prepared.MovementDeclaration.TriggerTimeOffsetSeconds;
+	Motion->MovementGate.OpenFloorPosition = Prepared.MovementFloor;
 	Motion->AbilityPath = GetPathNameSafe(this);
 	Motion->bExpectFXBegin = Step.FX.Mode == EGGYGOComboFXMode::MontageWindow
 		&& (Position > 0.0f ? Position : Motion->Source->MontageStartSeconds) < Motion->FXWindow.EndSeconds;
@@ -1749,11 +1795,7 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		return false;
 	}
 	TArray<FName> AuthoredPointNames;
-	TArray<FGGYGOMontageWindowDeclaration> WindowDeclarations;
-	if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
-		Step.Montage, Events, Motion->Source->MontageStartSeconds, Motion->Source->MontageEndSeconds,
-		WindowDeclarations, MotionError)
-		|| !StartedMontageTask->ConfigureOriginalMontageWindows(WindowDeclarations, MotionError))
+	if (!StartedMontageTask->ConfigureOriginalMontageWindows(Prepared.WindowDeclarations, MotionError))
 	{
 		FailStepMotion(Motion, FString::Printf(TEXT("原 Montage 窗口配置失败：%s"), *MotionError));
 		return false;
@@ -1770,10 +1812,13 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 	const TWeakObjectPtr<ThisClass> WeakThis(this);
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> WeakTask(StartedMontageTask);
 	const TWeakPtr<FStepMotionResources> WeakMotion(Motion);
-	const auto ResolveOriginalCaller = [WeakThis, WeakTask, Original, ThisStepToken]() -> ThisClass*
+	// 段资源释放时先解绑这些回调；这里只确认回调仍属于当前段资源。
+	const auto ResolveOriginalCaller = [WeakThis, WeakMotion]() -> ThisClass*
 	{
 		ThisClass* Self = WeakThis.Get();
-		return Self && Self->IsStepCurrent(Original, ThisStepToken, WeakTask.Get()) ? Self : nullptr;
+		const TSharedPtr<FStepMotionResources> Pinned = WeakMotion.Pin();
+		return Self && Pinned.IsValid() && Self->StepMotionResources == Pinned
+			&& Pinned->Section != FStepMotionResources::ESection::Retired ? Self : nullptr;
 	};
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FNativeCallbacks Callbacks;
 	Callbacks.OnCompleted = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
@@ -1808,20 +1853,13 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 			if (ThisClass* Self = WeakThis.Get()) { Self->HandleMontageNotify(WeakMotion.Pin(), Fact); }
 		});
 	Callbacks.OnFailed = FGGYGOMontageTaskFailureDelegate::CreateLambda(
-		[WeakThis, WeakTask, WeakMotion, Original, ThisStepToken](const FGGYGOMontageTaskFailureFact& Fact)
+		[ResolveOriginalCaller, WeakTask, WeakMotion, Original, ThisStepToken](const FGGYGOMontageTaskFailureFact& Fact)
 		{
-			ThisClass* Self = WeakThis.Get();
+			// 失败在原 Task EndTask 之后交付，发送者已标记 Garbage；只认所属段资源仍为当前段。
+			ThisClass* Self = ResolveOriginalCaller();
 			UGGYGOAbilityTask_PlayMontageAndWaitForEvent* const OriginalTask = WeakTask.Get(true);
 			const TSharedPtr<FStepMotionResources> OriginalResource = WeakMotion.Pin();
-			// Native EndTask marks this historical sender Garbage. Admit its exact remaining object,
-			// never a destroyed sender, and authenticate the GA's own original resources without live-task helpers.
-			if (!Self || !OriginalTask || OriginalTask->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-				|| !OriginalResource.IsValid() || !Self->IsActivationCurrent(Original)
-				|| ThisStepToken == 0 || Self->CurrentStepToken != ThisStepToken
-				|| Self->GetMontageTask() != OriginalTask || Self->StepMotionResources != OriginalResource
-				|| OriginalResource->Section == FStepMotionResources::ESection::Retired
-				|| Self->CurrentStep != OriginalResource->StepIndex || OriginalResource->StepToken != ThisStepToken
-				|| !OriginalResource->Activation.HasSameActivation(Original) || OriginalResource->Task.Get(true) != OriginalTask) { return; }
+			if (!Self || !OriginalTask || !OriginalResource.IsValid()) { return; }
 
 			const FString OriginalLogContext = FString::Printf(
 				TEXT("Ability='%s' Step=%d StepToken=%llu Task='%s' Montage='%s' Slot='%s' SourceValid=%d ExpectedMontage='%s' ExpectedSlot='%s' Stage=%u Instance=%d ExpectedInstance=%d Diagnostic='%s'"),
@@ -1842,21 +1880,17 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 				TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RequiredDependencyFailed %s"), *OriginalLogContext);
 			// Required dependency failure ends this original even when user cancellation is disabled.
 			const FGGYGOAbilityTerminationResult Result = Self->RequestAbilityEnd(Original, true, true);
-			switch (Result.Outcome)
+			if (Result.IsAccepted())
 			{
-			case EGGYGOAbilityTerminationOutcome::Completed:
-			case EGGYGOAbilityTerminationOutcome::Accepted:
-			case EGGYGOAbilityTerminationOutcome::Deferred:
-			case EGGYGOAbilityTerminationOutcome::AlreadyPending:
 				UE_LOG(LogGGYGOAbilitySystem, Display,
-					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d Reason=%d"),
-					*OriginalLogContext, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
-				break;
-			default:
+					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d"),
+					*OriginalLogContext, static_cast<int32>(Result.Outcome));
+			}
+			else
+			{
 				UE_LOG(LogGGYGOAbilitySystem, Error,
-					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d Reason=%d; original End request was not accepted"),
-					*OriginalLogContext, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
-				break;
+					TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult %s Outcome=%d; original End request was not accepted"),
+					*OriginalLogContext, static_cast<int32>(Result.Outcome));
 			}
 			// Only copied diagnostic context and the returned result are accessed after the external End request.
 		});
@@ -1884,12 +1918,11 @@ bool UGGYGOPlayerComboAbility::StartStep(const FGGYGOAbilityActivationHandle& Or
 		return false;
 	}
 	// 默认收尾路径显式钉住，防止编辑器中意外关联到其他段或循环。
+	// 引擎入口只改当前 Montage 实例的 NextSection，再更新复制数据或发 Server RPC，不执行本地回调。
 	if (UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo())
 	{
 		ASC->CurrentMontageSetNextSectionName(Step.MainSection, Step.EndSection);
-		if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get())) { return false; }
 		ASC->CurrentMontageSetNextSectionName(Step.EndSection, NAME_None);
-		if (!IsStepCurrent(Original, ThisStepToken, WeakTask.Get())) { return false; }
 	}
 	else
 	{
@@ -2075,6 +2108,17 @@ void UGGYGOPlayerComboAbility::ReleaseStepFX(const TSharedPtr<FStepMotionResourc
 {
 	if (!IsMotionResourceCurrent(Resource)) { return; }
 	Resource->ReleaseFX(bNormalExit);
+}
+
+void UGGYGOPlayerComboAbility::OnRemoveAbility(const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilitySpec& Spec)
+{
+	// GAS 先尝试结束活动实例再通知移除；原生清理被拒（如本实例 ScopeLock 中）时实例随后被标记为垃圾，
+	// 本段 FX lease 仍由本实例持有。发布只能由持有者关闭，这里只按 Abort 归还 FX，不代做其它资源清理。
+	if (const TSharedPtr<FStepMotionResources> Remaining = StepMotionResources)
+	{
+		Remaining->ReleaseFX(false);
+	}
+	Super::OnRemoveAbility(ActorInfo, Spec);
 }
 
 void UGGYGOPlayerComboAbility::HandleStepFXWindow(const TSharedPtr<FStepMotionResources>& Resource,
@@ -2499,31 +2543,25 @@ void UGGYGOPlayerComboAbility::HandleMeleeHit(const FGGYGOAbilityActivationHandl
 			// Internal dependency failure ends this captured original, even if user cancellation is disabled.
 			// GA validates stale/busy sources and owns cleanup/continuation; there is no alternate request.
 			const FGGYGOAbilityTerminationResult Result = Self->RequestAbilityEnd(Original, true, true);
-			switch (Result.Outcome)
+			if (!Result.IsAccepted())
 			{
-			case EGGYGOAbilityTerminationOutcome::Completed:
-			case EGGYGOAbilityTerminationOutcome::Accepted:
-			case EGGYGOAbilityTerminationOutcome::Deferred:
-			case EGGYGOAbilityTerminationOutcome::AlreadyPending:
-				break;
-			default:
 				UE_LOG(LogGGYGOAbilitySystem, Error,
-					TEXT("PlayerCombo runtime hit Ability [%s] Step %d original failure End was not accepted: outcome %d, reason %d."),
-					*AbilityPath, OriginalStep, static_cast<int32>(Result.Outcome), static_cast<int32>(Result.Reason));
-				break;
+					TEXT("PlayerCombo runtime hit Ability [%s] Step %d original failure End was not accepted: outcome %d."),
+					*AbilityPath, OriginalStep, static_cast<int32>(Result.Outcome));
 			}
 		}
 	};
-	TSubclassOf<UGameplayEffect> ResolvedDamageEffect;
-	FString DamageDependencyError;
-	if (!ValidateDamageEffectDependency(DamageDependencyError, &ResolvedDamageEffect))
+	// GE 与伤害模式来自本次激活的预备配置快照，段数值已在准入校验；GE 类在激活期间被卸载或替换时中止原激活。
+	const TSharedPtr<const FPreparedComboConfiguration> Prepared = PreparedActivation;
+	if (!Prepared.IsValid() || !Prepared->IsDamageEffectCurrent())
 	{
-		AbortOriginalHit(DamageDependencyError);
+		AbortOriginalHit(TEXT("ComboDamage: prepared-damage-effect-unavailable"));
 		return;
 	}
-	const FString EffectPath = GetPathNameSafe(ResolvedDamageEffect.Get());
+	const TSubclassOf<UGameplayEffect> PreparedDamageEffect(Prepared->DamageEffect.Get());
+	const FString EffectPath = GetPathNameSafe(PreparedDamageEffect.Get());
 	FGGYGOHitEffectPayload HitPayload;
-	if (!BuildHitEffectPayload(TargetASC, ResolvedDamageEffect, GetAbilityLevel(), HitResult,
+	if (!BuildHitEffectPayload(TargetASC, PreparedDamageEffect, GetAbilityLevel(), HitResult,
 		SourceAvatar->GetActorLocation(), HitPayload))
 	{
 		AbortOriginalHit(FString::Printf(TEXT("BuildHitEffectPayload returned false for GE [%s]; see the original Builder diagnostic."), *EffectPath));
@@ -2533,21 +2571,14 @@ void UGGYGOPlayerComboAbility::HandleMeleeHit(const FGGYGOAbilityActivationHandl
 	if (HitPayload.EffectSpec.IsValid())
 	{
 		FGameplayEffectSpec& Spec = *HitPayload.EffectSpec.Data.Get();
-		EGGYGOComboDamageMode Mode;
-		FString InputError;
-		// Builder的BP扩展可能替换Def或写入键；以返回的实际Spec检查，失败沿原身份收尾。
-		if (!IsValid(Spec.Def.Get()))
+		// Builder 的蓝图扩展可能替换 Def 或写入键。预备模式只对所选 GE 的 CDO 成立，Def 不同即沿原身份收尾。
+		const UClass* const PreparedClass = PreparedDamageEffect.Get();
+		if (!PreparedClass || Spec.Def.Get() != PreparedClass->GetDefaultObject(false))
 		{
-			AbortOriginalHit(TEXT("ComboDamage: invalid-returned-spec-definition"));
+			AbortOriginalHit(TEXT("ComboDamage: returned-spec-definition-mismatch"));
 			return;
 		}
-		if (!ResolveGGYGOComboDamageMode(Spec.Def.Get(), Mode, InputError)
-			|| !ValidateGGYGOComboStepDamage(Step, Mode, InputError))
-		{
-			AbortOriginalHit(InputError);
-			return;
-		}
-		if (Mode == EGGYGOComboDamageMode::Multiplier)
+		if (Prepared->DamageMode == EGGYGOComboDamageMode::Multiplier)
 		{
 			const float* Existing = Spec.SetByCallerTagMagnitudes.Find(GGYGOGameplayTags::SetByCaller_DamageMultiplier);
 			if (Spec.SetByCallerTagMagnitudes.Contains(GGYGOGameplayTags::SetByCaller_Damage)
@@ -2586,6 +2617,7 @@ void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYG
 	if (!ResourceActivation.HasSameActivation(Context.GetOriginalActivation()))
 	{
 		if (ResourceActivation.HasActivation() || InitialInputRoute.HasRoute() || !StepEntryAttempts.IsEmpty()
+			|| PreparedActivation.IsValid()
 			|| StepMotionResources.IsValid() || InputTask || TraceComponent || ActiveMesh || InputCallbackRegistration.IsValid()
 			|| TraceWindow.HasWindow() || TraceHitSubscription.IsValid()
 			|| OriginalWorld.IsValid() || bChangedMeshTick || bAddedMeshPrerequisite)
@@ -2617,11 +2649,11 @@ void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYG
 		auto& Facts = EndingMotion->Observation->Facts;
 		Facts.bCleanupObserved = true;
 		Facts.bCleanupCancelled = Context.WasCancelled();
-		Facts.CleanupKind = Context.GetRequestKind();
 	}
 
 	// Detach every original member before unregistering, restoring or ending external resources.
 	ResourceActivation = {};
+	PreparedActivation.Reset();
 	Window.Close();
 	CurrentStep = INDEX_NONE;
 	CurrentStepRequestId = 0;
@@ -2650,8 +2682,6 @@ void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYG
 		const EGGYGOActionMotionReleaseReason MotionReason = bNaturalEnd
 			? EGGYGOActionMotionReleaseReason::Completed
 			: (Context.WasCancelled() ? EGGYGOActionMotionReleaseReason::Cancelled : EGGYGOActionMotionReleaseReason::OwnerInvalidated);
-		EndingMotion->ClearWatchdog();
-		EndingMotion->ReleaseFX(bNaturalEnd);
 		EndingMotion->Release(MotionReason);
 	}
 
@@ -2663,6 +2693,11 @@ void UGGYGOPlayerComboAbility::CleanupAbilityResourcesForTermination(const FGGYG
 		{
 			EndingTraceComponent->RemoveTickPrerequisiteComponent(EndingMesh.Get());
 		}
+	}
+	if (EndingMotion.IsValid())
+	{
+		EndingMotion->ReleaseFX(bNaturalEnd);
+		EndingMotion->ClearWatchdog();
 	}
 	if (EndingMesh.IsValid() && bRestoreMesh)
 	{

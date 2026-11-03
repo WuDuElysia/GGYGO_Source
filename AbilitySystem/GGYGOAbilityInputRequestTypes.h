@@ -28,7 +28,7 @@ public:
 private:
 	struct FRouteProof;
 	TSharedPtr<FRouteProof> Proof;
-	friend class UGGYGOAbilitySystemComponent;
+	friend class FGGYGOAbilityStepInputRouter;
 	friend class UGGYGOAbilityTask_WaitComboInput;
 };
 
@@ -66,7 +66,7 @@ public:
 private:
 	struct FRequestProof;
 	TSharedPtr<FRequestProof> Proof;
-	friend class UGGYGOAbilitySystemComponent;
+	friend class FGGYGOAbilityStepInputRouter;
 	friend class UGGYGOAbilityTask_WaitComboInput;
 };
 
@@ -100,6 +100,24 @@ struct FGGYGOAbilityInputRequestIdentity
 	}
 };
 
+/**
+ * 签发输入请求的来源会话（如 Hero 的一次输入绑定）。ASC 把它记在每条请求上，
+ * 来源退役时按它一次结束该会话签发的全部请求。Owner 为空表示没有来源会话；
+ * 比较保留失效弱引用的原对象身份。
+ */
+struct FGGYGOAbilityInputSourceKey
+{
+	TWeakObjectPtr<const UObject> Owner;
+	uint64 Generation = 0;
+
+	bool IsSet() const { return !Owner.IsExplicitlyNull(); }
+
+	bool operator==(const FGGYGOAbilityInputSourceKey& Other) const
+	{
+		return Owner.HasSameIndexAndSerialNumber(Other.Owner) && Generation == Other.Generation;
+	}
+};
+
 /** 仅携带原请求与原截止的值副本，不执行入队、激活或期限解析。 */
 struct FGGYGOAbilityInputRetryRequest
 {
@@ -124,6 +142,7 @@ enum class EGGYGOAbilityInputRequestOutcome : uint8
 	Stale
 };
 
+/** 仅用于诊断，调用方按 Outcome 分支；只列仍可能产生的原因。 */
 enum class EGGYGOAbilityInputRequestReason : uint8
 {
 	None,
@@ -131,7 +150,6 @@ enum class EGGYGOAbilityInputRequestReason : uint8
 	InvalidTag,
 	InvalidDeadline,
 	InvalidPreviousIdentity,
-	InvalidEndKind,
 	InvalidASC,
 	WrongASC,
 	WrongRevision,
@@ -143,9 +161,7 @@ enum class EGGYGOAbilityInputRequestReason : uint8
 	NoMatchingSpec,
 	Expired,
 	NoQueuedAdmission,
-	NotHeld,
-	SerialExhausted,
-	RevisionExhausted
+	NotHeld
 };
 
 /** Invalidated is resource retirement, not a physical release. */

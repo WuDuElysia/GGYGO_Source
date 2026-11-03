@@ -40,7 +40,8 @@ bool IsActionStartInputFactWellFormed(const FGGYGOMovementInputStepFact& Fact)
 	return Fact.SourceSessionSerial != 0 && Fact.OriginalEdgeEvaluationSerial != 0 && Fact.StepEvaluationSerial != 0
 		&& FMath::IsFinite(Fact.ControlYaw) && !Fact.ActionValue.ContainsNaN()
 		&& (Fact.InputState == EGGYGOMovementInputRequestQueryResult::Held
-			|| (Fact.InputState == EGGYGOMovementInputRequestQueryResult::NotHeld
+			|| ((Fact.InputState == EGGYGOMovementInputRequestQueryResult::NotHeld
+					|| Fact.InputState == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof)
 				&& Fact.ActionValue == FVector2D::ZeroVector));
 }
 
@@ -2046,14 +2047,6 @@ void UGGYGOCharacterMovementComponent::SuspendLocomotionForAction()
 bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
 	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
 	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
-	int32& OutHandle, FString& OutError)
-{
-	return ActionMotionExecution.BeginMontageActionMotion(OriginalSource, OriginalMontageInstanceId, MontagePositionSeconds, EffectiveMontagePlayRate, TranslationScale, OutHandle, OutError);
-}
-
-bool UGGYGOCharacterMovementComponent::BeginMontageActionMotion(
-	const FGGYGOActionMotionSourceBindingPtr& OriginalSource, int32 OriginalMontageInstanceId,
-	float MontagePositionSeconds, float EffectiveMontagePlayRate, float TranslationScale,
 	const FGGYGOActionMotionStartFacing& Facing, int32& OutHandle, FQuat& OutEntryActorRotation, FString& OutError)
 {
 	return ActionMotionExecution.BeginMontageActionMotion(OriginalSource, OriginalMontageInstanceId,
@@ -2191,7 +2184,7 @@ EGGYGOMovementInputEvaluationState UGGYGOCharacterMovementComponent::PrepareActi
 	if (State != EState::Completed) return State;
 	if (!IsActionStartInputFactWellFormed(Candidate.Fact))
 	{
-		OutError = TEXT("段首事实没有完整来源/评价身份、有限 Axis/Yaw 或明确 Held/NotHeld。");
+		OutError = TEXT("段首事实没有完整来源/评价身份、有限 Axis/Yaw，或不是 Held／无方向的 NotHeld、AwaitingPhysicalProof。");
 		return EState::Invalidated;
 	}
 	const auto* Self = WeakSelf.Get();
@@ -3065,8 +3058,10 @@ void UGGYGOCharacterMovementComponent::UpdateCharacterStateAfterMovement(float D
 bool UGGYGOCharacterMovementComponent::IsMovementBlockedByTag() const
 {
 	// 仅查询原本地资源仍 Ready 的 ASC；Tag 规则与无 ASC 的合法暂态保持。
+	// 切回仍在续放的队员期间同样停住 locomotion；续放能力自己的动作位移不经过这里。
 	const UGGYGOAbilitySystemComponent* ASC = GetReadyLocalAbilitySystemComponent();
-	return ASC && ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantMove);
+	return ASC && (ASC->HasMatchingGameplayTag(GGYGOGameplayTags::Restriction_CantMove)
+		|| ASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_SwitchReturnPending));
 }
 
 bool UGGYGOCharacterMovementComponent::HasMoveInput() const
@@ -5659,146 +5654,24 @@ void UGGYGOCharacterMovementComponent::GetLocalVelocityBlend(float& OutBlendX, f
 	GetLocalVelocityAxes(OutBlendX, OutBlendY);
 }
 
-// Movement-LocalASC-A implementation begin.
-// This record owns one native subscription, not an ASC binding or readiness state.
-struct UGGYGOCharacterMovementComponent::FLocalAbilitySystemSubscription
-{
-	explicit FLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* InExtension)
-		: Extension(InExtension)
-	{
-	}
-
-	~FLocalAbilitySystemSubscription() { Retire(); }
-	FLocalAbilitySystemSubscription(const FLocalAbilitySystemSubscription&) = delete;
-	FLocalAbilitySystemSubscription& operator=(const FLocalAbilitySystemSubscription&) = delete;
-
-	void AcceptReturnedHandle(FDelegateHandle ReturnedHandle)
-	{
-		check(IsInGameThread());
-		check(!NoticeHandle.IsValid());
-		if (bRetired)
-		{
-			// An immediate replay can retire this record before RegisterAndCall returns.
-			if (ReturnedHandle.IsValid())
-			{
-				if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
-				{
-					OriginalExtension->UnregisterLocalAbilitySystemNotice(ReturnedHandle);
-				}
-			}
-			return;
-		}
-		NoticeHandle = ReturnedHandle;
-	}
-
-	void Retire()
-	{
-		// Seal local ownership before the external removal, including destructor cleanup.
-		bRetired = true;
-		Resource = FGGYGOPawnASCResourceHandle{};
-		const FDelegateHandle OriginalHandle = NoticeHandle;
-		NoticeHandle.Reset();
-		if (OriginalHandle.IsValid())
-		{
-			if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
-			{
-				OriginalExtension->UnregisterLocalAbilitySystemNotice(OriginalHandle);
-			}
-		}
-	}
-
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
-	FDelegateHandle NoticeHandle{};
-	FGGYGOPawnASCResourceHandle Resource{};
-	bool bRetired = false;
-};
-
 bool UGGYGOCharacterMovementComponent::PrepareLocalAbilitySystemSubscription(
 	UGGYGOPawnExtensionComponent* Extension, FString& OutError)
 {
 	check(IsInGameThread());
 	OutError.Reset();
-	const FString ErrorContext = FString::Printf(
-		TEXT("Movement LocalASC subscription: Consumer='%s', Owner='%s', Extension='%s'"),
-		*GetPathNameSafe(this), *GetPathNameSafe(GetOwner()), *GetPathNameSafe(Extension));
-	const auto Reject = [&OutError, &ErrorContext](const TCHAR* Reason)
+	if (!IsValid(Extension) || Extension->GetOwner() != GetOwner() || IsBeingDestroyed())
 	{
-		OutError = FString::Printf(TEXT("%s, Reason='%s'."), *ErrorContext, Reason);
+		OutError = FString::Printf(TEXT("Movement LocalASC subscription rejected: Consumer='%s', Owner='%s', Extension='%s'."),
+			*GetPathNameSafe(this), *GetPathNameSafe(GetOwner()), *GetPathNameSafe(Extension));
 		return false;
-	};
-	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalConsumer(this);
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(Extension);
-	const TWeakObjectPtr<APawn> OriginalPawn(Cast<APawn>(GetOwner()));
-	const auto IsOriginalTargetLive = [&]()
-	{
-		const UGGYGOCharacterMovementComponent* Consumer = OriginalConsumer.Get();
-		const UGGYGOPawnExtensionComponent* Source = OriginalExtension.Get();
-		const APawn* Pawn = OriginalPawn.Get();
-		return Consumer && !Consumer->IsBeingDestroyed()
-			&& !Consumer->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			&& Source && !Source->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			&& Pawn && !Pawn->IsActorBeingDestroyed()
-			&& Consumer->GetOwner() == Pawn && Source->GetOwner() == Pawn;
-	};
-	if (!IsOriginalTargetLive())
-	{
-		return Reject(TEXT("subscription requires a live CMC and its original Pawn Extension"));
 	}
-	if (LocalAbilitySystemSubscription.IsValid() && !LocalAbilitySystemSubscription->bRetired
-		&& LocalAbilitySystemSubscription->Extension.HasSameIndexAndSerialNumber(OriginalExtension))
-	{
-		return LocalAbilitySystemSubscription->NoticeHandle.IsValid()
-			? true : Reject(TEXT("original registration has not returned its delegate handle"));
-	}
-
-	// Retirement can call the original source; never write through the old CMC tail.
+	if (LocalASCSubscription.IsSubscribed() && LocalASCSubscription.GetExtension() == Extension) { return true; }
 	ReleaseLocalAbilitySystemSubscription();
-	UGGYGOCharacterMovementComponent* Consumer = OriginalConsumer.Get();
-	if (!IsOriginalTargetLive())
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakMovement(this);
+	LocalASCSubscription.Subscribe(Extension, [WeakMovement](const FGGYGOPawnASCNotice& Notice)
 	{
-		return Reject(TEXT("original consumer or source closed during subscription retirement"));
-	}
-	if (Consumer->LocalAbilitySystemSubscription.IsValid())
-	{
-		return Reject(TEXT("subscription was replaced during retirement; successor is retained"));
-	}
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription =
-		MakeShared<FLocalAbilitySystemSubscription>(OriginalExtension.Get());
-	Consumer->LocalAbilitySystemSubscription = OriginalSubscription;
-	const TWeakPtr<FLocalAbilitySystemSubscription> WeakSubscription(OriginalSubscription);
-	const FDelegateHandle ReturnedHandle = OriginalExtension.Get()->RegisterLocalAbilitySystemNoticeAndCall(
-		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(Consumer,
-			[OriginalConsumer, WeakSubscription](const FGGYGOPawnASCLocalNotice& Notice)
-			{
-				const TSharedPtr<FLocalAbilitySystemSubscription> Subscription = WeakSubscription.Pin();
-				if (UGGYGOCharacterMovementComponent* LiveConsumer = OriginalConsumer.Get())
-				{
-					if (Subscription.IsValid())
-					{
-						LiveConsumer->ConsumeLocalAbilitySystemNotice(Subscription, Notice);
-					}
-				}
-			}));
-	// The stack copy survives an immediate replay replacing/retiring the component's slot.
-	OriginalSubscription->AcceptReturnedHandle(ReturnedHandle);
-	Consumer = OriginalConsumer.Get();
-	if (!ReturnedHandle.IsValid() || !IsOriginalTargetLive()
-		|| !Consumer || Consumer->LocalAbilitySystemSubscription != OriginalSubscription
-		|| OriginalSubscription->bRetired)
-	{
-		if (Consumer && Consumer->LocalAbilitySystemSubscription == OriginalSubscription)
-		{
-			Consumer->ReleaseLocalAbilitySystemSubscription();
-		}
-		else
-		{
-			OriginalSubscription->Retire();
-		}
-		return Reject(ReturnedHandle.IsValid()
-			? TEXT("original subscription changed during immediate replay; only its handle was retired")
-			: TEXT("Extension did not return a valid delegate handle"));
-	}
-	// A registration is not Ready; only an authenticated notice can seed the derived cache.
+		if (UGGYGOCharacterMovementComponent* Movement = WeakMovement.Get()) { Movement->ConsumeLocalAbilitySystemNotice(Notice); }
+	});
 	return true;
 }
 
@@ -5806,12 +5679,8 @@ void UGGYGOCharacterMovementComponent::ReleaseLocalAbilitySystemSubscription()
 {
 	FLocomotionSourceRetirementScope RetirementScope(this);
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = LocalAbilitySystemSubscription;
-	if (!OriginalSubscription.IsValid()) return;
-	OriginalSubscription->bRetired = true;
-	const bool bHadConsumedResource = OriginalSubscription->Resource.HasResource();
-	OriginalSubscription->Resource = FGGYGOPawnASCResourceHandle{};
-	LocalAbilitySystemSubscription.Reset();
+	const bool bHadConsumedResource = LocalASCSubscription.GetConsumedResource().HasResource();
+	LocalASCSubscription.Unsubscribe();
 	if (bHadConsumedResource)
 	{
 		AbilitySystemComponent = nullptr;
@@ -5819,84 +5688,14 @@ void UGGYGOCharacterMovementComponent::ReleaseLocalAbilitySystemSubscription()
 			TEXT("AbilitySystemChanged"), FString(), true);
 		ResetLocomotionState();
 	}
-	// No component writes after native removal; a callback's successor remains untouched.
-	OriginalSubscription->Retire();
 }
 
-void UGGYGOCharacterMovementComponent::ConsumeLocalAbilitySystemNotice(
-	const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
-	const FGGYGOPawnASCLocalNotice& Notice)
+void UGGYGOCharacterMovementComponent::ConsumeLocalAbilitySystemNotice(const FGGYGOPawnASCNotice& Notice)
 {
 	FLocomotionSourceRetirementScope RetirementScope(this);
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = ExpectedSubscription;
-	const FGGYGOPawnASCLocalNotice OwnNotice = Notice;
-	if (!OriginalSubscription.IsValid() || OriginalSubscription->bRetired
-		|| LocalAbilitySystemSubscription != OriginalSubscription) return;
-	const FGGYGOPawnASCResourceHandle OriginalResource = OwnNotice.Resource;
-	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
-	const auto Reject = [&](const TCHAR* Reason)
-	{
-		const FString Diagnostic = FString::Printf(
-			TEXT("Movement LocalASC notice rejected: Consumer='%s', Owner='%s', Extension='%s', ASC='%s', Pawn='%s', Binding=%llu, Kind=%u, Reason='%s'."),
-			*GetPathNameSafe(this), *GetPathNameSafe(GetOwner()),
-			*GetPathNameSafe(OriginalSubscription->Extension.Get()), *GetPathNameSafe(Identity.ASC.Get()),
-			*GetPathNameSafe(Identity.Pawn.Get()), static_cast<unsigned long long>(Identity.Binding.Serial),
-			static_cast<uint32>(OwnNotice.Kind), Reason);
-		UE_LOG(LogGGYGOMovement, Verbose, TEXT("%s"), *Diagnostic);
-	};
-	if (!OriginalResource.HasResource())
-	{
-		Reject(TEXT("notice has no original opaque resource"));
-		return;
-	}
-	if (OwnNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Released)
-	{
-		// Withdrawal makes Ready false and can outlive ASC/Pawn liveness.
-		if (!OriginalSubscription->Resource.HasSameResource(OriginalResource))
-		{
-			Reject(TEXT("Released does not name the consumed original resource; successor is retained"));
-			return;
-		}
-		OriginalSubscription->Resource = FGGYGOPawnASCResourceHandle{};
-		AbilitySystemComponent = nullptr;
-		QueueCurrentLocomotionSourceRetirement(EGGYGOMotionExecutionEndReason::Cancelled,
-			TEXT("AbilitySystemChanged"), FString(), true);
-		ResetLocomotionState();
-		return;
-	}
-	if (OwnNotice.Kind != EGGYGOPawnASCLocalNoticeKind::Ready
-		&& OwnNotice.Kind != EGGYGOPawnASCLocalNoticeKind::Refreshed)
-	{
-		Reject(TEXT("notice kind is not Ready, Released or Refreshed"));
-		return;
-	}
-	UGGYGOPawnExtensionComponent* Source = OriginalSubscription->Extension.Get();
-	UGGYGOAbilitySystemComponent* ASC = Identity.ASC.Get();
-	APawn* Pawn = Identity.Pawn.Get();
-	if (IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| !Source || Source->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| !Pawn || Pawn->IsActorBeingDestroyed() || GetOwner() != Pawn || Source->GetOwner() != Pawn
-		|| !ASC || !Source->IsLocalAbilitySystemResourceReady(OriginalResource)
-		|| !Identity.Binding.HasSameIdentity(OwnNotice.PublishedContext.Binding)
-		|| !ASC->IsAvatarBindingPublicationContextCurrent(OwnNotice.PublishedContext))
-	{
-		Reject(TEXT("original Extension/Pawn/resource or actual publication Context is no longer Ready"));
-		return;
-	}
-	const bool bSameConsumedResource = OriginalSubscription->Resource.HasSameResource(OriginalResource);
-	if (OwnNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Refreshed || bSameConsumedResource)
-	{
-		if (!bSameConsumedResource || AbilitySystemComponent.Get() != ASC)
-		{
-			Reject(TEXT("Refresh/duplicate Ready requires the already consumed original resource and ASC"));
-		}
-		// No cache replacement, clock/sequence/Blend/TurnBack reset or resource cleanup.
-		return;
-	}
-	// A different opaque record is distinct even with the same ASC/Pawn/Binding identity.
-	OriginalSubscription->Resource = OriginalResource;
-	AbilitySystemComponent = ASC;
+	// 订阅已过滤重复 Ready 与非本次资源的 Released；两种通知都结束旧移动来源并复位本地移动状态。
+	AbilitySystemComponent = Notice.Kind == EGGYGOPawnASCNoticeKind::Ready ? Notice.Resource.GetIdentity().ASC.Get() : nullptr;
 	QueueCurrentLocomotionSourceRetirement(EGGYGOMotionExecutionEndReason::Cancelled,
 		TEXT("AbilitySystemChanged"), FString(), true);
 	ResetLocomotionState();
@@ -5905,18 +5704,6 @@ void UGGYGOCharacterMovementComponent::ConsumeLocalAbilitySystemNotice(
 const UGGYGOAbilitySystemComponent* UGGYGOCharacterMovementComponent::GetReadyLocalAbilitySystemComponent() const
 {
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = LocalAbilitySystemSubscription;
-	if (!OriginalSubscription.IsValid() || OriginalSubscription->bRetired
-		|| IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) return nullptr;
-	const FGGYGOPawnASCResourceHandle OriginalResource = OriginalSubscription->Resource;
-	UGGYGOPawnExtensionComponent* Source = OriginalSubscription->Extension.Get();
-	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
-	UGGYGOAbilitySystemComponent* ASC = Identity.ASC.Get();
-	APawn* Pawn = Identity.Pawn.Get();
-	if (!OriginalResource.HasResource() || !Source || !Pawn || Pawn->IsActorBeingDestroyed()
-		|| GetOwner() != Pawn || Source->GetOwner() != Pawn || !ASC
-		|| AbilitySystemComponent.Get() != ASC
-		|| !Source->IsLocalAbilitySystemResourceReady(OriginalResource)) return nullptr;
-	return ASC;
+	const UGGYGOAbilitySystemComponent* ASC = LocalASCSubscription.GetReadyASC();
+	return ASC && AbilitySystemComponent.Get() == ASC ? ASC : nullptr;
 }
-// Movement-LocalASC-A implementation end.

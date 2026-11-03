@@ -6,10 +6,12 @@
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
+#include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "FX/GGYGOMontageFXPublication.h"
 #include "UObject/StrongObjectPtr.h"
 #include "TimerManager.h"
 
+class UGGYGOActionMotionProfile;
 class USkeletalMeshComponent;
 class UWorld;
 
@@ -29,6 +31,11 @@ struct GGYGO_API FGGYGOMontageActionResources
 	FString AbilityPath;
 	bool bMontageCompleted = false;
 	bool bMotionCompleted = false;
+	/** 本资源持有的 Owned Trace 窗口、其作者声明与命中订阅；ReleaseTraceWindow 统一归还。 */
+	TWeakObjectPtr<UGGYGOMeleeTraceComponent> Trace;
+	FGGYGOMeleeTraceWindowHandle TraceWindow;
+	FGGYGOMontageWindowDeclaration TraceWindowSource;
+	FDelegateHandle TraceHits;
 	FGGYGOComboStepFX FX;
 	FGGYGOMontageFXWindowDeclaration FXWindow;
 	bool bFXBeginConsumed = false;
@@ -46,11 +53,13 @@ struct GGYGO_API FGGYGOMontageActionResources
 	bool HasTaskRegistration() const { return TaskRegistration.IsValid(); }
 	bool MatchesFailure(const FGGYGOMontageTaskFailureFact& Fact) const;
 	bool ReadOriginalSnapshot(FGGYGOMontageSectionSnapshot& OutSnapshot, FString& OutError) const;
-	bool BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot, FString& OutError);
 	/** 将原段的朝向请求交给 CMC，不读取输入或保存方向策略。
 	 * OutEntryActorRotation须为独立调用栈值；仅成功后由 GA 重核原段并保存。 */
 	bool BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot,
 		const FGGYGOActionMotionStartFacing& StartFacing, FQuat& OutEntryActorRotation, FString& OutError);
+	/** ActionMotionProfile 位移，与 Montage 原生位移互斥；成功后观察 CMC 失败通知。ReleaseMotion 统一释放。 */
+	bool BeginProfileMotion(const UGGYGOActionMotionProfile* Profile, float PlayRate,
+		FGGYGOActionMotionFailureDelegate Failure, FString& OutError);
 	bool ObserveMotion(FGGYGOActionMotionFailureDelegate Failure,
 		FGGYGOActionMotionCompletionDelegate Completion, TFunctionRef<bool()> IsCurrent, FString& OutError);
 	bool AcceptNaturalBlendOut(FString& OutError);
@@ -58,6 +67,8 @@ struct GGYGO_API FGGYGOMontageActionResources
 	bool IsComplete() const { return bMontageCompleted && bMotionCompleted; }
 	bool ArmWatchdog(USkeletalMeshComponent* Mesh, UWorld* World, float StartPosition, float GraceSeconds,
 		FTimerDelegate Callback, FString& OutError);
+	/** 固定超时：调用方给出实际播放时长＋固定宽限的秒数；与 ArmWatchdog 共用同一个计时器槽。 */
+	bool ArmFixedWatchdog(UWorld* World, float TimeoutSeconds, FTimerDelegate Callback, FString& OutError);
 	FTimerHandle GetWatchdogHandle() const { return WatchdogHandle; }
 	void ClearWatchdog();
 	/** 消费 GA 已在同步回调内经原 Task 认证的窗口事实；不重复解析资产或普通事件负载。
@@ -69,6 +80,9 @@ struct GGYGO_API FGGYGOMontageActionResources
 	/** Ready 事实只唤醒本原 Ticket；真实许可由 Task 当次消费，等待不等于 Spawn。 */
 	bool ContinueFXLocalStart(const FGGYGOMontageFXLocalStartReadyFact& Fact,
 		TFunctionRef<bool()> IsCurrent, FString& OutError);
+	/** 段释放第一步：解绑本资源安装的 Task 原生回调，之后的引擎事件不再进入 GA。 */
+	void UnregisterTaskCallbacks();
+	void ReleaseTraceWindow();
 	void ReleaseFX(bool bNormalExit);
 	void ReleaseMotion(EGGYGOActionMotionReleaseReason Reason);
 	void ReleaseTask(bool bOwnerEnded);
@@ -90,6 +104,8 @@ private:
 	/** 本 holder 安装的确切弱对象＋函数绑定；清理不移除其它订阅。 */
 	FScriptDelegate FXFailureCallback;
 	FDelegateHandle TaskRegistration;
+	/** MotionHandle 来自 Profile 位移（EndActionMotion 释放）而非 Montage 原生位移。 */
+	bool bProfileMotion = false;
 	TWeakObjectPtr<UWorld> WatchdogWorld;
 	FTimerHandle WatchdogHandle;
 };

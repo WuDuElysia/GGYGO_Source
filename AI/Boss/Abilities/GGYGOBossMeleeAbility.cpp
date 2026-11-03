@@ -3,6 +3,7 @@
 
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "AbilitySystem/Abilities/GGYGOMontageActionResources.h"
 #include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
 #include "Animation/Data/GGYGOActionMotionSourceBinding.h"
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
@@ -30,35 +31,14 @@
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOBossMeleeAbility)
 
-struct UGGYGOBossMeleeAbility::FOriginalMeleeResources
+/** 本次激活的 Montage、CMC、Trace 与 Watchdog 由共享资源持有；这里只补 Boss 特有的接收者与 Mesh 恢复。 */
+struct UGGYGOBossMeleeAbility::FOriginalMeleeResources : FGGYGOMontageActionResources
 {
-	FOriginalMeleeResources(UGGYGOBossMeleeAbility* InAbility, const FGGYGOAbilityActivationHandle& InOriginal)
-		: Original(InOriginal), Ability(InAbility) {}
-
-	const FGGYGOAbilityActivationHandle Original;
-	const TWeakObjectPtr<UGGYGOBossMeleeAbility> Ability;
 	TWeakObjectPtr<UAbilitySystemComponent> ASC;
 	TWeakObjectPtr<AActor> Avatar;
 	TWeakObjectPtr<UWorld> World;
 	TWeakObjectPtr<UAnimMontage> Montage;
 	TWeakObjectPtr<USkeletalMeshComponent> Mesh;
-	TWeakObjectPtr<UGGYGOMeleeTraceComponent> Trace;
-	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
-	TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> Task;
-	FDelegateHandle TaskCallbacks;
-	FGGYGOMeleeTraceWindowHandle Window;
-	// 原 Task 持有声明引用；本副本只关联自有 Trace 窗口，随 Window 清理，不授予工作资格。
-	FGGYGOMontageWindowDeclaration WindowSource;
-	FDelegateHandle WindowHits;
-	FTimerHandle Watchdog;
-	int32 MotionHandle = INDEX_NONE;
-	FGGYGOActionMotionSourceBindingPtr MotionSource;
-	int32 MontageInstanceId = INDEX_NONE;
-	float MotionTranslationScale = 1.0f;
-	// Independent original playback and native-physics facts; neither renews GA admission.
-	bool bMontageCompleted = false;
-	bool bMotionCompleted = false;
-	float EffectivePlayRate = 0.0f;
 	EVisibilityBasedAnimTickOption SavedMeshTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 	bool bSavedUpdateRateOptimizations = false;
 	bool bRestoreMesh = false;
@@ -160,7 +140,9 @@ void UGGYGOBossMeleeAbility::InitializeAbilityActivation(const FGGYGOAbilityActi
 			*GetPathName(), *GetNameSafe(AttackMontage));
 		return;
 	}
-	const TSharedPtr<FOriginalMeleeResources> Resources = MakeShared<FOriginalMeleeResources>(this, Original);
+	const TSharedPtr<FOriginalMeleeResources> Resources = MakeShared<FOriginalMeleeResources>();
+	Resources->Activation = Original;
+	Resources->AbilityPath = GetPathName();
 	OriginalResources = Resources;
 	Resources->ASC = GetAbilitySystemComponentFromActorInfo();
 	Resources->Avatar = GetAvatarActorFromActorInfo();
@@ -171,9 +153,8 @@ void UGGYGOBossMeleeAbility::InitializeAbilityActivation(const FGGYGOAbilityActi
 bool UGGYGOBossMeleeAbility::OwnsOriginalResources(
 	const TSharedPtr<FOriginalMeleeResources>& Resources, const FGGYGOAbilityActivationHandle& Original) const
 {
-	return Resources && OriginalResources == Resources && Resources->Original.HasSameActivation(Original)
-		&& Resources->Ability.Get() == this && IsValid(this)
-		&& !HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
+	// 回调只认本能力当前持有的这份资源；资源在结束清理时先摘除，后到的回调自然失效。
+	return Resources && OriginalResources == Resources && Resources->Activation.HasSameActivation(Original);
 }
 
 bool UGGYGOBossMeleeAbility::IsOriginalResourcesCurrent(
@@ -246,52 +227,26 @@ bool UGGYGOBossMeleeAbility::BeginOriginalMeleeMotion(
 		return false;
 	}
 	Resources->Movement = Movement;
-	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalMovement = Movement;
-	const int32 MotionHandle = Movement->BeginActionMotion(Profile, PlayRate);
-	if (!IsOriginalResourcesCurrent(Resources, Original))
-	{
-		if (UGGYGOCharacterMovementComponent* Receiver = OriginalMovement.Get(); Receiver && MotionHandle != INDEX_NONE)
-		{
-			Receiver->EndActionMotion(MotionHandle);
-		}
-		return false;
-	}
-	Resources->MotionHandle = MotionHandle;
-	if (MotionHandle == INDEX_NONE)
-	{
-		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("原 CMC 拒绝动作位移。"));
-		return false;
-	}
-	Movement = OriginalMovement.Get();
-	if (!Movement || !AreOriginalReceiversCurrent(Resources))
-	{
-		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("位移启动返回后原接收者已失效/改变。"));
-		return false;
-	}
 	const TWeakObjectPtr<UGGYGOBossMeleeAbility> WeakAbility(this);
 	const TWeakPtr<FOriginalMeleeResources> WeakResources(Resources);
-	FString ObservationError;
-	const bool bObserved = Movement->ObserveActionMotionFailure(MotionHandle,
-		FGGYGOActionMotionFailureDelegate::CreateLambda(
-			[WeakAbility, WeakResources, Original, OriginalMovement](int32 FailedHandle, const FString& Reason)
+	FString Error;
+	const bool bStarted = Resources->BeginProfileMotion(Profile, PlayRate,
+		FGGYGOActionMotionFailureDelegate::CreateLambda([WeakAbility, WeakResources, Original](int32 FailedHandle, const FString& Reason)
+		{
+			UGGYGOBossMeleeAbility* Ability = WeakAbility.Get();
+			const TSharedPtr<FOriginalMeleeResources> Batch = WeakResources.Pin();
+			// CMC 已退役该槽；只认仍是当前资源且句柄一致的失败。
+			if (Ability && Batch && Batch->MotionHandle == FailedHandle)
 			{
-				UGGYGOBossMeleeAbility* Ability = WeakAbility.Get();
-				const TSharedPtr<FOriginalMeleeResources> Batch = WeakResources.Pin();
-				// Movement has already retired its slot. Original End eligibility belongs to GAS,
-				// independently of HasActiveActionMotion or the old resource-work admission.
-				if (Ability && Batch
-					&& Batch->Movement.HasSameIndexAndSerialNumber(OriginalMovement)
-					&& Batch->MotionHandle == FailedHandle)
-				{
-					Ability->FailOriginalAction(Batch, Original, TEXT("Motion"), Reason);
-				}
-			}), ObservationError);
-	if (!bObserved)
+				Ability->FailOriginalAction(Batch, Original, TEXT("Motion"), Reason);
+			}
+		}), Error);
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
+	if (!bStarted)
 	{
-		FailOriginalAction(Resources, Original, TEXT("Motion 失败观察"), ObservationError);
+		FailOriginalAction(Resources, Original, TEXT("Motion"), Error);
 		return false;
 	}
-	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
 	if (!AreOriginalReceiversCurrent(Resources))
 	{
 		FailOriginalAction(Resources, Original, TEXT("Motion"), TEXT("位移观察返回后原接收者已失效/改变。"));
@@ -302,35 +257,21 @@ bool UGGYGOBossMeleeAbility::BeginOriginalMeleeMotion(
 
 bool UGGYGOBossMeleeAbility::BeginOriginalMontageMotion(const TSharedPtr<FOriginalMeleeResources>& Resources)
 {
-	const FGGYGOAbilityActivationHandle Original = Resources->Original;
+	const FGGYGOAbilityActivationHandle Original = Resources->Activation;
 	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
 	FGGYGOMontageSectionSnapshot Snapshot;
-	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Resources->Task.Get();
-	if (!AreOriginalReceiversCurrent(Resources) || !Task || !Resources->MotionSource.IsValid()
-		|| !Resources->Movement.IsValid() || Resources->MotionHandle != INDEX_NONE
-		|| !Task->TryGetOriginalSectionSnapshot(Snapshot)
-		|| Snapshot.Montage != Resources->MotionSource->Montage.Get() || Snapshot.MontageInstanceId == INDEX_NONE
-		|| Snapshot.SectionName != Resources->MotionSource->SectionName
-		|| !FMath::IsFinite(Snapshot.InstancePlayRate) || Snapshot.InstancePlayRate <= 0.0f
-		|| Snapshot.InstancePlayRate * Resources->MotionSource->MontageRateScale != Resources->EffectivePlayRate)
+	FString SnapshotError;
+	if (!AreOriginalReceiversCurrent(Resources) || !Resources->Movement.IsValid() || Resources->MotionHandle != INDEX_NONE
+		|| !Resources->ReadOriginalSnapshot(Snapshot, SnapshotError) || Snapshot.SectionName != Resources->Source->SectionName)
 	{
 		FailOriginalAction(Resources, Original, TEXT("Montage Motion 启动"), TEXT("原 Task 的实例/Section/固定速率快照或原 CMC 不可用。"));
 		return false;
 	}
-	Resources->MontageInstanceId = Snapshot.MontageInstanceId;
-	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalMovement = Resources->Movement;
 	FString Error;
-	const bool bStarted = OriginalMovement->BeginMontageActionMotion(Resources->MotionSource, Snapshot.MontageInstanceId,
-		Snapshot.PositionSeconds, Resources->EffectivePlayRate, Resources->MotionTranslationScale, Resources->MotionHandle, Error);
-	if (!IsOriginalResourcesCurrent(Resources, Original))
-	{
-		if (UGGYGOCharacterMovementComponent* Receiver = OriginalMovement.Get(); Receiver && Resources->MotionHandle != INDEX_NONE)
-		{
-			Receiver->ReleaseMontageActionMotion(Resources->MotionHandle, EGGYGOActionMotionReleaseReason::OwnerInvalidated, Error);
-		}
-		return false;
-	}
-	if (!bStarted || !OriginalMovement.IsValid() || !AreOriginalReceiversCurrent(Resources))
+	FQuat AcceptedEntryRotation = FQuat::Identity;
+	const bool bStarted = Resources->BeginMotion(Snapshot, FGGYGOActionMotionStartFacing{}, AcceptedEntryRotation, Error);
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
+	if (!bStarted || !AreOriginalReceiversCurrent(Resources))
 	{
 		FailOriginalAction(Resources, Original, TEXT("Montage Motion 启动"),
 			bStarted ? TEXT("位移启动返回后原接收者已失效/改变。") : Error);
@@ -338,38 +279,31 @@ bool UGGYGOBossMeleeAbility::BeginOriginalMontageMotion(const TSharedPtr<FOrigin
 	}
 	const TWeakObjectPtr<UGGYGOBossMeleeAbility> WeakAbility(this);
 	const TWeakPtr<FOriginalMeleeResources> WeakResources(Resources);
-	const bool bFailureObserved = OriginalMovement->ObserveMontageActionMotionFailure(Resources->MotionHandle,
-		FGGYGOActionMotionFailureDelegate::CreateLambda([WeakAbility, WeakResources, OriginalMovement](int32 Handle, const FString& Diagnostic)
+	const bool bObserved = Resources->ObserveMotion(
+		FGGYGOActionMotionFailureDelegate::CreateLambda([WeakAbility, WeakResources](int32 Handle, const FString& Diagnostic)
 		{
 			UGGYGOBossMeleeAbility* Ability = WeakAbility.Get();
 			const TSharedPtr<FOriginalMeleeResources> Batch = WeakResources.Pin();
-			if (Ability && Batch && Batch->Movement.HasSameIndexAndSerialNumber(OriginalMovement) && Batch->MotionHandle == Handle)
+			if (Ability && Batch && Batch->MotionHandle == Handle)
 			{
-				Ability->FailOriginalAction(Batch, Batch->Original, TEXT("Montage Motion"), Diagnostic);
+				Ability->FailOriginalAction(Batch, Batch->Activation, TEXT("Montage Motion"), Diagnostic);
 			}
-		}), Error);
-	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
-	if (!bFailureObserved || !AreOriginalReceiversCurrent(Resources))
-	{
-		FailOriginalAction(Resources, Original, TEXT("Montage Motion 失败观察"),
-			bFailureObserved ? TEXT("观察返回后原接收者已失效/改变。") : Error);
-		return false;
-	}
-	const bool bCompletionObserved = OriginalMovement->ObserveMontageActionMotionCompletion(Resources->MotionHandle,
-		FGGYGOActionMotionCompletionDelegate::CreateLambda([WeakAbility, WeakResources, OriginalMovement](int32 Handle)
+		}),
+		FGGYGOActionMotionCompletionDelegate::CreateLambda([WeakAbility, WeakResources](int32 Handle)
 		{
 			UGGYGOBossMeleeAbility* Ability = WeakAbility.Get();
 			const TSharedPtr<FOriginalMeleeResources> Batch = WeakResources.Pin();
-			if (!Ability || !Batch || !Batch->Movement.HasSameIndexAndSerialNumber(OriginalMovement)
-				|| Batch->MotionHandle != Handle || !Ability->IsOriginalResourcesCurrent(Batch, Batch->Original)) { return; }
+			if (!Ability || !Batch || Batch->MotionHandle != Handle
+				|| !Ability->IsOriginalResourcesCurrent(Batch, Batch->Activation)) { return; }
 			Batch->bMotionCompleted = true;
 			Ability->TryCompleteOriginalMontageMotion(Batch);
-		}), Error);
+		}),
+		[this, &Resources, &Original]() { return IsOriginalResourcesCurrent(Resources, Original); }, Error);
 	if (!IsOriginalResourcesCurrent(Resources, Original)) { return false; }
-	if (!bCompletionObserved || !AreOriginalReceiversCurrent(Resources))
+	if (!bObserved || !AreOriginalReceiversCurrent(Resources))
 	{
-		FailOriginalAction(Resources, Original, TEXT("Montage Motion 完成观察"),
-			bCompletionObserved ? TEXT("观察返回后原接收者已失效/改变。") : Error);
+		FailOriginalAction(Resources, Original, TEXT("Montage Motion 观察"),
+			bObserved ? TEXT("观察返回后原接收者已失效/改变。") : Error);
 		return false;
 	}
 	return true;
@@ -377,14 +311,14 @@ bool UGGYGOBossMeleeAbility::BeginOriginalMontageMotion(const TSharedPtr<FOrigin
 
 void UGGYGOBossMeleeAbility::TryCompleteOriginalMontageMotion(const TSharedPtr<FOriginalMeleeResources>& Resources)
 {
-	if (IsOriginalResourcesCurrent(Resources, Resources->Original) && Resources->bMontageCompleted && Resources->bMotionCompleted)
+	if (IsOriginalResourcesCurrent(Resources, Resources->Activation) && Resources->IsComplete())
 	{
 		if (!AreOriginalReceiversCurrent(Resources))
 		{
-			FailOriginalAction(Resources, Resources->Original, TEXT("Montage Motion 完成"), TEXT("原播放和位移完成后接收者已失效/改变。"));
+			FailOriginalAction(Resources, Resources->Activation, TEXT("Montage Motion 完成"), TEXT("原播放和位移完成后接收者已失效/改变。"));
 			return;
 		}
-		RequestOriginalTermination(Resources->Original, false, false);
+		RequestOriginalTermination(Resources->Activation, false, false);
 	}
 }
 
@@ -394,11 +328,11 @@ void UGGYGOBossMeleeAbility::HandleOriginalTaskFailure(const TSharedPtr<FOrigina
 	// EndTask already marked this sender Garbage. Authenticate its fixed N0 registration,
 	// never require live-task admission or look up another instance of the same Montage.
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get(true);
-	if (!OwnsOriginalResources(Resources, Resources->Original) || !Task
+	if (!OwnsOriginalResources(Resources, Resources->Activation) || !Task
 		|| Task->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
 		|| !Resources->Task.HasSameIndexAndSerialNumber(OriginalTask) || Fact.Montage != Resources->Montage.Get()) { return; }
 	if (Resources->MontageInstanceId != INDEX_NONE && Fact.MontageInstanceId != Resources->MontageInstanceId) { return; }
-	FailOriginalAction(Resources, Resources->Original, TEXT("Montage Task"), Fact.Diagnostic);
+	FailOriginalAction(Resources, Resources->Activation, TEXT("Montage Task"), Fact.Diagnostic);
 }
 
 bool UGGYGOBossMeleeAbility::HasOriginalMeleeMeshResource() const
@@ -408,7 +342,7 @@ bool UGGYGOBossMeleeAbility::HasOriginalMeleeMeshResource() const
 
 FGGYGOAbilityActivationHandle UGGYGOBossMeleeAbility::GetOriginalMeleeResourceActivation() const
 {
-	return OriginalResources ? OriginalResources->Original : FGGYGOAbilityActivationHandle();
+	return OriginalResources ? OriginalResources->Activation : FGGYGOAbilityActivationHandle();
 }
 
 void UGGYGOBossMeleeAbility::RequestOriginalTermination(
@@ -416,26 +350,18 @@ void UGGYGOBossMeleeAbility::RequestOriginalTermination(
 {
 	const FString OriginalAbilityName = GetPathName();
 	const TSharedPtr<FOriginalMeleeResources> Resources = OriginalResources;
-	const FString OriginalMontageName = Resources && Resources->Original.HasSameActivation(Original)
+	const FString OriginalMontageName = Resources && Resources->Activation.HasSameActivation(Original)
 		? GetNameSafe(Resources->Montage.Get()) : TEXT("<原资源批次不可用>");
 	const FGGYGOAbilityTerminationResult Result = bCancel
 		? RequestAbilityCancel(Original, true)
 		: RequestAbilityEnd(Original, true, bWasCancelled);
-	switch (Result.Outcome)
+	if (!Result.IsAccepted())
 	{
-	case EGGYGOAbilityTerminationOutcome::Completed:
-	case EGGYGOAbilityTerminationOutcome::Accepted:
-	case EGGYGOAbilityTerminationOutcome::Deferred:
-	case EGGYGOAbilityTerminationOutcome::AlreadyPending:
-		break;
-	default:
+		// 只诊断；结果不授权重试或强制结束。
 		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("BossMelee [%s] 原 %s 请求未获准：Outcome=%d Reason=%d；Montage [%s]。"),
-			*OriginalAbilityName, bCancel ? TEXT("Cancel") : TEXT("End"), int32(Result.Outcome),
-			int32(Result.Reason), *OriginalMontageName);
-		break;
+			TEXT("BossMelee [%s] 原 %s 请求未获准：Outcome=%d；Montage [%s]。"),
+			*OriginalAbilityName, bCancel ? TEXT("Cancel") : TEXT("End"), int32(Result.Outcome), *OriginalMontageName);
 	}
-	// The returned history never authorizes a replacement request or forced End.
 }
 
 void UGGYGOBossMeleeAbility::FailOriginalAction(
@@ -493,8 +419,9 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	Resources->Mesh = Mesh;
 	Resources->Trace = Trace;
 	Resources->Montage = AttackMontage;
+	// 资产配置在本次激活内只解析一次：这些属性对 BP 只读，Commit 也不会改写它们。
 	FString ConfigurationError;
-	if (!HasAuthority(&ActivationInfo) || !ValidateMeleeConfiguration(ConfigurationError)
+	if (!HasAuthority(&ActivationInfo) || !ResolveMeleeConfiguration(ConfigurationError, Resources->Source)
 		|| !IsValid(Mesh) || !Mesh->GetAnimInstance() || !IsValid(Trace)
 		|| !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket))
 	{
@@ -511,16 +438,14 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 		return;
 	}
 	if (!RecheckAfterExternal(TEXT("Commit"))) { return; }
-	// BP/Commit can change configuration. Freeze the actual montage and receivers used below.
-	Resources->Montage = AttackMontage;
+	// Commit 会应用 Cost/Cooldown GE 并触发其回调，可能改变 Avatar 的组件；这里只复核运行接收者。
 	const bool bRequiresMotion = bUseMontageSourceMotion || ActionMotionProfile != nullptr;
 	UGGYGOCharacterMovementComponent* Movement = bRequiresMotion && Character
 		? Cast<UGGYGOCharacterMovementComponent>(Character->GetCharacterMovement()) : nullptr;
 	Resources->Movement = Movement;
 	float TaskPlayRate = 0.0f;
 	float EffectivePlayRate = 0.0f;
-	if (!ResolveMeleeConfiguration(ConfigurationError, Resources->MotionSource)
-		|| !IsValid(Mesh) || !IsValid(Trace)
+	if (!IsValid(Mesh) || !IsValid(Trace)
 		|| Character->GetMesh() != Mesh || Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() != Trace
 		|| !Mesh->GetAnimInstance() || !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket)
 		|| !UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(
@@ -533,7 +458,7 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 		return;
 	}
 	const TWeakObjectPtr<const UGGYGOActionMotionProfile> MotionProfile = ActionMotionProfile.Get();
-	Resources->MotionTranslationScale = MotionTranslationScale;
+	Resources->TranslationScale = MotionTranslationScale;
 	const float MontageLength = AttackMontage->GetPlayLength();
 
 	if (!PrepareOriginalMeleeMesh(Original, Mesh))
@@ -571,10 +496,10 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 		if (IsValid(Task.Get())) { Task->TaskOwnerEnded(); }
 		return;
 	}
-	Resources->Task = Task.Get();
-	if (!IsValid(Task.Get()))
+	if (!IsValid(Task.Get()) || !Resources->AdoptTask(Task.Get()))
 	{
-		FailOriginalAction(Resources, Original, TEXT("Task"), TEXT("无法创建原 Montage Task。"));
+		if (IsValid(Task.Get())) { Task->TaskOwnerEnded(); }
+		FailOriginalAction(Resources, Original, TEXT("Task"), TEXT("无法创建或持有原 Montage Task。"));
 		return;
 	}
 	if (!RecheckAfterExternal(TEXT("Task 创建"))) { return; }
@@ -585,9 +510,9 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 		FailOriginalAction(Resources, Original, TEXT("窗口配置"), WindowError);
 		return;
 	}
-	Resources->EffectivePlayRate = Task->GetEffectivePlayRate();
-	const float WatchdogDuration = MontageLength / Resources->EffectivePlayRate + 2.0f;
-	if (!FMath::IsFinite(Resources->EffectivePlayRate) || Resources->EffectivePlayRate <= 0.0f
+	Resources->EffectiveRate = Task->GetEffectivePlayRate();
+	const float WatchdogDuration = MontageLength / Resources->EffectiveRate + 2.0f;
+	if (!FMath::IsFinite(Resources->EffectiveRate) || Resources->EffectiveRate <= 0.0f
 		|| !FMath::IsFinite(WatchdogDuration) || WatchdogDuration <= 0.0f)
 	{
 		FailOriginalAction(Resources, Original, TEXT("Task 速率"), TEXT("实际任务速率或 watchdog 时长无效。"));
@@ -628,27 +553,16 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 			HandleOriginalTaskFailure(Pinned, OriginalTask, Fact);
 		}
 	});
-	const FDelegateHandle Registration = Task->RegisterNativeCallbacks(MoveTemp(Callbacks));
-	if (!IsOriginalResourcesCurrent(Resources, Original))
-	{
-		if (Registration.IsValid()) { Task->UnregisterNativeCallbacks(Registration); }
-		return;
-	}
-	Resources->TaskCallbacks = Registration;
-	if (!Registration.IsValid())
+	const bool bRegistered = Resources->RegisterCallbacks(MoveTemp(Callbacks));
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return; }
+	if (!bRegistered)
 	{
 		FailOriginalAction(Resources, Original, TEXT("N0 注册"), TEXT("原 Task 的 pre-Ready 回调注册失败。"));
 		return;
 	}
 	if (!RecheckAfterExternal(TEXT("N0 注册"))) { return; }
 
-	// Arm before further external setup/Ready; a rejected interruption clears this exact timer.
-	UWorld* World = Resources->World.Get();
-	if (!IsValid(World))
-	{
-		FailOriginalAction(Resources, Original, TEXT("watchdog"), TEXT("原 World 已失效。"));
-		return;
-	}
+	// Ready 之前登记固定超时；被打断时清除这一个计时器。
 	FTimerDelegate Timeout;
 	Timeout.BindWeakLambda(this, [this, WeakResources, Original, OriginalTask]()
 	{
@@ -657,55 +571,37 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 			HandleOriginalMontageTimeout(Pinned, Original, OriginalTask);
 		}
 	});
-	FTimerHandle Watchdog;
-	World->GetTimerManager().SetTimer(Watchdog, MoveTemp(Timeout), WatchdogDuration, false);
-	if (!IsOriginalResourcesCurrent(Resources, Original))
+	FString WatchdogError;
+	const bool bWatchdogArmed = Resources->ArmFixedWatchdog(Resources->World.Get(), WatchdogDuration, MoveTemp(Timeout), WatchdogError);
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return; }
+	if (!bWatchdogArmed)
 	{
-		if (UWorld* Receiver = Resources->World.Get()) { Receiver->GetTimerManager().ClearTimer(Watchdog); }
+		FailOriginalAction(Resources, Original, TEXT("watchdog"), WatchdogError);
 		return;
 	}
-	Resources->Watchdog = Watchdog;
 	if (!RecheckAfterExternal(TEXT("watchdog"))) { return; }
-	if (!Watchdog.IsValid())
-	{
-		FailOriginalAction(Resources, Original, TEXT("watchdog"), TEXT("原 World 无法登记超时资源。"));
-		return;
-	}
 
 	if (MotionProfile.IsValid())
 	{
-		if (!BeginOriginalMeleeMotion(Original, Resources->Movement.Get(), MotionProfile.Get(), Resources->EffectivePlayRate)) { return; }
+		if (!BeginOriginalMeleeMotion(Original, Resources->Movement.Get(), MotionProfile.Get(), Resources->EffectiveRate)) { return; }
 	}
 	UE_LOG(LogGGYGOAbilitySystem, Display,
 		TEXT("BossMelee: [%s] 开始原播放 [%s]。"),
 		*GetNameSafe(Resources->Avatar.Get()), *GetNameSafe(Resources->Montage.Get()));
 	Task->ReadyForActivation();
 	if (!RecheckAfterExternal(TEXT("ReadyForActivation"))) { return; }
-	if (Resources->MotionSource.IsValid()) { BeginOriginalMontageMotion(Resources); }
+	if (Resources->Source.IsValid()) { BeginOriginalMontageMotion(Resources); }
 }
 
 void UGGYGOBossMeleeAbility::CloseOriginalTraceWindow(const TSharedPtr<FOriginalMeleeResources>& Resources)
 {
-	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace = Resources->Trace;
-	const FGGYGOMeleeTraceWindowHandle Window = Resources->Window;
-	const FDelegateHandle Subscription = Resources->WindowHits;
-	Resources->Window = {};
-	Resources->WindowSource = {};
-	Resources->WindowHits.Reset();
-	if (UGGYGOMeleeTraceComponent* Trace = OriginalTrace.Get())
-	{
-		if (Subscription.IsValid()) { Trace->UnsubscribeWindowHit(Subscription); }
-	}
-	if (UGGYGOMeleeTraceComponent* Trace = OriginalTrace.Get(); Trace && Window.HasWindow())
-	{
-		Trace->CloseOwnedTraceWindow(Window);
-	}
+	Resources->ReleaseTraceWindow();
 }
 
 void UGGYGOBossMeleeAbility::CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context)
 {
 	TSharedPtr<FOriginalMeleeResources> Resources = OriginalResources;
-	if (Resources && Resources->Original.HasSameActivation(Context.GetOriginalActivation()))
+	if (Resources && Resources->Activation.HasSameActivation(Context.GetOriginalActivation()))
 	{
 		OriginalResources.Reset(); // Retire the entire original batch before calling any receiver.
 		// Restore non-token Mesh/prerequisite resources before callbacks or task termination can reenter.
@@ -721,36 +617,14 @@ void UGGYGOBossMeleeAbility::CleanupAbilityResourcesForTermination(const FGGYGOA
 			Resources->bRemovePrerequisite = false;
 			Trace->RemoveTickPrerequisiteComponent(Mesh);
 		}
-		FTimerHandle Watchdog = Resources->Watchdog;
-		Resources->Watchdog.Invalidate();
-		if (UWorld* World = Resources->World.Get()) { World->GetTimerManager().ClearTimer(Watchdog); }
-		const FDelegateHandle Registration = Resources->TaskCallbacks;
-		Resources->TaskCallbacks.Reset();
-		if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Resources->Task.Get(); Task && Registration.IsValid())
-		{
-			Task->UnregisterNativeCallbacks(Registration);
-		}
-		CloseOriginalTraceWindow(Resources);
-		const int32 MotionHandle = Resources->MotionHandle;
-		Resources->MotionHandle = INDEX_NONE;
-		if (UGGYGOCharacterMovementComponent* Movement = Resources->Movement.Get(); Movement && MotionHandle != INDEX_NONE)
-		{
-			if (Resources->MotionSource.IsValid())
-			{
-				const EGGYGOActionMotionReleaseReason Reason = !Context.WasCancelled()
-					&& Resources->bMontageCompleted && Resources->bMotionCompleted
-					? EGGYGOActionMotionReleaseReason::Completed
-					: (Context.WasCancelled() ? EGGYGOActionMotionReleaseReason::Cancelled : EGGYGOActionMotionReleaseReason::OwnerInvalidated);
-				FString Error;
-				if (!Movement->ReleaseMontageActionMotion(MotionHandle, Reason, Error))
-				{
-					UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("BossMelee [%s] 原 CMC [%s] MotionHandle=%d 清理失败：%s"),
-						*GetPathName(), *GetPathNameSafe(Movement), MotionHandle, *Error);
-				}
-			}
-			else { Movement->EndActionMotion(MotionHandle); }
-		}
-		if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Resources->Task.Get()) { Task->TaskOwnerEnded(); }
+		// 段寿命顺序：Task 回调 → 位移 → Trace → Watchdog → Task。
+		Resources->UnregisterTaskCallbacks();
+		Resources->ReleaseMotion(!Context.WasCancelled() && Resources->IsComplete()
+			? EGGYGOActionMotionReleaseReason::Completed
+			: (Context.WasCancelled() ? EGGYGOActionMotionReleaseReason::Cancelled : EGGYGOActionMotionReleaseReason::OwnerInvalidated));
+		Resources->ReleaseTraceWindow();
+		Resources->ClearWatchdog();
+		Resources->ReleaseTask(true);
 	}
 	else if (Resources)
 	{
@@ -773,12 +647,10 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
 	if (Kind == EMontageCallback::Completed)
 	{
-		if (Resources->MotionSource.IsValid())
+		if (Resources->Source.IsValid())
 		{
-			Resources->bMontageCompleted = true;
 			FString Error;
-			if (!Resources->Movement.IsValid() || Resources->MotionHandle == INDEX_NONE
-				|| !Resources->Movement->ReleaseMontageActionMotion(Resources->MotionHandle, EGGYGOActionMotionReleaseReason::Completed, Error))
+			if (!Resources->AcceptMontageCompletion(Error))
 			{
 				FailOriginalAction(Resources, Original, TEXT("Montage 完成"),
 					FString::Printf(TEXT("原 CMC 尾帧请求失败：%s"), *Error));
@@ -790,16 +662,13 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 	}
 	else if (Kind == EMontageCallback::Interrupted)
 	{
-		FTimerHandle Watchdog = Resources->Watchdog;
-		Resources->Watchdog.Invalidate();
-		if (UWorld* World = Resources->World.Get()) { World->GetTimerManager().ClearTimer(Watchdog); }
+		Resources->ClearWatchdog();
 		if (IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { RequestOriginalTermination(Original, true, true); }
 	}
-	else if (Kind == EMontageCallback::BlendOut && Resources->MotionSource.IsValid())
+	else if (Kind == EMontageCallback::BlendOut && Resources->Source.IsValid())
 	{
 		FString Error;
-		if (!Resources->Movement.IsValid() || Resources->MotionHandle == INDEX_NONE
-			|| !Resources->Movement->NotifyMontageActionNaturalBlendOut(Resources->MotionHandle, Resources->MontageInstanceId, Error))
+		if (!Resources->AcceptNaturalBlendOut(Error))
 		{
 			FailOriginalAction(Resources, Original, TEXT("Montage 混出"), Error);
 		}
@@ -824,16 +693,16 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 	if (Fact.Phase == EGGYGOMontageWindowPhase::End)
 	{
 		if (Fact.Declaration.EndEventTag == GGYGOGameplayTags::Event_Montage_HitWindowEnd
-			&& Resources->WindowSource.HasSameWindow(Fact.Declaration))
+			&& Resources->TraceWindowSource.HasSameWindow(Fact.Declaration))
 		{
 			CloseOriginalTraceWindow(Resources);
 		}
 		return;
 	}
 	if (Fact.Declaration.BeginEventTag != GGYGOGameplayTags::Event_Montage_HitWindowBegin) { return; }
-	if (Resources->Window.HasWindow())
+	if (Resources->TraceWindow.HasWindow())
 	{
-		const EGGYGOMeleeTraceWindowQueryResult Query = Trace->QueryOwnedTraceWindow(Resources->Window);
+		const EGGYGOMeleeTraceWindowQueryResult Query = Trace->QueryOwnedTraceWindow(Resources->TraceWindow);
 		if (Query == EGGYGOMeleeTraceWindowQueryResult::Active) { return; } // 保留原活动窗口及其去重，不由新 Begin 抢占。
 		if (Query != EGGYGOMeleeTraceWindowQueryResult::Inactive)
 		{
@@ -868,8 +737,8 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 				*GetNameSafe(OriginalTrace.Get()), int32(OpenResult), *TraceStartSocket.ToString(), *TraceEndSocket.ToString(), TraceRadius));
 		return;
 	}
-	Resources->Window = OpenedWindow;
-	Resources->WindowSource = Fact.Declaration;
+	Resources->TraceWindow = OpenedWindow;
+	Resources->TraceWindowSource = Fact.Declaration;
 	Trace = OriginalTrace.Get();
 	if (!Trace)
 	{
@@ -889,7 +758,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 	FDelegateHandle Subscription;
 	const EGGYGOMeleeTraceWindowSubscribeResult SubscribeResult =
 		Trace->SubscribeWindowHit(OpenedWindow, MoveTemp(HitCallback), Subscription);
-	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask) || Resources->Window != OpenedWindow)
+	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask) || Resources->TraceWindow != OpenedWindow)
 	{
 		if (UGGYGOMeleeTraceComponent* Receiver = OriginalTrace.Get())
 		{
@@ -901,7 +770,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 		}
 		return;
 	}
-	Resources->WindowHits = Subscription;
+	Resources->TraceHits = Subscription;
 	if (SubscribeResult != EGGYGOMeleeTraceWindowSubscribeResult::Subscribed || !Subscription.IsValid())
 	{
 		CloseOriginalTraceWindow(Resources);
@@ -918,7 +787,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageTimeout(
 	// Its captured weak identity is provenance; the GA query owns permission to cancel.
 	if (!IsOriginalResourcesCurrent(Resources, Original)
 		|| !Resources->Task.HasSameIndexAndSerialNumber(OriginalTask)) { return; }
-	Resources->Watchdog.Invalidate();
+	Resources->ClearWatchdog();
 	UE_LOG(LogGGYGOAbilitySystem, Warning,
 		TEXT("BossMelee [%s] 原 Montage [%s] 完成回调超时，向原 Activation 请求取消。"),
 		*GetPathName(), *GetNameSafe(Resources->Montage.Get()));
@@ -941,7 +810,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalMeleeHit(
 		UGGYGOMeleeTraceComponent* Trace = OriginalTrace.Get();
 		UAbilitySystemComponent* ASC = Resources->ASC.Get();
 		return IsOriginalResourcesCurrent(Resources, Original)
-			&& Resources->Trace.HasSameIndexAndSerialNumber(OriginalTrace) && Resources->Window == Window
+			&& Resources->Trace.HasSameIndexAndSerialNumber(OriginalTrace) && Resources->TraceWindow == Window
 			&& Trace && Trace->QueryOwnedTraceWindow(Window) == EGGYGOMeleeTraceWindowQueryResult::Active
 			&& OriginalHitActor.IsValid() && ASC && ASC->IsOwnerActorAuthoritative()
 			&& AreOriginalReceiversCurrent(Resources);

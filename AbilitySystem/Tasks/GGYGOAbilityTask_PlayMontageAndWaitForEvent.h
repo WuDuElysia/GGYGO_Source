@@ -582,15 +582,14 @@ private:
 	TSharedPtr<FNativeCallbackRegistration> NativeCallbackRegistration;
 	/** Animation owns validation/failure state; this opaque lease never upgrades to new context. */
 	FGGYGOActionPoseContractTicket ActionPoseContractTicket;
-	FGGYGOAbilityMontagePlaybackHandle OriginalPlayback;
-	FGGYGOMontagePlayGuardIdentity OriginalGuardIdentity;
+	/** ASC 签发的本次播放身份；Guard 字段是本次调用创建的实例。 */
+	FGGYGOAbilityMontagePlayback OriginalPlayback;
 	/** 与调用栈共持停止义务，Task 被结束/销毁也不丢失；完整播放返回后释放。 */
 	TSharedPtr<FInFlightMontagePlayCleanup> InFlightMontagePlayCleanup;
-	TWeakPtr<FGameplayAbilityActorInfo> ActivatedActorInfo;
+	/** 激活时的能力与 ASC：解除本 Task 的取消／事件订阅，并判断能力是否仍是本 Task 的拥有者。 */
 	TWeakObjectPtr<UGameplayAbility> ActivatedAbility;
-	TWeakObjectPtr<AActor> ActivatedOwnerActor;
+	/** 根运动缩放租约与动作姿态契约的接收者。 */
 	TWeakObjectPtr<USkeletalMeshComponent> ActivatedMesh;
-	TWeakObjectPtr<AActor> ActivatedAvatarActor;
 	TWeakObjectPtr<ACharacter> ActivatedCharacter;
 	TWeakObjectPtr<UAnimInstance> ActivatedAnimInstance;
 	TWeakObjectPtr<UAbilitySystemComponent> ActivatedASC;

@@ -1,20 +1,9 @@
-/** @file GGYGOMeleeTraceSafetyTest.cpp @brief 真实碰撞查询下的去重、采样和回调取消边界 */
-#include "Combat/Tests/GGYGOMeleeTraceTestReceiver.h"
+/** @file GGYGOMeleeTraceSafetyTest.cpp @brief 真实碰撞查询下的去重、采样和回调取消边界；Editor 内的旧开窗入口消费者核查 */
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 #include "Engine/HitResult.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "GameFramework/Character.h"
 #include "PhysicalMaterials/PhysicalMaterial.h"
-
-#include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOMeleeTraceTestReceiver)
-
-void UGGYGOMeleeTraceTestReceiver::HandleHit(AActor* Actor, const FHitResult& Hit)
-{
-	++HitCount;
-	LastPhysicalMaterial = Hit.PhysMaterial.Get();
-	if (bCloseOnHit && Trace) { Trace->EndTraceWindow(); }
-	if (bReopenOnHit && Trace) { Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f); }
-}
 
 #if WITH_DEV_AUTOMATION_TESTS
 #include "ReferenceSkeleton.h"
@@ -98,14 +87,42 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 			FixtureTransform.TransformPosition(FVector(500.0, 0.0, 0.0)), 0.01))) { return false; }
 	UGGYGOMeleeTraceComponent* Trace = NewObject<UGGYGOMeleeTraceComponent>(Owner);
 	Trace->RegisterComponent();
-	TStrongObjectPtr<UGGYGOMeleeTraceTestReceiver> Receiver(NewObject<UGGYGOMeleeTraceTestReceiver>());
-	Receiver->Trace = Trace;
-	Trace->OnMeleeHit.AddDynamic(Receiver.Get(), &UGGYGOMeleeTraceTestReceiver::HandleHit);
 	auto TickTrace = [Trace]() { Trace->TickComponent(1.0f / 60.0f, LEVELTICK_All, nullptr); };
 
+	// 基础 RootTip 窗口：每次开窗订阅自己的原窗口；回调可按开关关闭或在回调内重开。
+	int32 HitCount = 0;
+	UPhysicalMaterial* LastPhysicalMaterial = nullptr;
+	bool bCloseOnHit = false;
+	bool bReopenOnHit = false;
+	FGGYGOMeleeTraceWindowHandle RootTipWindow;
+	FDelegateHandle RootTipSubscription;
+	TFunction<EGGYGOMeleeTraceWindowOpenResult(FName)> OpenRootTip;
+	OpenRootTip = [this, Trace, &HitCount, &LastPhysicalMaterial, &bCloseOnHit, &bReopenOnHit,
+		&RootTipWindow, &RootTipSubscription, &OpenRootTip](FName StartPoint)
+	{
+		FGGYGOMeleeTraceWindowHandle Opened;
+		const EGGYGOMeleeTraceWindowOpenResult Result = Trace->TryOpenOwnedTraceWindow(
+			StartPoint, TEXT("TraceTip"), 20.0f, FGGYGOMeleeTraceWindowHandle(), Opened);
+		RootTipWindow = Opened;
+		if (Result != EGGYGOMeleeTraceWindowOpenResult::Opened) { return Result; }
+		TestTrue(TEXT("RootTip 原窗口订阅"), Trace->SubscribeWindowHit(Opened, FGGYGOMeleeTraceWindowHitDelegate::CreateLambda(
+			[this, Trace, Opened, &HitCount, &LastPhysicalMaterial, &bCloseOnHit, &bReopenOnHit, &OpenRootTip]
+			(const FGGYGOMeleeTraceWindowHandle& Reported, AActor*, const FHitResult& Hit)
+			{
+				TestTrue(TEXT("RootTip 命中携带注册时的原窗口身份"), Reported == Opened);
+				++HitCount;
+				LastPhysicalMaterial = Hit.PhysMaterial.Get();
+				if (bCloseOnHit || bReopenOnHit) { Trace->CloseOwnedTraceWindow(Opened); }
+				if (bReopenOnHit) { OpenRootTip(TEXT("TraceBase")); }
+			}), RootTipSubscription) == EGGYGOMeleeTraceWindowSubscribeResult::Subscribed);
+		return Result;
+	};
+	auto CloseRootTip = [Trace, &RootTipWindow]() { Trace->CloseOwnedTraceWindow(RootTipWindow); };
+
 	AddExpectedError(TEXT("Mode=0 Chain=0 Point=0 [Missing, R=20]：Socket/Bone 缺失。"), EAutomationExpectedErrorFlags::Contains, 1, false);
-	Trace->BeginTraceWindow(TEXT("Missing"), TEXT("TraceTip"), 20.0f);
-	TestFalse(TEXT("缺失骨骼拒绝开窗而非回退原点"), Trace->IsTracing());
+	TestEqual(TEXT("缺失骨骼拒绝开窗而非回退原点"), OpenRootTip(TEXT("Missing")), EGGYGOMeleeTraceWindowOpenResult::InvalidConfiguration);
+	TestFalse(TEXT("拒绝开窗不签发句柄"), RootTipWindow.HasWindow());
+	TestFalse(TEXT("缺失骨骼不开窗"), Trace->IsTracing());
 	TestFalse(TEXT("无效窗口不启动 Tick"), Trace->IsComponentTickEnabled());
 
 	const FVector Base = Mesh->GetSocketLocation(TEXT("TraceBase"));
@@ -130,18 +147,18 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	}
 	MaterialTarget->SetActorLocation(FMath::Lerp(Base, Tip, 0.25) + FVector(0.0, 0.0, 40.0));
 
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	if (!TestEqual(TEXT("材质夹具取得原窗口"), OpenRootTip(TEXT("TraceBase")), EGGYGOMeleeTraceWindowOpenResult::Opened)) { return false; }
 	TickTrace();
 	Mesh->SetWorldTransform(FTransform(FixtureTransform.GetRotation(),
 		FixtureTransform.GetLocation() + FVector(0.0, 0.0, 80.0)));
 	TickTrace();
-	TestEqual(TEXT("非初始阻挡 Sweep 命中材质目标一次"), Receiver->HitCount, 1);
-	TestTrue(TEXT("Trace 查询返回目标物理材质"), Receiver->LastPhysicalMaterial == PhysicalMaterial.Get());
-	Trace->EndTraceWindow();
+	TestEqual(TEXT("非初始阻挡 Sweep 命中材质目标一次"), HitCount, 1);
+	TestTrue(TEXT("Trace 查询返回目标物理材质"), LastPhysicalMaterial == PhysicalMaterial.Get());
+	CloseRootTip();
 	MaterialSphere->UnregisterComponent();
 	Mesh->SetWorldTransform(FixtureTransform);
-	Receiver->HitCount = 0;
-	Receiver->LastPhysicalMaterial = nullptr;
+	HitCount = 0;
+	LastPhysicalMaterial = nullptr;
 
 	// 两个目标都位于旧固定四等分之间，重叠响应使一次查询可发现多个 Actor。
 	for (double Ratio : {0.125, 0.375})
@@ -164,46 +181,49 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 		}
 		Target->SetActorLocation(FMath::Lerp(Base, Tip, Ratio));
 	}
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	if (!TestEqual(TEXT("采样夹具取得原窗口"), OpenRootTip(TEXT("TraceBase")), EGGYGOMeleeTraceWindowOpenResult::Opened)) { return false; }
 	TickTrace();
-	TestEqual(TEXT("首帧只建基线"), Receiver->HitCount, 0);
+	TestEqual(TEXT("首帧只建基线"), HitCount, 0);
 	TickTrace();
-	TestEqual(TEXT("半径推导密度覆盖长武器采样间隙"), Receiver->HitCount, 2);
+	TestEqual(TEXT("半径推导密度覆盖长武器采样间隙"), HitCount, 2);
 	TickTrace();
-	TestEqual(TEXT("同窗口每个目标只命中一次"), Receiver->HitCount, 2);
-	Trace->EndTraceWindow();
+	TestEqual(TEXT("同窗口每个目标只命中一次"), HitCount, 2);
+	CloseRootTip();
 	TickTrace();
-	TestEqual(TEXT("结束后不再产生伤害事件"), Receiver->HitCount, 2);
+	TestEqual(TEXT("结束后不再产生伤害事件"), HitCount, 2);
 
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	OpenRootTip(TEXT("TraceBase"));
 	TickTrace(); TickTrace();
-	TestEqual(TEXT("新窗口允许每个目标再次命中"), Receiver->HitCount, 4);
-	Trace->EndTraceWindow();
-	Receiver->HitCount = 0;
-	Receiver->bCloseOnHit = true;
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	TestEqual(TEXT("新窗口允许每个目标再次命中"), HitCount, 4);
+	CloseRootTip();
+	HitCount = 0;
+	bCloseOnHit = true;
+	OpenRootTip(TEXT("TraceBase"));
 	TickTrace(); TickTrace();
-	TestEqual(TEXT("首个回调取消后旧扫掠不得继续命中第二个目标"), Receiver->HitCount, 1);
+	TestEqual(TEXT("首个回调取消后旧扫掠不得继续命中第二个目标"), HitCount, 1);
 	TestFalse(TEXT("回调取消立即关闭窗口"), Trace->IsTracing());
 
-	Receiver->HitCount = 0;
-	Receiver->bReopenOnHit = true;
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	HitCount = 0;
+	bCloseOnHit = false;
+	bReopenOnHit = true;
+	OpenRootTip(TEXT("TraceBase"));
 	TickTrace(); TickTrace();
-	TestEqual(TEXT("回调重开窗口也必须中止旧扫掠"), Receiver->HitCount, 1);
+	TestEqual(TEXT("回调重开窗口也必须中止旧扫掠"), HitCount, 1);
+	TestTrue(TEXT("回调重开取得新的活动原窗口"), Trace->IsTracing()
+		&& Trace->QueryOwnedTraceWindow(RootTipWindow) == EGGYGOMeleeTraceWindowQueryResult::Active);
 	TickTrace();
-	TestEqual(TEXT("回调重开的窗口重新建立基线"), Receiver->HitCount, 1);
-	Trace->EndTraceWindow();
+	TestEqual(TEXT("回调重开的窗口重新建立基线"), HitCount, 1);
+	bReopenOnHit = false;
+	CloseRootTip();
 	Trace->MaxTraceSegments = 4;
 	AddExpectedError(TEXT("超过上限 5或非有限。"), EAutomationExpectedErrorFlags::Contains, 1, false);
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	TestEqual(TEXT("超出采样预算时拒绝并诊断，不静默制造空洞"), OpenRootTip(TEXT("TraceBase")),
+		EGGYGOMeleeTraceWindowOpenResult::InvalidConfiguration);
 	TickTrace();
-	TestFalse(TEXT("超出采样预算时关闭并诊断，不静默制造空洞"), Trace->IsTracing());
+	TestFalse(TEXT("超出采样预算不开窗"), Trace->IsTracing());
 
-	Receiver->bCloseOnHit = false;
-	Receiver->bReopenOnHit = false;
 	Trace->MaxTraceSegments = 64;
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	OpenRootTip(TEXT("TraceBase"));
 	TickTrace();
 	TickTrace();
 	TestTrue(TEXT("停用前已建立采样基线"), Trace->bHasPreviousTransform);
@@ -219,7 +239,7 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	TestTrue(TEXT("重复 Deactivate 保持状态已清理"), Trace->HitActorsThisWindow.IsEmpty());
 
 	Trace->Activate();
-	Trace->BeginTraceWindow(TEXT("TraceBase"), TEXT("TraceTip"), 20.0f);
+	OpenRootTip(TEXT("TraceBase"));
 	TickTrace();
 	TickTrace();
 	TestTrue(TEXT("注销前已重新建立采样基线"), Trace->bHasPreviousTransform);
@@ -234,8 +254,8 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	Trace->RegisterComponent();
 	TestTrue(TEXT("清理后组件可以重新注册"), Trace->IsRegistered());
 
-	// Owned 冒烟复用同一真实查询夹具；旧动态接收器继续绑定以验证事件隔离。
-	const int32 LegacyHitCountBeforeOwned = Receiver->HitCount;
+	// 原窗口替换与回调重入复用同一真实查询夹具；已关闭的 RootTip 订阅不得收到后继窗口的命中。
+	const int32 ClosedRootTipHitCount = HitCount;
 	FGGYGOMeleeTraceWindowHandle OwnedWindow;
 	if (!TestTrue(TEXT("正常取得 Owned 窗口 A"), Trace->TryOpenOwnedTraceWindow(
 		TEXT("TraceBase"), TEXT("TraceTip"), 20.0f, FGGYGOMeleeTraceWindowHandle(), OwnedWindow)
@@ -294,7 +314,7 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("旧扫掠不能写回 C 的采样基线"), Trace->bHasPreviousTransform);
 	TestTrue(TEXT("C 的新采样端点与去重仍为空"), Trace->PreviousPoints.IsEmpty() && Trace->HitActorsThisWindow.IsEmpty());
 	TestFalse(TEXT("B 关闭已移除原订阅令牌"), Trace->UnsubscribeWindowHit(OwnedBSubscription));
-	TestEqual(TEXT("B 原生命中未广播 Legacy 全局事件"), Receiver->HitCount, LegacyHitCountBeforeOwned);
+	TestEqual(TEXT("B 命中不交给已关闭窗口的订阅"), HitCount, ClosedRootTipHitCount);
 	if (!TestTrue(TEXT("回调重开后 B 失效且 C 活动"),
 		Trace->QueryOwnedTraceWindow(OwnedWindowB) == EGGYGOMeleeTraceWindowQueryResult::Inactive
 		&& Trace->QueryOwnedTraceWindow(OwnedWindowC) == EGGYGOMeleeTraceWindowQueryResult::Active)) { return false; }
@@ -303,7 +323,7 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 	TestEqual(TEXT("C 首次 Tick 不命中"), OwnedCHitCount, 0);
 	TickTrace();
 	TestEqual(TEXT("C 原生扫掠命中现有两个目标"), OwnedCHitCount, 2);
-	TestEqual(TEXT("C 原生命中未广播 Legacy 全局事件"), Receiver->HitCount, LegacyHitCountBeforeOwned);
+	TestEqual(TEXT("C 命中不交给已关闭窗口的订阅"), HitCount, ClosedRootTipHitCount);
 	Trace->Deactivate();
 	TestTrue(TEXT("Deactivate 使 C 原窗口失效"), Trace->QueryOwnedTraceWindow(OwnedWindowC)
 		== EGGYGOMeleeTraceWindowQueryResult::Inactive);
@@ -313,7 +333,6 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 
 	// 分段形状复用同一物理世界；合成折角与第二链，不依赖角色/动画资产。
 	Trace->Activate();
-	Trace->EndTraceWindow();
 	auto AddSocket = [MeshAsset](FName Name, FVector Position)
 	{
 		USkeletalMeshSocket* Socket = NewObject<USkeletalMeshSocket>(MeshAsset);
@@ -530,10 +549,120 @@ bool FGGYGOMeleeTraceSafetyTest::RunTest(const FString& Parameters)
 		&& Trace->PreviousPoints.IsEmpty() && Trace->WindowHitSubscriptions.IsEmpty() && Trace->WindowMesh.IsExplicitlyNull()
 		&& Trace->WindowMeshAsset.IsExplicitlyNull() && Trace->WindowWorld.IsExplicitlyNull() && !Trace->IsComponentTickEnabled());
 	TestFalse(TEXT("多链Deactivate原令牌已移除"), Trace->UnsubscribeWindowHit(ChainCSubscription));
-	TestEqual(TEXT("全部分段Owned命中仍隔离Legacy事件"), Receiver->HitCount, LegacyHitCountBeforeOwned);
-
-	Trace->OnMeleeHit.RemoveDynamic(Receiver.Get(), &UGGYGOMeleeTraceTestReceiver::HandleHit);
+	TestEqual(TEXT("分段窗口命中不交给已关闭窗口的订阅"), HitCount, ClosedRootTipHitCount);
 	return true;
 }
+
+#if WITH_EDITOR
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "AssetRegistry/ARFilter.h"
+#include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "Engine/Blueprint.h"
+#include "Engine/MemberReference.h"
+#include "Modules/ModuleManager.h"
+
+namespace GGYGOMeleeTraceConsumerAudit
+{
+	/**
+	 * 已删除的无身份开窗入口与全局命中事件。蓝图节点按函数／委托引用（FMemberReference）
+	 * 或属性名（组件绑定事件）记录它们；按反射读取，不依赖 BlueprintGraph 的具体节点类。
+	 */
+	bool IsRetiredName(FName Name)
+	{
+		return Name == TEXT("BeginTraceWindow") || Name == TEXT("EndTraceWindow") || Name == TEXT("OnMeleeHit");
+	}
+
+	void CollectRetiredReferences(const UBlueprint& Blueprint, const UEdGraph& Graph, const UEdGraphNode& Node,
+		TArray<FString>& OutConsumers)
+	{
+		// K2 节点的引用字段都是单值属性（非静态数组）。
+		for (TFieldIterator<FProperty> It(Node.GetClass()); It; ++It)
+		{
+			FName Referenced;
+			FString Owner;
+			if (const FStructProperty* Struct = CastField<FStructProperty>(*It))
+			{
+				if (Struct->Struct != FMemberReference::StaticStruct()) { continue; }
+				const FMemberReference* Reference = Struct->ContainerPtrToValuePtr<FMemberReference>(&Node);
+				Referenced = Reference->GetMemberName();
+				Owner = GetNameSafe(Reference->GetMemberParentClass());
+			}
+			else if (const FNameProperty* NameProperty = CastField<FNameProperty>(*It))
+			{
+				Referenced = NameProperty->GetPropertyValue_InContainer(&Node);
+			}
+			if (IsRetiredName(Referenced))
+			{
+				OutConsumers.Add(FString::Printf(TEXT("%s Graph=%s Node=%s(%s) Property=%s Member=%s Owner=%s"),
+					*Blueprint.GetPathName(), *Graph.GetName(), *Node.GetName(), *Node.GetClass()->GetName(),
+					*It->GetName(), *Referenced.ToString(), *Owner));
+			}
+		}
+	}
+
+	/** 加载他人蓝图时的编译告警属于该资产作者；本核查只按找到的节点判定。 */
+	class FAuditTestBase : public FAutomationTestBase
+	{
+	public:
+		FAuditTestBase(const FString& InName, bool bInComplexTask) : FAutomationTestBase(InName, bInComplexTask) {}
+		virtual bool SuppressLogErrors() override { return true; }
+		virtual bool SuppressLogWarnings() override { return true; }
+	};
+}
+
+IMPLEMENT_CUSTOM_SIMPLE_AUTOMATION_TEST(FGGYGOMeleeTraceLegacyConsumerAuditTest, GGYGOMeleeTraceConsumerAudit::FAuditTestBase,
+	"GGYGO.Combat.MeleeTrace.LegacyConsumerAudit", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** 在 Editor 中加载 /Game 下全部蓝图（含 AnimBP、AnimNotify 与 Widget 蓝图），逐图逐节点核对已删除入口的引用。 */
+bool FGGYGOMeleeTraceLegacyConsumerAuditTest::RunTest(const FString& Parameters)
+{
+	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	Registry.SearchAllAssets(/*bSynchronousSearch=*/true);
+	FARFilter Filter;
+	Filter.ClassPaths.Add(UBlueprint::StaticClass()->GetClassPathName());
+	Filter.bRecursiveClasses = true;
+	Filter.PackagePaths.Add(TEXT("/Game"));
+	Filter.bRecursivePaths = true;
+	TArray<FAssetData> Assets;
+	Registry.GetAssets(Filter, Assets);
+	int32 LoadedCount = 0;
+	int32 GraphCount = 0;
+	int32 NodeCount = 0;
+	TArray<FString> Consumers;
+	for (const FAssetData& Asset : Assets)
+	{
+		const UBlueprint* Blueprint = Cast<UBlueprint>(Asset.GetAsset());
+		if (!Blueprint)
+		{
+			AddError(FString::Printf(TEXT("[Combat.MeleeTrace.LegacyConsumerAudit] 无法加载蓝图 %s，不能判定其消费关系。"),
+				*Asset.GetObjectPathString()));
+			continue;
+		}
+		++LoadedCount;
+		TArray<UEdGraph*> Graphs;
+		Blueprint->GetAllGraphs(Graphs);
+		for (const UEdGraph* Graph : Graphs)
+		{
+			if (!Graph) { continue; }
+			++GraphCount;
+			for (const UEdGraphNode* Node : Graph->Nodes)
+			{
+				if (!Node) { continue; }
+				++NodeCount;
+				GGYGOMeleeTraceConsumerAudit::CollectRetiredReferences(*Blueprint, *Graph, *Node, Consumers);
+			}
+		}
+	}
+	AddInfo(FString::Printf(TEXT("[Combat.MeleeTrace.LegacyConsumerAudit] Blueprints=%d Loaded=%d Graphs=%d Nodes=%d Consumers=%d"),
+		Assets.Num(), LoadedCount, GraphCount, NodeCount, Consumers.Num()));
+	for (const FString& Consumer : Consumers)
+	{
+		AddError(TEXT("[Combat.MeleeTrace.LegacyConsumerAudit] 仍引用已删除的旧开窗入口或全局命中事件：") + Consumer);
+	}
+	TestTrue(TEXT("Editor 实际加载并检查了项目蓝图"), LoadedCount > 0 && NodeCount > 0);
+	return true;
+}
+#endif
 
 #endif

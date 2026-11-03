@@ -75,15 +75,7 @@ EBTNodeResult::Type UBTTask_GGYGOChooseBossAction::ExecuteTask(
 		return Fail();
 	}
 
-	FString ValidationError;
-	if (!ActionSet->ValidateConfiguration(ValidationError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("ChooseBossAction: 拒绝无效 ActionSet [%s]：%s"),
-			*GetNameSafe(ActionSet), *ValidationError);
-		return Fail();
-	}
-
+	// ActionSet 已在 BossState 采纳 Definition 时整表校验；这里只按动作行过滤候选。
 	AActor* Target = Cast<AActor>(Blackboard->GetValueAsObject(TargetActorKey.SelectedKeyName));
 	FGameplayTagContainer OwnedTags;
 	ASC->GetOwnedGameplayTags(OwnedTags);

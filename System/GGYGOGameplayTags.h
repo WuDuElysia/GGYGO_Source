@@ -194,6 +194,12 @@ namespace GGYGOGameplayTags
 	 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_ActivationGroupQueued);
 
+	/**
+	 * 切回仍有续放能力的队员期间，来自输入缓冲的激活被拒绝。
+	 * 与组排队同样值得重试：输入缓冲登记许可，State.SwitchReturnPending 移除后在原截止前重试一次。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Ability_ActivateFail_SwitchReturnPending);
+
 	// ============================================================
 	// 五、State —— 状态身份
 	//
@@ -240,6 +246,16 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_PoiseBreak);
 	/** 交互中。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Interacting);
+	/**
+	 * 队员已换下但仍在场（留场或退场中）。由 Squad 在服务器上以复制 loose tag 施加，
+	 * 同时施加 `Gameplay_Damage_Immunity`；近战命中检测跳过持有本 Tag 的目标。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_OffField);
+	/**
+	 * 切回的队员仍有续放能力在执行：输入缓冲发起的新激活与 locomotion 移动被阻止，
+	 * 按下的输入照常进入缓冲。由 Squad 在服务器上以复制 loose tag 施加，续放全部结束时移除。
+	 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_SwitchReturnPending);
 	/** Boss 状态根标签。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(State_Boss);
 	/** Boss 形态标签根。具体 Boss 可以在配置中添加子标签。 */
@@ -354,6 +370,10 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Montage_CancelPoint);
 	/** 命中确认。由命中判定组件发出。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_HitConfirm);
+	/** 队员进场：Squad 显示角色并交出控制后发给其 ASC，触发进场能力。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Squad_SwitchIn);
+	/** 队员退场：留场结束或无续放时发给其 ASC；被激活的能力结束后 Squad 才隐藏角色。 */
+	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(Event_Squad_SwitchOut);
 
 	// ============================================================
 	// 十、GameplayCue —— 表现层触发键

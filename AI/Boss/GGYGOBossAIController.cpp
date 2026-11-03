@@ -238,15 +238,8 @@ const FGGYGOBossActionDefinition* AGGYGOBossAIController::SelectAction(
 		return nullptr;
 	}
 
-	FString ValidationError;
-	if (!ActionSet->ValidateConfiguration(ValidationError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("BossAIController [%s] 拒绝无效 ActionSet [%s]：%s"),
-			*GetNameSafe(this), *GetNameSafe(ActionSet), *ValidationError);
-		return nullptr;
-	}
-
+	// ActionSet 全表校验在 BossState 采纳 Definition 时完成（编辑器另有 IsDataValid）；
+	// 选招周期内各步只核对本次选择相关的动作行、Spec 与 Avatar。
 	if (WeightSource.Get() != ActionSet)
 	{
 		RuntimeActionWeights.Reset();
@@ -343,15 +336,6 @@ bool AGGYGOBossAIController::StoreActionSelection(const UGGYGOBossActionSet* Act
 		return false;
 	}
 
-	FString ValidationError;
-	if (!ActionSet->ValidateConfiguration(ValidationError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("BossAIController [%s] 无法保存选择：ActionSet [%s] 无效：%s"),
-			*GetNameSafe(this), *GetNameSafe(ActionSet), *ValidationError);
-		return false;
-	}
-
 	const FGGYGOBossActionDefinition* Action = ActionSet->FindAction(ActionTag);
 	UClass* AbilityClass = Action ? Action->AbilityClass.Get() : nullptr;
 	AActor* Avatar = ASC->GetAvatarActor();
@@ -402,15 +386,6 @@ bool AGGYGOBossAIController::ConsumeActionSelection(const UGGYGOBossActionSet* A
 		RecordedASC != ASC || Selection.PhaseTag != PhaseTag || Selection.ActionTag != ActionTag ||
 		!Selection.SpecHandle.IsValid())
 	{
-		return false;
-	}
-
-	FString ValidationError;
-	if (!ActionSet->ValidateConfiguration(ValidationError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("BossAIController [%s] 消费选择失败：ActionSet [%s] 无效：%s"),
-			*GetNameSafe(this), *GetNameSafe(ActionSet), *ValidationError);
 		return false;
 	}
 

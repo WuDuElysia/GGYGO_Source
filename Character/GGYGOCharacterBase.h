@@ -44,7 +44,6 @@ class UGGYGOPawnExtensionComponent;
 class UInputComponent;
 class UObject;
 struct FFrame;
-struct FGGYGOPawnASCLocalNotice;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "新版角色基类，Lyra 风格组件化"))
 class GGYGO_API AGGYGOCharacterBase : public ACharacter, public IAbilitySystemInterface
@@ -94,13 +93,18 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character")
 	UGGYGOCharacterMovementComponent* GetGGYGOMovementComponent() const;
 
-protected:
-	//~AActor / APawn 生命周期
-	virtual void PostInitializeComponents() override;
-	virtual void BeginPlay() override;
-	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
-	virtual void BeginDestroy() override;
+	/**
+	 * 设置整体碰撞（`SetActorEnableCollision`）并复制到客户端。仅权威端调用。
+	 *
+	 * 引擎的整体碰撞开关不复制：只在服务器关闭时，客户端仍保留这名角色的胶囊，
+	 * 本地预测移动会撞上看不见的角色、再被服务器纠正。用于不在场的 Avatar（如待命队员）。
+	 */
+	void SetReplicatedActorEnableCollision(bool bEnable);
 
+protected:
+	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+
+	//~AActor / APawn 生命周期
 	/** 服务器上被 Controller 附身。 */
 	virtual void PossessedBy(AController* NewController) override;
 
@@ -143,19 +147,15 @@ protected:
 	void UninitAndDestroy();
 
 private:
+	/** 客户端收到整体碰撞开关后应用同一值。 */
+	UFUNCTION()
+	void OnRep_ReplicatedActorEnableCollision();
+
 	FReplicatedLocalRoleChanged ReplicatedLocalRoleChanged;
 
-	/** 只拥有原对象身份和一个通知 token；Health 独占实际资源。 */
-	struct FHealthAbilitySystemSubscription;
-	bool RegisterHealthAbilitySystemSubscription(FString& OutError);
-	void UnregisterHealthAbilitySystemSubscription();
-	void ConsumeLocalAbilitySystemNotice(
-		const TSharedPtr<FHealthAbilitySystemSubscription>& ExpectedSubscription,
-		const FGGYGOPawnASCLocalNotice& Notice);
-
-	TSharedPtr<FHealthAbilitySystemSubscription> HealthAbilitySystemSubscription{};
-	/** 仅为本 Actor 的订阅生命周期准入，不代表 ASC／Health Ready。 */
-	bool bHealthAbilitySystemSubscriptionClosed = false;
+	/** 服务器设置的整体碰撞；默认开启，与引擎默认一致。 */
+	UPROPERTY(ReplicatedUsing = OnRep_ReplicatedActorEnableCollision)
+	bool bReplicatedActorEnableCollision = true;
 
 	/** 初始化协调者。必须存在，否则 InitState 链条断裂。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Character", meta = (AllowPrivateAccess = "true"))

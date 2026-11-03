@@ -31,8 +31,12 @@ struct UBTTask_GGYGOActivateAbility::FAbilityWait
 {
 	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
 	TWeakObjectPtr<UBehaviorTreeComponent> OwnerComp;
-	FGGYGOAbilityActivationHandle OriginalActivation;
-	FDelegateHandle CompletionBinding;
+	FGameplayAbilitySpecHandle Spec;
+	FDelegateHandle EndedBinding;
+	/** TryActivateAbility 调用栈内为真；期间的结束只记录，由 ExecuteTask 的返回值交付。 */
+	bool bTryInProgress = false;
+	bool bEndedDuringTry = false;
+	bool bWasCancelled = false;
 };
 
 UBTTask_GGYGOActivateAbility::UBTTask_GGYGOActivateAbility(const FObjectInitializer& ObjectInitializer)
@@ -118,16 +122,7 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 		return FailExecution();
 	}
 
-	FString ValidationError;
-	if (!ActionSet->ValidateConfiguration(ValidationError))
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("ActivateBossAbility: ActionSet [%s] 在消费后变为无效：%s"),
-			*GetNameSafe(ActionSet), *ValidationError);
-		return FailExecution();
-	}
-	if (!IsActionSourceCurrent()) { return FailExecution(); }
-
+	// ActionSet 已在 BossState 采纳 Definition 时整表校验；这里只核对被消费的动作行与 Spec。
 	const FGGYGOBossActionDefinition* Action = ActionSet->FindAction(ActionTag);
 	const FGameplayAbilitySpec* SelectedSpec = ASC->FindAbilitySpecFromHandle(SelectedHandle);
 	UClass* AbilityClass = Action ? Action->AbilityClass.Get() : nullptr;
@@ -149,59 +144,43 @@ EBTNodeResult::Type UBTTask_GGYGOActivateAbility::ExecuteTask(
 		return FailExecution();
 	}
 	Wait->ASC = ASC;
+	Wait->Spec = SelectedHandle;
 	const TWeakPtr<FAbilityWait> OriginalWait = Wait;
-	Wait->CompletionBinding = ASC->OnAbilityTerminationCompleted().AddWeakLambda(this,
-		[this, OriginalWait](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+	Wait->EndedBinding = ASC->OnAbilityEnded.AddWeakLambda(this,
+		[this, OriginalWait](const FAbilityEndedData& Data)
 		{
 			if (const TSharedPtr<FAbilityWait> PinnedWait = OriginalWait.Pin())
 			{
-				HandleTerminationCompleted(Notice, PinnedWait);
+				HandleAbilityEnded(Data, PinnedWait);
 			}
 		});
-	if (!Wait->CompletionBinding.IsValid())
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("ActivateBossAbility: ASC [%s] Spec [%s] 无法登记原终止完成订阅。"),
-			*GetNameSafe(ASC), *SelectedHandle.ToString());
-		return FailExecution();
-	}
 	const FString OriginalASCName = GetNameSafe(ASC);
 	const FString OriginalActionName = ActionTag.ToString();
-	const FGGYGOAbilityActivationRequestResult Request = ASC->TryActivateAbilityWithTerminationBoundary(SelectedHandle);
+	Wait->bTryInProgress = true;
+	const bool bActivated = ASC->TryActivateAbility(SelectedHandle);
+	Wait->bTryInProgress = false;
 	if (!IsWaitCurrent(Wait)) { return FailExecution(); }
-	if (Request.Outcome != EGGYGOAbilityActivationRequestOutcome::Accepted || !Request.bNativeAccepted)
+	if (!bActivated)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Verbose,
-			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 未取得可等待的原 Activation：Outcome=%d Reason=%d NativeAccepted=%d Original=%d。"),
-			*OriginalASCName, *OriginalActionName, *SelectedHandle.ToString(), int32(Request.Outcome),
-			int32(Request.Reason), Request.bNativeAccepted ? 1 : 0, Request.OriginalActivation.HasActivation() ? 1 : 0);
-		return FailExecution();
-	}
-	if (!Request.OriginalActivation.HasActivation())
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 原生请求已接受，但没有可等待的本地原 Activation。"),
+			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 激活未被接受。"),
 			*OriginalASCName, *OriginalActionName, *SelectedHandle.ToString());
 		return FailExecution();
 	}
-	Wait->OriginalActivation = Request.OriginalActivation;
-	// Notices inside Try arrive before its result issues our identity to this consumer.
-	// ASC seals this exact original history before dispatch; never match an unrelated early notice.
-	if (Request.OriginalTerminationCompleted.HasCompletion())
+	if (Wait->bEndedDuringTry)
 	{
-		if (!Request.OriginalTerminationCompleted.GetOriginal().GetOriginalActivation()
-			.HasSameActivation(Wait->OriginalActivation))
-		{
-			UE_LOG(LogGGYGOAbilitySystem, Error,
-				TEXT("ActivateBossAbility: ASC [%s] Spec [%s] 的同步完成历史不属于原请求。"),
-				*OriginalASCName, *SelectedHandle.ToString());
-			return FailExecution();
-		}
-		const bool bWasCancelled = Request.OriginalTerminationCompleted.GetOriginal().WasCancelled();
+		const bool bWasCancelled = Wait->bWasCancelled;
 		CleanupBinding(Wait);
 		return bWasCancelled ? EBTNodeResult::Failed : EBTNodeResult::Succeeded;
 	}
-	// No external call between installing the returned identity and returning InProgress.
+	const FGameplayAbilitySpec* ActivatedSpec = ASC->FindAbilitySpecFromHandle(SelectedHandle);
+	if (!ActivatedSpec || !ActivatedSpec->IsActive())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("ActivateBossAbility: ASC [%s] Action [%s] Spec [%s] 原生请求已接受，但本地没有可等待的运行中激活。"),
+			*OriginalASCName, *OriginalActionName, *SelectedHandle.ToString());
+		return FailExecution();
+	}
 	return EBTNodeResult::InProgress;
 }
 
@@ -233,16 +212,22 @@ bool UBTTask_GGYGOActivateAbility::IsWaitCurrent(const TSharedPtr<FAbilityWait>&
 		&& IsValid(OwnerComp) && !OwnerComp->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed);
 }
 
-void UBTTask_GGYGOActivateAbility::HandleTerminationCompleted(
-	const FGGYGOAbilityTerminationCompletedNotice& Notice, const TSharedPtr<FAbilityWait>& Wait)
+void UBTTask_GGYGOActivateAbility::HandleAbilityEnded(
+	const FAbilityEndedData& Data, const TSharedPtr<FAbilityWait>& Wait)
 {
-	if (!IsWaitCurrent(Wait) || !Notice.HasCompletion()
-		|| !Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Wait->OriginalActivation))
+	// 项目能力 InstancedPerActor 且禁止重触发，同一 Spec 同时只有一次激活，按 Spec 匹配即可。
+	if (!IsWaitCurrent(Wait) || Data.AbilitySpecHandle != Wait->Spec)
 	{
 		return;
 	}
+	if (Wait->bTryInProgress)
+	{
+		Wait->bEndedDuringTry = true;
+		Wait->bWasCancelled = Data.bWasCancelled;
+		return;
+	}
 	const TWeakObjectPtr<UBehaviorTreeComponent> OriginalOwner = Wait->OwnerComp;
-	const EBTNodeResult::Type Result = Notice.GetOriginal().WasCancelled()
+	const EBTNodeResult::Type Result = Data.bWasCancelled
 		? EBTNodeResult::Failed
 		: EBTNodeResult::Succeeded;
 	CleanupBinding(Wait);
@@ -261,13 +246,13 @@ void UBTTask_GGYGOActivateAbility::CleanupBinding(TSharedPtr<FAbilityWait> Wait)
 	if (!Wait) { return; }
 	if (ActiveWait == Wait) { ActiveWait.Reset(); }
 	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC = Wait->ASC;
-	const FDelegateHandle Binding = Wait->CompletionBinding;
-	Wait->CompletionBinding.Reset();
+	const FDelegateHandle Binding = Wait->EndedBinding;
+	Wait->EndedBinding.Reset();
 	Wait->ASC.Reset();
 	Wait->OwnerComp.Reset();
-	Wait->OriginalActivation = {};
+	Wait->Spec = {};
 	if (UGGYGOAbilitySystemComponent* ASC = OriginalASC.Get(); ASC && Binding.IsValid())
 	{
-		ASC->OnAbilityTerminationCompleted().Remove(Binding);
+		ASC->OnAbilityEnded.Remove(Binding);
 	}
 }

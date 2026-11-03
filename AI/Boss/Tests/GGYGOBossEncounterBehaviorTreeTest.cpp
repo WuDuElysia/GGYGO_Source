@@ -322,18 +322,20 @@ namespace
 		UEngine* Engine = nullptr;
 		bool bHasContext = false;
 		TStrongObjectPtr<UGGYGOEncounterBTProbe> Probe{NewObject<UGGYGOEncounterBTProbe>()};
-		TArray<TPair<TWeakObjectPtr<UGGYGOPawnExtensionComponent>, FDelegateHandle>> LocalNoticeHandles;
+		TArray<TUniquePtr<FGGYGOLocalASCSubscription>> LocalASCSubscriptions;
 
 		void ObserveLocalResourceRelease(UGGYGOPawnExtensionComponent* Extension)
 		{
-			UGGYGOEncounterBTProbe* OriginalProbe = Probe.Get();
-			const FDelegateHandle Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
-				FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(OriginalProbe,
-					[OriginalProbe](const FGGYGOPawnASCLocalNotice& Notice)
-					{
-						if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { OriginalProbe->HandleUninitialized(); }
-					}));
-			LocalNoticeHandles.Emplace(TWeakObjectPtr<UGGYGOPawnExtensionComponent>(Extension), Handle);
+			const TWeakObjectPtr<UGGYGOEncounterBTProbe> OriginalProbe(Probe.Get());
+			TUniquePtr<FGGYGOLocalASCSubscription>& Subscription =
+				LocalASCSubscriptions.Add_GetRef(MakeUnique<FGGYGOLocalASCSubscription>());
+			Subscription->Subscribe(Extension, [OriginalProbe](const FGGYGOPawnASCNotice& Notice)
+			{
+				if (Notice.Kind == EGGYGOPawnASCNoticeKind::Released && OriginalProbe.IsValid())
+				{
+					OriginalProbe->HandleUninitialized();
+				}
+			});
 		}
 
 		bool Initialize()
@@ -358,13 +360,7 @@ namespace
 			// Assertions finish before this guard. Teardown can never supply DUT evidence.
 			Probe->bRecording = false;
 			Probe->MessageWitness.Reset();
-			for (const auto& Registration : LocalNoticeHandles)
-			{
-				if (UGGYGOPawnExtensionComponent* Extension = Registration.Key.Get())
-				{
-					Extension->UnregisterLocalAbilitySystemNotice(Registration.Value);
-				}
-			}
+			LocalASCSubscriptions.Reset();
 			if (World)
 			{
 				for (TActorIterator<AGGYGOEncounterBTTestEncounter> It(World); It; ++It)
@@ -473,8 +469,9 @@ namespace
 					}
 				}
 			}));
-		// Keep real startup Errors visible. Behavior assertions and automation log failures
-		// are separate evidence; do not turn invalid required configuration into a green run.
+		// 生产启动失败的两条 Error 保持原级别输出；声明为恰好各一次的预期，缺失或重复都使本项失败。
+		Test.AddExpectedMessagePlain(TEXT("无法启动行为树"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1);
+		Test.AddExpectedMessagePlain(TEXT("初始装配失败"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1);
 		const bool bSpawned = Encounter->SpawnBoss();
 		Fixture.World->RemoveOnActorSpawnedHandler(SpawnWatch);
 		if (AGGYGOBossAIController* Controller = Probe->Controller.Get())
@@ -504,7 +501,7 @@ namespace
 		bPassed &= Test.TestTrue(TEXT("failed required tree never created or executed a task instance"),
 			Probe->InstanceCreatedCount == 0 && Probe->ExecuteCount == 0 && Probe->TickCount == 0);
 		bPassed &= Test.TestTrue(TEXT("failure cleanup preserves the external Actor with the same Encounter Owner"), ExternalWeak.IsValid());
-		Test.AddInfo(FString::Printf(TEXT("RequiredTreeRejectsInvalidRoot behavior assertions: %s; production startup Errors remain unsuppressed."),
+		Test.AddInfo(FString::Printf(TEXT("RequiredTreeRejectsInvalidRoot behavior assertions: %s; production startup Errors declared as exact-once expectations."),
 			bPassed ? TEXT("PASS") : TEXT("FAIL")));
 		return bPassed;
 	}

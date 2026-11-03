@@ -9,6 +9,7 @@
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/World.h"
 #include "GameFramework/WorldSettings.h"
+#include "FX/Components/GGYGOMontageFXReplicationComponent.h"
 #include "FX/Components/GGYGORemoteMontageFXComponent.h"
 #include "NiagaraSystem.h"
 #include "UObject/StrongObjectPtr.h"
@@ -45,11 +46,9 @@ struct UGGYGOLocomotionFXComponent::FConsumer
 {
 	TWeakObjectPtr<AGGYGOCharacterBase> Character;
 	TWeakObjectPtr<UGGYGOCharacterMovementComponent> Movement;
-	TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
+	/** 本 Pawn 的 ASC 就绪订阅；ASC 是已消费资源的派生缓存。 */
+	FGGYGOLocalASCSubscription ASCSubscription;
 	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
-	FGGYGOPawnASCResourceHandle Resource;
-	FGGYGOAvatarBindingContext Context;
-	FDelegateHandle Notice;
 	FDelegateHandle Retirement;
 	TArray<FGGYGOLocomotionFXCue> ConfiguredCues;
 	TArray<TSharedPtr<FSource>> Sources;
@@ -126,7 +125,6 @@ void UGGYGOLocomotionFXComponent::OnRegister()
 	const auto Original = MakeShared<FConsumer>();
 	Original->Character = Character;
 	Original->Movement = Movement;
-	Original->Extension = Extension;
 	Original->ConfiguredCues = Cues;
 	// 注册前已存在的区间不是本订阅收到的新事件；防同步重注册重放原回调。
 	Original->LastIntervalSerial = Movement->GetMotionExecutionSnapshot().CompletedIntervalSerial;
@@ -137,51 +135,22 @@ void UGGYGOLocomotionFXComponent::OnRegister()
 	Original->Retirement = Movement->OnLocomotionSourceRetired().AddWeakLambda(this,
 		[Self, WeakOriginal](const FGGYGOLocomotionSourceRetirementFact& Fact)
 		{ if (auto* Owner = Self.Get()) { Owner->ConsumeRetirement(WeakOriginal.Pin(), Fact); } });
-	const auto Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
-		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(this,
-			[Self, WeakOriginal](const FGGYGOPawnASCLocalNotice& Notice)
-			{ if (auto* Owner = Self.Get()) { Owner->ConsumeNotice(WeakOriginal.Pin(), Notice); } }));
-	if (!Self.IsValid() || !Self->IsOriginalConsumer(Original))
-	{ Extension->UnregisterLocalAbilitySystemNotice(Handle); return; }
-	Original->Notice = Handle;
-	if (!Handle.IsValid())
-	{ UE_LOG(LogGGYGOLocomotionFX, Error, TEXT("[%s] 原 PawnExtension 未提供有效通知订阅。"), *GetPathName()); }
+	// 已就绪时立即回放 Ready。
+	Original->ASCSubscription.Subscribe(Extension, [Self, WeakOriginal](const FGGYGOPawnASCNotice& Notice)
+	{ if (auto* Owner = Self.Get()) { Owner->ConsumeNotice(WeakOriginal.Pin(), Notice); } });
 }
 
 void UGGYGOLocomotionFXComponent::ConsumeNotice(const TSharedPtr<FConsumer>& Original,
-	const FGGYGOPawnASCLocalNotice& Notice)
+	const FGGYGOPawnASCNotice& Notice)
 {
 	if (!OwnsConsumer(Original)) { return; }
-	if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released || Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Closing)
-	{
-		if (Original->Resource.HasSameResource(Notice.Resource))
-		{
-			Original->Resource = {};
-			Original->Context = {};
-			Original->ASC.Reset();
-			CloseSources(Original);
-		}
-		return;
-	}
-	if (Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Ready && Notice.Kind != EGGYGOPawnASCLocalNoticeKind::Refreshed) { return; }
-	if (!IsOriginalConsumer(Original)) { CloseSources(Original); return; }
-	if (!Original->Extension.IsValid() || !Original->Extension->IsLocalAbilitySystemResourceReady(Notice.Resource)
-		|| !Notice.PublishedContext.HasIssuedContext()) { return; }
+	// 订阅已过滤重复 Ready 与非本次资源的 Released；绑定变化时旧来源的窗口全部关闭。
+	Original->ASC.Reset();
+	CloseSources(Original);
+	if (Notice.Kind != EGGYGOPawnASCNoticeKind::Ready || !IsOriginalConsumer(Original)
+		|| !Original->ASCSubscription.GetConsumedResource().HasSameResource(Notice.Resource)) { return; }
 	const auto Identity = Notice.Resource.GetIdentity();
 	if (Identity.Pawn.Get() != Original->Character.Get() || !Identity.ASC.IsValid()) { return; }
-	if (!Original->Resource.HasSameResource(Notice.Resource) || !Original->Context.HasSameContext(Notice.PublishedContext))
-	{
-		Original->Resource = {};
-		Original->Context = {};
-		Original->ASC.Reset();
-		CloseSources(Original);
-		if (!IsOriginalConsumer(Original) || !Original->Extension.IsValid()
-			|| Original->Resource.HasResource()
-			|| !Original->Extension->IsLocalAbilitySystemResourceReady(Notice.Resource)
-			|| !Identity.ASC.IsValid() || !Identity.ASC->GetAvatarBindingContext().HasSameContext(Notice.PublishedContext)) { return; }
-	}
-	Original->Resource = Notice.Resource;
-	Original->Context = Notice.PublishedContext;
 	Original->ASC = Identity.ASC;
 }
 
@@ -189,8 +158,8 @@ void UGGYGOLocomotionFXComponent::HandleMovementUpdated(float DeltaSeconds, FVec
 {
 	const auto Original = Consumer;
 	if (!OwnsConsumer(Original)) { return; }
-	if (!IsOriginalConsumer(Original) || !Original->Extension.IsValid()) { CloseSources(Original); return; }
-	if (!Original->ASC.IsValid() || !Original->Extension->IsLocalAbilitySystemResourceReady(Original->Resource)) { return; }
+	if (!IsOriginalConsumer(Original) || !Original->ASCSubscription.IsSubscribed()) { CloseSources(Original); return; }
+	if (!Original->ASC.IsValid() || Original->ASCSubscription.GetReadyASC() != Original->ASC.Get()) { return; }
 	const auto Role = Original->Character->GetLocalRole();
 	if (Role != ROLE_Authority && Role != ROLE_AutonomousProxy) { return; }
 	// 原 Character delegate 已晚于 CMC 的完整区间生产；本回调只查询一次。
@@ -282,7 +251,7 @@ void UGGYGOLocomotionFXComponent::BeginCue(const TSharedPtr<FConsumer>& Original
 		|| World != GetWorld() || !FMath::IsFinite(BeginTime) || BeginTime < 0.
 		|| (!Cue->Config.SocketName.IsNone() && !Mesh->DoesSocketExist(Cue->Config.SocketName)))
 	{ UE_LOG(LogGGYGOLocomotionFX, Error, TEXT("[%s:%s] 原源事件时间或挂点无效：%s"), *GetPathName(), *Cue->Config.CueName.ToString(), *Error); Cue->bClosed = true; return; }
-	Cue->Source = FGGYGOFXSourceIdentity::FromLocomotion(Source->Proof, Original->Context);
+	Cue->Source = FGGYGOFXSourceIdentity::FromLocomotion(Source->Proof, ASC);
 	Cue->BeginWorld = World;
 	Cue->BeginWorldTime = BeginTime;
 	Cue->System.Reset(Cue->Config.System);
@@ -301,14 +270,21 @@ void UGGYGOLocomotionFXComponent::BeginCue(const TSharedPtr<FConsumer>& Original
 	Request.RemoteSeekDeltaSeconds = Cue->Config.SeekDeltaSeconds;
 	Request.RemoteMaxSimTimeSeconds = Cue->Config.MaxSimTimeSeconds;
 	Request.BeginServerTime = BeginTime;
-	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher(ASC->GetMontageFXPublicationOwner());
+	const TWeakObjectPtr<UGGYGOMontageFXReplicationComponent> Host(UGGYGOMontageFXReplicationComponent::FindForASC(ASC));
+	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher(Host.IsValid() ? Host->GetPublicationOwner() : nullptr);
 	if (!Publisher.IsValid())
-	{ UE_LOG(LogGGYGOLocomotionFX, Error, TEXT("[%s] 原 ASC 发行者尚未建立。"), *GetPathName()); Cue->bClosed = true; return; }
+	{
+		UE_LOG(LogGGYGOLocomotionFX, Error, TEXT("[%s] 原 ASC [%s] 的 FX 发布宿主或发行者尚未建立。"),
+			*GetPathName(), *GetPathNameSafe(ASC));
+		Cue->bClosed = true;
+		return;
+	}
 	Cue->Publisher = Publisher;
 	if (Character->HasAuthority())
 	{
 		FGGYGOMontageFXLease Lease;
-		const bool bPublished = ASC->TryPublishLocomotionFX(Original->Movement.Get(), Interval, Request, Lease, Error);
+		const bool bPublished = Host.IsValid()
+			&& Host->PublishLocomotionFX(Original->Movement.Get(), Interval, Request, Lease, Error);
 		if (!IsOriginalConsumer(Original) || Source->bClosed || Cue->bClosed)
 		{
 			FGGYGOMontageFXCloseObligation Obligation;
@@ -330,9 +306,9 @@ void UGGYGOLocomotionFXComponent::StartLocalCue(const TSharedPtr<FConsumer>& Ori
 {
 	if (!IsOriginalConsumer(Original) || Source->bClosed || Cue->bClosed || Cue->Native.IsValid()) { return; }
 	UWorld* World = Cue->BeginWorld.Get();
-	if (!World || World->bIsTearingDown || World != GetWorld() || !Original->Extension.IsValid()
-		|| !Original->Extension->IsLocalAbilitySystemResourceReady(Original->Resource)
-		|| !Original->Context.HasSameContext(Cue->Source.GetAvatarBindingContext()))
+	if (!World || World->bIsTearingDown || World != GetWorld() || !Original->ASC.IsValid()
+		|| Original->ASCSubscription.GetReadyASC() != Original->ASC.Get()
+		|| Cue->Source.GetSourceAbilitySystem() != Original->ASC.Get())
 	{ CloseCue(Cue, false); return; }
 	if (World->GetNetMode() == NM_DedicatedServer) { return; }
 	const auto Role = Original->Character->GetLocalRole();
@@ -436,7 +412,7 @@ void UGGYGOLocomotionFXComponent::OnUnregister()
 		Original->bClosed = true;
 		if (Original->Character.IsValid()) { Original->Character->OnCharacterMovementUpdated.RemoveDynamic(this, &ThisClass::HandleMovementUpdated); }
 		if (Original->Movement.IsValid()) { Original->Movement->OnLocomotionSourceRetired().Remove(Original->Retirement); }
-		if (Original->Extension.IsValid()) { Original->Extension->UnregisterLocalAbilitySystemNotice(Original->Notice); }
+		Original->ASCSubscription.Unsubscribe();
 		CloseSources(Original);
 	}
 	Super::OnUnregister();

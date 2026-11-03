@@ -1181,29 +1181,21 @@ bool FGGYGOCameraModeOwnershipAndAvatarReceiverTest::RunTest(const FString& Para
 	int32 GenerationReadyNoticeCount = 0;
 	int32 GenerationReleasedNoticeCount = 0;
 	bool bGenerationNoticeResourceMatches = true;
-	const FDelegateHandle GenerationNoticeHandle = GenerationExtension->RegisterLocalAbilitySystemNoticeAndCall(
-		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateLambda([&](const FGGYGOPawnASCLocalNotice& Notice)
-		{
-			if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Ready)
-			{
-				++GenerationReadyNoticeCount;
-				bGenerationNoticeResourceMatches &= Notice.Resource.HasSameResource(GenerationResource);
-			}
-			else if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released)
-			{
-				++GenerationReleasedNoticeCount;
-				bGenerationNoticeResourceMatches &= Notice.Resource.HasSameResource(GenerationResource);
-			}
-		}));
-	ON_SCOPE_EXIT
+	FGGYGOLocalASCSubscription GenerationSubscription;
+	GenerationSubscription.Subscribe(GenerationExtension, [&](const FGGYGOPawnASCNotice& Notice)
 	{
-		if (GenerationNoticeHandle.IsValid())
+		if (Notice.Kind == EGGYGOPawnASCNoticeKind::Ready)
 		{
-			GenerationExtension->UnregisterLocalAbilitySystemNotice(GenerationNoticeHandle);
+			++GenerationReadyNoticeCount;
 		}
-	};
+		else
+		{
+			++GenerationReleasedNoticeCount;
+		}
+		bGenerationNoticeResourceMatches &= Notice.Resource.HasSameResource(GenerationResource);
+	});
 	if (!TestTrue(TEXT("typed observer replays the original ready resource exactly once"),
-		GenerationNoticeHandle.IsValid() && GenerationReadyNoticeCount == 1
+		GenerationSubscription.IsSubscribed() && GenerationReadyNoticeCount == 1
 		&& GenerationReleasedNoticeCount == 0 && bGenerationNoticeResourceMatches)) { return false; }
 	const FGameplayAbilitySpecHandle SpecA = GrantCameraTestAbility(GenerationASC,
 		UGGYGOCameraLifecycleTestAbility::StaticClass());
@@ -1259,7 +1251,7 @@ bool FGGYGOCameraModeOwnershipAndAvatarReceiverTest::RunTest(const FString& Para
 	GenerationFixture.Host->DetachAvatar(GenerationPawn);
 	TestTrue(TEXT("host detach withdraws the original resource and publishes typed Released exactly once"),
 		GenerationReleasedNoticeCount == 1 && bGenerationNoticeResourceMatches
-		&& !GenerationExtension->IsLocalAbilitySystemResourceInstalled(GenerationResource)
+		&& !GenerationExtension->IsLocalAbilitySystemResourceReady(GenerationResource)
 		&& !GenerationExtension->GetCurrentLocalAbilitySystemResource().HasResource()
 		&& !GenerationFixture.Host->GetAvatarPawn() && !GenerationASC->GetAvatarActor());
 	TestTrue(TEXT("released generation Pawn still has no input session"),

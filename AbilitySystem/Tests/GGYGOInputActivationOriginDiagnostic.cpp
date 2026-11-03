@@ -216,7 +216,7 @@ namespace
 			|| !Test.TestNotNull(TEXT("Request primary instance"), Request)
 			|| !Test.TestTrue(TEXT("Request and occupant are distinct instances"), Request != Occupant)
 			|| !Test.TestEqual(TEXT("Request uses native per-actor instancing"), Request->GetInstancingPolicy(), EGameplayAbilityInstancingPolicy::InstancedPerActor)
-			|| !Test.TestTrue(TEXT("Occupant activates through GAS"), Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle).bNativeAccepted)
+			|| !Test.TestTrue(TEXT("Occupant activates through GAS"), Scenario.ASC->TryActivateAbility(OccupantHandle))
 			|| !Test.TestTrue(TEXT("Initial occupant is really active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Initial setup has exactly one real group occupant"), Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 		EGGYGOAbilityGroupBlockReason BlockReason = EGGYGOAbilityGroupBlockReason::NotBlocked;
@@ -287,7 +287,7 @@ namespace
 		// Unarmed real retry exposes the original finite deadline publicly, before nesting.
 		Occupant->FinishForTest();
 		if (!Test.TestEqual(TEXT("Control retry has real GroupFreed"), Observation.GroupFreedCount, 1)
-			|| !Test.TestTrue(TEXT("Occupant restores real rejection for control retry"), Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle).bNativeAccepted)
+			|| !Test.TestTrue(TEXT("Occupant restores real rejection for control retry"), Scenario.ASC->TryActivateAbility(OccupantHandle))
 			|| !Test.TestTrue(TEXT("Control restart occupant is really active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Control restart has exactly one real group occupant"), Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 		Observation.Stage = EOriginStage::ControlRetry;
@@ -304,7 +304,7 @@ namespace
 
 		Occupant->FinishForTest();
 		if (!Test.TestEqual(TEXT("Nested retry has second real GroupFreed"), Observation.GroupFreedCount, 2)
-			|| !Test.TestTrue(TEXT("Occupant restores real rejection before arming"), Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle).bNativeAccepted)
+			|| !Test.TestTrue(TEXT("Occupant restores real rejection before arming"), Scenario.ASC->TryActivateAbility(OccupantHandle))
 			|| !Test.TestTrue(TEXT("Nested restart occupant is really active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Exactly one occupant before nested retry"), Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 		Observation.Stage = EOriginStage::NestedRetry;
@@ -389,7 +389,7 @@ namespace
 			|| !Test.TestEqual(TEXT("Finite tap has no ordinary WhileHeld self-retry"),
 				Request->GetActivationPolicy(), EGGYGOAbilityActivationPolicy::OnInputTriggered)
 			|| !Test.TestTrue(TEXT("Lost-wake occupant activates through native GAS"),
-				Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle).bNativeAccepted)
+				Scenario.ASC->TryActivateAbility(OccupantHandle))
 			|| !Test.TestTrue(TEXT("Lost-wake occupant is really active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Lost-wake setup has exactly one real group occupant"), Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
 

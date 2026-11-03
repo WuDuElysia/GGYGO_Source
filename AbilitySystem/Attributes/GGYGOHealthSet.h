@@ -23,6 +23,17 @@
  *   - **服务器**：GE 执行 → Pre/PostGameplayEffectExecute，能拿到完整 EffectSpec 与来源 Actor
  *   - **客户端**：属性复制 → OnRep_*，只有新旧值，来源上下文一律为 nullptr
  * 委托的前三个参数因此必须允许为空。
+ *
+ * ## 为什么不用 Lyra 的"PostGameplayEffectExecute 广播"
+ * 结果在 PostAttributeChange 中按真实 Old/New 提交，ModifierFrame／ExpectedAttributeChange
+ * 把每次写入归给发起它的 GE Modifier，因而持续（Duration/Infinite）GE 改变属性时同样广播。
+ * Lyra 只在 PostGameplayEffectExecute 广播，持续 GE 不经过该回调：
+ *   - 场景：持续 GE 下调 MaxHealth（GGYGO.AbilitySystem.HealthRepro.CurrentVersusLyra 的 MaxHealthDrop）。
+ *   - 差异：服务器（含 listen 主机）不广播 OnMaxHealthChanged；Health 被压低仍有广播。
+ *   - 消费方：HealthComponent 的 OnMaxHealthChanged 及其 UI／蓝图绑定。
+ * 同一复现中普通伤害、治疗、破韧、致死与持续 GE 下改当前 Health 两种做法结果一致，客户端六个场景
+ * 也一致。RepNotifyFrame／NetReceiveFrame 处理的是带聚合器时 REPNOTIFY 宏的临时回卷写入、
+ * 客户端上限重算及其中的重入，见 HealthMessage 的 RepNotify*／ClientMaxNetReceive 测试。
  */
 #pragma once
 
@@ -150,7 +161,7 @@ private:
 	TSharedPtr<FExpectedAttributeChange> PushExpectedAttributeChange(const TSharedPtr<FModifierFrame>& Frame, const FGameplayAttribute& Attribute);
 	void PopExpectedAttributeChange();
 	TSharedPtr<FExpectedAttributeChange> ConsumeExpectedAttributeChange(const FGameplayAttribute& Attribute);
-	/** 权威 Current 目标通过 ASC 换算为 Base，实际 Post 回调证明提交。 */
+	/** 权威 Current 目标经 GGYGOAttributeBase::CalculateBaseForCurrent 换算为 Base，实际 Post 回调证明提交。 */
 	bool TrySetCurrentValue(const FGameplayAttribute& Attribute, float DesiredCurrent, const TSharedPtr<FModifierFrame>& Frame);
 	void RequestClientMaxReevaluation(const FGameplayAttribute& Attribute);
 	void ReevaluateClientMax(const FGameplayAttribute& Attribute, const TWeakObjectPtr<AActor>& Owner, const TWeakObjectPtr<UAbilitySystemComponent>& ASC);

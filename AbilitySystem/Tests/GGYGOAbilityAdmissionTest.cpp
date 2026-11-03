@@ -90,29 +90,27 @@ void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveLifecycle(
 	LifecycleObserver.ExecuteIfBound(Sample);
 }
 
-#if WITH_DEV_AUTOMATION_TESTS
-void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityActivationEntryForTest(
-	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-	FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original)
 {
-	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::ActivateBeforeSuper, ActorInfo, Handle);
+	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::ActivateBeforeSuper, GetCurrentActorInfo(), GetCurrentAbilitySpecHandle());
+	Super::InitializeAbilityActivation(Original);
 }
 
-void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityActivationReturnForTest(
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
 	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 	FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData)
 {
+	Super::ActivateAbilityBody(Original, Handle, ActorInfo, ActivationInfo, TriggerEventData);
 	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::ActivateAfterSuper, ActorInfo, Handle);
 }
 
-void UGGYGOAbilityAdmissionPerExecutionTestAbility::ObserveAbilityEndEntryForTest(
-	FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-	FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled)
+void UGGYGOAbilityAdmissionPerExecutionTestAbility::CleanupAbilityResourcesForTermination(
+	const FGGYGOAbilityTerminationContext& Context)
 {
-	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::EndBeforeSuper, ActorInfo, Handle,
-		bReplicateEndAbility, bWasCancelled);
+	ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation::EndBeforeSuper, GetCurrentActorInfo(),
+		GetCurrentAbilitySpecHandle(), false, Context.WasCancelled());
+	Super::CleanupAbilityResourcesForTermination(Context);
 }
-#endif
 
 UGGYGOAbilityAdmissionUncancelableTestAbility::UGGYGOAbilityAdmissionUncancelableTestAbility(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)

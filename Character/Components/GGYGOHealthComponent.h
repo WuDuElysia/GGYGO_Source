@@ -35,6 +35,7 @@
  */
 #pragma once
 
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Components/GameFrameworkComponent.h"
 #include "Templates/SharedPointer.h"
 #include "Templates/SubclassOf.h"
@@ -42,9 +43,6 @@
 #include "GGYGOHealthComponent.generated.h"
 
 class AActor;
-class FGGYGOPawnASCResourceHandle;
-class UGGYGOPawnExtensionComponent;
-struct FGGYGOAvatarBindingContext;
 class UGameplayEffect;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOHealthComponent;
@@ -92,28 +90,22 @@ public:
 	}
 
 	/**
-	 * 兼容请求入口：捕获自身 Extension 的真实 Ready H/Context，验证 InASC 后调用唯一资源实现。
-	 * 没有原 H/Ready 时明确拒绝；不构造仅凭 ASC 的绑定。
-	 * 绑定成功后投影已有 DeathState，不重放死亡事件。
+	 * 蓝图入口：取自身 PawnExtension 的当前就绪资源，确认其 ASC 就是 InASC 后安装。
+	 * 没有就绪资源时明确拒绝；安装后投影已有 DeathState，不重放死亡事件。
+	 * 正常流程由本组件的就绪订阅自动安装，不需要调用。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Health")
 	void InitializeWithAbilitySystem(UGGYGOAbilitySystemComponent* InASC);
 
-	/** 捕获自身原记录并精确归还五个 token；不清死亡 Tag，不读取 Extension 后继换目标。 */
+	/** 归还当前记录的五个属性委托；不清死亡 Tag。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Health")
 	void UninitializeFromAbilitySystem();
 
-	/** 同步安装明确的原 Ready 资源；返回值为本次完成历史，不是当前权限。 */
+	/** 同步安装就绪资源：订阅 HealthSet 委托、投影死亡状态并广播三次初值。同一资源重复安装只投影。 */
 	bool InitializeWithLocalAbilitySystemResource(
 		UGGYGOPawnExtensionComponent* ExpectedExtension,
-		const FGGYGOPawnASCResourceHandle& ExpectedResource,
-		const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError);
-	/** 认证同 H 的新发布 Context；不重装 token 或重复 UI 初值。 */
-	bool RefreshLocalAbilitySystemResource(
-		UGGYGOPawnExtensionComponent* ExpectedExtension,
-		const FGGYGOPawnASCResourceHandle& ExpectedResource,
-		const FGGYGOAvatarBindingContext& PublishedContext, FString& OutError);
-	/** 只释放匹配的原 H；清理不依赖 Ready 或 Extension Released。 */
+		const FGGYGOPawnASCResourceHandle& ExpectedResource, FString& OutError);
+	/** 只释放与 ExpectedResource 相同的记录。 */
 	bool UninitializeFromLocalAbilitySystemResource(
 		const FGGYGOPawnASCResourceHandle& ExpectedResource, FString& OutError);
 
@@ -214,17 +206,17 @@ protected:
 	/** 将 DeathState 单调投影到仍以 Owner 为 Avatar 的绑定 ASC；NotDead 不清除 Tag。 */
 	void ApplyDeathStateToAbilitySystem();
 
-	//~HealthSet 原生委托处理器：原记录/事件 Context 加 FGGYGOAttributeEvent 的六个值参数。
+	//~HealthSet 原生委托处理器：原记录加 FGGYGOAttributeEvent 的六个值参数。
 	virtual void HandleHealthChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+		AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	virtual void HandleMaxHealthChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+		AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	virtual void HandleOutOfHealth(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+		AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	virtual void HandlePoiseChanged(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+		AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	virtual void HandlePoiseBroken(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext, AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
+		AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue);
 	//~End of handlers
 
 	/** 死亡状态复制到达。会把跳级变化补成逐级调用。 */
@@ -248,17 +240,17 @@ protected:
 private:
 	bool ValidateLocalReadyResource(UGGYGOPawnExtensionComponent* ExpectedExtension,
 		const FGGYGOPawnASCResourceHandle& ExpectedResource,
-		const FGGYGOAvatarBindingContext& PublishedContext,
 		UGGYGOAbilitySystemComponent*& OutASC, const UGGYGOHealthSet*& OutHealthSet, FString& OutError) const;
-	static bool IsOriginalResourceCurrent(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext);
+	static bool IsOriginalResourceCurrent(const TSharedPtr<FAbilitySystemResource>& ExpectedResource);
 	static void RetireOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource);
-	static bool ProjectDeathStateToOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource,
-		const FGGYGOAvatarBindingContext& ExpectedContext);
+	static bool ProjectDeathStateToOriginalResource(const TSharedPtr<FAbilitySystemResource>& ExpectedResource);
 	TSharedPtr<FAbilitySystemResource> GetReadyResource() const;
+	/** 订阅 Owner 上 PawnExtension 的 ASC 就绪／释放；已订阅同一 Extension 时不重复。 */
+	void SubscribeToPawnAbilitySystem();
 
-	/** 唯一 Health 装配记录；ASC/Set/token/Context 均由这份记录保存，不另建缓存。 */
+	/** 唯一 Health 装配记录；ASC/Set/委托句柄均由这份记录保存，不另建缓存。 */
 	TSharedPtr<FAbilitySystemResource> AbilitySystemResource{};
+	FGGYGOLocalASCSubscription LocalASCSubscription;
 	/** 本组件生命周期的新装配准入；清理始终按原记录执行。 */
 	bool bResourceAdmissionClosed = false;
 };

@@ -4,12 +4,15 @@
  */
 #include "Combat/HitDetection/GGYGOMeleeTraceComponent.h"
 
+#include "AbilitySystemComponent.h"
+#include "AbilitySystemGlobals.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/HitResult.h"
 #include "Engine/SkeletalMesh.h"
 #include "Engine/SkeletalMeshSocket.h"
 #include "Engine/World.h"
 #include "GameFramework/Character.h"
+#include "System/GGYGOGameplayTags.h"
 #include "Templates/UnrealTemplate.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOMeleeTraceComponent)
@@ -25,6 +28,16 @@ namespace
 		Chain.Points = {Start, End};
 		Chain.WorldRadiusCm = Radius;
 		return Shape;
+	}
+
+	/**
+	 * 已换下仍在场的队员不参与命中：不产生命中事件、伤害 GE、Cue 或受击。
+	 * 不记入本窗口的去重表，队员被切回后同一窗口仍可命中它。
+	 */
+	bool IsOffFieldTarget(const AActor* HitActor)
+	{
+		const UAbilitySystemComponent* TargetASC = UAbilitySystemGlobals::GetAbilitySystemComponentFromActor(HitActor);
+		return TargetASC && TargetASC->HasMatchingGameplayTag(GGYGOGameplayTags::State_OffField);
 	}
 }
 
@@ -223,24 +236,6 @@ bool UGGYGOMeleeTraceComponent::ReadTraceShapeFrame(const FGGYGOMeleeTraceShape&
 	return true;
 }
 
-void UGGYGOMeleeTraceComponent::BeginTraceWindow(FName InStartSocket, FName InEndSocket, float InTraceRadius)
-{
-	check(IsInGameThread());
-	if (bIsTracing && WindowSource == EWindowSource::Owned)
-	{
-		UE_LOG(LogGGYGOMeleeTrace, Warning,
-			TEXT("MeleeTrace [%s/%s] 拒绝 Legacy Begin 接管活动 Owned 窗口 [%s -> %s, R=%.2f]。"),
-			*GetNameSafe(GetOwner()), *GetName(), *InStartSocket.ToString(), *InEndSocket.ToString(), InTraceRadius);
-		return;
-	}
-	const FGGYGOMeleeTraceShape Shape = MakeRootTipShape(InStartSocket, InEndSocket, InTraceRadius);
-	const TWeakObjectPtr<USkeletalMeshComponent> OriginalMesh(GetTraceMesh());
-	const TWeakObjectPtr<USkeletalMesh> OriginalAsset(
-		OriginalMesh.IsValid() ? OriginalMesh->GetSkeletalMeshAsset() : nullptr);
-	CloseCurrentTraceWindow();
-	StartTraceWindow(Shape, OriginalMesh.Get(), OriginalAsset.Get(), EWindowSource::Legacy);
-}
-
 EGGYGOMeleeTraceWindowOpenResult UGGYGOMeleeTraceComponent::TryOpenOwnedTraceWindow(
 	FName InStartSocket, FName InEndSocket, float InTraceRadius,
 	const FGGYGOMeleeTraceWindowHandle& ExpectedWindow, FGGYGOMeleeTraceWindowHandle& OutWindow)
@@ -279,7 +274,7 @@ EGGYGOMeleeTraceWindowOpenResult UGGYGOMeleeTraceComponent::TryOpenOwnedTraceWin
 	}
 
 	const EGGYGOMeleeTraceWindowOpenResult Result = StartTraceWindow(
-		ShapeSnapshot, OriginalMesh.Get(), OriginalAsset.Get(), EWindowSource::Owned);
+		ShapeSnapshot, OriginalMesh.Get(), OriginalAsset.Get());
 	if (Result == EGGYGOMeleeTraceWindowOpenResult::Opened)
 	{
 		OutWindow.Issuer = this;
@@ -290,13 +285,13 @@ EGGYGOMeleeTraceWindowOpenResult UGGYGOMeleeTraceComponent::TryOpenOwnedTraceWin
 
 EGGYGOMeleeTraceWindowOpenResult UGGYGOMeleeTraceComponent::StartTraceWindow(
 	const FGGYGOMeleeTraceShape& Shape, const USkeletalMeshComponent* ExpectedMainMesh,
-	const USkeletalMesh* ExpectedMeshAsset, EWindowSource Source)
+	const USkeletalMesh* ExpectedMeshAsset)
 {
 	// 包括清理旧订阅期间发生重入的情况；不能覆盖刚取得窗口的新请求。
 	if (bIsTracing)
 	{
 		UE_LOG(LogGGYGOMeleeTrace, Warning,
-			TEXT("MeleeTrace [%s/%s] 拒绝开窗：已有活动窗口，必须提供匹配 Owned 身份或先结束 Legacy [Mode=%d]。"),
+			TEXT("MeleeTrace [%s/%s] 拒绝开窗：已有活动窗口，必须提供匹配的原窗口身份 [Mode=%d]。"),
 			*GetNameSafe(GetOwner()), *GetName(), static_cast<int32>(Shape.Mode));
 		return EGGYGOMeleeTraceWindowOpenResult::WindowConflict;
 	}
@@ -340,23 +335,9 @@ EGGYGOMeleeTraceWindowOpenResult UGGYGOMeleeTraceComponent::StartTraceWindow(
 	WindowMeshAsset = const_cast<USkeletalMesh*>(ExpectedMeshAsset);
 	WindowWorld = GetWorld();
 	++WindowSerial;
-	WindowSource = Source;
 	bIsTracing = true;
 	SetComponentTickEnabled(true);
 	return EGGYGOMeleeTraceWindowOpenResult::Opened;
-}
-
-void UGGYGOMeleeTraceComponent::EndTraceWindow()
-{
-	check(IsInGameThread());
-	if (bIsTracing && WindowSource == EWindowSource::Owned)
-	{
-		UE_LOG(LogGGYGOMeleeTrace, Warning,
-			TEXT("MeleeTrace [%s/%s] 拒绝 Legacy End 关闭活动 Owned 窗口 [Mode=%d]。"),
-			*GetNameSafe(GetOwner()), *GetName(), static_cast<int32>(ActiveShape.Mode));
-		return;
-	}
-	CloseCurrentTraceWindow();
 }
 
 EGGYGOMeleeTraceWindowCloseResult UGGYGOMeleeTraceComponent::CloseOwnedTraceWindow(
@@ -391,7 +372,7 @@ EGGYGOMeleeTraceWindowQueryResult UGGYGOMeleeTraceComponent::QueryOwnedTraceWind
 	{
 		return EGGYGOMeleeTraceWindowQueryResult::WrongComponent;
 	}
-	return WindowSource == EWindowSource::Owned && IsActiveWindow(Window.Serial)
+	return IsActiveWindow(Window.Serial)
 		? EGGYGOMeleeTraceWindowQueryResult::Active : EGGYGOMeleeTraceWindowQueryResult::Inactive;
 }
 
@@ -445,7 +426,6 @@ bool UGGYGOMeleeTraceComponent::UnsubscribeWindowHit(FDelegateHandle Subscriptio
 void UGGYGOMeleeTraceComponent::CloseCurrentTraceWindow()
 {
 	bIsTracing = false;
-	WindowSource = EWindowSource::None;
 	// 先脱离原窗口订阅，再完成清理，最后释放回调；不擦除重入新建的资源。
 	TArray<FWindowHitSubscription> RetiredSubscriptions = MoveTemp(WindowHitSubscriptions);
 	ActiveShape = FGGYGOMeleeTraceShape();
@@ -572,13 +552,9 @@ void UGGYGOMeleeTraceComponent::PerformTrace()
 	if (!bIsTracing) { return; }
 	const uint64 TraceSerial = WindowSerial;
 	if (!EnsureActiveTraceResources(TraceSerial)) { return; }
-	const bool bOwnedWindow = WindowSource == EWindowSource::Owned;
 	FGGYGOMeleeTraceWindowHandle TraceWindow;
-	if (bOwnedWindow)
-	{
-		TraceWindow.Issuer = this;
-		TraceWindow.Serial = TraceSerial;
-	}
+	TraceWindow.Issuer = this;
+	TraceWindow.Serial = TraceSerial;
 	const FGGYGOMeleeTraceShape Shape = ActiveShape;
 	const TArray<FVector> PriorPoints = PreviousPoints;
 	TArray<FVector> CurrentPoints;
@@ -629,13 +605,12 @@ void UGGYGOMeleeTraceComponent::PerformTrace()
 			for (const FHitResult& Hit : Hits)
 			{
 				AActor* HitActor = Hit.GetActor();
-				if (!IsValid(HitActor)) { continue; }
+				if (!IsValid(HitActor) || IsOffFieldTarget(HitActor)) { continue; }
 				const bool bAlreadyHit = HitActorsThisWindow.ContainsByPredicate(
 					[HitActor](const TWeakObjectPtr<AActor>& Weak) { return Weak.Get() == HitActor; });
 				if (bAlreadyHit) { continue; }
 				HitActorsThisWindow.Add(HitActor);
-				if (bOwnedWindow) { DispatchOwnedWindowHit(TraceWindow, HitActor, Hit); }
-				else { OnMeleeHit.Broadcast(HitActor, Hit); }
+				DispatchOwnedWindowHit(TraceWindow, HitActor, Hit);
 				if (!EnsureActiveTraceResources(TraceSerial)) { return; }
 			}
 		}

@@ -141,9 +141,8 @@ namespace
 		if (!Test.TestNotNull(TEXT("Occupant primary instance"), Occupant)
 			|| !Test.TestNotNull(TEXT("Original primary instance"), Original)
 			|| !Test.TestTrue(TEXT("Specs have distinct real instances"), Occupant != Original)) { return false; }
-		const FGGYGOAbilityActivationRequestResult OccupantActivation =
-			Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle);
-		if (!Test.TestTrue(TEXT("Occupant activates through GAS"), OccupantActivation.bNativeAccepted)
+		const bool bOccupantActivated = Scenario.ASC->TryActivateAbility(OccupantHandle);
+		if (!Test.TestTrue(TEXT("Occupant activates through GAS"), bOccupantActivated)
 			|| !Test.TestTrue(TEXT("Occupant is locally active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Exactly one real occupant after initial activation"),
 				Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }
@@ -232,9 +231,8 @@ namespace
 		// Only the real empty-group notification wakes ASC's original waiting request.
 		Occupant->FinishForTest();
 		if (!Test.TestEqual(TEXT("Initial real GroupFreed"), Observation.GroupFreedCount, 1)) { return false; }
-		const FGGYGOAbilityActivationRequestResult OccupantReactivation =
-			Scenario.ASC->TryActivateAbilityWithTerminationBoundary(OccupantHandle);
-		if (!Test.TestTrue(TEXT("Occupant reactivates before queued retry consumption"), OccupantReactivation.bNativeAccepted)
+		const bool bOccupantReactivated = Scenario.ASC->TryActivateAbility(OccupantHandle);
+		if (!Test.TestTrue(TEXT("Occupant reactivates before queued retry consumption"), bOccupantReactivated)
 			|| !Test.TestTrue(TEXT("Reactivated occupant is locally active"), Occupant->IsActive())
 			|| !Test.TestEqual(TEXT("Exactly one real occupant before old retry"),
 				Scenario.ASC->GetActiveAbilityCountInGroup(GroupTag), 1)) { return false; }

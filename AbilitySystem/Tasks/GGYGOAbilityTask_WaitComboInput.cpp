@@ -35,12 +35,14 @@ bool FGGYGOAbilityStepInputTargetData::HasValidFields() const
 		: Kind == EGGYGOAbilityStepInputKind::Continue && SourceStep >= 0 && SourceStep <= 65535
 			&& RequestId > 0 && RequestId <= 65535)) return false;
 	const bool bHeld = StepFact.InputState == EGGYGOMovementInputRequestQueryResult::Held;
-	const bool bNotHeld = StepFact.InputState == EGGYGOMovementInputRequestQueryResult::NotHeld;
+	// NotHeld 与无物理证明都不带方向，段首按当前朝向。
+	const bool bNoDirection = StepFact.InputState == EGGYGOMovementInputRequestQueryResult::NotHeld
+		|| StepFact.InputState == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof;
 	return StepFact.SourceSessionSerial != 0 && StepFact.OriginalEdgeEvaluationSerial != 0
-		&& StepFact.StepEvaluationSerial >= StepFact.OriginalEdgeEvaluationSerial && (bHeld || bNotHeld)
+		&& StepFact.StepEvaluationSerial >= StepFact.OriginalEdgeEvaluationSerial && (bHeld || bNoDirection)
 		&& FMath::IsFinite(StepFact.ActionValue.X) && FMath::IsFinite(StepFact.ActionValue.Y)
 		&& FMath::IsFinite(StepFact.ControlYaw)
-		&& (!bNotHeld || (StepFact.ActionValue.X == 0.0 && StepFact.ActionValue.Y == 0.0));
+		&& (!bNoDirection || (StepFact.ActionValue.X == 0.0 && StepFact.ActionValue.Y == 0.0));
 }
 
 struct UGGYGOAbilityTask_WaitComboInput::FNativeCallbackRegistration

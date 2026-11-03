@@ -79,7 +79,8 @@ private:
 	TSharedPtr<const FGGYGOMovementInputEvaluationProof> Proof;
 };
 
-/** 一次真实段首的输入值；原 edge 与段首评价分开，网络不传本地 Proof 或弱 UObject。 */
+/** 一次真实段首的输入值；原 edge 与段首评价分开，网络不传本地 Proof 或弱 UObject。
+ *  InputState 只取 Held、NotHeld 或 AwaitingPhysicalProof；后两者 ActionValue 为零，段首按当前朝向。 */
 struct GGYGO_API FGGYGOMovementInputStepFact
 {
 	uint64 SourceSessionSerial = 0;

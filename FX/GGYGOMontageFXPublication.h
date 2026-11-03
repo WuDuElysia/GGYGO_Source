@@ -2,12 +2,10 @@
 #pragma once
 
 #include "CoreMinimal.h"
-#include "AbilitySystem/GGYGOAvatarBindingTypes.h"
 #include "FX/Tasks/GGYGOAbilityTask_PlayNiagaraEffect.h"
-#include "UObject/Interface.h"
 #include "GGYGOMontageFXPublication.generated.h"
 
-class UAbilitySystemComponent;
+class UActorComponent;
 class USkeletalMeshComponent;
 class UGGYGORemoteMontageFXComponent;
 class UGGYGOMontageFXPublicationOwner;
@@ -16,6 +14,7 @@ class AController;
 class UWorld;
 class AGGYGOCharacterBase;
 class UNiagaraComponent;
+class UGGYGOAbilitySystemComponent;
 class UGGYGOCharacterMovementComponent;
 class UGGYGOLocomotionFXComponent;
 class FGGYGOLocomotionSourceProof;
@@ -29,28 +28,29 @@ class GGYGO_API FGGYGOFXSourceIdentity
 {
 public:
 	static FGGYGOFXSourceIdentity FromAbilityActivation(const TSharedPtr<const void>& OriginalProof);
+	/** SourceASC 是发布时 ActorInfo 指向该 CMC Avatar 的 ASC；换绑后旧来源由订阅方关闭。 */
 	static FGGYGOFXSourceIdentity FromLocomotion(const FGGYGOLocomotionSourceProof& OriginalProof,
-		const FGGYGOAvatarBindingContext& OriginalContext);
+		const UGGYGOAbilitySystemComponent* SourceASC);
 	bool IsSet() const;
 	EGGYGOFXSourceKind GetKind() const { return Kind; }
 	const TSharedPtr<const void>& GetAbilityActivationProof() const { return ActivationProof; }
 	/** 调用者先按 GetKind 分派；这里不把空证明解释为合法来源。 */
 	const FGGYGOLocomotionSourceProof& GetLocomotionSourceProof() const;
 	UGGYGOCharacterMovementComponent* GetOriginalMovement() const;
-	const FGGYGOAvatarBindingContext& GetAvatarBindingContext() const { return BindingContext; }
+	const UGGYGOAbilitySystemComponent* GetSourceAbilitySystem() const { return SourceASC.Get(); }
 	bool HasSameSource(const FGGYGOFXSourceIdentity& Other) const;
 	bool operator==(const FGGYGOFXSourceIdentity& Other) const { return HasSameSource(Other); }
 private:
 	EGGYGOFXSourceKind Kind = EGGYGOFXSourceKind::Invalid;
 	TSharedPtr<const void> ActivationProof;
 	TSharedPtr<const FGGYGOLocomotionSourceProof> LocomotionProof;
-	FGGYGOAvatarBindingContext BindingContext;
+	TWeakObjectPtr<const UGGYGOAbilitySystemComponent> SourceASC;
 };
 
 UENUM()
 enum class EGGYGOMontageFXCloseReason : uint8 { Normal, Abort };
 
-/** 原 ASC 签发的 occurrence 是唯一跨端身份；动画/activation 的认证身份不复制。 */
+/** 原 FX 宿主签发的 occurrence 是唯一跨端身份；动画/activation 的认证身份不复制。 */
 USTRUCT()
 struct GGYGO_API FGGYGOMontageFXRecord
 {
@@ -79,7 +79,7 @@ struct GGYGO_API FGGYGOMontageFXState
 	GENERATED_BODY()
 	UPROPERTY() uint64 StateRevision = 0;
 	UPROPERTY() TArray<FGGYGOMontageFXRecord> ActiveRecords;
-	/** 同一网络 ASC 跨重注册保留唯一资源视图；不是复制数据。 */
+	/** 同一网络宿主组件跨重注册保留唯一资源视图；不是复制数据。 */
 	UPROPERTY(Transient, NotReplicated) TObjectPtr<UGGYGOMontageFXPublicationOwner> LocalOwner = nullptr;
 	const FGGYGOMontageFXRecord* Find(uint64 Occurrence) const;
 };
@@ -106,7 +106,8 @@ struct GGYGO_API FGGYGOMontageFXObservationFact
 {
 	EGGYGOMontageFXObservationKind Kind = EGGYGOMontageFXObservationKind::Snapshot;
 	TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher;
-	TWeakObjectPtr<UAbilitySystemComponent> Issuer;
+	/** 签发 occurrence 的 FX 复制宿主组件。 */
+	TWeakObjectPtr<UActorComponent> Issuer;
 	TWeakObjectPtr<UWorld> World;
 	TWeakObjectPtr<AActor> Avatar;
 	TWeakObjectPtr<USkeletalMeshComponent> Mesh;
@@ -176,7 +177,7 @@ private:
 	friend class UGGYGORemoteMontageFXComponent;
 	void Add(const FGGYGOMontageFXObservationFact& Fact);
 	TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher;
-	TWeakObjectPtr<UAbilitySystemComponent> Issuer;
+	TWeakObjectPtr<UActorComponent> Issuer;
 	TWeakObjectPtr<UWorld> World;
 	uint64 Registration = 0;
 	uint32 IssuerObjectId = 0;
@@ -211,7 +212,7 @@ public:
 	FGGYGOMontageFXCloseObligation(const FGGYGOMontageFXCloseObligation&) = delete;
 	FGGYGOMontageFXCloseObligation& operator=(const FGGYGOMontageFXCloseObligation&) = delete;
 	bool IsSet() const { return Terminal.Occurrence != 0; }
-	/** 每次从原 weak issuer 重新取得，调用者不能改取当前 ASC owner。 */
+	/** 每次从原 weak issuer 重新取得，调用者不能改取当前宿主的 owner。 */
 	UGGYGOMontageFXPublicationOwner* GetIssuer() const { return Issuer.Get(); }
 private:
 	TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Issuer;
@@ -249,17 +250,10 @@ struct GGYGO_API FGGYGOMontageFXLocalStartReadyFact
 
 DECLARE_DELEGATE_OneParam(FGGYGOMontageFXSendTerminal, const FGGYGOMontageFXTerminal&);
 
-/** ASC 只提供 FX owner；FX 公共类型不依赖项目 ASC/GA 或 Combo。 */
-UINTERFACE(MinimalAPI)
-class UGGYGOMontageFXHost : public UInterface { GENERATED_BODY() };
-class GGYGO_API IGGYGOMontageFXHost
-{
-	GENERATED_BODY()
-public:
-	virtual UGGYGOMontageFXPublicationOwner* GetMontageFXPublicationOwner() = 0;
-};
-
-/** 原 GA/运动 owner 保持业务来源。本对象只拥有表现派生数据、资源能力及客户端实例，无 Tick。 */
+/**
+ * 原 GA/运动 owner 保持业务来源并持有 lease，只有持有者关闭自己的 lease。本对象只拥有表现派生数据、
+ * 资源能力及客户端实例，无 Tick。宿主是 UGGYGOMontageFXReplicationComponent，复制状态与终止多播都在宿主上。
+ */
 UCLASS()
 class GGYGO_API UGGYGOMontageFXPublicationOwner : public UObject
 {
@@ -269,25 +263,24 @@ public:
 	/** UE 热重载构造须在 FState 完整定义后实现，避免生成代码删除不完整类型。 */
 	UGGYGOMontageFXPublicationOwner(FVTableHelper& Helper);
 	virtual ~UGGYGOMontageFXPublicationOwner() override;
-	static UGGYGOMontageFXPublicationOwner* RegisterHost(UAbilitySystemComponent* OriginalIssuer,
+	static UGGYGOMontageFXPublicationOwner* RegisterHost(UActorComponent* OriginalHost,
 		FGGYGOMontageFXState& State, FGGYGOMontageFXSendTerminal SendTerminal);
 	uint64 GetRegistrationSerial() const;
-	/** State 地址属于同一原 ASC，持续至 Shutdown；调用前 ASC 应已安装强引用 owner。 */
-	void Initialize(UAbilitySystemComponent* OriginalIssuer, FGGYGOMontageFXState& State,
+	/** State 地址属于同一原宿主组件，持续至 Shutdown；调用前宿主应已安装强引用 owner。 */
+	void Initialize(UActorComponent* OriginalHost, FGGYGOMontageFXState& State,
 		FGGYGOMontageFXSendTerminal SendTerminal);
 	/** Request 的 BeginServerTime 必须来自已认证的原生事件采样；不重写为接收时刻。 */
 	bool Begin(const FGGYGOFXSourceIdentity& OriginalSource, const FGGYGOMontageFXRecord& Request,
 		FGGYGOMontageFXLease& OutLease, FString& OutError);
+	/** 只由 lease 持有者在释放自身资源时调用；纯写，派发由持有者在安全出口执行。 */
 	EGGYGOMontageFXCloseResult PrepareClose(const FGGYGOMontageFXLease& Lease,
 		EGGYGOMontageFXCloseReason Reason, FGGYGOMontageFXCloseObligation& OutObligation);
-	/** 按原种类与 owner 证明的历史身份匹配；不调用 Current 谓词或虚函数。 */
-	void PrepareCloseSource(const FGGYGOFXSourceIdentity& OriginalSource,
-		EGGYGOMontageFXCloseReason Reason, TArray<FGGYGOMontageFXCloseObligation>& OutObligations);
-	/** 复制全部未关闭来源；生产者分类与撤绑均消费同一 typed 描述。 */
+	/** 复制全部未关闭来源，只读，不关闭任何发布。 */
 	void GetSourceIdentities(TArray<FGGYGOFXSourceIdentity>& OutIdentities) const;
 	bool DispatchClose(FGGYGOMontageFXCloseObligation&& Obligation);
 	void ReceiveState();
 	void ReceiveTerminal(const FGGYGOMontageFXTerminal& Terminal);
+	/** 宿主寿命终点：仍未由持有者关闭的 lease 按 Abort 关闭并诊断一次。 */
 	void Shutdown(uint64 ExpectedRegistration = 0);
 
 	EGGYGOMontageFXLocalResourceFact ReadLocalResourceFact(AActor* Avatar) const;

@@ -102,7 +102,7 @@ namespace
 	{
 		UWorld* World = nullptr;
 		UEngine* Engine = nullptr;
-		TArray<TPair<TWeakObjectPtr<UGGYGOPawnExtensionComponent>, FDelegateHandle>> LocalNoticeHandles;
+		TArray<TUniquePtr<FGGYGOLocalASCSubscription>> LocalASCSubscriptions;
 		bool Initialize()
 		{
 			Engine = GEngine;
@@ -120,13 +120,7 @@ namespace
 		}
 		~FEncounterTestWorld()
 		{
-			for (const auto& Registration : LocalNoticeHandles)
-			{
-				if (UGGYGOPawnExtensionComponent* Extension = Registration.Key.Get())
-				{
-					Extension->UnregisterLocalAbilitySystemNotice(Registration.Value);
-				}
-			}
+			LocalASCSubscriptions.Reset();
 			if (World)
 			{
 				// No BeginPlay: explicitly release production resources before DestroyWorld.
@@ -187,13 +181,15 @@ namespace
 		Observer->ASC = Observer->State->GetGGYGOAbilitySystemComponent();
 		CurrentAvatar->Observer = Observer;
 		UGGYGOPawnExtensionComponent* Extension = CurrentAvatar->GetPawnExtensionComponent();
-		const FDelegateHandle Handle = Extension->RegisterLocalAbilitySystemNoticeAndCall(
-			FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(Observer,
-				[Observer](const FGGYGOPawnASCLocalNotice& Notice)
+		const TWeakObjectPtr<UGGYGOEncounterLifecycleObserver> WeakObserver(Observer);
+		Fixture.LocalASCSubscriptions.Add_GetRef(MakeUnique<FGGYGOLocalASCSubscription>())->Subscribe(Extension,
+			[WeakObserver](const FGGYGOPawnASCNotice& Notice)
+			{
+				if (Notice.Kind == EGGYGOPawnASCNoticeKind::Released && WeakObserver.IsValid())
 				{
-					if (Notice.Kind == EGGYGOPawnASCLocalNoticeKind::Released) { Observer->HandleUninitialized(); }
-				}));
-		Fixture.LocalNoticeHandles.Emplace(TWeakObjectPtr<UGGYGOPawnExtensionComponent>(Extension), Handle);
+					WeakObserver->HandleUninitialized();
+				}
+			});
 		Observer->CreatedAvatar->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);
 		Observer->Controller->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);
 		Observer->State->OnDestroyed.AddDynamic(Observer, &UGGYGOEncounterLifecycleObserver::HandleDestroyed);

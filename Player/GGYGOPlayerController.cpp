@@ -23,6 +23,8 @@
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Engine/AssetManager.h"
+#include "Player/GGYGOPlayerState.h"
+#include "Teams/GGYGOSquadComponent.h"
 #include "Teams/GGYGOSquadPresets.h"
 #endif
 
@@ -548,6 +550,20 @@ void AGGYGOPlayerController::GGYGOClearSquadPresets()
 		TEXT("GGYGOClearSquadPresets: 清空编队后的保存请求已接受，此提示未确认持久化结果。"));
 }
 
+void AGGYGOPlayerController::GGYGOSwitchToSlot(int32 SlotIndex)
+{
+	const AGGYGOPlayerState* GGYGOPlayerState = GetPlayerState<AGGYGOPlayerState>();
+	UGGYGOSquadComponent* Squad = GGYGOPlayerState ? GGYGOPlayerState->GetSquadComponent() : nullptr;
+	if (!Squad)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("GGYGOSwitchToSlot: Controller=%s 没有已复制的 PlayerState 编队组件，请求未发送。"), *GetPathName());
+		return;
+	}
+	// 与正式输入同一入口：服务器校验并执行，结果以复制回来的出战角色为准。
+	Squad->ServerRequestSwitchToSlot(SlotIndex);
+}
+
 #else
 
 // Shipping 下保留空实现：声明无法条件编译（UHT 限制），符号必须存在。
@@ -555,5 +571,6 @@ void AGGYGOPlayerController::GGYGODumpSquadPresets() {}
 void AGGYGOPlayerController::GGYGOSetSquadMember(int32, int32, const FString&) {}
 void AGGYGOPlayerController::GGYGOSetActiveSquadPreset(int32) {}
 void AGGYGOPlayerController::GGYGOClearSquadPresets() {}
+void AGGYGOPlayerController::GGYGOSwitchToSlot(int32) {}
 
 #endif

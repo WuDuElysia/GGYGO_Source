@@ -12,10 +12,10 @@
 #include "Engine/PackageMapClient.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/WorldSettings.h"
+#include "NiagaraSystem.h"
 #include "UObject/StrongObjectPtr.h"
 #if WITH_EDITOR
 #include "CoreGlobals.h"
-#include "NiagaraSystem.h"
 #endif
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMontageFX, Log, All);
@@ -28,14 +28,14 @@ FGGYGOFXSourceIdentity FGGYGOFXSourceIdentity::FromAbilityActivation(const TShar
 }
 
 FGGYGOFXSourceIdentity FGGYGOFXSourceIdentity::FromLocomotion(const FGGYGOLocomotionSourceProof& Proof,
-	const FGGYGOAvatarBindingContext& Context)
+	const UGGYGOAbilitySystemComponent* InSourceASC)
 {
 	FGGYGOFXSourceIdentity Result;
-	if (Proof.IsSet() && Proof.GetIssuer() && Context.HasIssuedContext())
+	if (Proof.IsSet() && Proof.GetIssuer() && IsValid(InSourceASC))
 	{
 		Result.Kind = EGGYGOFXSourceKind::Locomotion;
 		Result.LocomotionProof = MakeShared<FGGYGOLocomotionSourceProof>(Proof);
-		Result.BindingContext = Context;
+		Result.SourceASC = InSourceASC;
 	}
 	return Result;
 }
@@ -43,7 +43,7 @@ FGGYGOFXSourceIdentity FGGYGOFXSourceIdentity::FromLocomotion(const FGGYGOLocomo
 bool FGGYGOFXSourceIdentity::IsSet() const
 {
 	return (Kind == EGGYGOFXSourceKind::AbilityActivation && ActivationProof.IsValid())
-		|| (Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid() && BindingContext.HasIssuedContext());
+		|| (Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid() && !SourceASC.IsExplicitlyNull());
 }
 
 const FGGYGOLocomotionSourceProof& FGGYGOFXSourceIdentity::GetLocomotionSourceProof() const
@@ -63,7 +63,7 @@ bool FGGYGOFXSourceIdentity::HasSameSource(const FGGYGOFXSourceIdentity& Other) 
 	if (Kind == EGGYGOFXSourceKind::AbilityActivation)
 	{ return ActivationProof.IsValid() && ActivationProof == Other.ActivationProof; }
 	return Kind == EGGYGOFXSourceKind::Locomotion && LocomotionProof.IsValid() && Other.LocomotionProof.IsValid()
-		&& LocomotionProof->IsSameSource(*Other.LocomotionProof) && BindingContext.HasSameValue(Other.BindingContext);
+		&& LocomotionProof->IsSameSource(*Other.LocomotionProof) && SourceASC.HasSameIndexAndSerialNumber(Other.SourceASC);
 }
 
 #if WITH_EDITOR
@@ -195,11 +195,12 @@ struct FGGYGOMontageFXLocalCapability
 
 struct UGGYGOMontageFXPublicationOwner::FState
 {
-	TWeakObjectPtr<UAbilitySystemComponent> Issuer;
+	/** 宿主组件；其 Owner 的网络权威决定能否签发。 */
+	TWeakObjectPtr<UActorComponent> Issuer;
 	TWeakObjectPtr<UWorld> World;
 	FGGYGOMontageFXState* Snapshot = nullptr;
 	FGGYGOMontageFXSendTerminal Send;
-	/** Epoch 随实际 ASC owner 产生；Registration 只随同 owner 重注册推进。 */
+	/** Epoch 随实际宿主产生；Registration 只随同宿主重注册推进。 */
 	uint64 Epoch = 0;
 	uint64 NextId = 0;
 	uint64 NextOccurrence = 0;
@@ -329,7 +330,7 @@ UGGYGOMontageFXPublicationOwner::UGGYGOMontageFXPublicationOwner() : Data(MakeUn
 UGGYGOMontageFXPublicationOwner::UGGYGOMontageFXPublicationOwner(FVTableHelper& Helper) : Super(Helper) {}
 UGGYGOMontageFXPublicationOwner::~UGGYGOMontageFXPublicationOwner() = default;
 
-UGGYGOMontageFXPublicationOwner* UGGYGOMontageFXPublicationOwner::RegisterHost(UAbilitySystemComponent* Issuer,
+UGGYGOMontageFXPublicationOwner* UGGYGOMontageFXPublicationOwner::RegisterHost(UActorComponent* Issuer,
 	FGGYGOMontageFXState& State, FGGYGOMontageFXSendTerminal Send)
 {
 	if (!IsValid(State.LocalOwner)) { State.LocalOwner = NewObject<ThisClass>(Issuer); }
@@ -456,7 +457,7 @@ bool UGGYGOMontageFXPublicationOwner::CaptureObservation(
 }
 #endif
 
-void UGGYGOMontageFXPublicationOwner::Initialize(UAbilitySystemComponent* Issuer, FGGYGOMontageFXState& State,
+void UGGYGOMontageFXPublicationOwner::Initialize(UActorComponent* Issuer, FGGYGOMontageFXState& State,
 	FGGYGOMontageFXSendTerminal Send)
 {
 	check(IsInGameThread());
@@ -488,7 +489,7 @@ bool UGGYGOMontageFXPublicationOwner::Begin(const FGGYGOFXSourceIdentity& Source
 	FGGYGOMontageFXLease& OutLease, FString& OutError)
 {
 	OutLease = {};
-	UAbilitySystemComponent* Issuer = Data->Issuer.Get();
+	UActorComponent* Issuer = Data->Issuer.Get();
 	UWorld* World = Data->World.Get();
 	if (Data->bClosed || !Issuer || !IsValid(Issuer->GetOwner()) || !Issuer->GetOwner()->HasAuthority()
 		|| !World || World->bIsTearingDown || !Data->Snapshot || !Source.IsSet()
@@ -548,28 +549,6 @@ EGGYGOMontageFXCloseResult UGGYGOMontageFXPublicationOwner::PrepareClose(const F
 	{ return Record.Occurrence == Key; });
 	Data->Bindings.Remove(Lease.GetOccurrence());
 	return EGGYGOMontageFXCloseResult::Closed;
-}
-
-void UGGYGOMontageFXPublicationOwner::PrepareCloseSource(const FGGYGOFXSourceIdentity& Source,
-	EGGYGOMontageFXCloseReason Reason, TArray<FGGYGOMontageFXCloseObligation>& Out)
-{
-	if (!Source.IsSet()) { return; }
-	TArray<FGGYGOMontageFXLease> Leases;
-	for (const auto& Pair : Data->Bindings)
-	{
-		if (Pair.Value.Source.HasSameSource(Source))
-		{
-			FGGYGOMontageFXLease Lease;
-			Lease.State = Pair.Value.Lease;
-			Leases.Add(Lease);
-		}
-	}
-	for (const auto& Lease : Leases)
-	{
-		FGGYGOMontageFXCloseObligation Obligation;
-		if (PrepareClose(Lease, Reason, Obligation) == EGGYGOMontageFXCloseResult::Closed)
-		{ Out.Add(MoveTemp(Obligation)); }
-	}
 }
 
 bool UGGYGOMontageFXPublicationOwner::DispatchClose(FGGYGOMontageFXCloseObligation&& Obligation)
@@ -673,7 +652,8 @@ TSharedPtr<FGGYGOMontageFXLocalCapability> UGGYGOMontageFXPublicationOwner::Regi
 		|| (Kind == EGGYGOFXSourceKind::Locomotion && (!Source.IsSet() || Source.GetKind() != Kind))
 		|| (Kind == EGGYGOFXSourceKind::Locomotion && (!IsValid(Source.GetOriginalMovement())
 			|| Source.GetOriginalMovement()->GetOwner() != Avatar
-			|| Source.GetAvatarBindingContext().Binding.Issuer.Get() != Data->Issuer.Get()))
+			|| !Source.GetSourceAbilitySystem()
+			|| Source.GetSourceAbilitySystem()->GetOwner() != Data->Issuer->GetOwner()))
 		|| !IsValid(Avatar) || !IsValid(World) || World != Data->World.Get() || Avatar->GetWorld() != World)
 	{ OutError = TEXT("Local FX capability requires the initialized original issuer/Avatar/World scope."); return {}; }
 	auto Capability = MakeShared<FGGYGOMontageFXLocalCapability>();
@@ -1089,6 +1069,22 @@ void UGGYGOMontageFXPublicationOwner::Shutdown(uint64 ExpectedRegistration)
 	{
 		if (Pair.Value.Lease->Registration != Closing) { continue; }
 		FGGYGOMontageFXLease Lease; Lease.State = Pair.Value.Lease; Leases.Add(Lease);
+	}
+	if (!Leases.IsEmpty())
+	{
+		// 正常路径由持有者在释放资源时关闭；到宿主寿命终点仍未关闭的，在这里按 Abort 收尾并报告一次。
+		FString Residual;
+		for (const auto& Lease : Leases)
+		{
+			const uint64 Key = Lease.GetOccurrence();
+			const auto* Binding = Data->Bindings.Find(Key);
+			const auto* Record = Data->Snapshot ? Data->Snapshot->Find(Key) : nullptr;
+			Residual += FString::Printf(TEXT(" [Kind=%u Occurrence=%llu System=%s]"),
+				Binding ? static_cast<uint32>(Binding->Source.GetKind()) : 0u, static_cast<unsigned long long>(Key),
+				*GetPathNameSafe(Record ? Record->System.Get() : nullptr));
+		}
+		UE_LOG(LogGGYGOMontageFX, Warning, TEXT("FX host '%s' closing with %d lease(s) not closed by their holders; closing as Abort:%s"),
+			*GetPathNameSafe(Data->Issuer.Get()), Leases.Num(), *Residual);
 	}
 	TArray<FGGYGOMontageFXCloseObligation> Obligations;
 	for (const auto& Lease : Leases)

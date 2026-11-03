@@ -3,6 +3,7 @@
 
 #include "FX/GGYGOMontageFXPublication.h"
 #include "FX/Components/GGYGOFXNiagaraComponent.h"
+#include "FX/Components/GGYGOMontageFXReplicationComponent.h"
 #include "Abilities/GameplayAbility.h"
 #include "AbilitySystemComponent.h"
 #include "Components/SceneComponent.h"
@@ -137,11 +138,12 @@ UGGYGOAbilityTask_PlayNiagaraEffect* UGGYGOAbilityTask_PlayNiagaraEffect::PlayNi
 	}
 	UAbilitySystemComponent* const Issuer = OwningAbility->GetAbilitySystemComponentFromActorInfo();
 	AActor* const Avatar = OwningAbility->GetAvatarActorFromActorInfo();
-	IGGYGOMontageFXHost* Host = Cast<IGGYGOMontageFXHost>(Issuer);
-	UGGYGOMontageFXPublicationOwner* const ResourceScope = Host ? Host->GetMontageFXPublicationOwner() : nullptr;
+	const UGGYGOMontageFXReplicationComponent* Host = UGGYGOMontageFXReplicationComponent::FindForASC(Issuer);
+	UGGYGOMontageFXPublicationOwner* const ResourceScope = Host ? Host->GetPublicationOwner() : nullptr;
 	if (!IsValid(ResourceScope) || !IsValid(Avatar) || !IsValid(Avatar->GetWorld()))
 	{
-		UE_LOG(LogGGYGOFXTask, Error, TEXT("FX factory requires its initialized original resource scope."));
+		UE_LOG(LogGGYGOFXTask, Error, TEXT("FX factory requires its initialized original resource scope: ASC='%s' Host='%s'."),
+			*GetPathNameSafe(Issuer), *GetPathNameSafe(Host));
 		return nullptr;
 	}
 	UGGYGOAbilityTask_PlayNiagaraEffect* Task = NewAbilityTask<UGGYGOAbilityTask_PlayNiagaraEffect>(OwningAbility, TaskInstanceName);

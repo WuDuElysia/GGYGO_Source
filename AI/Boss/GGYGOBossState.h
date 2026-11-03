@@ -23,7 +23,8 @@ class GGYGO_API AGGYGOBossState : public AGGYGOCombatantState
 public:
 	AGGYGOBossState(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-	/** 仅服务器、仅一次。验证初始 Form/Phase 后一次性授予全部已声明能力。 */
+	/** 仅服务器、仅一次。验证初始 Form/Phase 及各阶段 ActionSet 后一次性授予全部已声明能力；
+	 *  采纳后的 ActionSet 不再在选招周期内整表复验。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Boss")
 	bool InitializeFromDefinition(const UGGYGOBossDefinition* InDefinition);
 

@@ -1,6 +1,9 @@
 /** @file GGYGOMontageFXPublicationTest.cpp @brief 派生关闭两序、资源归还与注册后继隔离。 */
 #include "FX/GGYGOMontageFXPublication.h"
 
+#include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
+#include "AbilitySystem/Tasks/GGYGOAbilityTask_PlayMontageAndWaitForEvent.h"
+#include "FX/Components/GGYGOMontageFXReplicationComponent.h"
 #include "AbilitySystemComponent.h"
 #include "Components/SkeletalMeshComponent.h"
 #include "Engine/Engine.h"
@@ -197,7 +200,7 @@ bool FGGYGOMontageFXRegistrationTest::RunTest(const FString&)
 	TestTrue(TEXT("原注册发布"), Fixture.Owner->Begin(OldSource, Fixture.Request(), Old, Error));
 	const uint64 OldRegistration = Fixture.Owner->GetRegistrationSerial();
 	auto* Registered = UGGYGOMontageFXPublicationOwner::RegisterHost(Fixture.Issuer.Get(), Fixture.Snapshot, {});
-	TestTrue(TEXT("同 ASC 保唯一资源 view"), Registered == Fixture.Owner.Get());
+	TestTrue(TEXT("同宿主组件保唯一资源 view"), Registered == Fixture.Owner.Get());
 	TestTrue(TEXT("重注册推进实际代次"), Registered->GetRegistrationSerial() > OldRegistration);
 	TestTrue(TEXT("新注册发布"), Registered->Begin(NewSource, Fixture.Request(), Current, Error));
 	TestTrue(TEXT("原 occurrence 不复用"), Current.GetOccurrence() > Old.GetOccurrence());
@@ -210,4 +213,123 @@ bool FGGYGOMontageFXRegistrationTest::RunTest(const FString&)
 	if (Sources.Num()) { TestTrue(TEXT("新原 source 身份保留"), Sources[0] == NewSource); }
 	return true;
 }
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOMontageFXShutdownResidualTest,
+	"GGYGO.FX.MontagePublication.ShutdownClosesResidualLeases",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOMontageFXShutdownResidualTest::RunTest(const FString&)
+{
+	TArray<FGGYGOMontageFXTerminal> Sent;
+	FPublicationWorld Fixture(FGGYGOMontageFXSendTerminal::CreateLambda(
+		[&Sent](const FGGYGOMontageFXTerminal& Terminal) { Sent.Add(Terminal); }));
+	if (!TestTrue(TEXT("独立 World 与 owner 有效"), Fixture.World && Fixture.Owner.IsValid())) { return false; }
+	const FGGYGOFXSourceIdentity Source = FGGYGOFXSourceIdentity::FromAbilityActivation(MakeShared<int32>(1));
+	FGGYGOMontageFXLease Closed, Residual;
+	FString Error;
+	if (!TestTrue(TEXT("两次实际发布"), Fixture.Owner->Begin(Source, Fixture.Request(), Closed, Error)
+		&& Fixture.Owner->Begin(Source, Fixture.Request(), Residual, Error))) { return false; }
+	FGGYGOMontageFXCloseObligation Close;
+	TestTrue(TEXT("持有者正常关闭第一份"), Fixture.Owner->PrepareClose(Closed, EGGYGOMontageFXCloseReason::Normal, Close)
+		== EGGYGOMontageFXCloseResult::Closed && Fixture.Owner->DispatchClose(MoveTemp(Close)));
+	AddExpectedMessagePlain(FString::Printf(TEXT("closing with 1 lease(s) not closed by their holders; closing as Abort: [Kind=%u Occurrence=%llu"),
+		static_cast<uint32>(EGGYGOFXSourceKind::AbilityActivation), static_cast<unsigned long long>(Residual.GetOccurrence())),
+		ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
+	Fixture.Owner->Shutdown();
+	TestEqual(TEXT("寿命终点只为残留 lease 多发一次终止"), Sent.Num(), 2);
+	if (Sent.Num() == 2)
+	{
+		TestEqual(TEXT("残留终止属于原 occurrence"), Sent[1].Occurrence, Residual.GetOccurrence());
+		TestTrue(TEXT("残留按 Abort 关闭"), Sent[1].Reason == EGGYGOMontageFXCloseReason::Abort);
+	}
+	TestNull(TEXT("残留记录已移除"), Fixture.Snapshot.Find(Residual.GetOccurrence()));
+	FGGYGOMontageFXCloseObligation Late;
+	TestTrue(TEXT("持有者迟到关闭得到 AlreadyClosed，不再发终止"),
+		Fixture.Owner->PrepareClose(Residual, EGGYGOMontageFXCloseReason::Normal, Late) == EGGYGOMontageFXCloseResult::AlreadyClosed);
+	TestEqual(TEXT("没有第三次终止"), Sent.Num(), 2);
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOMontageFXReplicationHostTest,
+	"GGYGO.FX.MontagePublication.ReplicationHostLifecycle",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOMontageFXReplicationHostTest::RunTest(const FString&)
+{
+	FPublicationWorld Fixture;
+	if (!TestTrue(TEXT("独立 World 有效"), Fixture.World && Fixture.Avatar)) { return false; }
+	TestNull(TEXT("没有宿主组件的 Actor 查不到宿主"), UGGYGOMontageFXReplicationComponent::FindForASC(Fixture.Issuer.Get()));
+	UGGYGOMontageFXReplicationComponent* Host = NewObject<UGGYGOMontageFXReplicationComponent>(Fixture.Avatar);
+	Host->RegisterComponentWithWorld(Fixture.World);
+	if (!TestTrue(TEXT("宿主注册即建立发行者"), Host->IsRegistered() && Host->GetPublicationOwner() != nullptr)) { return false; }
+	TestEqual(TEXT("同 Actor 上的 ASC 找到该宿主"), UGGYGOMontageFXReplicationComponent::FindForASC(Fixture.Issuer.Get()), Host);
+	UGGYGOMontageFXPublicationOwner* const FirstOwner = Host->GetPublicationOwner();
+	const uint64 FirstRegistration = FirstOwner->GetRegistrationSerial();
+	FGGYGOMontageFXLease Lease;
+	FString Error;
+	TestFalse(TEXT("缺原 GA/Task 的 Montage 发布明确拒绝"), Host->PublishMontageFX(nullptr, {}, nullptr, {},
+		Fixture.Request(), Lease, Error));
+	TestFalse(TEXT("拒绝不签发 lease"), Lease.HasLease());
+	TestFalse(TEXT("拒绝带可定位诊断"), Error.IsEmpty());
+	Host->UnregisterComponent();
+	TestNull(TEXT("注销后不再暴露发行者"), Host->GetPublicationOwner());
+	Host->RegisterComponentWithWorld(Fixture.World);
+	TestTrue(TEXT("重注册复用唯一资源 view 并推进代次"), Host->GetPublicationOwner() == FirstOwner
+		&& FirstOwner->GetRegistrationSerial() > FirstRegistration);
+	Host->DestroyComponent();
+	return true;
+}
+
+#if WITH_EDITOR
+#include "AssetRegistry/AssetRegistryModule.h"
+#include "Combatants/GGYGOCombatantState.h"
+#include "Modules/ModuleManager.h"
+
+namespace GGYGOMontageFXHostAudit
+{
+	/** 加载他人蓝图时的编译告警属于该资产作者；本核查只按 CDO 上的组件判定。 */
+	class FAuditTestBase : public FAutomationTestBase
+	{
+	public:
+		FAuditTestBase(const FString& InName, bool bInComplexTask) : FAutomationTestBase(InName, bInComplexTask) {}
+		virtual bool SuppressLogErrors() override { return true; }
+		virtual bool SuppressLogWarnings() override { return true; }
+	};
+}
+
+IMPLEMENT_CUSTOM_SIMPLE_AUTOMATION_TEST(FGGYGOMontageFXHostBlueprintAuditTest, GGYGOMontageFXHostAudit::FAuditTestBase,
+	"GGYGO.FX.MontagePublication.HostSubclassAudit", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+/** Editor 资产注册表列出 CombatantState 的全部子类（含 CharacterSlot、BossState 及其蓝图），逐个核对 CDO 带复制宿主组件。 */
+bool FGGYGOMontageFXHostBlueprintAuditTest::RunTest(const FString&)
+{
+	IAssetRegistry& Registry = FModuleManager::LoadModuleChecked<FAssetRegistryModule>(TEXT("AssetRegistry")).Get();
+	Registry.SearchAllAssets(/*bSynchronousSearch=*/true);
+	TSet<FTopLevelAssetPath> Derived;
+	Registry.GetDerivedClassNames({AGGYGOCombatantState::StaticClass()->GetClassPathName()}, {}, Derived);
+	Derived.Add(AGGYGOCombatantState::StaticClass()->GetClassPathName());
+	int32 BlueprintCount = 0;
+	int32 CheckedCount = 0;
+	for (const FTopLevelAssetPath& Path : Derived)
+	{
+		const bool bBlueprint = !Path.GetPackageName().ToString().StartsWith(TEXT("/Script/"));
+		BlueprintCount += bBlueprint;
+		const UClass* Class = LoadObject<UClass>(nullptr, *Path.ToString());
+		const AGGYGOCombatantState* Default = Class ? Class->GetDefaultObject<AGGYGOCombatantState>() : nullptr;
+		if (!Default)
+		{
+			AddError(FString::Printf(TEXT("[FX.MontagePublication.HostSubclassAudit] 无法加载 %s 的类或 CDO。"), *Path.ToString()));
+			continue;
+		}
+		++CheckedCount;
+		const UGGYGOMontageFXReplicationComponent* Host = Default->FindComponentByClass<UGGYGOMontageFXReplicationComponent>();
+		TestTrue(FString::Printf(TEXT("%s 的 CDO 带复制宿主组件 %s"), *Path.ToString(), *GetNameSafe(Host)),
+			Host && Host->GetFName() == TEXT("MontageFXReplication"));
+	}
+	AddInfo(FString::Printf(TEXT("[FX.MontagePublication.HostSubclassAudit] Classes=%d Blueprints=%d Checked=%d"),
+		Derived.Num(), BlueprintCount, CheckedCount));
+	TestTrue(TEXT("至少核对了原生 CharacterSlot 与 BossState"), CheckedCount >= 3);
+	return true;
+}
+#endif
 #endif

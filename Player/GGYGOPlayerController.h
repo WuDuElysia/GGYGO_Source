@@ -80,6 +80,15 @@ public:
 	UFUNCTION(Exec)
 	void GGYGOClearSquadPresets();
 
+	/**
+	 * 请求切换出战角色，经编队组件的 Server RPC 由服务器校验并执行；监听服务器与客户端都可用。
+	 * 正式按键接线前的调试入口。
+	 *
+	 * 控制台：`GGYGOSwitchToSlot 1`
+	 */
+	UFUNCTION(Exec)
+	void GGYGOSwitchToSlot(int32 SlotIndex);
+
 protected:
 	//~APlayerController interface
 	virtual void PostProcessInput(const float DeltaTime, const bool bGamePaused) override;

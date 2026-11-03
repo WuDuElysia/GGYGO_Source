@@ -29,6 +29,57 @@ void UGGYGOBossMeleeLifecycleTestAbility::ActivateAbilityBody(const FGGYGOAbilit
 	}
 }
 
+void UGGYGOBossMeleeLifecycleTestAbility::CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context)
+{
+	LastTermination = Context;
+	Super::CleanupAbilityResourcesForTermination(Context);
+}
+
+namespace GGYGOBossMeleeTestLifecycle
+{
+	/** 原生 Try 的返回值与 Try 内原生 PreActivate 签发的激活身份（Try 内同步结束时仍保留）。 */
+	struct FActivation
+	{
+		bool bNativeAccepted = false;
+		FGGYGOAbilityActivationHandle OriginalActivation;
+	};
+
+	FActivation Activate(UGGYGOAbilitySystemComponent* ASC, FGameplayAbilitySpecHandle Handle)
+	{
+		FActivation Result;
+		const FDelegateHandle Observer = ASC->AbilityActivatedCallbacks.AddLambda([&Result, Handle](UGameplayAbility* Ability)
+		{
+			const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Ability);
+			if (ProjectAbility && ProjectAbility->GetCurrentAbilitySpecHandle() == Handle && !Result.OriginalActivation.HasActivation())
+			{
+				Result.OriginalActivation = ProjectAbility->CaptureCurrentActivation();
+			}
+		});
+		Result.bNativeAccepted = ASC->TryActivateAbility(Handle);
+		ASC->AbilityActivatedCallbacks.Remove(Observer);
+		return Result;
+	}
+
+	/** 原生 OnAbilityEnded 时读取的那次结束清理参数。 */
+	struct FEnded
+	{
+		FGGYGOAbilityTerminationContext Original;
+		const FGGYGOAbilityTerminationContext& GetOriginal() const { return Original; }
+		bool HasCompletion() const { return Original.GetOriginalActivation().HasActivation(); }
+	};
+
+	FDelegateHandle ObserveEnded(UGGYGOAbilitySystemComponent* ASC, TFunction<void(const FEnded&)> Sink)
+	{
+		return ASC->OnAbilityEnded.AddLambda([Sink = MoveTemp(Sink)](const FAbilityEndedData& Data)
+		{
+			const UGGYGOBossMeleeLifecycleTestAbility* Ability = Cast<UGGYGOBossMeleeLifecycleTestAbility>(Data.AbilityThatEnded.Get());
+			FEnded Ended;
+			if (Ability) { Ended.Original = Ability->GetLastTerminationForTest(); }
+			Sink(Ended);
+		});
+	}
+}
+
 void UGGYGOBossMeleeLifecycleTestAbility::ConfigureMontageForTest(UAnimMontage* Montage, FName StartBone, FName EndBone)
 {
 	AttackMontage = Montage;
@@ -43,6 +94,26 @@ void UGGYGOBossMeleeLifecycleTestAbility::ConfigureMontageForTest(UAnimMontage* 
 void UGGYGOBossMeleeLifecycleTestAbility::FinishForTest(const FGGYGOAbilityActivationHandle& Original)
 {
 	RequestAbilityEnd(Original, false, false);
+}
+
+FGGYGOAbilityActivationHandle UGGYGOBossMeleeLifecycleTestAbility::DeferredEndAfterReactivationForTest(
+	const FGGYGOAbilityActivationHandle& Original, bool& bAcceptedWhileLocked)
+{
+	UAbilitySystemComponent* ASC = GetAbilitySystemComponentFromActorInfo();
+	const FGameplayAbilitySpecHandle Handle = CurrentSpecHandle;
+	FGGYGOAbilityActivationHandle Successor;
+	bAcceptedWhileLocked = false;
+	if (!ASC || !Handle.IsValid()) { return Successor; }
+	IncrementListLock();
+	// 先排队的回调在解锁时结束原激活并立即重激活同一 Spec；其后才执行的原延后请求不得结束后继。
+	WaitingToExecute.Add(FPostLockDelegate::CreateLambda([this, ASC, Handle, Original, &Successor]()
+	{
+		RequestAbilityEnd(Original, false, false);
+		if (ASC->TryActivateAbility(Handle)) { Successor = CaptureCurrentActivation(); }
+	}));
+	bAcceptedWhileLocked = RequestAbilityEnd(Original, false, false).IsAccepted() && IsActive();
+	DecrementListLock();
+	return Successor;
 }
 
 bool UGGYGOBossMeleeLifecycleTestAbility::BeginMotionForTest(
@@ -122,9 +193,9 @@ namespace
 		ASC->InitAbilityActorInfo(Owner, Owner);
 		const FGameplayAbilitySpecHandle SpecHandle = ASC->GiveAbility(
 			FGameplayAbilitySpec(UGGYGOBossMeleeLifecycleTestAbility::StaticClass(), 1));
-		const FGGYGOAbilityActivationRequestResult First = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		const GGYGOBossMeleeTestLifecycle::FActivation First = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 		if (!Test.TestTrue(TEXT("位移失败原受控激活"), First.bNativeAccepted
-			&& First.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted && First.OriginalActivation.HasActivation())) { return false; }
+			&& First.OriginalActivation.HasActivation())) { return false; }
 		const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(SpecHandle);
 		UGGYGOBossMeleeLifecycleTestAbility* Ability = Spec
 			? Cast<UGGYGOBossMeleeLifecycleTestAbility>(Spec->GetPrimaryInstance()) : nullptr;
@@ -154,7 +225,7 @@ namespace
 			&& static_cast<const FRootMotionSource_GGYGOActionCurve*>(LateOriginalSource.Get())->OriginalResource
 				== OriginalSource->OriginalResource)) { return false; }
 		TArray<bool> NativeCancelled;
-		TArray<FGGYGOAbilityTerminationCompletedNotice> Completions;
+		TArray<GGYGOBossMeleeTestLifecycle::FEnded> Completions;
 		bool bRetiredAndRestoredAtNativeEnd = false;
 		const FDelegateHandle NativeEnd = ASC->OnAbilityEnded.AddLambda([&](const FAbilityEndedData& Data)
 		{
@@ -165,8 +236,7 @@ namespace
 					&& Mesh->VisibilityBasedAnimTickOption == OriginalTick && Mesh->bEnableUpdateRateOptimizations;
 			}
 		});
-		const FDelegateHandle Completed = ASC->OnAbilityTerminationCompleted().AddLambda(
-			[&](const FGGYGOAbilityTerminationCompletedNotice& Notice) { Completions.Add(Notice); });
+		const FDelegateHandle Completed = GGYGOBossMeleeTestLifecycle::ObserveEnded(ASC, [&](const GGYGOBossMeleeTestLifecycle::FEnded& Notice) { Completions.Add(Notice); });
 		// Invalidate the accepted original configuration, then run native RMS preparation.
 		// The test never calls an Ability failure/End hook to supply this evidence.
 		Profile->Duration = 0.0f;
@@ -194,9 +264,8 @@ namespace
 		if (bPassed)
 		{
 			Profile->Duration = 1.0f;
-			const FGGYGOAbilityActivationRequestResult Next = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+			const GGYGOBossMeleeTestLifecycle::FActivation Next = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 			const bool bNextStarted = Test.TestTrue(TEXT("完整原结束返回后受控后继及 motion 启动"), Next.bNativeAccepted
-				&& Next.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
 				&& Next.OriginalActivation.HasActivation()
 				&& !Next.OriginalActivation.HasSameActivation(First.OriginalActivation)
 				&& Ability->BeginMotionForTest(Next.OriginalActivation, Profile));
@@ -224,7 +293,7 @@ namespace
 			}
 		}
 		ASC->OnAbilityEnded.Remove(NativeEnd);
-		ASC->OnAbilityTerminationCompleted().Remove(Completed);
+		ASC->OnAbilityEnded.Remove(Completed);
 		Test.AddInfo(FString::Printf(TEXT("BossMelee MotionFailure behavior assertions: %s; intentional Error expectations use exact messages/counts."),
 			bPassed ? TEXT("PASS") : TEXT("FAIL")));
 		return bPassed;
@@ -249,9 +318,8 @@ bool FGGYGOBossMeleeEndReentryTest::RunTest(const FString& Parameters)
 	Mesh->VisibilityBasedAnimTickOption = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 	Mesh->bEnableUpdateRateOptimizations = true;
 	const FGameplayAbilitySpecHandle Handle = ASC->GiveAbility(FGameplayAbilitySpec(UGGYGOBossMeleeLifecycleTestAbility::StaticClass(), 1));
-	const FGGYGOAbilityActivationRequestResult FirstRequest = ASC->TryActivateAbilityWithTerminationBoundary(Handle);
-	if (!TestTrue(TEXT("首个测试动作激活"), FirstRequest.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
-		&& FirstRequest.bNativeAccepted && FirstRequest.OriginalActivation.HasActivation()))
+	const GGYGOBossMeleeTestLifecycle::FActivation FirstRequest = GGYGOBossMeleeTestLifecycle::Activate(ASC, Handle);
+	if (!TestTrue(TEXT("首个测试动作激活"), FirstRequest.bNativeAccepted && FirstRequest.OriginalActivation.HasActivation()))
 	{
 		World->DestroyWorld(false);
 		return false;
@@ -280,26 +348,31 @@ bool FGGYGOBossMeleeEndReentryTest::RunTest(const FString& Parameters)
 	ASC->OnAbilityEnded.Remove(EndHandle);
 	if (bReactivated)
 	{
-		int32 RawSuccessorCompletions = 0;
-		const FDelegateHandle CompletionObserver = ASC->OnAbilityTerminationCompleted().AddLambda(
-			[&RawSuccessorCompletions, ReentryOriginal](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+		int32 SuccessorEnds = 0;
+		const FDelegateHandle SuccessorEnded = ASC->OnAbilityEnded.AddLambda(
+			[&SuccessorEnds, Ability](const FAbilityEndedData& Data)
 			{
-				if (Notice.HasCompletion()
-					&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(ReentryOriginal))
-				{
-					++RawSuccessorCompletions;
-				}
+				if (Data.AbilityThatEnded.Get() == Ability) { ++SuccessorEnds; }
 			});
-		TestTrue(TEXT("已登记原生后继最终清理的完成观察"), CompletionObserver.IsValid());
-		// 后继通过 raw Try 启动；显式请求清理必须诊断缺少受控完成证明，不能伪造 Completed。
-		AddExpectedMessage(FString::Printf(
-			TEXT("AbilitySystem original termination Ability [%s] ASC [%s] Spec [%s] failed: reason=%d."),
-			*GetPathNameSafe(Ability), *GetPathNameSafe(ASC), *Handle.ToString(),
-			static_cast<int32>(EGGYGOAbilityTerminationReason::UnsupportedEntry)),
-			ELogVerbosity::Error, EAutomationExpectedMessageFlags::Exact, 1, false);
+		// 结束广播内重新激活的后继拥有自己的激活身份；用它结束只结束后继一次。
+		TestTrue(TEXT("后继拥有新的激活身份"), ReentryOriginal.HasActivation()
+			&& !ReentryOriginal.HasSameActivation(FirstRequest.OriginalActivation));
 		Ability->FinishForTest(ReentryOriginal);
-		ASC->OnAbilityTerminationCompleted().Remove(CompletionObserver);
-		TestEqual(TEXT("无受控完成证明的原生后继不发布业务 Completed"), RawSuccessorCompletions, 0);
+		ASC->OnAbilityEnded.Remove(SuccessorEnded);
+		TestEqual(TEXT("后继正常结束恰一次"), SuccessorEnds, 1);
+	}
+	{
+		const GGYGOBossMeleeTestLifecycle::FActivation Deferred = GGYGOBossMeleeTestLifecycle::Activate(ASC, Handle);
+		bool bAcceptedWhileLocked = false;
+		const FGGYGOAbilityActivationHandle Successor = Deferred.bNativeAccepted
+			? Ability->DeferredEndAfterReactivationForTest(Deferred.OriginalActivation, bAcceptedWhileLocked)
+			: FGGYGOAbilityActivationHandle{};
+		TestTrue(TEXT("ScopeLock 内对原激活的结束请求被接受并延后"), bAcceptedWhileLocked);
+		TestTrue(TEXT("解锁后先结束原激活并重激活出新身份"), Successor.HasActivation()
+			&& !Successor.HasSameActivation(Deferred.OriginalActivation));
+		TestTrue(TEXT("其后执行的原延后结束请求不结束后继"), Ability->IsActive()
+			&& Ability->CaptureCurrentActivation().HasSameActivation(Successor));
+		Ability->FinishForTest(Successor);
 	}
 	TestTrue(TEXT("新动作最终恢复最初设置"), Mesh->VisibilityBasedAnimTickOption == EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered && Mesh->bEnableUpdateRateOptimizations);
 	World->DestroyWorld(false);
@@ -339,13 +412,12 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 
 	struct FCompletionObservation
 	{
-		FGGYGOAbilityTerminationCompletedNotice Notice;
+		GGYGOBossMeleeTestLifecycle::FEnded Notice;
 		bool bMeshRestored = false;
 	};
 	UGGYGOBossMeleeLifecycleTestAbility* Ability = nullptr;
 	TArray<FCompletionObservation> Completions;
-	const FDelegateHandle CompletionHandle = ASC->OnAbilityTerminationCompleted().AddLambda(
-		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+	const FDelegateHandle CompletionHandle = GGYGOBossMeleeTestLifecycle::ObserveEnded(ASC, [&](const GGYGOBossMeleeTestLifecycle::FEnded& Notice)
 		{
 			FCompletionObservation& Observation = Completions.AddDefaulted_GetRef();
 			Observation.Notice = Notice;
@@ -366,10 +438,9 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 	{
 		const TCHAR* Label = Index == 0 ? TEXT("A") : TEXT("B");
 		// On the second iteration, A's request and every completion listener have returned.
-		const FGGYGOAbilityActivationRequestResult Request = ASC->TryActivateAbilityWithTerminationBoundary(Handle);
+		const GGYGOBossMeleeTestLifecycle::FActivation Request = GGYGOBossMeleeTestLifecycle::Activate(ASC, Handle);
 		const bool bAccepted = TestTrue(FString::Printf(TEXT("普通链 %s 受控原生激活并取得固定 Original"), Label),
-			Request.Outcome == EGGYGOAbilityActivationRequestOutcome::Accepted
-			&& Request.bNativeAccepted && Request.OriginalActivation.HasActivation());
+			Request.bNativeAccepted && Request.OriginalActivation.HasActivation());
 		bPassed = bAccepted && bPassed;
 		if (!bAccepted) { break; }
 		const FGGYGOAbilityActivationHandle Original = Request.OriginalActivation;
@@ -386,7 +457,7 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 				Original.HasSameActivation(PreviousOriginal)) && bPassed;
 		}
 		bPassed = TestFalse(FString::Printf(TEXT("普通链 %s 启动没有提前完成"), Label),
-			Request.OriginalTerminationCompleted.HasCompletion()) && bPassed;
+			Completions.Num() > Index) && bPassed;
 		const bool bPrepared = TestTrue(FString::Printf(TEXT("普通链 %s 实际建立原 Mesh 资源"), Label),
 			Ability->IsActive() && Ability->HasActiveMeshForTest()
 			&& Ability->GetInitializedOriginalForTest().HasSameActivation(Original)
@@ -421,7 +492,7 @@ bool FGGYGOBossMeleeNormalLifecycleTest::RunTest(const FString& Parameters)
 		PreviousOriginal = Original;
 		if (!bPassed) { break; }
 	}
-	ASC->OnAbilityTerminationCompleted().Remove(CompletionHandle);
+	ASC->OnAbilityEnded.Remove(CompletionHandle);
 	World->DestroyWorld(false);
 	if (bPassed)
 	{
@@ -487,17 +558,13 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 		|| !TestNotNull(TEXT("XYZ original Host ASC"), ASC)
 		|| !TestNotNull(TEXT("XYZ original Controller"), Controller)
 		|| !TestNotNull(TEXT("XYZ original PawnExtension"), Extension)) { return false; }
-	const FGGYGOAvatarBindingContext InitialContext = ASC->GetAvatarBindingContext();
 	const FGGYGOPawnASCResourceHandle InitialResource = Extension->GetCurrentLocalAbilitySystemResource();
-	EGGYGOAvatarBindingReason BindingReason;
 	if (!TestTrue(TEXT("XYZ initial production assembly has real published Host Ready"),
 		Character->GetGGYGOAbilitySystemComponent() == ASC && State->GetAvatarPawn() == Character
 		&& State->GetGGYGOAbilitySystemComponent() == ASC && ASC->AbilityActorInfo.IsValid()
 		&& ASC->AbilityActorInfo->OwnerActor.Get() == State && ASC->AbilityActorInfo->AvatarActor.Get() == Character
-		&& InitialContext.HasIssuedContext() && InitialResource.HasResource()
-		&& InitialResource.GetIdentity().Binding.HasSameIdentity(InitialContext.Binding)
+		&& InitialResource.HasResource() && InitialResource.GetIdentity().ASC.Get() == ASC
 		&& Extension->IsLocalAbilitySystemResourceReady(InitialResource)
-		&& ASC->CheckAvatarBindingContext(InitialContext, BindingReason) == EGGYGOAvatarBindingOutcome::Succeeded
 		&& Character->GetController() == Controller && Controller->GetPawn() == Character
 		&& !Character->FindComponentByClass<UGGYGOAbilitySystemComponent>())) { return false; }
 	// Mesh/AnimInstance are part of the committed native binding source. Release its
@@ -508,9 +575,7 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 		&& ASC->GetOwnerActor() == State && !ASC->GetAvatarActor()
 		&& !Character->GetGGYGOAbilitySystemComponent()
 		&& !Extension->GetCurrentLocalAbilitySystemResource().HasResource()
-		&& !Extension->IsLocalAbilitySystemResourceInstalled(InitialResource)
 		&& !Extension->IsLocalAbilitySystemResourceReady(InitialResource)
-		&& ASC->CheckAvatarBindingContext(InitialContext, BindingReason) != EGGYGOAvatarBindingOutcome::Succeeded
 		&& Character->GetController() == Controller && Controller->GetPawn() == Character)) { return false; }
 	USkeletalMesh* Cube = LoadObject<USkeletalMesh>(nullptr, TEXT("/Engine/EngineMeshes/SkeletalCube.SkeletalCube"));
 	USkeleton* Skeleton = Cube && Cube->GetSkeleton() ? DuplicateObject<USkeleton>(Cube->GetSkeleton(), Character) : nullptr;
@@ -531,17 +596,13 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 	UGGYGOBossMeleeLifecycleTestAnimInstance* Guard = Cast<UGGYGOBossMeleeLifecycleTestAnimInstance>(Anim);
 	if (!TestNotNull(TEXT("XYZ original concrete Guard receiver"), Guard)) { return false; }
 	State->AttachAvatar(Character);
-	const FGGYGOAvatarBindingContext ReboundContext = ASC->GetAvatarBindingContext();
 	const FGGYGOPawnASCResourceHandle ReboundResource = Extension->GetCurrentLocalAbilitySystemResource();
 	if (!TestTrue(TEXT("XYZ same Host publishes a new real binding to the configured native source"),
 		State->GetGGYGOAbilitySystemComponent() == ASC && State->GetAvatarPawn() == Character
 		&& Character->GetGGYGOAbilitySystemComponent() == ASC
-		&& ReboundContext.HasIssuedContext() && !ReboundContext.Binding.HasSameIdentity(InitialContext.Binding)
 		&& ReboundResource.HasResource() && !ReboundResource.HasSameResource(InitialResource)
-		&& ReboundResource.GetIdentity().Binding.HasSameIdentity(ReboundContext.Binding)
 		&& Extension->IsLocalAbilitySystemResourceReady(ReboundResource)
-		&& !Extension->IsLocalAbilitySystemResourceInstalled(InitialResource)
-		&& ASC->CheckAvatarBindingContext(ReboundContext, BindingReason) == EGGYGOAvatarBindingOutcome::Succeeded
+		&& !Extension->IsLocalAbilitySystemResourceReady(InitialResource)
 		&& ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->OwnerActor.Get() == State
 		&& ASC->AbilityActorInfo->AvatarActor.Get() == Character
 		&& ASC->AbilityActorInfo->SkeletalMeshComponent.Get() == Mesh && ASC->AbilityActorInfo->GetAnimInstance() == Guard
@@ -611,25 +672,24 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 	bPassed &= TestTrue(TEXT("Mutual exclusion has explicit diagnostic"), Error.Contains(TEXT("互斥")));
 	Ability->SetProfileForTest(nullptr);
 	if (!TestTrue(TEXT("XYZ complete configuration valid"), Ability->ValidateMeleeConfiguration(Error))) { return false; }
-	TArray<FGGYGOAbilityTerminationCompletedNotice> Completed;
-	const FDelegateHandle Completion = ASC->OnAbilityTerminationCompleted().AddLambda(
-		[&](const FGGYGOAbilityTerminationCompletedNotice& Notice) { Completed.Add(Notice); });
+	TArray<GGYGOBossMeleeTestLifecycle::FEnded> Completed;
+	const FDelegateHandle Completion = GGYGOBossMeleeTestLifecycle::ObserveEnded(ASC, [&](const GGYGOBossMeleeTestLifecycle::FEnded& Notice) { Completed.Add(Notice); });
 	const FVector Entry = Character->GetActorLocation();
-	const auto Request = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+	const GGYGOBossMeleeTestLifecycle::FActivation Request = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 	if (!TestTrue(TEXT("XYZ production GA starts original native Task and CMC"), Request.bNativeAccepted
 		&& Request.OriginalActivation.HasActivation() && Ability->IsActive() && Movement->HasActiveActionMotion()))
 	{
-		ASC->OnAbilityTerminationCompleted().Remove(Completion);
+		ASC->OnAbilityEnded.Remove(Completion);
 		return false;
 	}
 	FAnimMontageInstance* Instance = Anim->GetActiveInstanceForMontage(Montage);
-	if (!TestNotNull(TEXT("XYZ original native instance"), Instance)) { ASC->OnAbilityTerminationCompleted().Remove(Completion); return false; }
+	if (!TestNotNull(TEXT("XYZ original native instance"), Instance)) { ASC->OnAbilityEnded.Remove(Completion); return false; }
 	const int32 OriginalInstanceId = Instance->GetInstanceID();
 	const TSharedPtr<FRootMotionSource> OriginalSource = Movement->GetRootMotionSource(TEXT("GGYGO.ActionCurve"));
 	if (!TestTrue(TEXT("XYZ activation owns its original native curve source"), OriginalSource.IsValid()
 		&& OriginalSource->GetScriptStruct() == FRootMotionSource_GGYGOActionCurve::StaticStruct()))
 	{
-		ASC->OnAbilityTerminationCompleted().Remove(Completion);
+		ASC->OnAbilityEnded.Remove(Completion);
 		return false;
 	}
 	const auto& OriginalCurveSource = static_cast<const FRootMotionSource_GGYGOActionCurve&>(*OriginalSource);
@@ -669,7 +729,7 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 	if (bPassed)
 	{
 		Movement->SetMovementMode(MOVE_Falling);
-		const auto Cancelled = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		const GGYGOBossMeleeTestLifecycle::FActivation Cancelled = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 		bPassed &= TestTrue(TEXT("XYZ next real activation starts"), Cancelled.bNativeAccepted && Ability->IsActive() && Movement->HasActiveActionMotion());
 		Ability->RequestAbilityCancel(Cancelled.OriginalActivation, true);
 		bPassed &= TestTrue(TEXT("XYZ cancellation releases only its original resources"), Completed.Num() == 2
@@ -682,7 +742,7 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 		Guard->RequiredPoseCorrectionSlot = TEXT("DefaultSlot");
 		AddExpectedMessage(TEXT("[AbilitySystem.MontageTask.Pose]"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1, false);
 		AddExpectedMessage(TEXT("原动作在 [Montage Task] 失败"), ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1, false);
-		const auto StartupFailed = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		const GGYGOBossMeleeTestLifecycle::FActivation StartupFailed = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 		bPassed &= TestTrue(TEXT("Original required Task startup failure ends once without issuing CMC motion"),
 			StartupFailed.bNativeAccepted && StartupFailed.OriginalActivation.HasActivation() && Completed.Num() == 3
 			&& Completed[2].GetOriginal().WasCancelled()
@@ -696,7 +756,7 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 	if (bPassed)
 	{
 		Movement->SetMovementMode(MOVE_Falling);
-		const auto Failed = ASC->TryActivateAbilityWithTerminationBoundary(SpecHandle);
+		const GGYGOBossMeleeTestLifecycle::FActivation Failed = GGYGOBossMeleeTestLifecycle::Activate(ASC, SpecHandle);
 		bPassed &= TestTrue(TEXT("XYZ failure probe starts through real GA"), Failed.bNativeAccepted && Ability->IsActive());
 		const FAnimationCurveIdentifier ZId(TEXT("RootMotion_PosZ"), ERawCurveTrackTypes::RCT_Float);
 		bPassed &= TestTrue(TEXT("Invalidate accepted original required Z source"), Data.RemoveCurve(ZId, false));
@@ -709,7 +769,7 @@ bool FGGYGOBossMeleeOriginalMontageTest::RunTest(const FString& Parameters)
 			&& Mesh->bEnableUpdateRateOptimizations);
 		bPassed &= TestFalse(TEXT("Missing Z rejects configuration rather than no-motion success"), Ability->ValidateMeleeConfiguration(Error));
 	}
-	ASC->OnAbilityTerminationCompleted().Remove(Completion);
+	ASC->OnAbilityEnded.Remove(Completion);
 	return bPassed;
 #else
 	AddError(TEXT("Original Montage fixture requires editor animation data model."));
@@ -758,7 +818,7 @@ namespace
 			if (!Check(OwnsPIE() && CountPIEWorlds() == 1 && Context && GEditor->PlayWorld == World.Get() && Context->ContextHandle == WorldContext
 				&& !GEditor->ShouldEndPlayMap() && Source.IsValid() && Target.IsValid() && ASC.IsValid()
 				&& TargetASC.IsValid() && Movement.IsValid() && Mesh.IsValid() && Anim.IsValid() && Trace.IsValid() && Ability.IsValid()
-				&& ASC->GetAvatarBindingContext().HasSameContext(SourceBinding) && TargetASC->GetAvatarBindingContext().HasSameContext(TargetBinding)
+				&& CurrentResource(Source.Get()).HasSameResource(SourceBinding) && CurrentResource(Target.Get()).HasSameResource(TargetBinding)
 				&& ASC->GetAvatarActor() == Source.Get() && TargetASC->GetAvatarActor() == Target.Get()
 				&& Mesh->GetAnimInstance() == Anim.Get(),
 				TEXT("原 PIE 或正式动作接收者已失效／被替换"))) return BeginEnding();
@@ -898,14 +958,11 @@ namespace
 			UGGYGOAbilitySystemComponent* HostASC = State ? State->GetGGYGOAbilitySystemComponent() : nullptr;
 			UGGYGOPawnExtensionComponent* Extension = Avatar ? Avatar->GetPawnExtensionComponent() : nullptr;
 			if (!Avatar || !HostASC || !Extension) return false;
-			const FGGYGOAvatarBindingContext Binding = HostASC->GetAvatarBindingContext();
 			const FGGYGOPawnASCResourceHandle Resource = Extension->GetCurrentLocalAbilitySystemResource();
-			EGGYGOAvatarBindingReason Reason;
 			return Avatar->HasAuthority() && Avatar->GetGGYGOAbilitySystemComponent() == HostASC && State->GetAvatarPawn() == Avatar
 				&& HostASC->AbilityActorInfo.IsValid() && HostASC->GetOwnerActor() == State && HostASC->GetAvatarActor() == Avatar
-				&& Binding.HasIssuedContext() && Resource.HasResource() && Resource.GetIdentity().Binding.HasSameIdentity(Binding.Binding)
+				&& Resource.HasResource() && Resource.GetIdentity().ASC.Get() == HostASC
 				&& Extension->IsLocalAbilitySystemResourceReady(Resource)
-				&& HostASC->CheckAvatarBindingContext(Binding, Reason) == EGGYGOAvatarBindingOutcome::Succeeded
 				&& Encounter->GetBossController() && Avatar->GetController() == Encounter->GetBossController()
 				&& Encounter->GetBossController()->GetPawn() == Avatar && !Avatar->FindComponentByClass<UGGYGOAbilitySystemComponent>();
 		}
@@ -1014,7 +1071,7 @@ namespace
 			Mesh = Source->GetMesh(); Movement = Source->GetGGYGOMovementComponent(); Trace = Source->FindComponentByClass<UGGYGOMeleeTraceComponent>();
 			if (!Check(Mesh.IsValid() && Movement.IsValid() && Trace.IsValid() && Mesh->GetSkeletalMeshAsset() == MeshAsset.Get()
 				&& Mesh->DoesSocketExist(FName(*StartSocket)) && Mesh->DoesSocketExist(FName(*EndSocket)), TEXT("正式 Mesh／CMC／Socket 接收者不符"))) return false;
-			Anim = Mesh->GetAnimInstance(); SourceBinding = ASC->GetAvatarBindingContext();
+			Anim = Mesh->GetAnimInstance(); SourceBinding = CurrentResource(Source.Get());
 			if (!Check(Anim.IsValid(), TEXT("正式动画实例缺失"))) return false;
 			if (!Check(!Anim->GetClass()->GetPackage()->IsDirty(), TEXT("正式 ABP 输入变脏"))) return false;
 			InputPackages.AddUnique(Anim->GetClass()->GetPackage());
@@ -1028,7 +1085,7 @@ namespace
 			AGGYGOEncounterLifecycleTestEncounter* TargetEncounter = SpawnEncounter(FixtureTransform);
 			if (!Check(TargetEncounter != nullptr, TEXT("正式 Target Encounter 装配／Ready 失败"))) return false;
 			Target = TargetEncounter->GetBossAvatar(); TargetASC = TargetEncounter->GetBossState()->GetGGYGOAbilitySystemComponent();
-			TargetBinding = TargetASC->GetAvatarBindingContext();
+			TargetBinding = CurrentResource(Target.Get());
 			Target->GetCharacterMovement()->SetComponentTickEnabled(false);
 			Target->GetCapsuleComponent()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
 			Target->GetMesh()->SetCollisionEnabled(ECollisionEnabled::NoCollision);
@@ -1093,13 +1150,13 @@ namespace
 						&& FMath::IsNearlyEqual(Spec.GetSetByCallerMagnitude(GGYGOGameplayTags::SetByCaller_PoiseDamage, false), PoiseDamage),
 						TEXT("原生 GE 回执的真实目标／正式 GA／GE／命中上下文／窗口／数值不符"));
 				});
-			CompletionObserver = ASC->OnAbilityTerminationCompleted().AddLambda([this](const FGGYGOAbilityTerminationCompletedNotice& Notice)
+			CompletionObserver = ASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data)
 			{
-				if (!Notice.GetOriginal().GetOriginalActivation().HasSameActivation(Original)) return;
-				++CompletionCount; bCancelled = Notice.GetOriginal().WasCancelled();
+				if (!Original.HasActivation() || Data.AbilityThatEnded.Get() != Ability.Get()) return;
+				++CompletionCount; bCancelled = Data.bWasCancelled;
 				if (Source.IsValid()) FinalLocation = Source->GetActorLocation();
 			});
-			const FGGYGOAbilityActivationRequestResult Request = ASC->TryActivateAbilityWithTerminationBoundary(Selected->Handle);
+			const GGYGOBossMeleeTestLifecycle::FActivation Request = GGYGOBossMeleeTestLifecycle::Activate(ASC.Get(), Selected->Handle);
 			Original = Request.OriginalActivation;
 			if (!Check(Request.bNativeAccepted && Original.HasActivation() && Ability->IsActive() && Movement->HasActiveActionMotion(),
 				TEXT("正式已授予 GA 未建立原始播放／CMC"))) return false;
@@ -1122,7 +1179,7 @@ namespace
 			{
 				ASC->RemoveGameplayEventTagContainerDelegate(WindowEventTags, WindowObserver);
 				ASC->OnGameplayEffectAppliedDelegateToTarget.Remove(EffectObserver);
-				ASC->OnAbilityTerminationCompleted().Remove(CompletionObserver);
+				ASC->OnAbilityEnded.Remove(CompletionObserver);
 			}
 			WindowObserver.Reset();
 			if (Ability.IsValid() && Ability->IsActive() && Original.HasActivation()) Ability->RequestAbilityCancel(Original, true);
@@ -1160,7 +1217,13 @@ namespace
 		TWeakObjectPtr<USphereComponent> Probe;
 		TSharedPtr<FRootMotionSource_GGYGOActionCurve> CurveSource;
 		FGGYGOAbilityActivationHandle Original;
-		FGGYGOAvatarBindingContext SourceBinding, TargetBinding;
+		/** 绑定身份：同一次绑定的 PawnExtension 资源句柄。 */
+		FGGYGOPawnASCResourceHandle SourceBinding, TargetBinding;
+		static FGGYGOPawnASCResourceHandle CurrentResource(const APawn* Pawn)
+		{
+			const UGGYGOPawnExtensionComponent* Extension = UGGYGOPawnExtensionComponent::FindPawnExtensionComponent(Pawn);
+			return Extension ? Extension->GetCurrentLocalAbilitySystemResource() : FGGYGOPawnASCResourceHandle{};
+		}
 		FGameplayTagContainer WindowEventTags;
 		FDelegateHandle WindowObserver, EffectObserver, CompletionObserver;
 		FName TraceStart, TraceEnd;

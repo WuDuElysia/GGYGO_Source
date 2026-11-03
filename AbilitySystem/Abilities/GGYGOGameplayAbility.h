@@ -23,7 +23,6 @@
 #pragma once
 
 #include "Abilities/GameplayAbility.h"
-#include "AbilitySystem/GGYGOAbilityMontagePlaybackTypes.h"
 #include "AbilitySystem/Groups/GGYGOAbilityGroupTypes.h"
 #include "GameplayPrediction.h"
 #include "GameplayAbilitySpecHandle.h"
@@ -59,16 +58,16 @@ struct FGameplayAbilityTargetDataHandle;
 struct FHitResult;
 
 /**
- * GA issues provenance and owns each original termination; ASC supplies native exit witnesses.
- * These values do not own GAS Active/spec state.
- * Handles share immutable issuer-created history. Empty/copy/equality never prove liveness.
+ * 一次 GAS 激活的身份。GA 在原生 PreActivate 通知 ASC 时签发，在原生 EndAbility 通知 ASC 时退役。
+ * 句柄共享不可变记录：复制或相等只说明是同一次激活，不说明它仍在运行；是否仍在运行以
+ * UGGYGOGameplayAbility::IsActivationCurrent 为准。GAS 仍是 Active 与 Spec 计数的唯一权威。
  */
 class GGYGO_API FGGYGOAbilityActivationHandle
 {
 public:
 	FGGYGOAbilityActivationHandle() = default;
 	bool HasActivation() const { return Proof.IsValid(); }
-	/** 保持原 Proof 寿命的只读资源身份；仅用于匹配历史归还，不表示当前工作资格。 */
+	/** 保持原记录寿命的只读资源身份；仅用于匹配历史归还，不表示当前工作资格。 */
 	TSharedPtr<const void> GetResourceIdentity() const { return StaticCastSharedPtr<const void>(Proof); }
 	bool HasSameActivation(const FGGYGOAbilityActivationHandle& Other) const
 	{
@@ -76,186 +75,45 @@ public:
 	}
 
 private:
-	// GA-issued nonreused identity for the original ASC/instance/Spec/ActorInfo source.
-	// A zero prediction key is not an identity; this proof must distinguish each activation.
 	struct FActivationProof;
 	TSharedPtr<const FActivationProof> Proof{};
 
 	friend class UGGYGOGameplayAbility;
 };
 
-class GGYGO_API FGGYGOAbilityTerminationHandle
-{
-public:
-	FGGYGOAbilityTerminationHandle() = default;
-	bool HasTermination() const { return Proof.IsValid(); }
-	bool HasSameTermination(const FGGYGOAbilityTerminationHandle& Other) const
-	{
-		return Proof.IsValid() && Proof == Other.Proof;
-	}
-
-private:
-	// GA-issued identity for the first accepted request against one original activation.
-	struct FTerminationProof;
-	TSharedPtr<const FTerminationProof> Proof{};
-
-	friend class UGGYGOGameplayAbility;
-};
-
-enum class EGGYGOAbilityTerminationRequestKind : uint8
-{
-	None = 0,
-	End,
-	Cancel
-};
-
-enum class EGGYGOAbilityActivationRequestOutcome : uint8
-{
-	Rejected = 0,
-	/** Native Try accepted its request; does not imply local activation or Commit success. */
-	Accepted,
-	Busy,
-	Stale,
-	Failed
-};
-
-enum class EGGYGOAbilityActivationRequestReason : uint8
-{
-	InvalidRequest = 0,
-	None,
-	InvalidASC,
-	InvalidSpec,
-	InvalidAbility,
-	InvalidActorInfo,
-	WrongIssuer,
-	IdentityExhausted,
-	MissingActivationBoundary,
-	SameInstanceRetrigger,
-	TerminationInProgress,
-	NativeActivationRejected,
-	UnsupportedEntry
-};
-
+/** RequestAbilityEnd／RequestAbilityCancel 的结果，只用于诊断；调用方不据此重试。 */
 enum class EGGYGOAbilityTerminationOutcome : uint8
 {
-	Rejected = 0,
-	Completed,
+	/** 已对当前激活调用原生 EndAbility／CancelAbility；原生 ScopeLock 时由 GAS 延后执行。 */
 	Accepted,
-	Deferred,
-	AlreadyPending,
-	Busy,
-	Stale,
-	Failed
+	/** 请求的激活已不是当前激活：已结束、正在结束或已被后继取代。 */
+	NotCurrent,
+	/** 当前激活声明不可取消。 */
+	NotCancelable
 };
 
-enum class EGGYGOAbilityTerminationReason : uint8
+struct GGYGO_API FGGYGOAbilityTerminationResult
 {
-	InvalidRequest = 0,
-	None,
-	WrongIssuer,
-	InvalidASC,
-	InvalidAbility,
-	InvalidActorInfo,
-	IdentityExhausted,
-	ActivationChanged,
-	NotActive,
-	NotCancelable,
-	ScopeLocked,
-	TerminationInProgress,
-	ActivationCallInProgress,
-	MontageCaptureFailed,
-	NativeEndNotObserved,
-	UnsupportedEntry,
-	/** GAS resources were retired by a trusted native cleanup, not a completed gameplay request. */
-	NativeCleanup
+	EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::NotCurrent;
+	bool IsAccepted() const { return Outcome == EGGYGOAbilityTerminationOutcome::Accepted; }
 };
 
-/**
- * Immutable first-request snapshot, created only by GA; not an alternate execution state.
- * Capture precedes cancellation broadcast/cleanup. Repeated requests cannot change these
- * parameters or recapture resources. Deferred resume carries this same original identity.
- */
+/** CleanupAbilityResourcesForTermination 的参数：正在结束的那次激活及原生 bWasCancelled。 */
 class GGYGO_API FGGYGOAbilityTerminationContext
 {
 public:
 	FGGYGOAbilityTerminationContext() = default;
+	FGGYGOAbilityTerminationContext(const FGGYGOAbilityActivationHandle& InActivation, bool bInWasCancelled)
+		: OriginalActivation(InActivation), bWasCancelled(bInWasCancelled)
+	{
+	}
 
 	const FGGYGOAbilityActivationHandle& GetOriginalActivation() const { return OriginalActivation; }
-	const FGGYGOAbilityTerminationHandle& GetOriginalTermination() const { return OriginalTermination; }
-	EGGYGOAbilityTerminationRequestKind GetRequestKind() const { return RequestKind; }
-	bool GetReplicateEndAbility() const { return bReplicateEndAbility; }
-	bool GetReplicateCancelAbility() const { return bReplicateCancelAbility; }
 	bool WasCancelled() const { return bWasCancelled; }
-	const FGGYGOAbilityMontageOwnershipCheck& GetOriginalMontageCapture() const { return OriginalMontageCapture; }
 
 private:
 	FGGYGOAbilityActivationHandle OriginalActivation{};
-	FGGYGOAbilityTerminationHandle OriginalTermination{};
-	EGGYGOAbilityTerminationRequestKind RequestKind = EGGYGOAbilityTerminationRequestKind::None;
-	// Only the replication flag for RequestKind is an input; the other remains false.
-	bool bReplicateEndAbility = false;
-	bool bReplicateCancelAbility = false;
-	// End preserves its original bWasCancelled argument; Cancel records true.
 	bool bWasCancelled = false;
-	// Default remains K3 Rejected/InvalidRequest. Explicit NoOwnedPlayback is normal;
-	// every other capture failure stays visible and never substitutes current playback.
-	FGGYGOAbilityMontageOwnershipCheck OriginalMontageCapture{};
-
-	friend class UGGYGOGameplayAbility;
-};
-
-/**
- * ASC-created original-source completion history, never current-idle or restart permission.
- * Only publish after original native End, outer Cancel and related controlled activation
- * calls have exited. Retire that original record and release its Busy fence before dispatch.
- * Receivers match the original activation; a successor cannot replace this copied history.
- */
-class GGYGO_API FGGYGOAbilityTerminationCompletedNotice
-{
-public:
-	FGGYGOAbilityTerminationCompletedNotice() = default;
-
-	bool HasCompletion() const
-	{
-		return Outcome == EGGYGOAbilityTerminationOutcome::Completed
-			&& Original.GetOriginalActivation().HasActivation()
-			&& Original.GetOriginalTermination().HasTermination();
-	}
-	const FGGYGOAbilityTerminationContext& GetOriginal() const { return Original; }
-	EGGYGOAbilityTerminationOutcome GetOutcome() const { return Outcome; }
-	EGGYGOAbilityTerminationReason GetReason() const { return Reason; }
-
-private:
-	FGGYGOAbilityTerminationContext Original{};
-	EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Rejected;
-	EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::InvalidRequest;
-
-	friend class UGGYGOAbilitySystemComponent;
-};
-
-/** Copied request result. Editing a copy cannot alter issuer history or authorize execution. */
-struct GGYGO_API FGGYGOAbilityActivationRequestResult
-{
-	EGGYGOAbilityActivationRequestOutcome Outcome = EGGYGOAbilityActivationRequestOutcome::Rejected;
-	EGGYGOAbilityActivationRequestReason Reason = EGGYGOAbilityActivationRequestReason::InvalidRequest;
-	// Exact native Try return when entered; false when admission prevented the call.
-	bool bNativeAccepted = false;
-	// Empty for a remote-only request; a nonempty handle is observed local history, not Active.
-	FGGYGOAbilityActivationHandle OriginalActivation{};
-	// Exact original history if it completed synchronously, even if dispatch started a successor.
-	FGGYGOAbilityTerminationCompletedNotice OriginalTerminationCompleted{};
-};
-
-/**
- * Copied first-request result. Completed requires the original completion boundary;
- * Deferred uses one original-bound delegate in native WaitingToExecute, not a new queue.
- * AlreadyPending returns the same first context; Busy never schedules activation/restart.
- */
-struct GGYGO_API FGGYGOAbilityTerminationResult
-{
-	EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Rejected;
-	EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::InvalidRequest;
-	FGGYGOAbilityTerminationContext Original{};
 };
 
 /**
@@ -286,7 +144,7 @@ enum class EGGYGOAbilityActivationPolicy : uint8
 	OnSpawn
 };
 
-/** Explicit ability configuration for giving up player control of its original Avatar. */
+/** OnAvatarSwitchOut 默认实现读取的配置：Cancel→取消，ContinueInBackground→留场放完。 */
 UENUM(BlueprintType)
 enum class EGGYGOAbilityAvatarExitPolicy : uint8
 {
@@ -294,32 +152,70 @@ enum class EGGYGOAbilityAvatarExitPolicy : uint8
 	ContinueInBackground
 };
 
+/** 一次换出中能力的处理结果。 */
+UENUM(BlueprintType)
+enum class EGGYGOSwitchOutDecision : uint8
+{
+	/** 换出时取消。 */
+	Cancel,
+	/** 留在场上继续执行；队员在这些能力全部结束后才退场。 */
+	ContinueOnField
+};
+
+/** 换人的发起来源。 */
+UENUM(BlueprintType)
+enum class EGGYGOSwitchSource : uint8
+{
+	/** 玩家输入经 Server RPC 发起。 */
+	PlayerRequest,
+	/** 出战队员死亡后的自动切换。 */
+	DeathAutoSwitch,
+	/** 蓝图或其它游戏逻辑直接调用。 */
+	Script
+};
+
+/** 换出时交给能力的上下文。 */
+USTRUCT(BlueprintType)
+struct FGGYGOSwitchContext
+{
+	GENERATED_BODY()
+
+	/** 切换目标的槽位序号。 */
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Squad")
+	int32 TargetSlotIndex = INDEX_NONE;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Squad")
+	EGGYGOSwitchSource Source = EGGYGOSwitchSource::PlayerRequest;
+};
+
 UCLASS(Abstract, HideCategories = Input, Meta = (ShortTooltip = "GGYGO 项目的 GameplayAbility 基类。"))
 class GGYGO_API UGGYGOGameplayAbility : public UGameplayAbility
 {
 	GENERATED_BODY()
 
-	// ASC 需要读写本类的组信息与运行期状态。
+	// ASC 需要读写本类的组信息与运行期状态；分段输入路由核对激活与结束状态。
 	friend class UGGYGOAbilitySystemComponent;
+	friend class FGGYGOAbilityStepInputRouter;
 
 public:
 	UGGYGOGameplayAbility(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-	// ===== Controlled activation identity and original termination =====
+	// ===== 激活身份与结束 =====
 
-	/** Copy the actual activation only while its original resource-work source still matches.
-	 * A committed same-Binding Refresh may retain End eligibility without renewing this source. */
+	/** 当前激活身份；未激活或正在结束时返回空句柄。 */
 	FGGYGOAbilityActivationHandle CaptureCurrentActivation() const;
 
+	/** Activation 仍是本实例当前运行、且尚未进入结束流程的那次激活。 */
+	bool IsActivationCurrent(const FGGYGOAbilityActivationHandle& Activation) const;
+
 	/**
-	 * End only the authenticated original activation. First parameters/resources stay fixed;
-	 * A committed same-Binding Refresh preserves termination eligibility only, not old resource work.
-	 * Stale/invalid sources fail explicitly. Completed is later than native OnAbilityEnded.
+	 * 只结束 Original 指定的当前激活；否则返回 NotCurrent，不重试。
+	 * 原生 ScopeLock 期间按原生规则延后执行，执行时 Original 已不是当前激活则不作用于后继。
 	 */
 	FGGYGOAbilityTerminationResult RequestAbilityEnd(const FGGYGOAbilityActivationHandle& Original,
 		bool bReplicateEndAbility, bool bWasCancelled);
 
-	/** Capture the original before cancellation broadcast; no replacement activation or retry queue. */
+	/** 取消 Original 指定的当前激活；当前不可取消时返回 NotCancelable。 */
 	FGGYGOAbilityTerminationResult RequestAbilityCancel(const FGGYGOAbilityActivationHandle& Original,
 		bool bReplicateCancelAbility);
 
@@ -354,8 +250,25 @@ public:
 	/** 激活时机策略。 */
 	EGGYGOAbilityActivationPolicy GetActivationPolicy() const { return ActivationPolicy; }
 
-	/** Continue is an explicit class default; it never renews old resource-work provenance. */
-	EGGYGOAbilityAvatarExitPolicy GetAvatarExitPolicy() const { return AvatarExitPolicy; }
+	// ===== 换人 =====
+
+	/**
+	 * 队员被换出时，Squad 在服务器上对其每个活动能力调用一次，决定取消还是留场放完。
+	 * 默认读 AvatarExitPolicy。这里只做决定：同批有 Cancel 能力不可取消时，整次换人在任何
+	 * 取消之前被拒绝，所以不要在这里做不可撤销的操作。
+	 */
+	UFUNCTION(BlueprintNativeEvent, Category = "GGYGO|Squad")
+	EGGYGOSwitchOutDecision OnAvatarSwitchOut(const FGGYGOSwitchContext& Context);
+
+	/**
+	 * 选择 ContinueOnField 的能力在拥有者失去玩家控制时收到一次通知。此前仍按住的输入已补发真实释放
+	 * （WaitInputRelease 同样会触发），蓄力类能力可任选一处收尾；此时 Controller 仍可读取，随后解除附身。
+	 * 留场期间没有 Controller，依赖 PlayerController 的逻辑（瞄准方向等）需要在这里处理。
+	 */
+	void NotifyOwnerControlLost();
+
+	/** 玩家切回仍在续放的队员时通知。之后按键照常送入本能力；新能力激活要等续放全部结束。 */
+	void NotifyOwnerControlRegained();
 
 	/** 所属组。为空表示不参与组仲裁。 */
 	FGameplayTag GetGroupTag() const { return GroupTag; }
@@ -392,6 +305,16 @@ protected:
 	/** 蓝图失败反馈。在原生反馈之后触发。 */
 	UFUNCTION(BlueprintImplementableEvent)
 	void ScriptOnAbilityFailedToActivate(const FGameplayTagContainer& FailedReason) const;
+
+	/** 失去／重获玩家控制的原生钩子，在对应蓝图事件之前调用。默认无操作。 */
+	virtual void NativeOnOwnerControlLost() {}
+	virtual void NativeOnOwnerControlRegained() {}
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "GGYGO|Squad", DisplayName = "OnOwnerControlLost")
+	void K2_OnOwnerControlLost();
+
+	UFUNCTION(BlueprintImplementableEvent, Category = "GGYGO|Squad", DisplayName = "OnOwnerControlRegained")
+	void K2_OnOwnerControlRegained();
 
 	/**
 	 * 仅追加业务准入条件；final 入口已完成 ActorInfo、原生/BP 和组规则检查。
@@ -490,14 +413,18 @@ protected:
 	void ClearCameraOffset();
 
 	/**
-	 * 能力结束时清理相机接管。
+	 * 结束入口。原生 Cancel、ClearAbility 与 RequestAbilityEnd 都经过这里。
 	 *
-	 * final 入口统一受理；派生在 CleanupAbilityResourcesForTermination 清自身原资源。
-	 * 能力可能被组仲裁取消、死亡取消或因 Avatar 销毁而结束，
-	 * 相机会永久停在演出视角。
+	 * 原生 ScopeLock 期间直接交给父类排队，真正执行时会再次进入本函数。正式结束时先调用
+	 * CleanupAbilityResourcesForTermination 归还本次激活的资源（含相机接管），再执行原生结束。
+	 * 清理期间对本实例的重复结束请求不再执行。
 	 */
 	virtual void EndAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled) override final;
-	virtual void CancelAbility(const FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo, const FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility) override final;
+
+#if WITH_EDITOR
+	/** 生命周期依赖 InstancedPerActor 且禁止原生自动重触发：同一 Spec 同时只有一次激活。 */
+	virtual EDataValidationResult IsDataValid(class FDataValidationContext& Context) const override;
+#endif
 
 	/**
 	 * 激活时接管的相机模式。留空表示不换模式。
@@ -549,40 +476,26 @@ protected:
 	void K2_OnPawnAvatarSet();
 
 protected:
-	/** Per-activation initialization before group finalization/camera/body. Receives only the
-	 * already-issued original; may end that original, after which no body may run. */
+	/** 每次激活在组准入、镜头与业务体之前的初始化。可以结束本次激活，结束后不再执行业务体。 */
 	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original);
 
-	/** Business body at the original parent activation position. Default calls native Super
-	 * once, preserving BP activation. Original is authenticated existing native history;
-	 * this hook neither issues identity nor authorizes execution from Spec/key. */
+	/** 业务体，位于父类 ActivateAbility 的原位置。默认调用一次父类以保留蓝图激活事件。 */
 	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
 		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
 		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData);
 
-	/** Once per authenticated original termination, before native End. Overrides call Super.
-	 * Task playback execution remains owned by the task; this hook owns only original resources. */
+	/** 每次正式结束调用一次，位于原生 EndAbility 之前；覆盖须调用 Super（归还相机接管）。
+	 * Task 的播放与回调仍由 Task 自己结束；这里只归还本次激活自持的资源。 */
 	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context);
-
-#if WITH_DEV_AUTOMATION_TESTS
-	/** Synchronous read-only sampling of this invocation. No lifecycle reentry/state mutation;
-	 * borrowed parameters must not escape. Return is not a native Try/full-exit witness. */
-	virtual void ObserveAbilityActivationEntryForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		const FGameplayEventData* TriggerEventData);
-	virtual void ObserveAbilityActivationReturnForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		const FGameplayEventData* TriggerEventData);
-	virtual void ObserveAbilityEndEntryForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		bool bReplicateEndAbility, bool bWasCancelled);
-#endif
 
 	/** 何时尝试激活。默认输入触发。 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Ability Activation")
 	EGGYGOAbilityActivationPolicy ActivationPolicy;
 
-	/** Default switch behavior is cancellation. Explicit Continue may be noncancelable. */
+	/**
+	 * OnAvatarSwitchOut 默认实现的配置。默认 Cancel；ContinueInBackground 让能力留场放完，
+	 * 期间队员可见、不可受击，能力照常命中结算。蓝图覆盖 OnAvatarSwitchOut 后本字段不再参与。
+	 */
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "GGYGO|Avatar Exit")
 	EGGYGOAbilityAvatarExitPolicy AvatarExitPolicy = EGGYGOAbilityAvatarExitPolicy::Cancel;
 
@@ -617,170 +530,16 @@ protected:
 	TMap<FGameplayTag, TObjectPtr<UAnimMontage>> FailureTagToAnimMontage;
 
 private:
-	/** Provenance only: GAS remains the sole activation/ending authority. */
-	FGGYGOAbilityActivationHandle IssueControlledActivation(UGGYGOAbilitySystemComponent* OriginalASC,
-		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		bool bHasControlledTryBoundary, EGGYGOAbilityActivationRequestReason& OutReason);
-	void RetireControlledActivation(TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	void RetireControlledActivationForNativeEnd(FGameplayAbilitySpecHandle Handle,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	static bool IsPublicationSourceCurrent(UGGYGOAbilitySystemComponent* Issuer, const TSharedPtr<const void>& Identity);
-	/** 只把原身份转成纯关闭义务，随后在实际安全出口派发。 */
-	static void DispatchRetiredMontageFX(TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	TArray<FGGYGOAbilityActivationHandle>* FindRetirementOutput(UGGYGOAbilitySystemComponent* Issuer) const;
-	/** 跨引擎固定 virtual 签名借用当前同步调用的输出；不持跨帧队列，不在析构派发。 */
-	class FScopedRetirementOutput
-	{
-	public:
-		FScopedRetirementOutput(UGGYGOGameplayAbility* InAbility, TArray<FGGYGOAbilityActivationHandle>& InOutput);
-		~FScopedRetirementOutput();
-	private:
-		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
-		FScopedRetirementOutput* Previous = nullptr;
-		TArray<FGGYGOAbilityActivationHandle>& Output;
-		friend class UGGYGOGameplayAbility;
-	};
-	FScopedRetirementOutput* RetirementOutput = nullptr;
-	void ExecuteActivationWithRetirement(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	void ExecuteCancelWithRetirement(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateCancelAbility,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	void ExecuteEndWithRetirement(FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, bool bReplicateEndAbility, bool bWasCancelled,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	enum class EControlledActivationValidationPurpose : uint8 { ResourceWork, Termination };
-	FGGYGOAbilityActivationHandle CaptureCurrentActivationForTermination() const;
-	/** Read-only admission; does not install a termination or release resources. */
-	EGGYGOAbilityTerminationReason CheckAvatarSwitchExitPreflight(bool bRequiresCancellation,
-		FGGYGOAbilityActivationHandle& OutOriginal) const;
-	/** Shared pure admission. None certifies only the live original; End/Cancel also capture resources. */
-	EGGYGOAbilityTerminationReason CheckOriginalTerminationAdmission(
-		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-		FGGYGOAbilityMontageOwnershipCheck& OutMontageCapture) const;
-	FGGYGOAbilityActivationHandle ValidateCurrentControlledActivation(bool bRequireActive = true,
-		bool bRequireSpec = true,
-		EControlledActivationValidationPurpose Purpose = EControlledActivationValidationPurpose::ResourceWork) const;
+	/** 由 ASC::NotifyAbilityActivated 在原生 PreActivate 中调用，是唯一签发点。 */
+	void IssueActivation(UGGYGOAbilitySystemComponent* OwnerASC, FGameplayAbilitySpecHandle Handle);
+	/** 由 ASC::NotifyAbilityEnded 在原生结束广播之前调用；广播内的重激活随后签发新身份。 */
+	void RetireActivation();
 
-	struct FOriginalTerminationRecord;
-	/** Actual final End stack span; owns a dispatch only when this entry created the record. */
-	class FScopedControlledActivationEnd
-	{
-	public:
-		explicit FScopedControlledActivationEnd(UGGYGOGameplayAbility* InAbility,
-			TArray<FGGYGOAbilityActivationHandle>& InRetiredActivations, bool bInOwnsDispatch = false);
-		~FScopedControlledActivationEnd();
-		FScopedControlledActivationEnd(const FScopedControlledActivationEnd&) = delete;
-		FScopedControlledActivationEnd& operator=(const FScopedControlledActivationEnd&) = delete;
-
-	private:
-		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
-		FScopedControlledActivationEnd* Previous = nullptr;
-		FGGYGOAbilityActivationHandle Original;
-		TSharedPtr<FOriginalTerminationRecord> Termination;
-		bool bOwnsDispatch = false;
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations;
-		friend class UGGYGOGameplayAbility;
-	};
-
-	/** Stack-local final Activate span, not another activation state. A termination begun
-	 * inside Initialize/body retains this exact return obligation, including raw entries. */
-	class FScopedAbilityActivationCall
-	{
-	public:
-		explicit FScopedAbilityActivationCall(UGGYGOGameplayAbility* InAbility,
-			const FGGYGOAbilityActivationHandle& InOriginal, TArray<FGGYGOAbilityActivationHandle>& InRetiredActivations);
-		~FScopedAbilityActivationCall();
-		FScopedAbilityActivationCall(const FScopedAbilityActivationCall&) = delete;
-		FScopedAbilityActivationCall& operator=(const FScopedAbilityActivationCall&) = delete;
-	private:
-		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
-		FScopedAbilityActivationCall* Previous = nullptr;
-		FGGYGOAbilityActivationHandle Original;
-		TSharedPtr<FOriginalTerminationRecord> Termination;
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations;
-		friend class UGGYGOGameplayAbility;
-	};
-	FScopedAbilityActivationCall* AbilityActivationCall = nullptr;
-
-	bool IsControlledActivationTerminationBusy() const;
-	/** 原 native End 的已认证事实；不代表完整返回或业务 Completed。 */
-	bool HasOriginalNativeEnd(const FGGYGOAbilityActivationHandle& Original) const;
-	uint64 LastControlledActivationSerial = 0;
-	FGGYGOAbilityActivationHandle CurrentControlledActivation{};
-	/** Original resource lease only; business retirement cannot erase native cleanup provenance.
-	 * GAS Active/spec state remains authoritative. Retired by its actual native End notification. */
-	FGGYGOAbilityActivationHandle NativeCleanupActivation{};
-	FScopedControlledActivationEnd* ControlledActivationEndScope = nullptr;
-
-	/** One original resource/return obligation. GAS alone owns Active, counts and task execution.
-	 * Open counters describe actual native call spans, never another activation/ending state. */
-	struct FOriginalTerminationRecord
-	{
-		FGGYGOAbilityTerminationContext Context;
-		TWeakObjectPtr<UGGYGOGameplayAbility> Ability;
-		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC;
-		TWeakPtr<const FGameplayAbilityActorInfo> ActorInfo;
-		FGameplayAbilitySpecHandle SpecHandle;
-		FGameplayAbilityActivationInfo ActivationInfo;
-		TWeakObjectPtr<UGGYGOCameraComponent> CameraOffsetComponent;
-		FGGYGOCameraOffsetHandle CameraOffsetHandle;
-		TWeakObjectPtr<UGGYGOHeroComponent> CameraModeHero;
-		FGameplayAbilitySpecHandle CameraModeSpec;
-		uint64 CameraModeGeneration = 0;
-		uint32 OpenDispatches = 0;
-		uint32 OpenTryCalls = 0;
-		bool bContinuationUsed = false;
-		bool bContinuationQueued = false;
-		bool bContinuationReady = false;
-		bool bDriving = false;
-		bool bCancelEntered = false;
-		bool bCancelReturned = false;
-		bool bCleanupStarted = false;
-		bool bNativeEndStarted = false;
-		bool bNativeEndObserved = false;
-		bool bNativeEndReturned = false;
-		bool bFullEndReturned = false;
-		bool bSealed = false;
-		/** 显式完成请求或受控激活需要完成证明；普通 raw 适配只归还原生资源。 */
-		bool bRequiresCompletion = true;
-		/** Set only by an exact ASC native cleanup source; never qualifies business Completed. */
-		bool bHasNativeCleanupSource = false;
-		EGGYGOAbilityTerminationOutcome Outcome = EGGYGOAbilityTerminationOutcome::Accepted;
-		EGGYGOAbilityTerminationReason Reason = EGGYGOAbilityTerminationReason::None;
-		TArray<TWeakPtr<FGGYGOAbilityTerminationCompletedNotice>> TryCompletionSlots;
-	};
-	TSharedPtr<FOriginalTerminationRecord> FindOriginalTermination(const FGGYGOAbilityActivationHandle& Original) const;
-	void ReleaseOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record);
-	TSharedPtr<FOriginalTerminationRecord> BeginOriginalTermination(
-		const FGGYGOAbilityActivationHandle& Original, EGGYGOAbilityTerminationRequestKind Kind,
-		bool bReplicate, bool bWasCancelled, FGGYGOAbilityTerminationResult& OutResult, bool bRequiresCompletion = true);
-	TSharedPtr<FOriginalTerminationRecord> InstallOriginalTerminationRecord(
-		const FGGYGOAbilityTerminationContext& Context, UGGYGOAbilitySystemComponent* ASC,
-		const TSharedPtr<const FGameplayAbilityActorInfo>& ActorInfo,
-		FGameplayAbilitySpecHandle Handle, FGameplayAbilityActivationInfo ActivationInfo, bool bRequiresCompletion = true);
-	bool HandleNativeAbilityCleanup(EGGYGOAbilityTerminationRequestKind Kind,
-		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
-		FGameplayAbilityActivationInfo ActivationInfo, bool bReplicate, bool bWasCancelled,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	void ResumeOriginalTermination(TSharedPtr<FOriginalTerminationRecord> Record, TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	void DeferOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record, TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	static void ContinueDeferredTermination(const TSharedPtr<FOriginalTerminationRecord>& Record,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	EGGYGOAbilityTerminationReason CheckOriginalTerminationSource(const FOriginalTerminationRecord& Record) const;
-	void ObserveOriginalNativeEnd(UGGYGOAbilitySystemComponent* OriginalASC, FGameplayAbilitySpecHandle Handle);
-	void InvalidateOriginalTerminationForActivation(TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	static void FailOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record,
-		EGGYGOAbilityTerminationReason Reason);
-	static void TryCompleteOriginalTermination(const TSharedPtr<FOriginalTerminationRecord>& Record,
-		TArray<FGGYGOAbilityActivationHandle>& RetiredActivations);
-	static FGGYGOAbilityTerminationResult GetOriginalTerminationResult(const FOriginalTerminationRecord& Record);
-	uint64 LastOriginalTerminationSerial = 0;
-	/** 当前仍拥有原结束资源的记录；native End 后可以与后继激活分离。 */
-	TSharedPtr<FOriginalTerminationRecord> OriginalTermination;
-	/** 仅索引由现有调用栈或 WaitingToExecute 持有的未封口记录；不持执行权，封口即移除。 */
-	TArray<TWeakPtr<FOriginalTerminationRecord>> UnreturnedTerminations;
+	FGGYGOAbilityActivationHandle CurrentActivation{};
+	/** 区分同一实例的连续激活（ServerOnly 能力没有预测键）；只在本实例内单调递增。 */
+	uint64 LastActivationSerial = 0;
+	/** CleanupAbilityResourcesForTermination 与原生 EndAbility 执行期间为真。 */
+	bool bEndingActivation = false;
 
 	/** 镜头微调凭证及申请时的相机接收者。 */
 	TWeakObjectPtr<UGGYGOCameraComponent> AppliedCameraOffsetComponent;

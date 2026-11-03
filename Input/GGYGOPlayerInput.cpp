@@ -1226,9 +1226,12 @@ EGGYGOMovementInputEvaluationState UGGYGOPlayerInput::ValidateStepStartInputRead
 	if (!OutProducer->HasCurrentCompletedMovementInputEvaluation(OutError)) { return EState::Waiting; }
 	FGGYGOMovementInputRequestIdentity CurrentRequest;
 	const auto InputState = OutProducer->QueryMovementInputRequest(OriginalEdgeToken.Proof->Session, CurrentRequest, OutError);
-	if (InputState == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof) { return EState::Waiting; }
+	// 移动来源尚无物理证明（如聚焦／出生后未碰移动键）时段首不等待：事实记为 AwaitingPhysicalProof、零轴，
+	// 消费者按当前朝向起段。只用于段首方向；移动执行仍只接受 QueryMovementInputRequest 的 Held。
 	if (InputState != EGGYGOMovementInputRequestQueryResult::Held
-		&& InputState != EGGYGOMovementInputRequestQueryResult::NotHeld) { return EState::Invalidated; }
+		&& InputState != EGGYGOMovementInputRequestQueryResult::NotHeld
+		&& InputState != EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof) { return EState::Invalidated; }
+	if (InputState == EGGYGOMovementInputRequestQueryResult::AwaitingPhysicalProof) { OutError.Reset(); }
 	if (InputState == EGGYGOMovementInputRequestQueryResult::Held)
 	{
 		const auto* Instance = OutProducer->FindActionInstanceData(OutProducer->SessionAction.Get());

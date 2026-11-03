@@ -492,9 +492,11 @@ bool FGGYGOActionMotionTest::RunTest(const FString& Parameters)
 		FAnimMontageInstance* XYZInstance = XYZAnim->GetActiveInstanceForMontage(XYZMontage);
 		if (!TestNotNull(TEXT("XYZ playback has an actual original instance"), XYZInstance)) return INDEX_NONE;
 		int32 XYZHandle = INDEX_NONE;
+		FQuat XYZEntryRotation = FQuat::Identity;
 		if (!TestTrue(TEXT("XYZ execution accepts the original native instance"),
 			XYZMove->BeginMontageActionMotion(XYZBinding, XYZInstance->GetInstanceID(), XYZInstance->GetPosition(),
-				XYZInstance->GetPlayRate() * XYZMontage->RateScale, 1.0f, XYZHandle, Error))) return INDEX_NONE;
+				XYZInstance->GetPlayRate() * XYZMontage->RateScale, 1.0f, FGGYGOActionMotionStartFacing{},
+				XYZHandle, XYZEntryRotation, Error))) return INDEX_NONE;
 		XYZMontageInstanceId = XYZInstance->GetInstanceID();
 		XYZInstance->OnMontageBlendingOutStarted.BindLambda(
 			[&, OriginalHandle = XYZHandle, OriginalInstance = XYZMontageInstanceId](UAnimMontage* Montage, bool bInterrupted)

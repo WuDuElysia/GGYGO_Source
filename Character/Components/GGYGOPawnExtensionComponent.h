@@ -3,7 +3,7 @@
  * @brief Pawn 初始化协调者
  *
  * 本组件**不实现任何玩法**。它只做两件事：
- *   1. 持有 PawnData 与本地 ASC 资源，提供经过真实 Ready 校验的读取入口
+ *   1. 持有 PawnData 与本 Pawn 当前的 ASC 绑定资源，向本地消费方广播就绪／释放
  *   2. 驱动 InitState 状态机，让各组件不必互相知道彼此的初始化顺序
  *
  * ## 为什么需要一个专门的协调者
@@ -30,9 +30,10 @@
  * 变成向 Manager 的一次查询（`HaveAllFeaturesReachedInitState`）。
  *
  * ## 与 Lyra 的差异
- * 1. **ASC 可以来自外部持久战斗状态宿主**。玩家是 `AGGYGOCharacterSlot`，可换形态
- *    Boss 是 `AGGYGOBossState`；本组件只接收 `ExternalASC + OwnerActor`，不依赖宿主类型，
- *    自己不创建也不拥有 ASC。
+ * 1. **ASC 来自外部持久战斗状态宿主**。玩家是 `AGGYGOCharacterSlot`，可换形态
+ *    Boss 是 `AGGYGOBossState`。宿主执行 InitAbilityActorInfo 后调用
+ *    `HandleAbilitySystemBound`，释放时调用 `HandleAbilitySystemReleased`；
+ *    本组件不创建也不拥有 ASC，也不自己写 ActorInfo（Controller 变化时的 Refresh 除外）。
  * 2. **本组件不授予 AbilitySet**。Lyra 在 `ALyraPlayerState::SetPawnData` 里授予，
  *    因为 ASC 归 PlayerState；本项目归位置，所以授予方也在位置上。
  *    本组件只分发 PawnData 里属于 Pawn 的部分：移动参数与 Cue 预热。
@@ -40,10 +41,8 @@
 #pragma once
 
 #include "AbilitySystem/GGYGOAbilitySet.h"
-// K4-Character-L1 includes begin.
-#include "AbilitySystem/GGYGOAvatarBindingTypes.h"
+#include "Templates/Function.h"
 #include "Templates/SharedPointer.h"
-// K4-Character-L1 includes end.
 #include "Components/GameFrameworkInitStateInterface.h"
 #include "Components/PawnComponent.h"
 
@@ -61,96 +60,87 @@ struct FActorInitStateChangedParams;
 struct FFrame;
 struct FGameplayTag;
 
-// K4-Character-L1 native resource types begin.
 class UGGYGOPawnExtensionComponent;
-class FGGYGOAvatarBindingPublicationReceipt;
 
-/** Retained weak identities and the ASC-issued Binding; never an execution permission. */
+/** 资源记录的弱引用副本；只描述端点，不授予执行权。 */
 struct GGYGO_API FGGYGOPawnASCResourceIdentity
 {
 	TWeakObjectPtr<UGGYGOAbilitySystemComponent> ASC{};
 	TWeakObjectPtr<APawn> Pawn{};
-	FGGYGOAvatarBindingIdentity Binding{};
-
-	bool HasSameIdentity(const FGGYGOPawnASCResourceIdentity& Other) const;
 };
 
-/** Copyable original local resource. Only Extension can create or mutate its private record. */
+/**
+ * 一次 ASC 绑定在本 Pawn 上的不透明身份。
+ * 每次 HandleAbilitySystemBound 新建一份共享记录；同一 ASC 解绑后重绑也得到不同资源，
+ * 消费方据此区分"同一次绑定"。可复制，只有 PawnExtension 能创建。
+ */
 class GGYGO_API FGGYGOPawnASCResourceHandle final
 {
 public:
 	FGGYGOPawnASCResourceHandle() = default;
-	/** History exists, not liveness, installation or Ready. */
-	bool HasResource() const;
-	bool HasSameResource(const FGGYGOPawnASCResourceHandle& Other) const;
-	/** Writable copy; changing it cannot change the retained original resource. */
-	FGGYGOPawnASCResourceIdentity GetIdentity() const;
+	bool HasResource() const { return Resource.IsValid(); }
+	bool HasSameResource(const FGGYGOPawnASCResourceHandle& Other) const
+	{
+		return Resource.IsValid() && Resource == Other.Resource;
+	}
+	FGGYGOPawnASCResourceIdentity GetIdentity() const
+	{
+		return Resource.IsValid() ? *Resource : FGGYGOPawnASCResourceIdentity{};
+	}
 
 private:
-	struct FLocalResource;
-	TSharedPtr<FLocalResource> Resource{};
+	TSharedPtr<const FGGYGOPawnASCResourceIdentity> Resource{};
 	friend class UGGYGOPawnExtensionComponent;
 };
 
-enum class EGGYGOPawnASCLocalOutcome : uint8
+enum class EGGYGOPawnASCNoticeKind : uint8
 {
-	Rejected = 0,
-	Succeeded,
-	Stale,
-	Failed
-};
-
-enum class EGGYGOPawnASCLocalReason : uint8
-{
-	None = 0,
-	InvalidArguments,
-	InvalidASC,
-	InvalidPawn,
-	WrongExtension,
-	LifecycleClosed,
-	InvalidBinding,
-	ContextMismatch,
-	ResourceConflict,
-	ResourceNotInstalled,
-	ResourceNotWithdrawn,
-	InvalidPublication,
-	PublicationNotDispatching,
-	ReadyNotEstablished,
-	CallbackInvalidated
-};
-
-/** Caller-stack historical local result. No ActorInfo commit or global readiness claim. */
-struct GGYGO_API FGGYGOPawnASCLocalResult
-{
-	EGGYGOPawnASCLocalOutcome Outcome = EGGYGOPawnASCLocalOutcome::Rejected;
-	EGGYGOPawnASCLocalReason Reason = EGGYGOPawnASCLocalReason::InvalidArguments;
-	FGGYGOPawnASCResourceHandle Resource{};
-	bool bLocalChanged = false;
-};
-
-enum class EGGYGOPawnASCLocalNoticeKind : uint8
-{
-	Invalid = 0,
+	/** 宿主已对本 Pawn 执行 InitAbilityActorInfo。 */
 	Ready,
-	Released,
-	Refreshed,
-	Closing
+	/** 宿主已取消能力、清输入并移除 Cue，ActorInfo 即将清除或改绑。 */
+	Released
+};
+
+struct GGYGO_API FGGYGOPawnASCNotice
+{
+	EGGYGOPawnASCNoticeKind Kind = EGGYGOPawnASCNoticeKind::Ready;
+	FGGYGOPawnASCResourceHandle Resource{};
 };
 
 /**
- * Ready/Refreshed carry an authenticated PublishedContext. Released/Closing carry an empty Context.
- * Closing retires the original H's consumer associations when it is withdrawn or its Extension ends play.
- * It does not prove native Cancel/Clear success. Consumers return only their original resources.
+ * 本 Pawn 的 ASC 就绪／释放订阅，消费方作为成员持有，析构时退订。仅游戏线程。
+ *
+ * - Subscribe 时若已就绪，立即回放一次 Ready；
+ * - 与已消费资源相同的 Ready 不再回调；Released 只在资源与已消费的相同时回调，
+ *   回调前已清空已消费资源；
+ * - 回调中退订或重新订阅是安全的：分发前复制订阅者列表，跳过已退订者；新订阅自行回放。
  */
-struct GGYGO_API FGGYGOPawnASCLocalNotice
+class GGYGO_API FGGYGOLocalASCSubscription final
 {
-	EGGYGOPawnASCLocalNoticeKind Kind = EGGYGOPawnASCLocalNoticeKind::Invalid;
-	FGGYGOPawnASCResourceHandle Resource{};
-	FGGYGOAvatarBindingContext PublishedContext{};
-};
+public:
+	using FCallback = TFunction<void(const FGGYGOPawnASCNotice&)>;
 
-DECLARE_MULTICAST_DELEGATE_OneParam(FGGYGOPawnASCLocalNoticeDelegate, const FGGYGOPawnASCLocalNotice&);
-// K4-Character-L1 native resource types end.
+	FGGYGOLocalASCSubscription() = default;
+	~FGGYGOLocalASCSubscription() { Unsubscribe(); }
+	FGGYGOLocalASCSubscription(const FGGYGOLocalASCSubscription&) = delete;
+	FGGYGOLocalASCSubscription& operator=(const FGGYGOLocalASCSubscription&) = delete;
+
+	/** 替换现有订阅。Extension 为空或 Callback 未绑定时返回 false 且不保留订阅。 */
+	bool Subscribe(UGGYGOPawnExtensionComponent* Extension, FCallback Callback);
+	/** 幂等；不回调 Released，消费方自行清理已消费资源对应的状态。 */
+	void Unsubscribe();
+	bool IsSubscribed() const;
+	UGGYGOPawnExtensionComponent* GetExtension() const;
+	/** 已消费资源仍是 Extension 当前就绪资源时返回其 ASC，否则 nullptr。 */
+	UGGYGOAbilitySystemComponent* GetReadyASC() const;
+	/** 最近一次 Ready 消费的资源；Released 或退订后为空。 */
+	FGGYGOPawnASCResourceHandle GetConsumedResource() const;
+
+private:
+	struct FState;
+	TSharedPtr<FState> State;
+	friend class UGGYGOPawnExtensionComponent;
+};
 
 UCLASS(meta = (BlueprintSpawnableComponent))
 class GGYGO_API UGGYGOPawnExtensionComponent : public UPawnComponent, public IGameFrameworkInitStateInterface
@@ -160,37 +150,17 @@ class GGYGO_API UGGYGOPawnExtensionComponent : public UPawnComponent, public IGa
 public:
 	UGGYGOPawnExtensionComponent(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
 
-// K4-Character-L1 native APIs begin.
-	/** Game-thread installation of an original local H; does not establish Ready. */
-	FGGYGOPawnASCLocalResult InstallLocalAbilitySystemResources(
-		UGGYGOAbilitySystemComponent* ExpectedASC, APawn* ExpectedPawn,
-		const FGGYGOAvatarBindingContext& CommittedContext);
-	/** Detach original H before synchronous Closing; expired/transferred ASC cleanup stays local. */
-	FGGYGOPawnASCLocalResult WithdrawLocalAbilitySystemResources(
-		const FGGYGOPawnASCResourceHandle& ExpectedResource);
-	/** Consume before callbacks. Never clear a successor or claim an ASC Clear commit. */
-	FGGYGOPawnASCLocalResult NotifyLocalResourcesReleased(
-		const FGGYGOPawnASCResourceHandle& ReleasedResource);
-	/** Authenticate real ASC Dispatching before history. Refresh requires prior real Ready. */
-	FGGYGOPawnASCLocalResult NotifyLocalResourcesReady(
-		const FGGYGOPawnASCResourceHandle& ExpectedResource,
-		const FGGYGOAvatarBindingPublicationReceipt& Publication);
-	/** Game-thread current local slot copy, including stale ASC; no Installed/Ready permission. */
-	FGGYGOPawnASCResourceHandle GetCurrentLocalAbilitySystemResource() const;
-	/** Pure assembly/publication precondition; never requires Ready or grants ASC execution. */
-	bool IsLocalAbilitySystemResourceInstalled(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
-	/** Pure local/ASC publication gate; installation and historical receipts are insufficient. */
-	bool IsLocalAbilitySystemResourceReady(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
 	/**
-	 * Subscribe to original H/Context notices; synchronously replay only authenticated current Ready.
-	 * Caller owns the returned token and returns it to this Extension, including after replay retired the receiver.
-	 * Closing is delivered once per H after its withdrawal or after Extension admission closes in EndPlay.
-	 * A registration token does not grant Ready; a closed Extension accepts no new registrations or replay.
+	 * 宿主对本 Pawn 执行 InitAbilityActorInfo 后调用：新建资源并广播 Ready。
+	 * 已有同一 ASC 的资源时不重复广播；已有其它 ASC 的资源时拒绝并诊断（跨宿主须先释放）。
 	 */
-	FDelegateHandle RegisterLocalAbilitySystemNoticeAndCall(FGGYGOPawnASCLocalNoticeDelegate::FDelegate Delegate);
-	/** Remove only the supplied original registration token; no resource or Ready changes. */
-	void UnregisterLocalAbilitySystemNotice(FDelegateHandle Handle);
-// K4-Character-L1 native APIs end.
+	bool HandleAbilitySystemBound(UGGYGOAbilitySystemComponent* ASC);
+	/** 宿主释放流程中调用：先清空当前资源再广播 Released。没有资源时无操作。 */
+	void HandleAbilitySystemReleased();
+	/** 当前绑定资源；未绑定时为空。 */
+	FGGYGOPawnASCResourceHandle GetCurrentLocalAbilitySystemResource() const;
+	/** ExpectedResource 仍是当前资源，且其 ASC 的 Avatar 仍是本 Pawn。 */
+	bool IsLocalAbilitySystemResourceReady(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
 
 	/**
 	 * 本 feature 在 InitState 系统里的名字。
@@ -231,25 +201,17 @@ public:
 	 */
 	void SetPawnData(const UGGYGOPawnData* InPawnData);
 
-	/** 仅返回原本地资源通过真实 Ready 校验的 ASC；安装或历史提交不代表就绪。 */
+	/** 当前就绪资源的 ASC；未绑定或 Avatar 已不是本 Pawn 时为 nullptr。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Pawn")
 	UGGYGOAbilitySystemComponent* GetGGYGOAbilitySystemComponent() const;
 
 	/**
-	 * 同步请求明确的原 Host 将本 Pawn 绑定到 InASC；自身不执行 ActorInfo 写入。
-	 * InOwnerActor 必须实现 native Host 接口并拥有 InASC。
-	 * 跨 Host 由外层显式释放旧资源、核对后再调用；失败不自动回滚或替换其它装配。
+	 * 请求当前宿主立即释放本 Pawn 的绑定（死亡后销毁前，避免 GE 落到正在销毁的 Avatar）。
+	 * 宿主即 ASC 的组件 Owner，须实现 IGGYGOAvatarBindingHostInterface；不支持时诊断。
 	 */
-	void InitializeAbilitySystem(UGGYGOAbilitySystemComponent* InASC, AActor* InOwnerActor);
+	void UninitializeAbilitySystem();
 
-	/**
-	 * 一次捕获原本地 H/Context，向该 H 的 ASC 组件 Owner 请求释放。
-	 * ExpectedASC 不匹配时不执行；端口失效时仅清理原本地资源并明确诊断失败。
-	 * EndPlay 关闭新准入后仍可处理原释放义务，不读取后继继续清理。
-	 */
-	void UninitializeAbilitySystem(UGGYGOAbilitySystemComponent* ExpectedASC = nullptr);
-
-	/** Controller 变更时仅请求刷新原 Ready 资源，再推进原作用域的配置初始化。 */
+	/** Controller 变更：刷新当前 ASC 的 ActorInfo，再推进 InitState。不经过宿主。 */
 	void HandleControllerChanged();
 
 	/** PlayerState 复制到达时由拥有者 Pawn 调用。 */
@@ -297,16 +259,10 @@ private:
 	/** EndPlay closes scope publication; only a real subsequent BeginPlay reopens it. */
 	bool bPawnDataInitializationClosed = false;
 
-// K4-Character-L1 private local resources begin.
-	bool OwnsLocalAbilitySystemResource(const FGGYGOPawnASCResourceHandle& ExpectedResource) const;
-	/** Consume the original H's notification obligation before external exact consumer cleanup. */
-	void NotifyLocalResourcesClosing(const FGGYGOPawnASCResourceHandle& OriginalResource);
-	/** Release captured original H only; callbacks cannot redirect cleanup to the current slot. */
-	void UninitializeLocalAbilitySystemResource(const FGGYGOPawnASCResourceHandle& OriginalResource);
-	/** 本组件生命周期准入：EndPlay 关闭，真实下一次 BeginPlay 重开；不发行 Binding/Ready。 */
-	bool bLocalAbilitySystemAdmissionClosed = false;
+	void BroadcastLocalASCNotice(const FGGYGOPawnASCNotice& Notice);
+	/** 当前绑定资源；只由宿主经 HandleAbilitySystemBound／Released 改写。 */
 	FGGYGOPawnASCResourceHandle LocalAbilitySystemResource{};
-	FGGYGOPawnASCLocalNoticeDelegate LocalAbilitySystemNotice;
-// K4-Character-L1 private local resources end.
+	TArray<TWeakPtr<FGGYGOLocalASCSubscription::FState>> LocalASCSubscribers;
+	friend class FGGYGOLocalASCSubscription;
 
 };

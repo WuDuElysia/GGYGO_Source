@@ -22,10 +22,8 @@
 #include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "Character/Components/GGYGOMovementPrediction.h"
-// Movement-LocalASC-A includes begin.
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Templates/SharedPointer.h"
-// Movement-LocalASC-A includes end.
-
 
 #include "GGYGOCharacterMovementComponent.generated.h"
 
@@ -265,10 +263,7 @@ struct FGGYGOCurveRootMotionPrepared
 	bool bEnteredTurnBackRunOut = false;
 	EGGYGOCurveRootMotionPrepareResult Result = EGGYGOCurveRootMotionPrepareResult::Failed;
 };
-// Movement-LocalASC-A forward declarations begin.
 class UGGYGOPawnExtensionComponent;
-struct FGGYGOPawnASCLocalNotice;
-// Movement-LocalASC-A forward declarations end.
 
 
 /** Fact acknowledgement only; Recorded does not grant movement execution. */
@@ -388,11 +383,11 @@ public:
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement|Action Motion")
 	void EndActionMotion(int32 Handle);
 
-	/** Original complete Montage range, including an End start; native physics owns collision and landing. */
-	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
-		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
-		float TranslationScale, int32& OutHandle, FString& OutError);
-	/** 真正新段可采当前有效输入；纠正以原基底恢复，返回实际接受的整段基础方向。 */
+	/**
+	 * 原 Montage 完整区间（可从 End 段开始）的位移；碰撞与落地由原生物理负责。
+	 * 真正新段可采当前有效输入；纠正以原基底恢复，返回实际接受的整段基础方向。
+	 * 不需要朝向策略的调用方传默认 Facing（CurrentFacing）。
+	 */
 	bool BeginMontageActionMotion(const FGGYGOActionMotionSourceBindingPtr& OriginalSource,
 		int32 OriginalMontageInstanceId, float MontagePositionSeconds, float EffectiveMontagePlayRate,
 		float TranslationScale, const FGGYGOActionMotionStartFacing& Facing,
@@ -568,7 +563,7 @@ public:
 	bool ReportLocomotionCurveRootMotionFailure(
 		const TSharedPtr<const FGGYGOCurveRootMotionOrigin>& Origin, const FString& Reason);
 
-	/** 是否正被 `Restriction.CantMove` 禁止移动。 */
+	/** 是否正被 `Restriction.CantMove` 或 `State.SwitchReturnPending` 禁止 locomotion 移动。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Movement")
 	bool IsMovementBlockedByTag() const;
 
@@ -1271,22 +1266,17 @@ protected:
 	friend class FSavedMove_GGYGO;
 	friend struct FCharacterNetworkMoveData_GGYGO;
 	friend struct FCharacterMoveResponseDataContainer_GGYGO;
-// Movement-LocalASC-A declarations begin.
 protected:
-	/** 生产 Cache 只订阅原 Extension；返回成功表示订阅成立，不表示资源 Ready。 */
+	/** 订阅本 Pawn 的 ASC 就绪／释放；返回成功表示订阅成立，不表示已就绪。 */
 	bool PrepareLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
-	/** Retire only this component's original subscription and consumed local resource. */
+	/** 退订；已消费资源时清 ASC 缓存并复位移动状态。 */
 	void ReleaseLocalAbilitySystemSubscription();
-	/** Derived query of the original ready resource; never grants movement execution. */
+	/** 订阅已消费且仍就绪的 ASC；不授予移动执行权。 */
 	const UGGYGOAbilitySystemComponent* GetReadyLocalAbilitySystemComponent() const;
 
 private:
-	struct FLocalAbilitySystemSubscription;
-	void ConsumeLocalAbilitySystemNotice(
-		const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
-		const FGGYGOPawnASCLocalNotice& Notice);
-	/** Actual delegate ownership only; no Binding allocator, Ready fact or movement gate. */
-	TSharedPtr<FLocalAbilitySystemSubscription> LocalAbilitySystemSubscription;
-// Movement-LocalASC-A declarations end.
+	void ConsumeLocalAbilitySystemNotice(const FGGYGOPawnASCNotice& Notice);
+	/** 只持有订阅；ASC 缓存仍是派生值，不是移动准入。 */
+	FGGYGOLocalASCSubscription LocalASCSubscription;
 
 };

@@ -4,6 +4,7 @@
  */
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 
+#include "AbilitySystem/Attributes/GGYGOAttributeBaseCalculation.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "Engine/GameInstance.h"
 #include "Engine/World.h"
@@ -305,8 +306,8 @@ bool UGGYGOHealthSet::TrySetCurrentValue(const FGameplayAttribute& Attribute, fl
 	}
 
 	const float ExpectedCurrent = ASC->GetNumericAttribute(Attribute);
-	const FGGYGOAttributeBaseCalculationResult Calculation = ASC->TryCalculateNumericAttributeBaseForCurrentValue(
-		this, Attribute, ExpectedCurrent, DesiredCurrent);
+	const FGGYGOAttributeBaseCalculationResult Calculation = GGYGOAttributeBase::CalculateBaseForCurrent(
+		ASC, this, Attribute, ExpectedCurrent, DesiredCurrent);
 	if (Calculation.Outcome != EGGYGOAttributeBaseCalculationOutcome::Ready
 		|| Calculation.Reason != EGGYGOAttributeBaseCalculationReason::None)
 	{
@@ -836,8 +837,8 @@ bool UGGYGOHealthSet::PreGameplayEffectExecute(FGameplayEffectModCallbackData& D
 			return false;
 		}
 		// Validate support before accepting the meta write. This candidate is never saved or committed.
-		const FGGYGOAttributeBaseCalculationResult Preflight = ASC->TryCalculateNumericAttributeBaseForCurrentValue(
-			this, Resource, Current, Current);
+		const FGGYGOAttributeBaseCalculationResult Preflight = GGYGOAttributeBase::CalculateBaseForCurrent(
+			ASC, this, Resource, Current, Current);
 		if (Preflight.Outcome != EGGYGOAttributeBaseCalculationOutcome::Ready
 			|| Preflight.Reason != EGGYGOAttributeBaseCalculationReason::None)
 		{

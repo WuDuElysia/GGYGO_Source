@@ -53,10 +53,17 @@ void UGGYGOInputTestGameInstance::Init()
 	// InitializeStandalone already establishes this instance's real WorldContext.
 	// The source gate needs LocalPlayer subsystems, not GI services/online delegates.
 	// Intentionally do not call Super: installing global network handlers is unrelated.
+	// 需要 GI 子系统（如 MessageRouter）的夹具显式选原生 Init，与 Shutdown 成对。
+	if (bNativeLifecycle) { Super::Init(); }
 }
 
 void UGGYGOInputTestGameInstance::Shutdown()
 {
+	if (bNativeLifecycle)
+	{
+		Super::Shutdown();
+		return;
+	}
 	const TArray<ULocalPlayer*> Players = GetLocalPlayers();
 	for (ULocalPlayer* LocalPlayer : Players)
 	{
@@ -96,6 +103,11 @@ bool AGGYGOInputTestController::EnableNativeInputInitializationForTest()
 void AGGYGOInputTestController::ConsumeInputForTest(float DeltaTime)
 {
 	PostProcessInput(DeltaTime, false);
+}
+
+void AGGYGOInputTestController::TickInputForTest(float DeltaTime)
+{
+	TickPlayerInput(DeltaTime, false);
 }
 
 void UGGYGOInputTestHeroComponent::ConfigureMappingForTest(const UInputMappingContext* Mapping, int32 Priority)
@@ -180,6 +192,11 @@ AGGYGOInputTestPawn::AGGYGOInputTestPawn(const FObjectInitializer& ObjectInitial
 	Hero = CreateDefaultSubobject<UGGYGOInputTestHeroComponent>(TEXT("Hero"));
 }
 
+UAbilitySystemComponent* AGGYGOInputTestPawn::GetAbilitySystemComponent() const
+{
+	return PawnExtension ? PawnExtension->GetGGYGOAbilitySystemComponent() : nullptr;
+}
+
 void AGGYGOInputTestPawn::SetAbilitySystemHostForTest(AGGYGOCombatantState* Host)
 {
 	check(IsValid(Host) && AbilitySystemHost.IsExplicitlyNull());
@@ -219,6 +236,10 @@ void AGGYGOInputTestPawn::SetupPlayerInputComponent(UInputComponent* PlayerInput
 struct FGGYGOInputTestFixture::FState
 {
 	bool bNativeMovementOrigin = false;
+	bool bGameInstanceSubsystems = false;
+	// 未设置时能力动作不映射任何键，只能经 ExecuteAbilityBinding 在绑定边界注入。
+	FKey AbilityKey;
+	TFunction<bool(AGGYGOInputTestPawn&)> PawnPreparation;
 	UEngine* Engine = nullptr;
 	UWorld* World = nullptr;
 	TStrongObjectPtr<UGGYGOInputTestGameInstance> GameInstance;
@@ -282,6 +303,7 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 	if (!Test.TestNotNull(TEXT("GEngine"), State->Engine)) { return false; }
 
 	State->GameInstance.Reset(NewObject<UGGYGOInputTestGameInstance>(State->Engine, NAME_None, RF_Transient));
+	if (State->bGameInstanceSubsystems) { State->GameInstance->UseNativeLifecycleForTest(); }
 	State->GameInstance->InitializeStandalone();
 	State->World = State->GameInstance->GetWorld();
 	if (!Test.TestNotNull(TEXT("private standalone world"), State->World)) { return false; }
@@ -443,6 +465,10 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 			State->Mapping->MapKey(State->MoveAction.Get(), Key);
 		}
 	}
+	if (State->AbilityKey.IsValid())
+	{
+		State->Mapping->MapKey(State->AbilityAction.Get(), State->AbilityKey);
+	}
 	FGGYGOInputAction MoveBinding;
 	MoveBinding.InputAction = State->MoveAction.Get();
 	MoveBinding.InputTag = GGYGOGameplayTags::InputTag_Move;
@@ -459,6 +485,16 @@ bool FGGYGOInputTestFixture::Initialize(FAutomationTestBase& Test)
 
 	State->Pawn = State->World->SpawnActor<AGGYGOInputTestPawn>();
 	if (!Test.TestNotNull(TEXT("private Pawn"), State->Pawn)) { return false; }
+	if (State->PawnPreparation)
+	{
+		const TFunction<bool(AGGYGOInputTestPawn&)> Preparation = MoveTemp(State->PawnPreparation);
+		if (!Preparation(*State->Pawn))
+		{
+			Test.AddError(FString::Printf(TEXT("[Input.Fixture] Pawn=%s Reason=PawnPreparationBeforeBindingFailed."),
+				*GetPathNameSafe(State->Pawn)));
+			return false;
+		}
+	}
 	if (State->bNativeMovementOrigin
 		&& !Test.TestTrue(TEXT("select Source probe ownership before the first input setup"),
 			State->Pawn->EnableSourceMovementProbeForTest())) { return false; }
@@ -544,7 +580,7 @@ void FGGYGOInputTestFixture::Shutdown()
 	{
 		State->Pawn->GetHeroForTest()->StopObservingNativeMappingRebuildForTest();
 		State->Pawn->GetHeroForTest()->ReleasePlayerInput();
-		State->Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem(State->Pawn->GetASCForTest());
+		State->Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem();
 		State->Pawn->GetHeroForTest()->StopObservingLocalAbilitySystemForTest();
 	}
 	// Pawn 销毁可能连带销毁无 PlayerState 的 Controller；先归还原输入的 IMC。
@@ -617,6 +653,58 @@ void FGGYGOInputTestFixture::Shutdown()
 	State->AbilityAction.Reset();
 	State->GameInstance.Reset();
 	State->bNativeMovementOrigin = false;
+	State->bGameInstanceSubsystems = false;
+	State->AbilityKey = FKey();
+	State->PawnPreparation.Reset();
+}
+
+void FGGYGOInputTestFixture::RequestGameInstanceSubsystemsForTest() { State->bGameInstanceSubsystems = true; }
+void FGGYGOInputTestFixture::MapAbilityKeyForTest(const FKey& Key) { State->AbilityKey = Key; }
+void FGGYGOInputTestFixture::PreparePawnBeforeBindingForTest(TFunction<bool(AGGYGOInputTestPawn&)> Preparation)
+{
+	State->PawnPreparation = MoveTemp(Preparation);
+}
+
+bool FGGYGOInputTestFixture::CompleteNativeMappingRebuildForTest(FAutomationTestBase& Test)
+{
+	UEnhancedInputLocalPlayerSubsystem* Subsystem = GetInputSubsystem();
+	if (!Test.TestNotNull(TEXT("[Input.Fixture] mapping rebuild uses the original LocalPlayer subsystem"), Subsystem))
+	{
+		return false;
+	}
+	// 与 EnhancedInput 模块帧末顺序一致：先编译挂起的映射，再由子系统自己的入口广播重建完成。
+	FModifyContextOptions Options;
+	Options.bForceImmediately = true;
+	Subsystem->RequestRebuildControlMappings(Options);
+	Subsystem->ControlMappingsRebuiltThisFrame();
+	return true;
+}
+
+bool FGGYGOInputTestFixture::PressAbilityKeyForTest(FAutomationTestBase& Test)
+{
+	return SendAbilityKeyForTest(Test, IE_Pressed);
+}
+
+bool FGGYGOInputTestFixture::ReleaseAbilityKeyForTest(FAutomationTestBase& Test)
+{
+	return SendAbilityKeyForTest(Test, IE_Released);
+}
+
+bool FGGYGOInputTestFixture::SendAbilityKeyForTest(FAutomationTestBase& Test, EInputEvent Event)
+{
+	UEnhancedPlayerInput* PlayerInput = GetPlayerInput();
+	if (!State->AbilityKey.IsValid() || !PlayerInput)
+	{
+		Test.AddError(FString::Printf(TEXT("[Input.Fixture] Key=%s PlayerInput=%s Reason=AbilityKeyRouteUnavailable."),
+			*State->AbilityKey.ToString(), *GetPathNameSafe(PlayerInput)));
+		return false;
+	}
+	// 键事件经原 PlayerInput 入队，再走一次 PC 原生输入帧：评价 → Hero 绑定 → PostProcessInput → ASC。
+	const bool bPressed = Event == IE_Pressed;
+	PlayerInput->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), State->AbilityKey,
+		Event, bPressed ? 1.0f : 0.0f, false, FPlatformTime::Cycles64()));
+	State->Controller->TickInputForTest(1.0f / 60.0f);
+	return true;
 }
 
 UWorld* FGGYGOInputTestFixture::GetWorld() const { return State->World; }
@@ -716,7 +804,7 @@ bool FGGYGOInputFixtureLocalSessionReadyTest::RunTest(const FString& Parameters)
 	TestFalse(TEXT("fixture IMC returned"), Fixture.GetInputSubsystem()->HasMappingContext(Fixture.GetMappingContext()));
 	TestFalse(TEXT("fixture retry subscription returned"), ASC->OnAbilityInputRetryable.IsBoundToObject(Hero));
 	TestFalse(TEXT("fixture group subscription returned"), ASC->OnAbilityGroupFreed.IsBoundToObject(Hero));
-	Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem(ASC);
+	Pawn->GetPawnExtensionForTest()->UninitializeAbilitySystem();
 	TestNull(TEXT("coordinator released its ASC"), Pawn->GetPawnExtensionForTest()->GetGGYGOAbilitySystemComponent());
 	TestNull(TEXT("ASC released its Avatar"), ASC->GetAvatarActor());
 

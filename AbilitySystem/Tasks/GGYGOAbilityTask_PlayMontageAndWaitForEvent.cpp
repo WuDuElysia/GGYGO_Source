@@ -128,7 +128,7 @@ namespace
 	}
 
 	bool StopOriginalMontageInstance(const FGGYGOMontagePlayGuardIdentity& Identity,
-		const FGGYGOAbilityMontagePlaybackHandle& Playback,
+		const FGGYGOAbilityMontagePlayback& Playback,
 		const TWeakObjectPtr<UAbilitySystemComponent>& OriginalASC,
 		const TWeakObjectPtr<UAnimMontage>& OriginalMontage,
 		const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask)
@@ -173,11 +173,9 @@ namespace
 
 		UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(OriginalASC.Get());
 		const FAnimMontageInstance* ActiveInstance = Guard->GetActiveInstanceForMontage(Montage);
-		if (ASC && Playback.HasPlayback()
-			&& ASC->CheckMontagePlaybackOwnership(Playback).Outcome == EGGYGOAbilityMontagePlaybackOutcome::Succeeded
-			&& ActiveInstance == Instance)
+		if (ASC && ASC->IsPlaybackCurrent(Playback) && ActiveInstance == Instance)
 		{
-			// Proven original ownership plus exact active ID allows the existing GAS replication path.
+			// 仍是本激活的当前播放且实例一致：走 GAS 现有的停止与复制路径。
 			ASC->CurrentMontageStop();
 			return true;
 		}
@@ -288,7 +286,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalCallback(
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
-	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalPlayback.Guard;
 	const auto Recheck = [&]() -> UGGYGOAbilityTask_PlayMontageAndWaitForEvent*
 	{
 		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
@@ -358,7 +356,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalSectionSnapshot
 {
 	check(IsInGameThread());
 	OutSnapshot = {};
-	if (!CanDispatchOriginalInstanceFact(OriginalGuardIdentity)) { return false; }
+	if (!CanDispatchOriginalInstanceFact(OriginalPlayback.Guard)) { return false; }
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
 	if (!Instance) { return false; } // The exact instance may be blending out after ASC ownership retired.
 	const float Position = Instance->GetPosition();
@@ -636,7 +634,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TryGetOriginalMontageNotifySn
 	OutFact = {};
 	OutPositionSeconds = 0.0f;
 	const FGGYGOMontageNotifyDeclaration* Declaration = FindConfiguredMontageNotify(NotifyName);
-	if (!Declaration || !CanDispatchOriginalInstanceFact(OriginalGuardIdentity)
+	if (!Declaration || !CanDispatchOriginalInstanceFact(OriginalPlayback.Guard)
 		|| !IsOriginalMontageNotifySourceCurrent(*Declaration)) { return false; }
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
 	if (!Instance || !FMath::IsFinite(Instance->GetPosition())) { return false; }
@@ -697,7 +695,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnOriginalMontageNotifyBegin(
 	if (!ResolveNativeMontageNotify(MontageToPlay, NotifyName, Event, Actual, Diagnostic)
 		|| Event != Payload.NotifyEvent || Event->Notify != Declaration->NativeNotify
 		|| !HasSameGGYGOMontageTaskNotifyTiming(Actual, *Declaration)) { return; }
-	const FGGYGOMontagePlayGuardIdentity Original = OriginalGuardIdentity;
+	const FGGYGOMontagePlayGuardIdentity Original = OriginalPlayback.Guard;
 	if (!CanDispatchOriginalInstanceFact(Original)) { return; }
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
 	if (!Instance || !FMath::IsFinite(Instance->GetPosition())) { return; }
@@ -767,7 +765,7 @@ UGGYGOAbilityTask_PlayMontageAndWaitForEvent* UGGYGOAbilityTask_PlayMontageAndWa
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 {
 	if (bEndingTask || bCancellationRequested || bPoseFailureRequested || GetState() == EGameplayTaskState::Finished) { return; }
-	if (InFlightMontagePlayCleanup.IsValid() || OriginalGuardIdentity.CallId != 0)
+	if (InFlightMontagePlayCleanup.IsValid() || OriginalPlayback.Guard.CallId != 0)
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("MontageTask [%s] 拒绝重复 Activate：原播放任务不可复用。"), *GetNameSafe(this));
 		return;
@@ -824,10 +822,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		return;
 	}
 
-	ActivatedActorInfo = OriginalActorInfo;
 	ActivatedAbility = Ability;
-	ActivatedOwnerActor = ActorInfo->OwnerActor;
-	ActivatedAvatarActor = AvatarActor;
 	ActivatedMesh = ActorInfo->SkeletalMeshComponent;
 	ActivatedCharacter = Cast<ACharacter>(AvatarActor);
 	ActivatedAnimInstance = AnimInstance;
@@ -908,7 +903,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	EventHandle = ASC->AddGameplayEventTagContainerDelegate(EventTags,
 		FGameplayEventTagMulticastDelegate::FDelegate::CreateUObject(this, &ThisClass::OnGameplayEvent));
 
-	const FGGYGOAbilityMontagePlaybackResult Result = ASC->TryPlayMontageWithOwnership(
+	const FGGYGOAbilityMontagePlaybackResult Result = ASC->PlayAbilityMontage(
 		OriginalAbility.Get(), OriginalActivationInfo, OriginalMontage.Get(), Rate, StartSection,
 		StartTimeSeconds, [OriginalTask, OriginalAbility, OriginalASC]()
 		{
@@ -951,8 +946,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 		return; // No installation or writes through a Task ended by the external call.
 	}
 	Task->InFlightMontagePlayCleanup.Reset();
-	if (Result.Outcome != EGGYGOAbilityMontagePlaybackOutcome::Succeeded || !Result.Playback.HasPlayback()
-		|| Result.Guard.Outcome != EGGYGOMontagePlayGuardOutcome::Accepted
+	if (!Result.Playback.HasPlayback() || Result.Guard.Outcome != EGGYGOMontagePlayGuardOutcome::Accepted
 		|| Result.Guard.Identity.CreatedInstanceId == INDEX_NONE
 		|| !FMath::IsFinite(Result.Duration) || Result.Duration <= 0.0f)
 	{
@@ -967,7 +961,6 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::Activate()
 	}
 
 	Task->OriginalPlayback = Result.Playback;
-	Task->OriginalGuardIdentity = Result.Guard.Identity;
 	Task->MontageInstanceId = Result.Guard.Identity.CreatedInstanceId;
 	FAnimMontageInstance* Instance = Task->GetTaskMontageInstance();
 	if (!Instance || !Instance->IsActive() || !Instance->IsPlaying())
@@ -1029,7 +1022,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::TickTask(float /*DeltaTime*/)
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	const TWeakObjectPtr<UGameplayAbility> OriginalAbility = ActivatedAbility;
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC = ActivatedASC;
-	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalPlayback.Guard;
 	const FGGYGOActionPoseContractTicket OriginalTicket = ActionPoseContractTicket;
 	UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
 	if (!Guard || !IsActivatedActorInfoCurrent() || !Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuard))
@@ -1123,31 +1116,20 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnDestroy(bool AbilityEnded)
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsNotifyValid() const
 {
-	const UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(ActivatedASC.Get());
+	// 被别的播放替换由原生 BlendOut／Interrupted 通知；这里只看本 Task 与本实例仍在播放。
 	const FAnimMontageInstance* Instance = GetTaskMontageInstance();
 	return !bEndingTask && !bCancellationRequested && !bPoseFailureRequested && !bBlendingOut && IsActivatedActorInfoCurrent()
-		&& ASC && OriginalPlayback.HasPlayback() && Instance && Instance->IsActive() && Instance->IsPlaying()
-		&& ASC->CheckMontagePlaybackOwnership(OriginalPlayback).Outcome == EGGYGOAbilityMontagePlaybackOutcome::Succeeded;
+		&& OriginalPlayback.HasPlayback() && Instance && Instance->IsActive() && Instance->IsPlaying();
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsActivatedActorInfoCurrent() const
 {
-	const TSharedPtr<FGameplayAbilityActorInfo> OriginalInfo = ActivatedActorInfo.Pin();
+	// 播放实例属于激活时的 AnimInstance；Avatar 或 Mesh 被替换后它不再是 ASC 当前的 AnimInstance。
 	const UAbilitySystemComponent* ASC = ActivatedASC.Get();
 	const UGameplayAbility* OriginalAbility = ActivatedAbility.Get();
 	const UAnimInstance* AnimInstance = ActivatedAnimInstance.Get();
-	const AActor* OwnerActor = ActivatedOwnerActor.Get();
-	const AActor* AvatarActor = ActivatedAvatarActor.Get();
-	const USkeletalMeshComponent* Mesh = ActivatedMesh.Get();
-	const FGameplayAbilityActorInfo* CurrentInfo = ASC && ASC->AbilityActorInfo.IsValid()
-		? ASC->AbilityActorInfo.Get() : nullptr;
-	return OriginalInfo.IsValid() && CurrentInfo == OriginalInfo.Get()
-		&& OriginalAbility && Ability == OriginalAbility && AbilitySystemComponent.Get() == ASC
-		&& OriginalAbility->GetCurrentActorInfo() == CurrentInfo
-		&& OwnerActor && AvatarActor && Mesh && AnimInstance
-		&& CurrentInfo->AbilitySystemComponent.Get() == ASC && CurrentInfo->OwnerActor.Get() == OwnerActor
-		&& CurrentInfo->AvatarActor.Get() == AvatarActor && CurrentInfo->SkeletalMeshComponent.Get() == Mesh
-		&& CurrentInfo->GetAnimInstance() == AnimInstance;
+	return ASC && OriginalAbility && AnimInstance && Ability == OriginalAbility && AbilitySystemComponent.Get() == ASC
+		&& ASC->AbilityActorInfo.IsValid() && ASC->AbilityActorInfo->GetAnimInstance() == AnimInstance;
 }
 
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::MatchesOriginalMontageCallback(
@@ -1156,18 +1138,18 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::MatchesOriginalMontageCallbac
 	// The engine queues a copy of the exact instance delegate. The instance may already be gone.
 	return !bEndingTask && !bCancellationRequested && !bPoseFailureRequested
 		&& Original.CallId != 0 && Original.CreatedInstanceId != INDEX_NONE
-		&& Original.CallId == OriginalGuardIdentity.CallId
-		&& Original.LifecycleGeneration == OriginalGuardIdentity.LifecycleGeneration
+		&& Original.CallId == OriginalPlayback.Guard.CallId
+		&& Original.LifecycleGeneration == OriginalPlayback.Guard.LifecycleGeneration
 		&& Original.CreatedInstanceId == MontageInstanceId
-		&& Original.CreatedInstanceId == OriginalGuardIdentity.CreatedInstanceId
-		&& Original.OriginalAnimInstance.HasSameIndexAndSerialNumber(OriginalGuardIdentity.OriginalAnimInstance);
+		&& Original.CreatedInstanceId == OriginalPlayback.Guard.CreatedInstanceId
+		&& Original.OriginalAnimInstance.HasSameIndexAndSerialNumber(OriginalPlayback.Guard.OriginalAnimInstance);
 }
 
 FAnimMontageInstance* UGGYGOAbilityTask_PlayMontageAndWaitForEvent::GetTaskMontageInstance() const
 {
 	UGGYGOMontageGuardAnimInstance* Guard = Cast<UGGYGOMontageGuardAnimInstance>(ActivatedAnimInstance.Get());
-	if (!Guard || MontageInstanceId == INDEX_NONE || MontageInstanceId != OriginalGuardIdentity.CreatedInstanceId
-		|| !Guard->IsMontagePlayGuardIdentityCurrent(OriginalGuardIdentity))
+	if (!Guard || MontageInstanceId == INDEX_NONE || MontageInstanceId != OriginalPlayback.Guard.CreatedInstanceId
+		|| !Guard->IsMontagePlayGuardIdentityCurrent(OriginalPlayback.Guard))
 	{
 		return nullptr;
 	}
@@ -1192,10 +1174,9 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailAndEndTask(
 	const TCHAR* Reason, const FGGYGOAbilityMontagePlaybackResult* Result)
 {
 	UE_LOG(LogGGYGOAbilitySystem, Error,
-		TEXT("MontageTask [%s] 启动失败：Ability [%s]，ASC [%s]，Avatar [%s]，Montage [%s]；%s；Outcome=%d Reason=%d Guard=%d Stage=%d Call=%llu Instance=%d。"),
+		TEXT("MontageTask [%s] 启动失败：Ability [%s]，ASC [%s]，Avatar [%s]，Montage [%s]；%s；Guard=%d Stage=%d Call=%llu Instance=%d。"),
 		*GetNameSafe(this), *GetNameSafe(Ability), *GetNameSafe(AbilitySystemComponent.Get()),
-		*GetNameSafe(ActivatedAvatarActor.Get()), *GetNameSafe(MontageToPlay), Reason,
-		Result ? int32(Result->Outcome) : -1, Result ? int32(Result->Reason) : -1,
+		*GetNameSafe(GetAvatarActor()), *GetNameSafe(MontageToPlay), Reason,
 		Result ? int32(Result->Guard.Outcome) : -1, Result ? int32(Result->Guard.NativeStage) : -1,
 		Result ? Result->Guard.Identity.CallId : uint64(0), Result ? Result->Guard.Identity.CreatedInstanceId : INDEX_NONE);
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
@@ -1227,8 +1208,8 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailActionPoseContract(
 	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC(AbilitySystemComponent.Get());
 	const FGameplayAbilitySpecHandle OriginalSpecHandle = Ability ? Ability->GetCurrentAbilitySpecHandle() : FGameplayAbilitySpecHandle();
-	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalGuardIdentity;
-	const FGGYGOAbilityMontagePlaybackHandle OriginalHandle = OriginalPlayback;
+	const FGGYGOMontagePlayGuardIdentity OriginalGuard = OriginalPlayback.Guard;
+	const FGGYGOAbilityMontagePlayback OriginalHandle = OriginalPlayback;
 	const TWeakObjectPtr<UAbilitySystemComponent> PlaybackASC = ActivatedASC;
 	const TWeakObjectPtr<UAnimMontage> OriginalMontage(MontageToPlay);
 	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = MoveTemp(NativeCallbackRegistration);
@@ -1238,7 +1219,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailActionPoseContract(
 	UE_LOG(LogGGYGOAbilitySystem, Error,
 		TEXT("[AbilitySystem.MontageTask.Pose] Task='%s' Ability='%s' ASC='%s' Avatar='%s' Mesh='%s' Anim='%s' Montage='%s' Slot='%s' Stage=%d Generation=%llu Call=%llu Instance=%d; %s"),
 		*GetPathName(), *GetPathNameSafe(OriginalAbility.Get()), *GetPathNameSafe(OriginalASC.Get()),
-		*GetPathNameSafe(ActivatedAvatarActor.Get()), *GetPathNameSafe(ActivatedMesh.Get()),
+		*GetPathNameSafe(GetAvatarActor()), *GetPathNameSafe(ActivatedMesh.Get()),
 		*GetPathNameSafe(ActivatedAnimInstance.Get()), *GetPathNameSafe(Fact.Montage.Get()),
 		*Fact.SlotName.ToString(), int32(Stage), OriginalGuard.LifecycleGeneration,
 		OriginalGuard.CallId, Fact.MontageInstanceId, *Fact.Diagnostic);
@@ -1294,16 +1275,9 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::FailActionPoseContract(
 	NativeSnapshot.Reset(); // Capture destruction may end/reactivate the GA too.
 	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = Recheck())
 	{
-		const TSharedPtr<FGameplayAbilityActorInfo> OriginalInfo = Task->ActivatedActorInfo.Pin();
-		const FGameplayAbilityActorInfo* CurrentInfo = OriginalASC->AbilityActorInfo.Get();
-		if (OriginalInfo.IsValid() && CurrentInfo == OriginalInfo.Get()
-			&& OriginalAbility->GetCurrentActorInfo() == CurrentInfo
-			&& Task->ActivatedOwnerActor.IsValid() && Task->ActivatedAvatarActor.IsValid()
-			&& Task->ActivatedMesh.IsValid() && Task->ActivatedAnimInstance.IsValid()
-			&& CurrentInfo->AbilitySystemComponent.Get() == OriginalASC.Get()
-			&& CurrentInfo->OwnerActor == Task->ActivatedOwnerActor && CurrentInfo->AvatarActor == Task->ActivatedAvatarActor
-			&& CurrentInfo->SkeletalMeshComponent == Task->ActivatedMesh
-			&& CurrentInfo->GetAnimInstance() == Task->ActivatedAnimInstance.Get())
+		// 原生 OnDestroy 已清空 Task->Ability，这里只核对原 AnimInstance 仍是 ASC 当前的 AnimInstance。
+		if (OriginalASC->AbilityActorInfo.IsValid() && Task->ActivatedAnimInstance.IsValid()
+			&& OriginalASC->AbilityActorInfo->GetAnimInstance() == Task->ActivatedAnimInstance.Get())
 		{
 			BlueprintSnapshot.Broadcast(Fact);
 		}
@@ -1321,7 +1295,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ReleaseRootMotionScaleLease()
 bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::StopPlayingMontage()
 {
 	if (MontageInstanceId == INDEX_NONE) { return false; } // In-flight play returns its exact ID later.
-	return StopOriginalMontageInstance(OriginalGuardIdentity, OriginalPlayback, ActivatedASC,
+	return StopOriginalMontageInstance(OriginalPlayback.Guard, OriginalPlayback, ActivatedASC,
 		TWeakObjectPtr<UAnimMontage>(MontageToPlay.Get()), TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>(this));
 }
 
@@ -1353,28 +1327,16 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnMontageBlendingOut(UAnimMon
 	if (bEndingTask || bCancellationRequested || bPoseFailureRequested || bBlendingOut || Montage != MontageToPlay) { return; }
 	bBlendingOut = true;
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
-	const FGGYGOAbilityMontagePlaybackHandle Playback = OriginalPlayback;
-	const FGGYGOMontagePlayGuardIdentity GuardIdentity = OriginalGuardIdentity;
+	const FGGYGOAbilityMontagePlayback Playback = OriginalPlayback;
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalASC = ActivatedASC;
-	const TWeakObjectPtr<UAnimMontage> OriginalMontage(MontageToPlay);
 	ReleaseRootMotionScaleLease();
+	// 混出开始即归还本次播放的 GAS 归属；已被替换时 ClearPlayback 不触碰后继。
 	if (UGGYGOAbilitySystemComponent* ASC = Cast<UGGYGOAbilitySystemComponent>(OriginalASC.Get()))
 	{
-		if (Playback.HasPlayback())
-		{
-			const FGGYGOAbilityMontageClearResult Cleared = ASC->TryClearMontageAnimatingAbility(Playback);
-			if (Cleared.Outcome == EGGYGOAbilityMontagePlaybackOutcome::Failed
-				|| Cleared.Outcome == EGGYGOAbilityMontagePlaybackOutcome::Rejected)
-			{
-				UE_LOG(LogGGYGOAbilitySystem, Warning,
-					TEXT("MontageTask [%s] 原混出归属清除失败：ASC [%s]，Montage [%s]，Call=%llu Instance=%d，Outcome=%d Reason=%d。"),
-					*GetNameSafe(OriginalTask.Get()), *GetNameSafe(OriginalASC.Get()), *GetNameSafe(OriginalMontage.Get()),
-					GuardIdentity.CallId, GuardIdentity.CreatedInstanceId, int32(Cleared.Outcome), int32(Cleared.Reason));
-			}
-		}
+		ASC->ClearPlayback(Playback);
 	}
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
-	if (!Task || !Task->MatchesOriginalMontageCallback(GuardIdentity)) { return; }
+	if (!Task || !Task->MatchesOriginalMontageCallback(Playback.Guard)) { return; }
 	// These are original instance facts. They do not grant authority over the current GA resource.
 	Task->DispatchOriginalCallback(bInterrupted ? ENativeCallback::Interrupted : ENativeCallback::BlendOut,
 		FGameplayTag(), FGameplayEventData());
@@ -1426,7 +1388,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::IsOriginalMontageWindowFact(
 		|| !Fact.Declaration.HasSameWindow(DispatchingWindowFact.Declaration)
 		|| !IsOriginalMontageWindowDeclarationCurrent(Fact.Declaration)) { return false; }
 	return Fact.Phase == EGGYGOMontageWindowPhase::Begin
-		? IsNotifyValid() : CanDispatchOriginalInstanceFact(OriginalGuardIdentity);
+		? IsNotifyValid() : CanDispatchOriginalInstanceFact(OriginalPlayback.Guard);
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageWindowFact(
@@ -1444,7 +1406,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalMontageWindow
 		{ return Identity.Pin() == Source.DispatchIdentity; })) { return; }
 	if ((Source.Phase != EGGYGOMontageWindowPhase::Begin && Source.Phase != EGGYGOMontageWindowPhase::End)
 		|| (Source.Phase == EGGYGOMontageWindowPhase::Begin
-			? !IsNotifyValid() : !CanDispatchOriginalInstanceFact(OriginalGuardIdentity))) { return; }
+			? !IsNotifyValid() : !CanDispatchOriginalInstanceFact(OriginalPlayback.Guard))) { return; }
 	const FGGYGOMontageWindowDeclaration* Match = nullptr;
 	for (const auto& Declaration : ConfiguredMontageWindowDeclarations)
 	{

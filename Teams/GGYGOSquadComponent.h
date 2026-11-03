@@ -15,9 +15,17 @@
  * 甚至是否已生成都无关。
  *
  * ## 换人的方式：换 Controller 的附身目标
- * 换人时把 Controller 从当前 Pawn 转到目标 Pawn，非出战成员的 Pawn 留在场上但
- * 隐藏且不参与碰撞。不销毁重建 Pawn 的理由不再是"会丢状态"（状态在位置上，
- * 销毁 Pawn 不会丢），而是切人要即时响应，重新生成 Pawn 有可见延迟。
+ * 换人时把 Controller 从当前 Pawn 转到目标 Pawn。不销毁重建 Pawn 的理由不再是"会丢状态"
+ * （状态在位置上，销毁 Pawn 不会丢），而是切人要即时响应，重新生成 Pawn 有可见延迟。
+ *
+ * ## 队员状态（仅服务器）
+ * - Benched：隐藏、无碰撞、移动停用。
+ * - Active：被玩家控制。切回仍在续放的队员时加 State.SwitchReturnPending，续放全部结束才解除。
+ * - Lingering：换出时有能力选择 ContinueOnField，留在场上放完；可见、可动、不可受击（State.OffField）。
+ * - Exiting：向 ASC 发 Event.Squad.SwitchOut，等被激活的退场能力结束后转 Benched。
+ * 同一时刻一个 Active，任意数量 Lingering／Exiting；可以切回留场或退场中的队员。
+ * 订阅各槽位 ASC 的 OnAbilityEnded 推进状态；不设计时器，也不复制状态本身——
+ * 可见性、碰撞与移动由 Pawn 原生复制，OffField／ReturnPending 由复制的 loose tag 承载。
  *
  * ## 为什么不做成能力
  * 换人牵动 Controller 归属、相机、输入绑定这些跨 Actor 的关系，
@@ -26,7 +34,9 @@
  */
 #pragma once
 
+#include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "Components/GameFrameworkComponent.h"
+#include "GameplayAbilitySpecHandle.h"
 #include "UObject/WeakObjectPtrTemplates.h"
 
 #include "GGYGOSquadComponent.generated.h"
@@ -38,11 +48,24 @@ class APlayerController;
 class AGGYGOCharacterBase;
 class AGGYGOCharacterSlot;
 class AGGYGOGameMode;
+class UCharacterMovementComponent;
+class UGGYGOAbilitySystemComponent;
 class UGGYGOPawnData;
 class UObject;
+struct FAbilityEndedData;
 
 /** 出战角色变更。@param NewCharacter 新出战角色的 Pawn，可能为 nullptr。 */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOActiveCharacterChanged, AGGYGOCharacterBase*, NewCharacter);
+
+/** 队员在编队中的场上状态。见文件头"队员状态"。 */
+UENUM(BlueprintType)
+enum class EGGYGOSquadMemberState : uint8
+{
+	Benched,
+	Active,
+	Lingering,
+	Exiting
+};
 
 UCLASS(meta = (BlueprintSpawnableComponent))
 class GGYGO_API UGGYGOSquadComponent : public UGameFrameworkComponent
@@ -130,13 +153,29 @@ public:
 	/**
 	 * 切到指定序号的位置。仅服务器有效。
 	 *
-	 * 默认取消旧位置的技能，只有显式后台继续的技能保留。待取消集合不能完整退出时，
-	 * 不释放输入或转移控制；成功只在真实双向附身关系确认后提交，不清除 Slot/ASC/GE/冷却。
-	 * 取消已发生后若外调改变原请求，返回失败，不承诺恢复技能或旧 Held 输入。
-	 * @return 是否真的完成切换。同步重入、无效目标或退出/附身失败均返回 false。
+	 * 1. 旧队员的每个活动能力经 OnAvatarSwitchOut 决定取消或留场；任一 Cancel 决定的能力
+	 *    不可取消时，在任何取消之前整次拒绝。
+	 * 2. 留场集合登记后取消其余能力，补发按住输入的真实释放，通知留场能力失去控制，
+	 *    退役 Hero 输入并解除附身。
+	 * 3. 附身新队员（镜头随原生 ViewTarget 立即切换）。待命队员显示后发 SwitchIn；
+	 *    留场／退场中的队员取消退场、解除 OffField，仍有续放时加 ReturnPending，不播进场。
+	 * 4. 旧队员加 OffField：有续放进入 Lingering，否则直接退场。
+	 * 不清除任何 Slot 的 GE、冷却或属性。外调改变原布局时停止并记录错误，已发生的效果不恢复。
+	 * @return 是否完成切换。目标是当前出战、无 Avatar、已死亡、同步重入或附身失败均返回 false 并诊断。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
-	bool SwitchToSlot(int32 SlotIndex);
+	bool SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Source = EGGYGOSwitchSource::Script);
+
+	/**
+	 * 客户端请求切换。服务器只校验序号范围，其余由 SwitchToSlot 校验与诊断。
+	 * 在服务器上调用时直接执行。
+	 */
+	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "GGYGO|Squad")
+	void ServerRequestSwitchToSlot(int32 SlotIndex);
+
+	/** 服务器上的队员状态；越界或客户端上返回 Benched。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
+	EGGYGOSquadMemberState GetMemberState(int32 SlotIndex) const;
 
 	/** 切到下一个可出战的位置。已死亡或无实体的位置会被跳过。 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
@@ -243,4 +282,40 @@ private:
 	bool bFinalComponentDestructionRequested = false;
 	/** 仅由一次同步 Switch 栈持有，退出即归还；不是第二份出战状态或延期切换队列。 */
 	bool bSwitchRequestInProgress = false;
+
+	/** 一个槽位的场上状态与本组件施加的资源；与 Slots 同序，仅服务器。 */
+	struct FSlotRuntime
+	{
+		EGGYGOSquadMemberState State = EGGYGOSquadMemberState::Benched;
+		/** 选择 ContinueOnField、仍在执行的能力。 */
+		TArray<FGameplayAbilitySpecHandle> Continuing;
+		/** 本次 SwitchOut 事件激活、仍在执行的能力。 */
+		TArray<FGameplayAbilitySpecHandle> ExitAbilities;
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ObservedASC;
+		FDelegateHandle AbilityEndedHandle;
+		/** 施加 OffField 时改过 bRunPhysicsWithNoController 的移动组件及原值。 */
+		TWeakObjectPtr<UCharacterMovementComponent> OffFieldMovement;
+		bool bSavedRunPhysicsWithNoController = false;
+		bool bOffField = false;
+		bool bReturnPending = false;
+	};
+	TArray<FSlotRuntime> SlotRuntimes;
+
+	/** 槽位能力结束：更新续放／退场集合，按状态推进退场、完成退场或解除 ReturnPending。 */
+	void HandleSlotAbilityEnded(const FAbilityEndedData& Data, TWeakObjectPtr<AGGYGOCharacterSlot> Slot);
+	/** 外调后核对：组件未终止，Index 仍是原 Slot。 */
+	bool IsSlotCurrent(int32 Index, const AGGYGOCharacterSlot* Slot) const;
+	/** 失去控制的队员离场：加 OffField，有续放进入 Lingering，否则 BeginExit。 */
+	void MoveOffField(int32 Index);
+	/** 发 SwitchOut；有能力被激活且仍在执行时等待它们结束，否则立即 FinishExit。 */
+	void BeginExit(int32 Index);
+	/** 解除 OffField 后隐藏、关碰撞、停用移动，转 Benched。 */
+	void FinishExit(int32 Index);
+	/** OffField：复制的 State.OffField、仅服务器的伤害免疫，及无 Controller 时继续执行移动。 */
+	void SetOffField(int32 Index, bool bOffField);
+	void SetReturnPending(int32 Index, bool bPending);
+	/** 向槽位 ASC 发 Squad 事件，返回这次事件同步激活的能力。 */
+	TArray<FGameplayAbilitySpecHandle> SendSquadEvent(AGGYGOCharacterSlot* Slot, FGameplayTag EventTag);
+	/** 终止时退订并移除本组件施加的 Tag 与移动开关。 */
+	void ReleaseSlotRuntimes();
 };

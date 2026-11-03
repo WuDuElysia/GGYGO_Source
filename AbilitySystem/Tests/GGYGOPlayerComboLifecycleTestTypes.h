@@ -3,31 +3,11 @@
 #include "AbilitySystem/Abilities/GGYGOPlayerComboAbility.h"
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "GameplayEffect.h"
-#include "GameFramework/Character.h"
-#include "GameFramework/PlayerController.h"
 
 #include "GGYGOPlayerComboLifecycleTestTypes.generated.h"
 
 class UAnimMontage;
 class UFunction;
-
-/** The real CMC entry is part of the Combo prerequisite; no motion gate is bypassed for tests. */
-UCLASS(Transient)
-class AGGYGOPlayerComboLifecycleTestCharacter : public ACharacter
-{
-	GENERATED_BODY()
-public:
-	AGGYGOPlayerComboLifecycleTestCharacter(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
-};
-
-/** Native input is explicit for this GAS lifecycle fixture; it creates no physical Source request. */
-UCLASS(Transient)
-class AGGYGOPlayerComboLifecycleTestController : public APlayerController
-{
-	GENERATED_BODY()
-public:
-	AGGYGOPlayerComboLifecycleTestController(const FObjectInitializer& ObjectInitializer = FObjectInitializer::Get());
-};
 
 /** Native fixture that routes the real GAS Blueprint activation dispatch through ProcessEvent. */
 UCLASS(Transient)
@@ -46,8 +26,11 @@ public:
 	void SetK2ActivateActionForTest(TFunction<void()> Action) { K2ActivateAction = MoveTemp(Action); }
 	/** 在真实原 cleanup 入口执行一次夹具动作；不改公共 GA／CMC 生命周期入口。 */
 	void SetBeforeCleanupActionForTest(TFunction<void()> Action) { BeforeCleanupAction = MoveTemp(Action); }
+	/** 最近一次正式结束清理收到的参数；原生结束广播时读取，用于把结束通知对应到那次激活。 */
+	const FGGYGOAbilityTerminationContext& GetLastTerminationForTest() const { return LastTermination; }
 	bool EndAndReactivateForTest();
-	bool EndAndReactivateAfterDeferredEndForTest(bool& bDeferredEndWasCoalesced);
+	/** 在原生 ScopeLock 内对同一原激活连续请求两次结束；返回解锁后能力是否已结束。 */
+	bool DeferTwoEndsForTest(const FGGYGOAbilityActivationHandle& Original, bool& bBothAcceptedWhileLocked);
 	void FinishForTest();
 	void UsePredictingActivationModeForTest();
 	int32 GetActiveTaskCountForTest() const { return ActiveTasks.Num(); }
@@ -67,6 +50,7 @@ protected:
 private:
 	TFunction<void()> K2ActivateAction;
 	TFunction<void()> BeforeCleanupAction;
+	FGGYGOAbilityTerminationContext LastTermination;
 	mutable bool bInvalidateNextRequiredSpec = false;
 	mutable int32 SpecExtensionCount = 0;
 	mutable int32 InvalidatedSpecCount = 0;

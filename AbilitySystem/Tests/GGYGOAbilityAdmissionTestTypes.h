@@ -78,17 +78,12 @@ public:
 	static FGGYGOAbilityAdmissionLifecycleObserver LifecycleObserver;
 
 protected:
-#if WITH_DEV_AUTOMATION_TESTS
-	virtual void ObserveAbilityActivationEntryForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		const FGameplayEventData* TriggerEventData) override;
-	virtual void ObserveAbilityActivationReturnForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		const FGameplayEventData* TriggerEventData) override;
-	virtual void ObserveAbilityEndEntryForTest(FGameplayAbilitySpecHandle Handle,
-		const FGameplayAbilityActorInfo* ActorInfo, FGameplayAbilityActivationInfo ActivationInfo,
-		bool bReplicateEndAbility, bool bWasCancelled) override;
-#endif
+	/** 通过公共生命周期覆盖点采样：初始化（业务体之前）、业务体返回、正式结束清理。 */
+	virtual void InitializeAbilityActivation(const FGGYGOAbilityActivationHandle& Original) override;
+	virtual void ActivateAbilityBody(const FGGYGOAbilityActivationHandle& Original,
+		FGameplayAbilitySpecHandle Handle, const FGameplayAbilityActorInfo* ActorInfo,
+		FGameplayAbilityActivationInfo ActivationInfo, const FGameplayEventData* TriggerEventData) override;
+	virtual void CleanupAbilityResourcesForTermination(const FGGYGOAbilityTerminationContext& Context) override;
 
 private:
 	void ObserveLifecycle(EGGYGOAbilityAdmissionLifecycleObservation Observation,

@@ -1,84 +1,33 @@
 #pragma once
 
+#include "AbilitySystem/Abilities/GGYGOGameplayAbility.h"
 #include "Animation/Runtime/GGYGOMontagePlayGuard.h"
-#include "Templates/SharedPointer.h"
 
-class UGGYGOAbilitySystemComponent;
+class UAnimMontage;
+class UGameplayAbility;
 
-/** Copied original resource only. Only ASC may issue its immutable native-write proof. */
-class GGYGO_API FGGYGOAbilityMontagePlaybackHandle final
+/**
+ * 一次 ASC 播放的身份：Guard 识别的本次调用创建的实例、GAS Local 播放序号与所属激活。
+ * 只由 UGGYGOAbilitySystemComponent::PlayAbilityMontage 填写；复制不表示播放仍是当前播放，
+ * 是否仍属于本激活以 ASC::IsPlaybackCurrent 为准。
+ */
+struct GGYGO_API FGGYGOAbilityMontagePlayback
 {
-public:
-	FGGYGOAbilityMontagePlaybackHandle() = default;
-	bool HasPlayback() const { return Proof.IsValid(); }
-	bool HasSamePlayback(const FGGYGOAbilityMontagePlaybackHandle& Other) const
-	{
-		return Proof.IsValid() && Proof == Other.Proof;
-	}
+	FGGYGOMontagePlayGuardIdentity Guard{};
+	/** 项目能力的那次激活；非项目能力为空，此时只要求能力仍在运行。 */
+	FGGYGOAbilityActivationHandle Activation{};
+	TWeakObjectPtr<UGameplayAbility> Ability;
+	TWeakObjectPtr<UAnimMontage> Montage;
+	uint8 LocalPlayInstanceId = 0;
 
-private:
-	struct FPlaybackProof;
-	TSharedPtr<const FPlaybackProof> Proof{};
-	friend class UGGYGOAbilitySystemComponent;
+	bool HasPlayback() const { return Guard.CreatedInstanceId != INDEX_NONE && !Ability.IsExplicitlyNull(); }
 };
 
-enum class EGGYGOAbilityMontagePlaybackOutcome : uint8
+/** PlayAbilityMontage 的结果副本。Playback 为空表示没有取得本次播放；Guard 保留拒绝原因。 */
+struct GGYGO_API FGGYGOAbilityMontagePlaybackResult
 {
-	Rejected = 0,
-	Succeeded,
-	NoOwnedPlayback,
-	Busy,
-	Stale,
-	Failed
-};
-
-enum class EGGYGOAbilityMontagePlaybackReason : uint8
-{
-	InvalidRequest = 0,
-	None,
-	MissingCallerQuery,
-	InvalidASC,
-	InvalidAbility,
-	InvalidActorInfo,
-	NoOwnedPlayback,
-	WrongIssuer,
-	PlaybackReplaced,
-	ActorInfoChanged,
-	AbilitySourceChanged,
-	GuardLifecycleInvalid,
-	GuardUnsupported,
-	GuardRejected,
-	GuardSuperseded,
-	NativePlayFailed,
-	LocalWriteMismatch,
-	NativeWriteBusy
-};
-
-/** Native history is preserved on failure. Only Succeeded may issue Playback. */
-struct FGGYGOAbilityMontagePlaybackResult
-{
-	EGGYGOAbilityMontagePlaybackOutcome Outcome = EGGYGOAbilityMontagePlaybackOutcome::Rejected;
-	EGGYGOAbilityMontagePlaybackReason Reason = EGGYGOAbilityMontagePlaybackReason::InvalidRequest;
 	FGGYGOMontagePlayGuardResult Guard{};
+	/** Guard 接受时的原生返回值；其它情况为 0。 */
 	float Duration = 0.0f;
-	FGGYGOAbilityMontagePlaybackHandle Playback{};
-};
-
-/** Pure query: copied original evidence does not grant a new playback or change state. */
-struct FGGYGOAbilityMontageOwnershipCheck
-{
-	EGGYGOAbilityMontagePlaybackOutcome Outcome = EGGYGOAbilityMontagePlaybackOutcome::Rejected;
-	EGGYGOAbilityMontagePlaybackReason Reason = EGGYGOAbilityMontagePlaybackReason::InvalidRequest;
-	FGGYGOMontagePlayGuardResult Guard{};
-	FGGYGOAbilityMontagePlaybackHandle Original{};
-};
-
-/** Succeeded proves only the native GA/Local animating-pointer clear, never a Montage stop. */
-struct FGGYGOAbilityMontageClearResult
-{
-	EGGYGOAbilityMontagePlaybackOutcome Outcome = EGGYGOAbilityMontagePlaybackOutcome::Rejected;
-	EGGYGOAbilityMontagePlaybackReason Reason = EGGYGOAbilityMontagePlaybackReason::InvalidRequest;
-	FGGYGOMontagePlayGuardResult Guard{};
-	FGGYGOAbilityMontagePlaybackHandle Original{};
-	bool bCleared = false;
+	FGGYGOAbilityMontagePlayback Playback{};
 };

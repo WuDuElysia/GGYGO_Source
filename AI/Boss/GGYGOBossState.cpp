@@ -1,6 +1,7 @@
 /** @file GGYGOBossState.cpp */
 #include "AI/Boss/GGYGOBossState.h"
 
+#include "AI/Boss/GGYGOBossActionSet.h"
 #include "AI/Boss/GGYGOBossDefinition.h"
 #include "AbilitySystem/GGYGOAbilitySet.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
@@ -56,6 +57,19 @@ bool AGGYGOBossState::InitializeFromDefinition(const UGGYGOBossDefinition* InDef
 			TEXT("InitializeFromDefinition: [%s] 的初始标签必须位于 State.Boss.Form / State.Boss.Phase 下。"),
 			*GetNameSafe(InDefinition));
 		return false;
+	}
+
+	// 各阶段 ActionSet 是静态数据资产，只在采纳定义时整表校验一次；之后选招、保存、消费与激活只按 ActionTag 查行。
+	for (const FGGYGOBossPhaseDefinition& Phase : InDefinition->Phases)
+	{
+		FString ActionSetError;
+		if (Phase.ActionSet && !Phase.ActionSet->ValidateConfiguration(ActionSetError))
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Error,
+				TEXT("InitializeFromDefinition: 定义 [%s] 阶段 [%s] 的 ActionSet [%s] 无效：%s"),
+				*GetNameSafe(InDefinition), *Phase.PhaseTag.ToString(), *GetNameSafe(Phase.ActionSet), *ActionSetError);
+			return false;
+		}
 	}
 
 	BossDefinition = InDefinition;

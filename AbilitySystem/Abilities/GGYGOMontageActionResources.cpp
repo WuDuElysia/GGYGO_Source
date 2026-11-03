@@ -2,6 +2,7 @@
 #include "AbilitySystem/Abilities/GGYGOMontageActionResources.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
+#include "FX/Components/GGYGOMontageFXReplicationComponent.h"
 #include "System/GGYGOGameplayTags.h"
 
 #include "Animation/AnimInstance.h"
@@ -167,20 +168,6 @@ bool FGGYGOMontageActionResources::ReadOriginalSnapshot(FGGYGOMontageSectionSnap
 	return true;
 }
 
-bool FGGYGOMontageActionResources::BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot, FString& OutError)
-{
-	OutError.Reset();
-	if (!Movement.IsValid() || !Source.IsValid() || MotionHandle != INDEX_NONE
-		|| Snapshot.Montage != Source->Montage.Get() || Snapshot.MontageInstanceId == INDEX_NONE)
-	{
-		OutError = TEXT("Original CMC/source/playback is invalid or motion has already been issued.");
-		return false;
-	}
-	MontageInstanceId = Snapshot.MontageInstanceId;
-	return Movement->BeginMontageActionMotion(Source, MontageInstanceId, Snapshot.PositionSeconds,
-		EffectiveRate, TranslationScale, MotionHandle, OutError) && MotionHandle != INDEX_NONE;
-}
-
 bool FGGYGOMontageActionResources::BeginMotion(const FGGYGOMontageSectionSnapshot& Snapshot,
 	const FGGYGOActionMotionStartFacing& StartFacing, FQuat& OutEntryActorRotation, FString& OutError)
 {
@@ -202,6 +189,32 @@ bool FGGYGOMontageActionResources::BeginMotion(const FGGYGOMontageSectionSnapsho
 	}
 	OutEntryActorRotation = AcceptedEntryActorRotation;
 	return true;
+}
+
+bool FGGYGOMontageActionResources::BeginProfileMotion(const UGGYGOActionMotionProfile* Profile, float PlayRate,
+	FGGYGOActionMotionFailureDelegate Failure, FString& OutError)
+{
+	OutError.Reset();
+	if (!Movement.IsValid() || !IsValid(Profile) || MotionHandle != INDEX_NONE || Source.IsValid())
+	{
+		OutError = TEXT("Original CMC/Profile is invalid, motion has already been issued, or a Montage motion source is configured.");
+		return false;
+	}
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> OriginalMovement = Movement;
+	const int32 Handle = OriginalMovement->BeginActionMotion(Profile, PlayRate);
+	if (Handle == INDEX_NONE)
+	{
+		OutError = TEXT("Original CMC rejected the Profile motion.");
+		return false;
+	}
+	MotionHandle = Handle;
+	bProfileMotion = true;
+	if (!OriginalMovement.IsValid())
+	{
+		OutError = TEXT("Original CMC expired after starting the Profile motion.");
+		return false;
+	}
+	return OriginalMovement->ObserveActionMotionFailure(Handle, MoveTemp(Failure), OutError);
 }
 
 bool FGGYGOMontageActionResources::ObserveMotion(FGGYGOActionMotionFailureDelegate Failure,
@@ -254,6 +267,21 @@ bool FGGYGOMontageActionResources::ArmWatchdog(USkeletalMeshComponent* Mesh, UWo
 	return WatchdogHandle.IsValid();
 }
 
+bool FGGYGOMontageActionResources::ArmFixedWatchdog(UWorld* World, float TimeoutSeconds, FTimerDelegate Callback, FString& OutError)
+{
+	OutError.Reset();
+	if (!World || !FMath::IsFinite(TimeoutSeconds) || TimeoutSeconds <= 0.0f)
+	{
+		OutError = TEXT("Original world or fixed completion deadline is invalid.");
+		return false;
+	}
+	ClearWatchdog();
+	WatchdogWorld = World;
+	World->GetTimerManager().SetTimer(WatchdogHandle, MoveTemp(Callback), TimeoutSeconds, false);
+	if (!WatchdogHandle.IsValid()) { OutError = TEXT("Original world could not register the completion deadline."); }
+	return WatchdogHandle.IsValid();
+}
+
 void FGGYGOMontageActionResources::ClearWatchdog()
 {
 	const auto World = WatchdogWorld;
@@ -298,10 +326,46 @@ void FGGYGOMontageActionResources::ReleaseFX(bool bNormalExit)
 void FGGYGOMontageActionResources::ReleaseMotion(EGGYGOActionMotionReleaseReason Reason)
 {
 	const int32 OriginalHandle = MotionHandle;
+	const bool bOriginalProfileMotion = bProfileMotion;
 	MotionHandle = INDEX_NONE;
+	bProfileMotion = false;
+	if (!Movement.IsValid() || OriginalHandle == INDEX_NONE) { return; }
+	if (bOriginalProfileMotion)
+	{
+		Movement->EndActionMotion(OriginalHandle);
+		return;
+	}
 	FString Error;
-	if (Movement.IsValid() && OriginalHandle != INDEX_NONE && !Movement->ReleaseMontageActionMotion(OriginalHandle, Reason, Error))
+	if (!Movement->ReleaseMontageActionMotion(OriginalHandle, Reason, Error))
 	{ UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("MontageAction [%s] original handle %d cleanup failed: %s"), *AbilityPath, OriginalHandle, *Error); }
+}
+
+void FGGYGOMontageActionResources::ReleaseTraceWindow()
+{
+	const TWeakObjectPtr<UGGYGOMeleeTraceComponent> OriginalTrace = Trace;
+	const FGGYGOMeleeTraceWindowHandle OriginalWindow = TraceWindow;
+	const FDelegateHandle OriginalHits = TraceHits;
+	TraceWindow = {};
+	TraceWindowSource = {};
+	TraceHits.Reset();
+	if (UGGYGOMeleeTraceComponent* Receiver = OriginalTrace.Get(); Receiver && OriginalHits.IsValid())
+	{
+		Receiver->UnsubscribeWindowHit(OriginalHits);
+	}
+	if (UGGYGOMeleeTraceComponent* Receiver = OriginalTrace.Get(); Receiver && OriginalWindow.HasWindow())
+	{
+		Receiver->CloseOwnedTraceWindow(OriginalWindow);
+	}
+}
+
+void FGGYGOMontageActionResources::UnregisterTaskCallbacks()
+{
+	const FDelegateHandle Registration = TaskRegistration;
+	TaskRegistration.Reset();
+	if (UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask = TaskOwner.Get(); OriginalTask && Registration.IsValid())
+	{
+		OriginalTask->UnregisterNativeCallbacks(Registration);
+	}
 }
 
 void FGGYGOMontageActionResources::ReleaseTask(bool bOwnerEnded)
@@ -454,11 +518,17 @@ bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 	TFunctionRef<bool()> IsCurrent, FString& OutError)
 {
 	if (!Issuer->IsOwnerActorAuthoritative()) { return true; }
-	IGGYGOMontageFXHost* Host = Cast<IGGYGOMontageFXHost>(Issuer);
-	if (!Host) { OutError = TEXT("原 ASC 没有必需的 Montage FX 发布接口。"); return false; }
-	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher(Host->GetMontageFXPublicationOwner());
+	UGGYGOMontageFXReplicationComponent* Host = UGGYGOMontageFXReplicationComponent::FindForASC(Issuer);
+	if (!Host)
+	{
+		OutError = FString::Printf(TEXT("原 ASC [%s] 的 Owner [%s] 没有 Montage FX 发布宿主。"),
+			*GetPathNameSafe(Issuer), *GetPathNameSafe(Issuer->GetOwner()));
+		return false;
+	}
+	const TWeakObjectPtr<UGGYGOMontageFXReplicationComponent> OriginalHost(Host);
+	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Publisher(Host->GetPublicationOwner());
 	if (!IsCurrent() || bFXWindowClosed) { return true; }
-	if (!Publisher.IsValid()) { OutError = TEXT("原 ASC 的 Montage FX 发行者尚未建立。"); return false; }
+	if (!Publisher.IsValid()) { OutError = TEXT("原宿主的 Montage FX 发行者尚未建立。"); return false; }
 	FGGYGOMontageFXRecord Record;
 	Record.Avatar = Avatar;
 	Record.Mesh = Fact.Mesh;
@@ -474,7 +544,9 @@ bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 		Record.System = Unit.System;
 		Record.FieldSettings = Unit.FieldSettings;
 		FGGYGOMontageFXLease NewLease;
-		const bool bPublished = Issuer->TryPublishMontageFX(Owner, Activation, Task.Get(), Fact, Record, NewLease, OutError);
+		UGGYGOMontageFXReplicationComponent* LiveHost = OriginalHost.Get();
+		const bool bPublished = LiveHost
+			&& LiveHost->PublishMontageFX(Owner, Activation, Task.Get(), Fact, Record, NewLease, OutError);
 		if (!IsCurrent() || bFXWindowClosed)
 		{
 			const EGGYGOMontageFXCloseReason Reason = FXTerminalReason.IsSet()

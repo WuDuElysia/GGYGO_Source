@@ -23,6 +23,7 @@
 #pragma once
 
 #include "AbilitySystem/GGYGOAbilityInputRequestTypes.h"
+#include "Character/Components/GGYGOPawnExtensionComponent.h"
 
 #include "Components/GameFrameworkInitStateInterface.h"
 #include "Components/PawnComponent.h"
@@ -49,7 +50,6 @@ class UInputComponent;
 class UInputMappingContext;
 class UObject;
 class UGGYGOPawnExtensionComponent;
-struct FGGYGOPawnASCLocalNotice;
 struct FActorInitStateChangedParams;
 struct FGameplayTag;
 struct FInputActionInstance;
@@ -171,11 +171,8 @@ private:
 	uint64 LastAbilityCameraModeRequestGeneration = 0;
 
 	struct FPlayerInputSession;
-	struct FAbilityInputAssociation;
 	struct FAbilityActionBinding;
-	struct FAbilityInputObservation;
-	struct FLocalAbilitySystemSubscription;
-	/** Owns this original input component's bindings, IMC registrations and Action associations. */
+	/** Owns this original input component's bindings, IMC registrations, ASC association and current requests. */
 	TSharedPtr<FPlayerInputSession> PlayerInputSession;
 	/** 只用于使同步回调中的旧初始化失效；不保存物理输入事实。 */
 	uint64 InputSessionGeneration = 0;
@@ -190,39 +187,36 @@ private:
 	void HandleMovementMappingsRebuilt(const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
 	void Input_Move(const FInputActionInstance& Instance, const TSharedPtr<FGGYGOHeroMovementInputScope>& OriginalScope);
 
-	bool IsAbilityInputAssociationCurrent(const TSharedPtr<FAbilityInputAssociation>& Association) const;
+	/** 会话关联的资源仍是订阅已消费且就绪的同一 ASC 资源。 */
+	bool IsSessionAssociationCurrent(const TSharedPtr<FPlayerInputSession>& Session) const;
 	bool HasValidPlayerInputSession() const;
 	void AssociateReadyAbilitySystemWithInput();
-	/** Retires the original association locally; returned IDs still require exact ASC cleanup. */
-	TArray<FGGYGOAbilityInputRequestIdentity> RetireAbilityInputAssociation(const TSharedPtr<FPlayerInputSession>& Session);
-	void PruneEndedAbilityInputObservations(double Now);
+	/** 摘掉会话关联与各动作的请求身份，并让原 ASC 按来源结束本会话签发的全部请求；不外调。 */
+	void RetireSessionAbilityRequests(const TSharedPtr<FPlayerInputSession>& Session);
 	bool IsAbilityActionBindingCurrent(const TSharedPtr<FAbilityActionBinding>& Binding) const;
 	void Input_AbilityActionTriggered(const FInputActionInstance& ActionInstance,
 		const TSharedPtr<FAbilityActionBinding>& Binding);
 	void Input_AbilityActionReleased(const FInputActionInstance& ActionInstance,
 		const TSharedPtr<FAbilityActionBinding>& Binding);
-	/** Seals records and removes only their own session membership before any cleanup callout. */
-	static TArray<FGGYGOAbilityInputRequestIdentity> RetireAbilityInputObservations(
-		const TArray<TSharedPtr<FAbilityInputObservation>>& Observations);
-	void InvalidateAbilityInputObservations(const TArray<TSharedPtr<FAbilityInputObservation>>& Observations);
+	/** 以 Invalidated 结束该动作当前请求并清空身份；按住状态不变，释放前不再请求。 */
+	void InvalidateCurrentAbilityInputRequest(FAbilityActionBinding& Binding);
+	/** 每个动作每种 Hero 侧拒绝原因只记一次 Warning。 */
+	void ReportAbilityInputOnce(FAbilityActionBinding& Binding, FName Reason, const FString& Detail) const;
 	void InvalidateAbilityActionBinding(const TSharedPtr<FAbilityActionBinding>& Binding);
 
 protected:
-	/** Register before replay; Ready associates only an already established input session. */
+	/** 订阅本 Pawn 的 ASC 就绪／释放；已就绪时立即回放。Ready 只关联已建立的输入会话。 */
 	bool PrepareLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* Extension, FString& OutError);
-	/** Derived query of the exact consumed resource; no input or movement permission. */
+	/** 订阅已消费且仍就绪的 ASC；不授予输入或移动权限。 */
 	UGGYGOAbilitySystemComponent* GetReadyLocalAbilitySystemComponent() const;
-	/** @return ASC of this input session's exact Ready H association, or nullptr when unavailable.
-	 *  Read-only: never follows a successor ASC or changes input/held state. */
+	/** 当前输入会话关联的就绪 ASC；只读，不跟随后继 ASC，不改输入／按住状态。 */
 	UGGYGOAbilitySystemComponent* GetInputSessionAbilitySystem() const;
-	/** Retire this original notice record and its own accepted input requests. */
+	/** 退订并按来源结束本会话已被接受的输入请求。 */
 	void ReleaseLocalAbilitySystemSubscription();
 
 private:
-	void ConsumeLocalAbilitySystemNotice(
-		const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
-		const FGGYGOPawnASCLocalNotice& Notice);
-	TSharedPtr<FLocalAbilitySystemSubscription> LocalAbilitySystemSubscription;
+	void ConsumeLocalAbilitySystemNotice(const FGGYGOPawnASCNotice& Notice);
+	FGGYGOLocalASCSubscription LocalASCSubscription;
 };
 
 /** Original context for the native parameterless dynamic notification; never a movement source. */

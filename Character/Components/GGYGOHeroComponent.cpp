@@ -57,9 +57,15 @@ struct UGGYGOHeroComponent::FPlayerInputSession
 	TArray<uint32> BindHandles;
 	TArray<FRegisteredMapping> Mappings;
 	TArray<TSharedPtr<FAbilityActionBinding>> ActionBindings;
-	TArray<TSharedPtr<FAbilityInputObservation>> Observations;
-	TSharedPtr<FAbilityInputAssociation> AbilityAssociation;
+	/** 本会话当前关联的 ASC 绑定资源；未关联时为空。资源变化或会话退役时，
+	 *  按 SourceKey 让原 ASC 一次结束本会话签发的全部请求（含已释放、仍在缓冲期的请求）。 */
+	FGGYGOPawnASCResourceHandle AssociatedResource;
 	bool bRetired = false;
+
+	FGGYGOAbilityInputSourceKey MakeSourceKey(const UGGYGOHeroComponent* Hero) const
+	{
+		return FGGYGOAbilityInputSourceKey{Hero, Generation};
+	}
 };
 
 struct UGGYGOHeroComponent::FAbilityActionBinding
@@ -75,104 +81,15 @@ struct UGGYGOHeroComponent::FAbilityActionBinding
 	const TWeakPtr<FPlayerInputSession> Session;
 	const FString SourceActionPath;
 	bool bRetired = false;
-	TSharedPtr<FAbilityInputObservation> Observation;
+	/** 本次按住已开始（首个 Triggered 到 Completed/Canceled）；按住期间不产生新请求。 */
+	bool bPressed = false;
+	/** 本次按下的请求：Tag、截止与移动评价 Token 在首个 Triggered 固定；Identity 只由首次 Receive 写入。
+	 *  按住期间 Identity 未分配（首次被拒、ASC 未就绪或关联已变化）时，本次按住不再请求。 */
+	FGGYGOAbilityInputRetryRequest CurrentRequest;
+	/** 已诊断过的 Hero 侧拒绝原因；每个动作每种原因只报一次。 */
+	TSet<FName> ReportedReasons;
 };
 
-struct UGGYGOHeroComponent::FAbilityInputObservation
-{
-	FAbilityInputObservation(const TSharedPtr<FAbilityActionBinding>& InBinding, double InDeadline,
-		const FGGYGOMovementInputEvaluationToken& InEvaluationToken)
-		: Binding(InBinding), Session(InBinding->Session), Request{InBinding->InputTag, {}, InDeadline, InEvaluationToken}
-	{
-	}
-
-	const TWeakPtr<FAbilityActionBinding> Binding;
-	const TWeakPtr<FPlayerInputSession> Session;
-	// First Receive's exact H association; never replaced by later Ready or Triggered.
-	TWeakPtr<FAbilityInputAssociation> Association;
-	// Tag/deadline are fixed at observation; Identity can only be supplied by the first Receive.
-	FGGYGOAbilityInputRetryRequest Request;
-	bool bActionEnded = false;
-	bool bInvalidated = false;
-};
-
-struct UGGYGOHeroComponent::FLocalAbilitySystemSubscription
-{
-	FLocalAbilitySystemSubscription(UGGYGOPawnExtensionComponent* InExtension, APawn* InPawn)
-		: Extension(InExtension), Pawn(InPawn)
-	{}
-
-	~FLocalAbilitySystemSubscription() { Retire(); }
-
-	void AcceptReturnedHandle(FDelegateHandle ReturnedHandle)
-	{
-		if (bRetired)
-		{
-			if (ReturnedHandle.IsValid())
-			{
-				if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
-				{
-					OriginalExtension->UnregisterLocalAbilitySystemNotice(ReturnedHandle);
-				}
-			}
-			return;
-		}
-		check(!NoticeHandle.IsValid());
-		NoticeHandle = ReturnedHandle;
-	}
-
-	void Retire()
-	{
-		// Seal this original record before native removal; Hero coordinates its owned resources.
-		bRetired = true;
-		Resource = FGGYGOPawnASCResourceHandle{};
-		AssociatedInputSession.Reset();
-		const FDelegateHandle OriginalHandle = NoticeHandle;
-		NoticeHandle.Reset();
-		if (OriginalHandle.IsValid())
-		{
-			if (UGGYGOPawnExtensionComponent* OriginalExtension = Extension.Get())
-			{
-				OriginalExtension->UnregisterLocalAbilitySystemNotice(OriginalHandle);
-			}
-		}
-	}
-
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> Extension;
-	const TWeakObjectPtr<APawn> Pawn;
-	FDelegateHandle NoticeHandle{};
-	FGGYGOPawnASCResourceHandle Resource{};
-	TWeakPtr<FPlayerInputSession> AssociatedInputSession;
-	bool bRetired = false;
-};
-
-// Exact association between an existing native input session and a consumed H resource.
-struct UGGYGOHeroComponent::FAbilityInputAssociation
-{
-	FAbilityInputAssociation(const TSharedPtr<FLocalAbilitySystemSubscription>& InSubscription,
-		const FGGYGOPawnASCResourceHandle& InResource, const TSharedPtr<FPlayerInputSession>& InSession)
-		: Subscription(InSubscription), Resource(InResource), Session(InSession)
-	{}
-
-	const TWeakPtr<FLocalAbilitySystemSubscription> Subscription;
-	const FGGYGOPawnASCResourceHandle Resource;
-	const TWeakPtr<FPlayerInputSession> Session;
-	bool bRetired = false;
-};
-
-namespace
-{
-	void EndOriginalAbilityInputRequests(const TArray<FGGYGOAbilityInputRequestIdentity>& Identities)
-	{
-		for (const FGGYGOAbilityInputRequestIdentity& Identity : Identities)
-		{
-			if (UGGYGOAbilitySystemComponent* OriginalASC = Identity.SourceASC.Get())
-			{
-				OriginalASC->EndAbilityInputRequest(Identity, EGGYGOAbilityInputRequestEndKind::Invalidated);
-			}
-		}
-	}
-}
 
 // Resource identity and diagnostic cache only. No physical facts, request issuer or execution state.
 struct FGGYGOHeroMovementInputScope
@@ -912,20 +829,13 @@ void UGGYGOHeroComponent::ReleasePlayerInput()
 	if (PreviousSession.IsValid())
 	{
 		PreviousSession->bRetired = true;
-		const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = LocalAbilitySystemSubscription;
-		if (OriginalSubscription.IsValid() && OriginalSubscription->AssociatedInputSession.Pin() == PreviousSession)
-		{
-			OriginalSubscription->AssociatedInputSession.Reset();
-		}
 		for (const TSharedPtr<FAbilityActionBinding>& Binding : PreviousSession->ActionBindings)
 		{
 			Binding->bRetired = true;
 		}
 	}
-	// Seal local records before Source/CMC or ASC cleanup can install a successor.
-	TArray<FGGYGOAbilityInputRequestIdentity> OriginalIdentities = PreviousSession.IsValid()
-		? RetireAbilityInputObservations(PreviousSession->Observations) : TArray<FGGYGOAbilityInputRequestIdentity>{};
-	OriginalIdentities.Append(RetireAbilityInputAssociation(PreviousSession));
+	// 先结束本会话签发的全部 ASC 请求，再做可能外调的 Source/CMC 清理。
+	RetireSessionAbilityRequests(PreviousSession);
 	const TWeakObjectPtr<UGGYGOInputComponent> PreviousComponent =
 		PreviousSession.IsValid() ? PreviousSession->Component : TWeakObjectPtr<UGGYGOInputComponent>{};
 	const TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> PreviousSubsystem =
@@ -947,7 +857,6 @@ void UGGYGOHeroComponent::ReleasePlayerInput()
 		Movement->SetForceWalkRequested(false);
 	}
 	GGYGOHeroMovementInput::Retire(PreviousMovementScope, TEXT("HeroInputReleased"));
-	EndOriginalAbilityInputRequests(OriginalIdentities);
 
 	if (UGGYGOInputComponent* InputComponent = PreviousComponent.Get())
 	{
@@ -1426,54 +1335,44 @@ bool UGGYGOHeroComponent::IsAbilityActionBindingCurrent(const TSharedPtr<FAbilit
 		&& Binding->SourceAction.IsValid() && Session->ActionBindings.Contains(Binding);
 }
 
-TArray<FGGYGOAbilityInputRequestIdentity> UGGYGOHeroComponent::RetireAbilityInputObservations(
-	const TArray<TSharedPtr<FAbilityInputObservation>>& Observations)
+void UGGYGOHeroComponent::InvalidateCurrentAbilityInputRequest(FAbilityActionBinding& Binding)
 {
-	const TArray<TSharedPtr<FAbilityInputObservation>> OriginalObservations = Observations;
-	TArray<FGGYGOAbilityInputRequestIdentity> OriginalIdentities;
-	for (const TSharedPtr<FAbilityInputObservation>& Observation : OriginalObservations)
+	const FGGYGOAbilityInputRequestIdentity Identity = Binding.CurrentRequest.Identity;
+	Binding.CurrentRequest.Identity = FGGYGOAbilityInputRequestIdentity{};
+	if (UGGYGOAbilitySystemComponent* OriginalASC = Identity.IsAssigned() ? Identity.SourceASC.Get() : nullptr)
 	{
-		if (Observation && !Observation->bInvalidated)
-		{
-			Observation->bInvalidated = true;
-			if (Observation->Request.Identity.IsAssigned()) { OriginalIdentities.AddUnique(Observation->Request.Identity); }
-		}
+		OriginalASC->EndAbilityInputRequest(Identity, EGGYGOAbilityInputRequestEndKind::Invalidated);
 	}
-	for (const TSharedPtr<FAbilityInputObservation>& Observation : OriginalObservations)
-	{
-		if (Observation)
-		{
-			if (const TSharedPtr<FPlayerInputSession> Session = Observation->Session.Pin())
-			{
-				Session->Observations.Remove(Observation);
-			}
-		}
-	}
-	// Active binding latches retain these retired observations until their Action ends.
-	return OriginalIdentities;
 }
 
-void UGGYGOHeroComponent::InvalidateAbilityInputObservations(
-	const TArray<TSharedPtr<FAbilityInputObservation>>& Observations)
+void UGGYGOHeroComponent::ReportAbilityInputOnce(FAbilityActionBinding& Binding, FName Reason, const FString& Detail) const
 {
-	EndOriginalAbilityInputRequests(RetireAbilityInputObservations(Observations));
-	// No Hero fields are touched after cleanup, which may install a successor.
+	if (Binding.ReportedReasons.Contains(Reason)) { return; }
+	Binding.ReportedReasons.Add(Reason);
+	UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("Input/Hero Trigger rejected: Hero=%s Action=%s Tag=%s Reason=%s %s"),
+		*GetPathName(), *Binding.SourceActionPath, *Binding.InputTag.ToString(), *Reason.ToString(), *Detail);
 }
 
 void UGGYGOHeroComponent::InvalidateAbilityActionBinding(const TSharedPtr<FAbilityActionBinding>& Binding)
 {
 	if (!Binding || Binding->bRetired) { return; }
 	Binding->bRetired = true;
-	TArray<TSharedPtr<FAbilityInputObservation>> OriginalObservations;
-	if (const TSharedPtr<FPlayerInputSession> Session = Binding->Session.Pin())
+	Binding->bPressed = false;
+	InvalidateCurrentAbilityInputRequest(*Binding);
+}
+
+void UGGYGOHeroComponent::RetireSessionAbilityRequests(const TSharedPtr<FPlayerInputSession>& Session)
+{
+	if (!Session.IsValid()) { return; }
+	// 先在本地摘掉关联与各动作的请求身份；按住中的动作保持 bPressed，释放前不再请求。
+	UGGYGOAbilitySystemComponent* const OriginalASC = Session->AssociatedResource.GetIdentity().ASC.Get();
+	Session->AssociatedResource = FGGYGOPawnASCResourceHandle{};
+	for (const TSharedPtr<FAbilityActionBinding>& Binding : Session->ActionBindings)
 	{
-		for (const TSharedPtr<FAbilityInputObservation>& Observation : Session->Observations)
-		{
-			if (Observation->Binding.Pin() == Binding) { OriginalObservations.Add(Observation); }
-		}
+		Binding->CurrentRequest.Identity = FGGYGOAbilityInputRequestIdentity{};
 	}
-	if (Binding->Observation) { OriginalObservations.AddUnique(Binding->Observation); }
-	InvalidateAbilityInputObservations(OriginalObservations);
+	// 原 ASC 按来源结束本会话签发的全部请求（含已释放、仍在缓冲期的）；该调用不外调。
+	if (OriginalASC) { OriginalASC->EndAbilityInputRequestsFromSource(Session->MakeSourceKey(this)); }
 }
 
 void UGGYGOHeroComponent::Input_AbilityActionTriggered(const FInputActionInstance& ActionInstance,
@@ -1492,113 +1391,59 @@ void UGGYGOHeroComponent::Input_AbilityActionTriggered(const FInputActionInstanc
 		InvalidateAbilityActionBinding(Binding);
 		return;
 	}
-	const UWorld* World = GetWorld();
-	const double Now = World ? World->GetTimeSeconds() : -1.0;
-	if (World && FMath::IsFinite(Now)) { PruneEndedAbilityInputObservations(Now); }
-	const bool bFirstTrigger = !Binding->Observation;
+	FGGYGOAbilityInputRetryRequest& Request = Binding->CurrentRequest;
+	const bool bFirstTrigger = !Binding->bPressed;
 	if (bFirstTrigger)
 	{
-		FGGYGOMovementInputEvaluationToken EvaluationToken;
+		// 首个 Triggered 固定本次按下的 Tag、截止与移动评价 Token；按住期间不再采样。
+		Binding->bPressed = true;
+		Request = FGGYGOAbilityInputRetryRequest{Binding->InputTag, {},
+			UGGYGOAbilitySystemComponent::NoAbilityInputRetryDeadline, {}};
 		const TSharedPtr<FGGYGOHeroMovementInputScope> MovementScope = MovementInputScope;
 		if (IsMovementInputScopeCurrent(MovementScope))
 		{
+			// 缺源保留未分配 Token；需要方向的消费者明确拒绝，普通能力不新增移动前置。
 			FString EvaluationError;
 			MovementScope->Source->CaptureMovementInputEvaluationToken(
-				MovementScope->Session, EvaluationToken, EvaluationError);
+				MovementScope->Session, Request.OriginalEvaluationToken, EvaluationError);
 		}
-		// 缺源保留未分配 Token；需要方向的消费者明确拒绝，普通能力不新增移动前置。
+		const UWorld* World = GetWorld();
+		const double Now = World ? World->GetTimeSeconds() : -1.0;
 		const double Window = static_cast<double>(InputBufferWindow);
 		const double Deadline = Now + Window;
-		const bool bValidDeadline = World && FMath::IsFinite(Now) && Now >= 0.0
-			&& FMath::IsFinite(Window) && Window >= 0.0 && FMath::IsFinite(Deadline);
-		const TSharedPtr<FAbilityInputObservation> Observation = MakeShared<FAbilityInputObservation>(
-			Binding, bValidDeadline ? Deadline : UGGYGOAbilitySystemComponent::NoAbilityInputRetryDeadline,
-			EvaluationToken);
-		Binding->Observation = Observation;
-		Binding->Session.Pin()->Observations.Add(Observation);
-		// The original observation is installed even on failure; later Ready/Triggered cannot issue it.
-		if (!bValidDeadline)
+		if (!World || !FMath::IsFinite(Now) || Now < 0.0 || !FMath::IsFinite(Window) || Window < 0.0
+			|| !FMath::IsFinite(Deadline))
 		{
-			UE_LOG(LogGGYGOAbilitySystem, Error,
-				TEXT("Input/Hero Trigger rejected: Hero=%s Action=%s Tag=%s Window=%g Reason=InvalidWorldOrBufferWindow"),
-				*GetPathName(), *Binding->SourceActionPath, *Binding->InputTag.ToString(), Window);
-			return;
+			ReportAbilityInputOnce(*Binding, TEXT("InvalidWorldOrBufferWindow"), FString::Printf(TEXT("Window=%g"), Window));
+			return; // 本次按住以空身份锁存，释放前不再请求。
 		}
+		Request.OriginalDeadline = Deadline;
 	}
-	const TSharedPtr<FAbilityInputObservation> Original = Binding->Observation;
-	if (Original->bInvalidated || Original->bActionEnded || (!bFirstTrigger && !Original->Request.Identity.IsAssigned()))
+	else if (!Request.Identity.IsAssigned())
 	{
+		return; // 首次被拒、ASC 未就绪或关联已变化：本次按住不重试。
+	}
+	UGGYGOAbilitySystemComponent* ASC = GetInputSessionAbilitySystem();
+	if (!ASC || (!bFirstTrigger && !Request.Identity.SourceASC.HasSameIndexAndSerialNumber(ASC)))
+	{
+		if (bFirstTrigger) { ReportAbilityInputOnce(*Binding, TEXT("ASCNotReady"), TEXT("original press latched")); }
+		else { InvalidateCurrentAbilityInputRequest(*Binding); }
 		return;
 	}
-	const TSharedPtr<FPlayerInputSession> OriginalSession = Binding->Session.Pin();
-	const TSharedPtr<FAbilityInputAssociation> OriginalAssociation = OriginalSession->AbilityAssociation;
-	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> ExpectedASC(GetInputSessionAbilitySystem());
-	if (!ExpectedASC.IsValid())
-	{
-		if (bFirstTrigger)
-		{
-			UE_LOG(LogGGYGOAbilitySystem, Warning,
-				TEXT("Input/Hero Trigger rejected: Hero=%s Action=%s Tag=%s Reason=ASCNotReady; original observation latched"),
-				*GetPathName(), *Binding->SourceActionPath, *Binding->InputTag.ToString());
-		}
-		else
-		{
-			InvalidateAbilityInputObservations({Original});
-		}
-		return;
-	}
-	if (!bFirstTrigger && (Original->Association.Pin() != OriginalAssociation
-		|| !Original->Request.Identity.SourceASC.HasSameIndexAndSerialNumber(ExpectedASC)))
-	{
-		InvalidateAbilityInputObservations({Original});
-		return;
-	}
-	if (bFirstTrigger) { Original->Association = OriginalAssociation; }
-	const FGGYGOAbilityInputRequestIdentity PreviousIdentity = Original->Request.Identity;
-	const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
-	const FGGYGOAbilityInputRequestResult Result = ExpectedASC->ReceiveAbilityInputRequest(
-		Original->Request.InputTag, PreviousIdentity, Original->Request.OriginalDeadline, Original->Request.OriginalEvaluationToken);
-	UGGYGOHeroComponent* OriginalHero = WeakHero.Get();
-	if (!OriginalHero || !OriginalHero->IsAbilityActionBindingCurrent(Binding)
-		|| Binding->Observation != Original || Original->bInvalidated || Original->bActionEnded
-		|| !ExpectedASC.IsValid() || OriginalHero->PlayerInputSession != OriginalSession
-		|| OriginalSession->AbilityAssociation != OriginalAssociation
-		|| !OriginalHero->IsAbilityInputAssociationCurrent(OriginalAssociation))
-	{
-		if (OriginalHero) { OriginalHero->InvalidateAbilityInputObservations({Original}); }
-		else
-		{
-			Original->bInvalidated = true;
-			if (UGGYGOAbilitySystemComponent* OriginalASC = PreviousIdentity.SourceASC.Get())
-			{
-				OriginalASC->EndAbilityInputRequest(PreviousIdentity, EGGYGOAbilityInputRequestEndKind::Invalidated);
-			}
-		}
-		// A first Receive may return an ID after its association was already retired.
-		if (bFirstTrigger && Result.Identity.IsAssigned()
-			&& Result.Identity.SourceASC.HasSameIndexAndSerialNumber(ExpectedASC))
-		{
-			if (UGGYGOAbilitySystemComponent* OriginalASC = ExpectedASC.Get())
-			{
-				OriginalASC->EndAbilityInputRequest(Result.Identity, EGGYGOAbilityInputRequestEndKind::Invalidated);
-			}
-		}
-		return;
-	}
+	// Receive 只改 ASC 输入表与 Spec.InputPressed，不外调；返回后无需重验 Hero/Binding/Session。
+	const TSharedPtr<FPlayerInputSession> Session = Binding->Session.Pin();
+	const FGGYGOAbilityInputRequestResult Result = ASC->ReceiveAbilityInputRequest(Request.InputTag, Request.Identity,
+		Request.OriginalDeadline, Request.OriginalEvaluationToken, Session->MakeSourceKey(this));
 	const bool bAccepted = Result.Outcome == EGGYGOAbilityInputRequestOutcome::Accepted
 		|| Result.Outcome == EGGYGOAbilityInputRequestOutcome::AlreadyApplied;
 	if (bFirstTrigger)
 	{
-		if (bAccepted && Result.Identity.IsAssigned()
-			&& Result.Identity.SourceASC.HasSameIndexAndSerialNumber(ExpectedASC))
-		{
-			Original->Request.Identity = Result.Identity;
-		}
-		// Rejection leaves the original empty ID latched, never retries with an empty Previous.
+		// 被拒时保持空身份锁存；ASC 已按原因记录诊断。
+		if (bAccepted && Result.Identity.IsAssigned()) { Request.Identity = Result.Identity; }
 	}
-	else if (!bAccepted || Result.Identity != PreviousIdentity)
+	else if (!bAccepted || Result.Identity != Request.Identity)
 	{
-		OriginalHero->InvalidateAbilityInputObservations({Original});
+		InvalidateCurrentAbilityInputRequest(*Binding);
 	}
 }
 
@@ -1618,44 +1463,15 @@ void UGGYGOHeroComponent::Input_AbilityActionReleased(const FInputActionInstance
 		InvalidateAbilityActionBinding(Binding);
 		return;
 	}
-	const TSharedPtr<FAbilityInputObservation> Original = Binding->Observation;
-	if (!Original) { return; }
-	Binding->Observation.Reset();
-	Original->bActionEnded = true;
-	if (Original->bInvalidated || !Original->Request.Identity.IsAssigned())
-	{
-		if (const TSharedPtr<FPlayerInputSession> Session = Original->Session.Pin()) { Session->Observations.Remove(Original); }
-		return;
-	}
-	const FGGYGOAbilityInputRequestIdentity Identity = Original->Request.Identity;
-	const TWeakObjectPtr<UGGYGOAbilitySystemComponent> OriginalASC = Identity.SourceASC;
-	if (!OriginalASC.IsValid() || !PlayerInputSession.IsValid()
-		|| Original->Association.Pin() != PlayerInputSession->AbilityAssociation
-		|| GetInputSessionAbilitySystem() != OriginalASC.Get())
-	{
-		InvalidateAbilityInputObservations({Original});
-		return;
-	}
-	const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
-	const FGGYGOAbilityInputRequestResult Result = OriginalASC->EndAbilityInputRequest(
-		Identity, EGGYGOAbilityInputRequestEndKind::Released);
-	if (Result.Outcome != EGGYGOAbilityInputRequestOutcome::Accepted
-		&& Result.Outcome != EGGYGOAbilityInputRequestOutcome::AlreadyApplied)
-	{
-		// Failed release remains a failure; exact retirement only returns this association's resource.
-		if (UGGYGOHeroComponent* OriginalHero = WeakHero.Get())
-		{
-			OriginalHero->InvalidateAbilityInputObservations({Original});
-		}
-		else
-		{
-			Original->bInvalidated = true;
-			if (UGGYGOAbilitySystemComponent* ASC = OriginalASC.Get())
-			{
-				ASC->EndAbilityInputRequest(Identity, EGGYGOAbilityInputRequestEndKind::Invalidated);
-			}
-		}
-	}
+	if (!Binding->bPressed) { return; }
+	const FGGYGOAbilityInputRequestIdentity Identity = Binding->CurrentRequest.Identity;
+	Binding->bPressed = false;
+	Binding->CurrentRequest = FGGYGOAbilityInputRetryRequest{};
+	UGGYGOAbilitySystemComponent* const OriginalASC = Identity.IsAssigned() ? Identity.SourceASC.Get() : nullptr;
+	if (!OriginalASC) { return; }
+	// 关联仍是同一 ASC 时以 Released 结束（保留缓冲期内的单击）；被拒时 ASC 已诊断，身份已在本地结束。
+	OriginalASC->EndAbilityInputRequest(Identity, GetInputSessionAbilitySystem() == OriginalASC
+		? EGGYGOAbilityInputRequestEndKind::Released : EGGYGOAbilityInputRequestEndKind::Invalidated);
 }
 
 bool UGGYGOHeroComponent::HasValidPlayerInputSession() const
@@ -1673,101 +1489,32 @@ bool UGGYGOHeroComponent::HasValidPlayerInputSession() const
 		&& Subsystem->GetPlayerInput() == Session->PlayerInput.Get();
 }
 
-bool UGGYGOHeroComponent::IsAbilityInputAssociationCurrent(const TSharedPtr<FAbilityInputAssociation>& Association) const
+bool UGGYGOHeroComponent::IsSessionAssociationCurrent(const TSharedPtr<FPlayerInputSession>& Session) const
 {
-	if (!Association.IsValid() || Association->bRetired || !HasValidPlayerInputSession()) { return false; }
-	const TSharedPtr<FPlayerInputSession> Session = Association->Session.Pin();
-	const TSharedPtr<FLocalAbilitySystemSubscription> Subscription = Association->Subscription.Pin();
-	if (Session != PlayerInputSession || Session->AbilityAssociation != Association
-		|| !Subscription.IsValid() || LocalAbilitySystemSubscription != Subscription || Subscription->bRetired
-		|| !Subscription->Resource.HasSameResource(Association->Resource)
-		|| Subscription->AssociatedInputSession.Pin() != Session)
+	if (!Session.IsValid() || Session != PlayerInputSession || !HasValidPlayerInputSession()
+		|| !Session->AssociatedResource.HasSameResource(LocalASCSubscription.GetConsumedResource()))
 	{
 		return false;
 	}
-	const FGGYGOPawnASCResourceIdentity Identity = Association->Resource.GetIdentity();
-	return Identity.ASC.IsValid() && GetReadyLocalAbilitySystemComponent() == Identity.ASC.Get();
+	const UGGYGOAbilitySystemComponent* ASC = Session->AssociatedResource.GetIdentity().ASC.Get();
+	return ASC && GetReadyLocalAbilitySystemComponent() == ASC;
 }
 
 UGGYGOAbilitySystemComponent* UGGYGOHeroComponent::GetInputSessionAbilitySystem() const
 {
-	const TSharedPtr<FAbilityInputAssociation> Association =
-		PlayerInputSession.IsValid() ? PlayerInputSession->AbilityAssociation : nullptr;
-	return IsAbilityInputAssociationCurrent(Association) ? Association->Resource.GetIdentity().ASC.Get() : nullptr;
-}
-
-TArray<FGGYGOAbilityInputRequestIdentity> UGGYGOHeroComponent::RetireAbilityInputAssociation(
-	const TSharedPtr<FPlayerInputSession>& Session)
-{
-	if (!Session.IsValid()) { return {}; }
-	const TSharedPtr<FAbilityInputAssociation> Association = MoveTemp(Session->AbilityAssociation);
-	if (!Association.IsValid()) { return {}; }
-	Association->bRetired = true;
-	// Closing retires only this H association. Keep the subscription's original native
-	// session provenance until Released or explicit native session retirement returns it.
-	TArray<TSharedPtr<FAbilityInputObservation>> OriginalObservations;
-	for (const TSharedPtr<FAbilityInputObservation>& Observation : Session->Observations)
-	{
-		if (Observation->Association.Pin() == Association) { OriginalObservations.Add(Observation); }
-	}
-	return RetireAbilityInputObservations(OriginalObservations);
+	return IsSessionAssociationCurrent(PlayerInputSession)
+		? PlayerInputSession->AssociatedResource.GetIdentity().ASC.Get() : nullptr;
 }
 
 void UGGYGOHeroComponent::AssociateReadyAbilitySystemWithInput()
 {
-	if (!HasValidPlayerInputSession()) { return; }
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = LocalAbilitySystemSubscription;
-	if (!OriginalSubscription.IsValid() || !GetReadyLocalAbilitySystemComponent()) { return; }
-	const TSharedPtr<FPlayerInputSession> OriginalSession = PlayerInputSession;
-	const FGGYGOPawnASCResourceHandle OriginalResource = OriginalSubscription->Resource;
-	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
-	const TSharedPtr<FPlayerInputSession> AssociatedSession = OriginalSubscription->AssociatedInputSession.Pin();
-	if (AssociatedSession.IsValid() && AssociatedSession != OriginalSession)
-	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("[Input/Hero] Association rejected: Hero='%s' Extension='%s' ASC='%s' InputGeneration=%llu Reason=OriginalResourceNamesDifferentLiveInputSession."),
-			*GetPathNameSafe(this), *GetPathNameSafe(OriginalSubscription->Extension.Get()), *GetPathNameSafe(Identity.ASC.Get()),
-			static_cast<unsigned long long>(OriginalSession->Generation));
-		return;
-	}
-	const TSharedPtr<FAbilityInputAssociation> Association = OriginalSession->AbilityAssociation;
-	if (Association.IsValid() && !Association->bRetired && Association->Session.Pin() == OriginalSession
-		&& Association->Subscription.Pin() == OriginalSubscription && Association->Resource.HasSameResource(OriginalResource)
-		&& AssociatedSession == OriginalSession)
-	{
-		return;
-	}
-	const TArray<FGGYGOAbilityInputRequestIdentity> OriginalIdentities = RetireAbilityInputAssociation(OriginalSession);
-	if (!OriginalIdentities.IsEmpty())
-	{
-		const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
-		EndOriginalAbilityInputRequests(OriginalIdentities);
-		UGGYGOHeroComponent* Hero = WeakHero.Get();
-		// Exact End may call out through failure diagnostics; only this original H/session can continue.
-		if (!Hero || Hero->PlayerInputSession != OriginalSession || OriginalSession->bRetired
-			|| OriginalSession->AbilityAssociation.IsValid()
-			|| Hero->LocalAbilitySystemSubscription != OriginalSubscription || OriginalSubscription->bRetired
-			|| !OriginalSubscription->Resource.HasSameResource(OriginalResource)
-			|| !Hero->HasValidPlayerInputSession() || Hero->GetReadyLocalAbilitySystemComponent() != Identity.ASC.Get())
-		{
-			return;
-		}
-	}
-	OriginalSession->AbilityAssociation = MakeShared<FAbilityInputAssociation>(
-		OriginalSubscription, OriginalResource, OriginalSession);
-	OriginalSubscription->AssociatedInputSession = OriginalSession;
-}
-
-void UGGYGOHeroComponent::PruneEndedAbilityInputObservations(double Now)
-{
-	if (!PlayerInputSession.IsValid()) { return; }
-	PlayerInputSession->Observations.RemoveAll([Now](const TSharedPtr<FAbilityInputObservation>& Observation)
-	{
-		return Observation->bInvalidated || (Observation->bActionEnded
-			&& (!Observation->Request.Identity.IsAssigned()
-				|| !FMath::IsFinite(Observation->Request.OriginalDeadline) || Now >= Observation->Request.OriginalDeadline));
-	});
-	// Active Action latches survive deadline expiry. ASC alone prunes finite retry work.
+	if (!HasValidPlayerInputSession() || !GetReadyLocalAbilitySystemComponent()) { return; }
+	const TSharedPtr<FPlayerInputSession> Session = PlayerInputSession;
+	const FGGYGOPawnASCResourceHandle Resource = LocalASCSubscription.GetConsumedResource();
+	if (Session->AssociatedResource.HasSameResource(Resource)) { return; }
+	// 资源变化：原 ASC 先按来源结束本会话的全部请求（不外调），再关联新资源。
+	RetireSessionAbilityRequests(Session);
+	Session->AssociatedResource = Resource;
 }
 
 bool UGGYGOHeroComponent::PrepareLocalAbilitySystemSubscription(
@@ -1775,262 +1522,69 @@ bool UGGYGOHeroComponent::PrepareLocalAbilitySystemSubscription(
 {
 	check(IsInGameThread());
 	OutError.Reset();
-	const FString ErrorContext = FString::Printf(
-		TEXT("[Input/Hero] LocalASC prepare: Hero='%s', Owner='%s', Extension='%s'"),
-		*GetPathNameSafe(this), *GetPathNameSafe(GetOwner()), *GetPathNameSafe(Extension));
-	const auto Reject = [&OutError, &ErrorContext](const TCHAR* Reason)
+	if (bEndingPlay || !IsValid(Extension) || Extension->GetOwner() != GetOwner())
 	{
-		OutError = FString::Printf(TEXT("%s, Reason='%s'."), *ErrorContext, Reason);
+		OutError = FString::Printf(TEXT("[Input/Hero] LocalASC subscribe rejected: Hero='%s', Owner='%s', Extension='%s'."),
+			*GetPathNameSafe(this), *GetPathNameSafe(GetOwner()), *GetPathNameSafe(Extension));
 		return false;
-	};
-	const TWeakObjectPtr<UGGYGOHeroComponent> OriginalHero(this);
-	const TWeakObjectPtr<UGGYGOPawnExtensionComponent> OriginalExtension(Extension);
-	const TWeakObjectPtr<APawn> OriginalPawn(Cast<APawn>(GetOwner()));
-	const auto IsOriginalTargetLive = [&]()
-	{
-		const UGGYGOHeroComponent* Hero = OriginalHero.Get();
-		const UGGYGOPawnExtensionComponent* Source = OriginalExtension.Get();
-		const APawn* Pawn = OriginalPawn.Get();
-		return Hero && !Hero->bEndingPlay && !Hero->IsBeingDestroyed()
-			&& !Hero->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			&& Source && !Source->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-			&& Pawn && !Pawn->IsActorBeingDestroyed()
-			&& Hero->GetOwner() == Pawn && Source->GetOwner() == Pawn;
-	};
-	if (!IsOriginalTargetLive())
-	{
-		return Reject(TEXT("requires a live Hero and its original Pawn Extension"));
 	}
-	if (LocalAbilitySystemSubscription.IsValid() && !LocalAbilitySystemSubscription->bRetired
-		&& LocalAbilitySystemSubscription->Extension.HasSameIndexAndSerialNumber(OriginalExtension)
-		&& LocalAbilitySystemSubscription->Pawn.HasSameIndexAndSerialNumber(OriginalPawn))
-	{
-		return true; // Original registration only, never a claim of Ready.
-	}
+	if (LocalASCSubscription.IsSubscribed() && LocalASCSubscription.GetExtension() == Extension) { return true; }
 	ReleaseLocalAbilitySystemSubscription();
-	UGGYGOHeroComponent* Hero = OriginalHero.Get();
-	if (!IsOriginalTargetLive() || !Hero || Hero->LocalAbilitySystemSubscription.IsValid())
+	const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
+	// 已就绪时立即回放 Ready；Ready 不建立输入，只关联已存在的输入会话。
+	LocalASCSubscription.Subscribe(Extension, [WeakHero](const FGGYGOPawnASCNotice& Notice)
 	{
-		return Reject(TEXT("original target or subscription changed while retiring the old record"));
-	}
-
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription =
-		MakeShared<FLocalAbilitySystemSubscription>(OriginalExtension.Get(), OriginalPawn.Get());
-	Hero->LocalAbilitySystemSubscription = OriginalSubscription;
-	const TWeakPtr<FLocalAbilitySystemSubscription> WeakSubscription(OriginalSubscription);
-	const FDelegateHandle ReturnedHandle = OriginalExtension.Get()->RegisterLocalAbilitySystemNoticeAndCall(
-		FGGYGOPawnASCLocalNoticeDelegate::FDelegate::CreateWeakLambda(Hero,
-			[OriginalHero, WeakSubscription](const FGGYGOPawnASCLocalNotice& Notice)
-			{
-				const TSharedPtr<FLocalAbilitySystemSubscription> Subscription = WeakSubscription.Pin();
-				if (UGGYGOHeroComponent* LiveHero = OriginalHero.Get())
-				{
-					if (Subscription.IsValid())
-					{
-						LiveHero->ConsumeLocalAbilitySystemNotice(Subscription, Notice);
-					}
-				}
-			}));
-	// The original stack record owns this return even if synchronous Ready retired/replaced it.
-	OriginalSubscription->AcceptReturnedHandle(ReturnedHandle);
-	Hero = OriginalHero.Get();
-	if (!ReturnedHandle.IsValid() || !IsOriginalTargetLive() || !Hero
-		|| Hero->LocalAbilitySystemSubscription != OriginalSubscription || OriginalSubscription->bRetired)
-	{
-		if (Hero && Hero->LocalAbilitySystemSubscription == OriginalSubscription)
-		{
-			Hero->ReleaseLocalAbilitySystemSubscription();
-		}
-		else
-		{
-			OriginalSubscription->Retire();
-		}
-		return Reject(ReturnedHandle.IsValid()
-			? TEXT("original record changed during immediate replay; only its returned handle was retired")
-			: TEXT("Extension returned no valid notice handle"));
-	}
-	return true; // A valid subscription can still have no Ready resource.
+		if (UGGYGOHeroComponent* Hero = WeakHero.Get()) { Hero->ConsumeLocalAbilitySystemNotice(Notice); }
+	});
+	return true;
 }
 
 void UGGYGOHeroComponent::ReleaseLocalAbilitySystemSubscription()
 {
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = MoveTemp(LocalAbilitySystemSubscription);
-	if (!OriginalSubscription.IsValid()) { return; }
-	const TSharedPtr<FPlayerInputSession> Session = OriginalSubscription->AssociatedInputSession.Pin();
-	TArray<FGGYGOAbilityInputRequestIdentity> OriginalIdentities;
-	if (Session.IsValid() && Session->AbilityAssociation.IsValid()
-		&& Session->AbilityAssociation->Subscription.Pin() == OriginalSubscription)
+	const TSharedPtr<FPlayerInputSession> Session = PlayerInputSession;
+	if (Session.IsValid() && Session->AssociatedResource.HasResource())
 	{
-		OriginalIdentities = RetireAbilityInputAssociation(Session);
+		RetireSessionAbilityRequests(Session);
 	}
-	OriginalSubscription->Retire();
-	EndOriginalAbilityInputRequests(OriginalIdentities);
-	// Exact cleanup uses captured records only, even if notice removal installed a successor.
+	LocalASCSubscription.Unsubscribe();
 }
 
-void UGGYGOHeroComponent::ConsumeLocalAbilitySystemNotice(
-	const TSharedPtr<FLocalAbilitySystemSubscription>& ExpectedSubscription,
-	const FGGYGOPawnASCLocalNotice& Notice)
+void UGGYGOHeroComponent::ConsumeLocalAbilitySystemNotice(const FGGYGOPawnASCNotice& Notice)
 {
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = ExpectedSubscription;
-	if (!OriginalSubscription.IsValid() || OriginalSubscription->bRetired
-		|| LocalAbilitySystemSubscription != OriginalSubscription) { return; }
-	const FGGYGOPawnASCLocalNotice OriginalNotice = Notice;
-	const FGGYGOPawnASCResourceHandle OriginalResource = OriginalNotice.Resource;
-	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
-	const auto Reject = [&](const TCHAR* Reason)
+	if (Notice.Kind == EGGYGOPawnASCNoticeKind::Ready)
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Verbose,
-			TEXT("[Input/Hero] LocalASC notice rejected: Hero='%s', Extension='%s', Pawn='%s', ASC='%s', Kind=%u, Reason='%s'."),
-			*GetPathNameSafe(this), *GetPathNameSafe(OriginalSubscription->Extension.Get()),
-			*GetPathNameSafe(Identity.Pawn.Get()), *GetPathNameSafe(Identity.ASC.Get()),
-			static_cast<uint32>(OriginalNotice.Kind), Reason);
-	};
-	if (!OriginalResource.HasResource())
-	{
-		Reject(TEXT("notice has no original opaque resource"));
+		AssociateReadyAbilitySystemWithInput();
 		return;
 	}
-	if (OriginalNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Closing)
+	// Released：本会话关联的是这次绑定时退出输入；相机覆盖随原 Avatar 一起复位。
+	const TSharedPtr<FPlayerInputSession> Session = PlayerInputSession;
+	const bool bOwnsInput = Session.IsValid() && Session->AssociatedResource.HasSameResource(Notice.Resource);
+	const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
+	const uint64 OriginalCameraGeneration = LastAbilityCameraModeRequestGeneration;
+	if (bOwnsInput)
 	{
-		if (!OriginalSubscription->Resource.HasSameResource(OriginalResource))
-		{
-			Reject(TEXT("Closing does not name the consumed original resource; successor is retained"));
-			return;
-		}
-		const TSharedPtr<FPlayerInputSession> OriginalSession = OriginalSubscription->AssociatedInputSession.Pin();
-		const TSharedPtr<FAbilityInputAssociation> OriginalAssociation =
-			OriginalSession.IsValid() ? OriginalSession->AbilityAssociation : nullptr;
-		if (OriginalAssociation.IsValid() && OriginalAssociation->Subscription.Pin() == OriginalSubscription
-			&& OriginalAssociation->Resource.HasSameResource(OriginalResource))
-		{
-			// Original H loss of admission needs no Ready/ASC/Pawn qualification. Seal
-			// local observations first; exact cleanup cannot touch a reentrant successor.
-			EndOriginalAbilityInputRequests(RetireAbilityInputAssociation(OriginalSession));
-		}
-		// Native bindings and the active Action's first observation survive this H boundary.
+		ReleasePlayerInput();
+	}
+	// ReleasePlayerInput 会外调 Enhanced Input；回调里出现新绑定、新输入会话或新相机请求时不再复位。
+	UGGYGOHeroComponent* Hero = WeakHero.Get();
+	if (!Hero || Hero->bEndingPlay || Hero->LocalASCSubscription.GetConsumedResource().HasResource()
+		|| Hero->LastAbilityCameraModeRequestGeneration != OriginalCameraGeneration
+		|| (bOwnsInput ? Hero->PlayerInputSession.IsValid() : Hero->PlayerInputSession != Session))
+	{
 		return;
 	}
-	if (OriginalNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Released)
+	Hero->AbilityCameraModeOverrides.Reset();
+	if (UGGYGOCameraComponent* Camera = UGGYGOCameraComponent::FindCameraComponent(Hero->GetOwner()))
 	{
-		// Exact withdrawal may outlive Pawn/ASC validity; capture cleanup provenance before revoking it.
-		if (!OriginalSubscription->Resource.HasSameResource(OriginalResource))
-		{
-			Reject(TEXT("Released does not name the consumed original resource; successor is retained"));
-			return;
-		}
-		const TSharedPtr<FPlayerInputSession> AssociatedSession = OriginalSubscription->AssociatedInputSession.Pin();
-		const TSharedPtr<FPlayerInputSession> OriginalSession = PlayerInputSession;
-		const TSharedPtr<FAbilityInputAssociation> OriginalAssociation =
-			OriginalSession.IsValid() ? OriginalSession->AbilityAssociation : nullptr;
-		const bool bOwnsInput = AssociatedSession.IsValid() && AssociatedSession == OriginalSession;
-		const bool bOwnsAssociation = OriginalAssociation.IsValid()
-			&& OriginalAssociation->Subscription.Pin() == OriginalSubscription
-			&& OriginalAssociation->Resource.HasSameResource(OriginalResource);
-		const uint64 OriginalInputGeneration = InputSessionGeneration;
-		const uint64 ExpectedInputGeneration = bOwnsInput && OriginalInputGeneration != MAX_uint64
-			? OriginalInputGeneration + 1 : OriginalInputGeneration;
-		const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(this);
-		const uint64 OriginalCameraGeneration = LastAbilityCameraModeRequestGeneration;
-		const TWeakObjectPtr<APawn> OriginalPawn = OriginalSubscription->Pawn;
-		const TWeakObjectPtr<UGGYGOCameraComponent> OriginalCamera =
-			UGGYGOCameraComponent::FindCameraComponent(OriginalPawn.Get());
-		OriginalSubscription->Resource = FGGYGOPawnASCResourceHandle{};
-		OriginalSubscription->AssociatedInputSession.Reset();
-		if (bOwnsInput)
-		{
-			ReleasePlayerInput();
-		}
-		else if (bOwnsAssociation)
-		{
-			EndOriginalAbilityInputRequests(RetireAbilityInputAssociation(OriginalSession));
-		}
-		// Camera withdrawal follows this matching H. Input cleanup is external, so a
-		// new H, native session or camera request must stop this original withdrawal.
-		UGGYGOHeroComponent* Hero = WeakHero.Get();
-		if (!Hero || Hero->bEndingPlay || Hero->IsBeingDestroyed()
-			|| Hero->LocalAbilitySystemSubscription != OriginalSubscription || OriginalSubscription->bRetired
-			|| OriginalSubscription->Resource.HasResource()
-			|| Hero->InputSessionGeneration != ExpectedInputGeneration
-			|| Hero->LastAbilityCameraModeRequestGeneration != OriginalCameraGeneration
-			|| (bOwnsInput ? Hero->PlayerInputSession.IsValid() : Hero->PlayerInputSession != OriginalSession))
-		{
-			return;
-		}
-		Hero->AbilityCameraModeOverrides.Reset();
-		if (UGGYGOCameraComponent* Camera = OriginalCamera.Get())
-		{
-			if (OriginalPawn.IsValid() && Camera->GetOwner() == OriginalPawn.Get())
-			{
-				Camera->ResetCameraRuntimeState();
-			}
-		}
-		return;
+		Camera->ResetCameraRuntimeState();
 	}
-	if (OriginalNotice.Kind != EGGYGOPawnASCLocalNoticeKind::Ready
-		&& OriginalNotice.Kind != EGGYGOPawnASCLocalNoticeKind::Refreshed)
-	{
-		Reject(TEXT("kind is not Ready, Released, Refreshed or Closing"));
-		return;
-	}
-	UGGYGOPawnExtensionComponent* Source = OriginalSubscription->Extension.Get();
-	APawn* Pawn = OriginalSubscription->Pawn.Get();
-	UGGYGOAbilitySystemComponent* ASC = Identity.ASC.Get();
-	if (bEndingPlay || IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| !Source || Source->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| !Pawn || Pawn->IsActorBeingDestroyed() || GetOwner() != Pawn || Source->GetOwner() != Pawn
-		|| !Identity.Pawn.HasSameIndexAndSerialNumber(OriginalSubscription->Pawn) || !ASC
-		|| !Source->IsLocalAbilitySystemResourceReady(OriginalResource)
-		|| !Identity.Binding.HasSameIdentity(OriginalNotice.PublishedContext.Binding)
-		|| !ASC->IsAvatarBindingPublicationContextCurrent(OriginalNotice.PublishedContext))
-	{
-		Reject(TEXT("original owner/resource or actual publication Context is no longer Ready"));
-		return;
-	}
-	if (OriginalSubscription->bRetired || LocalAbilitySystemSubscription != OriginalSubscription) { return; }
-	const bool bSameResource = OriginalSubscription->Resource.HasSameResource(OriginalResource);
-	if (OriginalSubscription->Resource.HasResource() && !bSameResource)
-	{
-		Reject(TEXT("different opaque resource cannot be adopted, even with the same ASC/Pawn"));
-		return;
-	}
-	if (OriginalNotice.Kind == EGGYGOPawnASCLocalNoticeKind::Refreshed)
-	{
-		if (!bSameResource)
-		{
-			Reject(TEXT("Refreshed requires the already consumed original opaque resource"));
-		}
-		return; // No input association, generation, binding or mapping changes.
-	}
-	if (!bSameResource) { OriginalSubscription->Resource = OriginalResource; }
-	// Ready never builds input. Associate only if the existing input session is live.
-	AssociateReadyAbilitySystemWithInput();
 }
 
 UGGYGOAbilitySystemComponent* UGGYGOHeroComponent::GetReadyLocalAbilitySystemComponent() const
 {
 	check(IsInGameThread());
-	const TSharedPtr<FLocalAbilitySystemSubscription> OriginalSubscription = LocalAbilitySystemSubscription;
-	if (!OriginalSubscription.IsValid() || OriginalSubscription->bRetired
-		|| bEndingPlay || IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed))
-	{
-		return nullptr;
-	}
-	const FGGYGOPawnASCResourceHandle OriginalResource = OriginalSubscription->Resource;
-	const FGGYGOPawnASCResourceIdentity Identity = OriginalResource.GetIdentity();
-	const UGGYGOPawnExtensionComponent* Source = OriginalSubscription->Extension.Get();
-	const APawn* Pawn = OriginalSubscription->Pawn.Get();
-	UGGYGOAbilitySystemComponent* ASC = Identity.ASC.Get();
-	if (!OriginalResource.HasResource() || !Source
-		|| Source->HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)
-		|| !Pawn || Pawn->IsActorBeingDestroyed() || GetOwner() != Pawn || Source->GetOwner() != Pawn
-		|| !Identity.Pawn.HasSameIndexAndSerialNumber(OriginalSubscription->Pawn) || !ASC
-		|| !Source->IsLocalAbilitySystemResourceReady(OriginalResource))
-	{
-		return nullptr;
-	}
-	return LocalAbilitySystemSubscription == OriginalSubscription && !OriginalSubscription->bRetired
-		&& OriginalSubscription->Resource.HasSameResource(OriginalResource) ? ASC : nullptr;
+	if (bEndingPlay || IsBeingDestroyed() || HasAnyFlags(RF_BeginDestroyed | RF_FinishDestroyed)) { return nullptr; }
+	return LocalASCSubscription.GetReadyASC();
 }
