@@ -27,8 +27,6 @@ namespace GGYGOGameplayTags
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Dodge, "InputTag.Dodge");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Skill, "InputTag.Skill");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Ultimate, "InputTag.Ultimate");
-	UE_DEFINE_GAMEPLAY_TAG(InputTag_SwitchCharacter_Next, "InputTag.SwitchCharacter.Next");
-	UE_DEFINE_GAMEPLAY_TAG(InputTag_SwitchCharacter_Prev, "InputTag.SwitchCharacter.Prev");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Jump, "InputTag.Jump");
 	UE_DEFINE_GAMEPLAY_TAG(InputTag_Interact, "InputTag.Interact");
 

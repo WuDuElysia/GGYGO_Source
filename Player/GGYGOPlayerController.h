@@ -26,6 +26,7 @@ class UGGYGOAbilitySystemComponent;
 class UInputAction;
 class UInputComponent;
 class UInputMappingContext;
+class ULocalPlayer;
 class UObject;
 
 UCLASS(Config = Game, meta = (ShortTooltip = "GGYGO 玩家控制器"))
@@ -93,6 +94,22 @@ public:
 	UFUNCTION(Exec)
 	void GGYGOSwitchToSlot(int32 SlotIndex);
 
+	/**
+	 * 打开本地玩家的键盘改键界面：列出已登记 IMC 中可改键的映射，改动立即生效并存档
+	 * （Enhanced Input 用户设置）。打开期间输入只给界面。已打开时不重复创建。
+	 * 菜单入口尚未接入，现在经控制台 `GGYGOOpenKeySettings` 调用。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	void OpenKeySettings();
+
+	/** 关闭改键界面并恢复游戏输入；未打开时不做任何事。 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	void CloseKeySettings();
+
+	/** 控制台：`GGYGOOpenKeySettings`。 */
+	UFUNCTION(Exec)
+	void GGYGOOpenKeySettings();
+
 protected:
 	//~APlayerController interface
 	virtual void SetupInputComponent() override;
@@ -102,8 +119,8 @@ protected:
 
 	/**
 	 * 换人输入属于 Controller：它跨 Pawn 存在，不随 Hero 输入会话在换人中途退役。
-	 * 键位在本 IMC 中配置（默认 Z 上一个、C 下一个）；两个 InputAction 带 PlayerMappableKeySettings，
-	 * 供按键设置界面改键。三项都不配表示本 Controller 不提供换人键；只配一部分是配置错误，整组不安装。
+	 * 默认键位见所配 IMC（IMC_Squad）；两个 InputAction 带 PlayerMappableKeySettings，可在改键界面修改。
+	 * 三项都不配表示本 Controller 不提供换人键；只配一部分是配置错误，整组不安装。
 	 */
 	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
 	TObjectPtr<const UInputMappingContext> SquadSwitchInputMapping;
@@ -117,9 +134,18 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input|Squad")
 	int32 SquadSwitchInputMappingPriority = 0;
 
+	/**
+	 * 登记到 Enhanced Input 用户设置的 IMC：其中设置了 PlayerMappableKeySettings 的映射出现在改键界面，
+	 * 存档的改键在映射重建时生效。只登记，不激活；激活仍由各自拥有者（Hero、上面的换人 IMC）负责。
+	 */
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input")
+	TArray<TObjectPtr<const UInputMappingContext>> PlayerMappableInputMappings;
+
 private:
 	/** 本地 Controller 的 InputComponent 建好后绑定换人键并注册 IMC；同一 InputComponent 只安装一次。 */
 	void InstallSquadSwitchInput();
+	/** 把 PlayerMappableInputMappings 登记到本地玩家的用户设置；设置未启用时诊断一次，按默认键位运行。 */
+	void RegisterPlayerMappableInput();
 	void Input_SwitchToPreviousMember();
 	void Input_SwitchToNextMember();
 	/** 发给本玩家编队的服务器请求；目标由服务器选择。 */
@@ -130,6 +156,11 @@ private:
 	/** 本 Controller 自己注册的那一份 IMC，EndPlay 时归还。 */
 	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> SquadSwitchMappingSubsystem;
 	TWeakObjectPtr<const UInputMappingContext> RegisteredSquadSwitchMapping;
+
+	/** 打开中的改键界面；它不持有 Controller，关闭或 EndPlay 时从视口移除。 */
+	TSharedPtr<class SGGYGOKeyBindingMenu> KeyBindingMenu;
+	TWeakObjectPtr<ULocalPlayer> KeyBindingMenuPlayer;
+	bool bReportedUserSettingsUnavailable = false;
 
 	enum class ENativeInputInitializationStage : uint8 { Idle, Running, Rejected };
 	ENativeInputInitializationStage NativeInputInitializationStage = ENativeInputInitializationStage::Idle;

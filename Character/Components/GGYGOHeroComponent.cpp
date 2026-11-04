@@ -469,6 +469,10 @@ bool UGGYGOHeroComponent::ConsumeLocalCameraProviderReady(APawn* ExpectedPawn, c
 	// BeginPlay installs the existing mode provider before its native init-state continuation.
 	// Setup/input may arrive earlier; do not evaluate an uninstalled provider or poll for it.
 	if (!HasBegunPlay()) { return true; }
+	// 本地 Controller 附身时，原生 OnPossess 先调 Pawn::PossessedBy（在这里推进到 DataInitialized），
+	// 之后才 SetPawn；此刻 Controller 还没指向本 Pawn，不是关联错误。同一次附身随后的
+	// PawnClientRestart → InitializePlayerInput 会再次进入这里完成镜头 Ready。
+	if (FCString::Strcmp(NativeEntry, TEXT("DataInitialized")) == 0 && PC->GetPawn() != ExpectedPawn) { return true; }
 	const TWeakObjectPtr<APlayerController> OriginalPC(PC);
 	const TWeakObjectPtr<UWorld> OriginalWorld(GetWorld());
 	const TWeakObjectPtr<ULocalPlayer> OriginalPlayer(PC->GetLocalPlayer());

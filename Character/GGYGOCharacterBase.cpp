@@ -118,6 +118,17 @@ void AGGYGOCharacterBase::OnRep_Controller()
 {
 	Super::OnRep_Controller();
 
+	// 客户端：服务器解除附身只经复制到达，本地不调用 UnPossessed。与服务器 UnPossessed 一样归还本地输入：
+	// 退役 Hero 输入会话、销毁玩家输入组件；之后再附身时 PawnClientRestart 才会重新建立输入与移动会话。
+	if (!IsLocallyControlled() && InputComponent)
+	{
+		if (UGGYGOHeroComponent* Hero = UGGYGOHeroComponent::FindHeroComponent(this))
+		{
+			Hero->ReleasePlayerInput();
+		}
+		DestroyPlayerInputComponent();
+	}
+
 	// 客户端路径。本地控制端的 InitState 在此才能推进到 DataAvailable。
 	if (PawnExtComponent)
 	{

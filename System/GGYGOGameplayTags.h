@@ -82,10 +82,6 @@ namespace GGYGOGameplayTags
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Skill);
 	/** 大招。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Ultimate);
-	/** 切换到下一个队伍角色。 */
-	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_SwitchCharacter_Next);
-	/** 切换到上一个队伍角色。 */
-	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_SwitchCharacter_Prev);
 	/** 跳跃。 */
 	GGYGO_API UE_DECLARE_GAMEPLAY_TAG_EXTERN(InputTag_Jump);
 	/** 交互。 */

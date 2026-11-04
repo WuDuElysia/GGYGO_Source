@@ -1156,6 +1156,12 @@ bool FGGYGOLocomotionFailedRequestRecoveryTest::RunTest(const FString& Parameter
 	UWorld* World = UWorld::CreateWorld(EWorldType::Game, false, NAME_None, nullptr, true, ERHIFeatureLevel::Num, &Init);
 	if (!TestNotNull(TEXT("Failed recovery world"), World)) return false;
 	FLocomotionTestWorldCleanup WorldCleanup(*this, World);
+	// 本测试故意制造的三次生产拒绝，各按原诊断恰好声明：两次坏曲线请求在第二个原生区间失败，
+	// 一次未归属的 Override 源被地面准入拒绝。
+	AddExpectedMessagePlain(TEXT("RootMotion_Speed: interval [0.100000001, 0.200000003] has non-finite or negative endpoint speed"),
+		ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 2);
+	AddExpectedMessagePlain(TEXT("UnsupportedSource='UnownedGroundAdmissionProbe'"),
+		ELogVerbosity::Error, EAutomationExpectedMessageFlags::Contains, 1);
 
 	AGGYGOLocomotionTestCharacter* Character = World->SpawnActor<AGGYGOLocomotionTestCharacter>();
 	if (!TestNotNull(TEXT("Failed recovery character"), Character)) return false;

@@ -50,6 +50,7 @@ class AGGYGOCharacterSlot;
 class AGGYGOGameMode;
 class UCharacterMovementComponent;
 class UGGYGOAbilitySystemComponent;
+class UGGYGOHealthComponent;
 class UGGYGOPawnData;
 class UObject;
 struct FAbilityEndedData;
@@ -67,7 +68,7 @@ enum class EGGYGOSquadMemberState : uint8
 	Exiting
 };
 
-UCLASS(meta = (BlueprintSpawnableComponent))
+UCLASS(Config = Game, meta = (BlueprintSpawnableComponent))
 class GGYGO_API UGGYGOSquadComponent : public UGameFrameworkComponent
 {
 	GENERATED_BODY()
@@ -153,15 +154,19 @@ public:
 	/**
 	 * 切到指定序号的位置。仅服务器有效。
 	 *
-	 * 1. 旧队员的每个活动能力经 OnAvatarSwitchOut 决定取消或留场；任一 Cancel 决定的能力
-	 *    不可取消时，在任何取消之前整次拒绝。
+	 * 0. PlayerRequest 来源另受两项玩法限制：出战队员倒下（死亡演出）期间不能切，
+	 *    距上次换人不足 SwitchCooldownSeconds 不能切。Script 与 DeathAutoSwitch 不受限。
+	 * 1. 旧队员的每个活动能力经 OnAvatarSwitchOut 决定取消或留场；Cancel 决定的能力不可取消时
+	 *    改为留场放完。
 	 * 2. 留场集合登记后取消其余能力，补发按住输入的真实释放，通知留场能力失去控制，
 	 *    退役 Hero 输入并解除附身。
-	 * 3. 附身新队员（镜头随原生 ViewTarget 立即切换）。待命队员显示后发 SwitchIn；
-	 *    留场／退场中的队员取消退场、解除 OffField，仍有续放时加 ReturnPending，不播进场。
+	 * 3. 附身新队员（镜头随原生 ViewTarget 立即切换）。替换在场队员时，待命队员显示后发 SwitchIn；
+	 *    开局第一名没有被替换的队员，不发。留场／退场中的队员取消退场、解除 OffField，
+	 *    仍有续放时加 ReturnPending，不播进场。
 	 * 4. 旧队员加 OffField：有续放进入 Lingering，否则直接退场。
 	 * 不清除任何 Slot 的 GE、冷却或属性。外调改变原布局时停止并记录错误，已发生的效果不恢复。
-	 * @return 是否完成切换。目标是当前出战、无 Avatar、已死亡、同步重入或附身失败均返回 false 并诊断。
+	 * @return 是否完成切换。目标是当前出战、无 Avatar、已死亡、同步重入、受上述玩法限制或附身失败
+	 *         均返回 false 并诊断。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Squad")
 	bool SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Source = EGGYGOSwitchSource::Script);
@@ -192,6 +197,10 @@ public:
 	UFUNCTION(Server, Reliable, WithValidation, BlueprintCallable, Category = "GGYGO|Squad")
 	void ServerRequestSwitchToAdjacentSlot(int32 Direction);
 
+	/** 服务器上玩家换人冷却的剩余秒数；没有换过人或已过冷却返回 0。客户端上恒为 0。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Squad")
+	float GetSwitchCooldownRemaining() const;
+
 	/** 出战角色变更时广播。UI 与相机据此更新。 */
 	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Squad")
 	FGGYGOActiveCharacterChanged OnActiveCharacterChanged;
@@ -213,6 +222,13 @@ protected:
 
 	/** 位置是否可以出战（有实体且未死亡）。 */
 	bool CanSlotBeActive(const AGGYGOCharacterSlot* Slot) const;
+
+	/**
+	 * 玩家两次换人之间的最短间隔（秒），从上次替换在场队员的换人成功起算，只限制 PlayerRequest。
+	 * 在 DefaultGame.ini 的 [/Script/GGYGO.GGYGOSquadComponent] 配置。
+	 */
+	UPROPERTY(Config, EditDefaultsOnly, Category = "GGYGO|Squad", meta = (ClampMin = "0", Units = "s"))
+	float SwitchCooldownSeconds = 0.5f;
 
 	/**
 	 * 本局的编队名单：这一局带哪几个角色，按什么顺序。
@@ -264,7 +280,10 @@ private:
 	 */
 	bool RegisterCreatedSlot(AGGYGOCharacterSlot* Slot, APawn* OriginalCreatedPawn);
 
-	/** 从出战位置起按 Direction（±1）循环找第一个可出战的位置并切换；只试一次真实切换。 */
+	/**
+	 * 从出战位置起按 Direction（±1）循环找第一个可出战的位置并切换；只试一次真实切换。
+	 * 没有出战位置时从队首（下一个）或队尾（上一个）起，覆盖全部位置。
+	 */
 	bool SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSource Source);
 
 	/** 两种入口共用接收事务；所有身份验证先于名单和责任提交。 */
@@ -292,6 +311,15 @@ private:
 	bool bFinalComponentDestructionRequested = false;
 	/** 仅由一次同步 Switch 栈持有，退出即归还；不是第二份出战状态或延期切换队列。 */
 	bool bSwitchRequestInProgress = false;
+	/** 上次替换在场队员的换人成功时的世界时间（服务器）；只供玩家换人冷却读取。 */
+	TOptional<double> LastSwitchWorldTime;
+
+	/**
+	 * 队员死亡演出结束（HealthComponent::OnDeathFinished）。仅服务器：出战队员倒下后
+	 * 以 DeathAutoSwitch 切到下一个可出战的队员；没有可出战的队员时保持现状并记录。
+	 */
+	UFUNCTION()
+	void HandleMemberDeathFinished(AActor* OwningActor);
 
 	/** 一个槽位的场上状态与本组件施加的资源；与 Slots 同序，仅服务器。 */
 	struct FSlotRuntime
@@ -303,6 +331,8 @@ private:
 		TArray<FGameplayAbilitySpecHandle> ExitAbilities;
 		TWeakObjectPtr<UGGYGOAbilitySystemComponent> ObservedASC;
 		FDelegateHandle AbilityEndedHandle;
+		/** 登记时队员 Pawn 的 HealthComponent；订阅其 OnDeathFinished，终止时退订。 */
+		TWeakObjectPtr<UGGYGOHealthComponent> ObservedHealth;
 		/** 施加 OffField 时改过 bRunPhysicsWithNoController 的移动组件及原值。 */
 		TWeakObjectPtr<UCharacterMovementComponent> OffFieldMovement;
 		bool bSavedRunPhysicsWithNoController = false;

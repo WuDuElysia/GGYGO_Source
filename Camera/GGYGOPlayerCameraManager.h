@@ -73,6 +73,8 @@ private:
 	void RejectCurrentUpdate(const FGGYGOCameraEvaluationResult& Failure);
 	void ValidateNativeBlendBeforeFill();
 	void ReportExternalCacheWrite();
+	/** Running 时原生 ViewTarget 带着尚未准入的 GG 相机；为真时本帧不发布。 */
+	bool IsAwaitingSourceAdmission();
 
 	EGGYGOCameraPublicationState PublicationState = EGGYGOCameraPublicationState::NotActivated;
 	FGGYGOCameraEvaluationResult PublicationResult;
@@ -89,6 +91,8 @@ private:
 	TWeakObjectPtr<AActor> FailureTarget;
 	TWeakObjectPtr<UGGYGOCameraComponent> FailureComponent;
 	bool bFailureHadComponent = false;
+	/** 只用于等待准入诊断去重：同一目标只记一次。 */
+	TWeakObjectPtr<AActor> ReportedAwaitingTarget;
 
 	// Nonowning pointer to one synchronous native call's stack-local scratch/rollback data.
 	FGGYGONativeCameraUpdateScope* ActiveNativeUpdate = nullptr;

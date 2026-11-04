@@ -443,6 +443,14 @@ bool UGGYGOSquadComponent::RegisterSlotInternal(AGGYGOCharacterSlot* Slot, APawn
 	Runtime.ObservedASC = Slot->GetGGYGOAbilitySystemComponent();
 	Runtime.AbilityEndedHandle = Runtime.ObservedASC->OnAbilityEnded.AddUObject(
 		this, &ThisClass::HandleSlotAbilityEnded, TWeakObjectPtr<AGGYGOCharacterSlot>(Slot));
+	if (const AGGYGOCharacterBase* Member = Cast<AGGYGOCharacterBase>(Slot->GetAvatarPawn()))
+	{
+		if (UGGYGOHealthComponent* Health = Member->GetHealthComponent())
+		{
+			Runtime.ObservedHealth = Health;
+			Health->OnDeathFinished.AddUniqueDynamic(this, &ThisClass::HandleMemberDeathFinished);
+		}
+	}
 	if (bAcceptCreatedResources)
 	{
 		FCreatedSlotResources& Resources = CreatedSlotResources.AddDefaulted_GetRef();
@@ -512,6 +520,20 @@ bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Sour
 		|| (OldCharacter ? PC->GetPawn() != OldCharacter || OldCharacter->GetController() != PC : PC->GetPawn() != nullptr))
 	{
 		return Reject(TEXT("OriginalControlMismatch"));
+	}
+	if (Source == EGGYGOSwitchSource::PlayerRequest)
+	{
+		// 玩家操作的正常结果，不是配置或状态错误：Verbose 记录，不报 Warning。
+		const UGGYGOHealthComponent* OldHealth = OldCharacter ? OldCharacter->GetHealthComponent() : nullptr;
+		const TCHAR* BlockedReason = OldHealth && OldHealth->IsDeadOrDying() ? TEXT("ActiveMemberDying")
+			: GetSwitchCooldownRemaining() > 0.0f ? TEXT("SwitchCooldown") : nullptr;
+		if (BlockedReason)
+		{
+			UE_LOG(LogGGYGOAbilitySystem, Verbose,
+				TEXT("[Teams] SwitchToSlot Squad=%s Target=%d Active=%d Reason=%s; player request not executed."),
+				*SquadPath, SlotIndex, OldIndex, BlockedReason);
+			return false;
+		}
 	}
 	UGGYGOAbilitySystemComponent* NewASC = NewSlot->GetGGYGOAbilitySystemComponent();
 	UGGYGOAbilitySystemComponent* OldASC = OldSlot ? OldSlot->GetGGYGOAbilitySystemComponent() : nullptr;
@@ -596,14 +618,17 @@ bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Sour
 			if (!IsLayoutCurrent()) { return Reject(TEXT("SwitchOutDecisionChangedLayout")); }
 			Decisions.Add_GetRef(Candidate).Decision = Decision;
 		}
-		for (const FSwitchOutDecision& Decided : Decisions)
+		for (FSwitchOutDecision& Decided : Decisions)
 		{
 			const UGGYGOGameplayAbility* Ability = Decided.Ability.Get();
 			if (Decided.Decision == EGGYGOSwitchOutDecision::Cancel && Ability
 				&& Ability->IsActivationCurrent(Decided.Original) && !Ability->CanBeCanceled())
 			{
-				return Reject(TEXT("UncancelableAbility"),
-					FString::Printf(TEXT(" Spec=%s Ability=%s"), *Decided.Handle.ToString(), *GetPathNameSafe(Ability)));
+				// 不可取消的能力不阻止换人：改为留场放完，与 ContinueOnField 同一条留场路径。
+				Decided.Decision = EGGYGOSwitchOutDecision::ContinueOnField;
+				UE_LOG(LogGGYGOAbilitySystem, Log,
+					TEXT("[Teams] SwitchToSlot Squad=%s Target=%d Spec=%s Ability=%s: uncancelable Cancel decision continues on field."),
+					*SquadPath, SlotIndex, *Decided.Handle.ToString(), *GetPathNameSafe(Ability));
 			}
 		}
 	}
@@ -664,6 +689,10 @@ bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Sour
 		return Stop(TEXT("PossessReadbackFailed"));
 	}
 	ActiveSlotIndex = SlotIndex;
+	if (OldIndex != INDEX_NONE)
+	{
+		LastSwitchWorldTime = GetWorld()->GetTimeSeconds();
+	}
 
 	// 5. 新队员：留场／退场中切回不播进场，待命队员显示后发 SwitchIn。
 	const EGGYGOSquadMemberState PreviousState = SlotRuntimes[SlotIndex].State;
@@ -698,8 +727,12 @@ bool UGGYGOSquadComponent::SwitchToSlot(int32 SlotIndex, EGGYGOSwitchSource Sour
 	{
 		ActivateSlot(WeakNewSlot.Get());
 		if (!IsLayoutCurrent()) { return Stop(TEXT("SwitchInPresentationChangedLayout")); }
-		SendSquadEvent(WeakNewSlot.Get(), GGYGOGameplayTags::Event_Squad_SwitchIn);
-		if (!IsLayoutCurrent()) { return Stop(TEXT("SwitchInEventChangedLayout")); }
+		// 开局第一名没有替换任何人，不播进场。
+		if (OldIndex != INDEX_NONE)
+		{
+			SendSquadEvent(WeakNewSlot.Get(), GGYGOGameplayTags::Event_Squad_SwitchIn);
+			if (!IsLayoutCurrent()) { return Stop(TEXT("SwitchInEventChangedLayout")); }
+		}
 	}
 
 	// 6. 旧队员离场。
@@ -747,6 +780,29 @@ bool UGGYGOSquadComponent::ServerRequestSwitchToAdjacentSlot_Validate(int32 Dire
 	return Direction == 1 || Direction == -1;
 }
 
+float UGGYGOSquadComponent::GetSwitchCooldownRemaining() const
+{
+	const UWorld* World = GetWorld();
+	if (!LastSwitchWorldTime.IsSet() || !World) { return 0.0f; }
+	const double Elapsed = World->GetTimeSeconds() - LastSwitchWorldTime.GetValue();
+	return static_cast<float>(FMath::Max(0.0, SwitchCooldownSeconds - Elapsed));
+}
+
+void UGGYGOSquadComponent::HandleMemberDeathFinished(AActor* OwningActor)
+{
+	// 客户端经 OnRep 也会广播；换人只在服务器。
+	if (!GetOwner() || !GetOwner()->HasAuthority() || bSquadTerminationStarted || !OwningActor) { return; }
+	const AGGYGOCharacterSlot* ActiveSlot = GetActiveSlot();
+	if (!ActiveSlot || ActiveSlot->GetAvatarPawn() != OwningActor) { return; }
+	// 在 FinishDeath 广播内同步换人：角色在下一帧才销毁，此时附身关系与槽位绑定仍完整。
+	if (!SwitchToAdjacentSlot(1, EGGYGOSwitchSource::DeathAutoSwitch))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Log,
+			TEXT("[Teams] Squad=%s Dead=%s: no member could take the field after death (none alive, or switch in progress)."),
+			*GetPathName(), *GetPathNameSafe(OwningActor));
+	}
+}
+
 bool UGGYGOSquadComponent::SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSource Source)
 {
 	check(Direction == 1 || Direction == -1);
@@ -756,16 +812,19 @@ bool UGGYGOSquadComponent::SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSou
 	}
 	const TWeakObjectPtr<UGGYGOSquadComponent> OriginalSquad(this);
 	const int32 Count = Slots.Num();
-	if (Count <= 1)
+	const bool bHasActive = ActiveSlotIndex != INDEX_NONE;
+	if (Count == 0 || (bHasActive && Count == 1))
 	{
 		return false;
 	}
 
-	// 从相邻位置起逐个试，跳过死亡或无实体的位置；最多试 Count - 1 次，
-	// 试满一圈还没有可出战的说明只有自己。加 Count 再取模，避免负数下标。
-	for (int32 Offset = 1; Offset < Count; ++Offset)
+	// 从相邻位置起逐个试，跳过死亡或无实体的位置；有出战位置时试 Count - 1 个（不含自己），
+	// 没有时从队首／队尾起试全部 Count 个。加 Count 再取模，避免负数下标。
+	const int32 Origin = bHasActive ? ActiveSlotIndex : (Direction > 0 ? -1 : 0);
+	const int32 Attempts = bHasActive ? Count - 1 : Count;
+	for (int32 Offset = 1; Offset <= Attempts; ++Offset)
 	{
-		const int32 Candidate = ((ActiveSlotIndex + Direction * Offset) % Count + Count) % Count;
+		const int32 Candidate = ((Origin + Direction * Offset) % Count + Count) % Count;
 		if (CanSlotBeActive(GetSlot(Candidate)))
 		{
 			// 真实切换请求失败后不换目标重试：它可能已执行了部分换出。
@@ -1057,6 +1116,10 @@ void UGGYGOSquadComponent::ReleaseSlotRuntimes()
 		if (UCharacterMovementComponent* Movement = Runtime.OffFieldMovement.Get())
 		{
 			Movement->bRunPhysicsWithNoController = Runtime.bSavedRunPhysicsWithNoController;
+		}
+		if (UGGYGOHealthComponent* Health = Runtime.ObservedHealth.Get())
+		{
+			Health->OnDeathFinished.RemoveDynamic(this, &ThisClass::HandleMemberDeathFinished);
 		}
 		UGGYGOAbilitySystemComponent* ASC = Runtime.ObservedASC.Get();
 		if (!ASC) { continue; }

@@ -355,14 +355,32 @@ void AGGYGOPlayerCameraManager::UpdateCamera(float DeltaTime)
 		RejectCurrentUpdate(CameraPublicationFailure(TEXT("NativeUpdate.Context"), TEXT("invalid-delta-time-original-controller-or-world")));
 		return;
 	}
+	if (IsAwaitingSourceAdmission()) { return; }
 	Super::UpdateCamera(DeltaTime);
+}
+
+bool AGGYGOPlayerCameraManager::IsAwaitingSourceAdmission()
+{
+	// 原生 ViewTarget 已换到另一个带 GG 相机的 Actor（例如换人后附身的新 Pawn），而它还没经
+	// ActivateCameraEvaluation 准入：本帧不发布，保持上一帧原生视图，等它的 Ready 重新准入。
+	AActor* Target = PendingViewTarget.Target ? PendingViewTarget.Target.Get() : ViewTarget.Target.Get();
+	const bool bAwaiting = Target && Target != AdmissionTarget.Get()
+		&& Cast<UGGYGOCameraComponent>(FindNativeSelectedCamera(Target, CameraStyle)) != nullptr;
+	if (bAwaiting && ReportedAwaitingTarget.Get() != Target)
+	{
+		ReportedAwaitingTarget = Target;
+		UE_LOG(LogGGYGOCameraPublication, Verbose,
+			TEXT("Module=[Camera] Manager=[%s] Target=[%s] Admitted=[%s]: view target has an unadmitted GG camera; publication waits for its Ready."),
+			*GetPathName(), *GetPathNameSafe(Target), *GetPathNameSafe(AdmissionTarget.Get()));
+	}
+	return bAwaiting;
 }
 
 void AGGYGOPlayerCameraManager::UpdateCameraPhotographyOnly()
 {
 	// LevelTick dispatches this virtual entry while paused without UpdateCamera.
 	// Reject before native Fill can write timestamps after our POV setters return.
-	if (PublicationState != EGGYGOCameraPublicationState::Running) { return; }
+	if (PublicationState != EGGYGOCameraPublicationState::Running || IsAwaitingSourceAdmission()) { return; }
 	Super::UpdateCameraPhotographyOnly();
 }
 

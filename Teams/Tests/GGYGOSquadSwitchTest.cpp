@@ -593,7 +593,7 @@ bool FGGYGOSquadSwitchCancelSmoke::RunTest(const FString& Parameters)
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOSquadSwitchUncancelableSmoke,
-	"GGYGO.Teams.SquadSwitch.UncancelableRejectsBeforeEffects", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+	"GGYGO.Teams.SquadSwitch.UncancelableContinuesOnField", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
 bool FGGYGOSquadSwitchUncancelableSmoke::RunTest(const FString& Parameters)
 {
 	GGYGOSquadSwitchTests::FFixture Fixture;
@@ -606,38 +606,65 @@ bool FGGYGOSquadSwitchUncancelableSmoke::RunTest(const FString& Parameters)
 	if (!TestTrue(TEXT("Second real Cancel-policy GA activated"), bActivated && Blocking->IsActive())) { return false; }
 	Blocking->SetCanBeCanceledForTest(false);
 	if (!TestFalse(TEXT("Native blocker really cannot be cancelled"), Blocking->CanBeCanceled())) { return false; }
-	const auto OriginalInput = Fixture.Pawns[0]->GetInputComponentForTest();
-	const int32 BindingCount = OriginalInput->GetActionEventBindings().Num();
-	const FGGYGOPawnASCResourceHandle OldResource = Fixture.Resource(0);
+	const FGGYGOAbilityActivationHandle BlockingOriginal = Blocking->ActivatedOriginal;
 	if (!Fixture.CheckCurrentBindings(*this)) { return false; }
-	const GGYGOSquadSwitchTests::FPresentationSnapshot OldPresentation(Fixture.Pawns[0]);
-	const GGYGOSquadSwitchTests::FPresentationSnapshot NewPresentation(Fixture.Pawns[1]);
-	AddInfo(FString::Printf(TEXT("Before rejection: old %s; new %s"), *OldPresentation.Describe(), *NewPresentation.Describe()));
-	// Native PawnClientRestart calls Character::Restart. In this floorless private
-	// world SetDefaultMovementMode may legally enter Falling instead of Walking.
-	if (!TestTrue(TEXT("Original active Pawn has legal native presentation before rejection"),
-		!OldPresentation.bHidden && OldPresentation.bCollisionEnabled && OldPresentation.CustomMovementMode == 0
-		&& (OldPresentation.MovementMode == MOVE_Walking || OldPresentation.MovementMode == MOVE_Falling))
-		|| !TestTrue(TEXT("Original standby Pawn has legal inactive presentation before rejection"),
-			NewPresentation.bHidden && !NewPresentation.bCollisionEnabled
-			&& NewPresentation.MovementMode == MOVE_None && NewPresentation.CustomMovementMode == 0)) { return false; }
-	AddExpectedMessagePlain(TEXT("Reason=UncancelableAbility"), ELogVerbosity::Warning, EAutomationExpectedMessageFlags::Contains, 1);
-	TestFalse(TEXT("A Cancel decision on an uncancelable GA rejects the whole switch"), Fixture.Squad->SwitchToSlot(1));
-	TestTrue(TEXT("No partial cancellation or completion"), Cancel->IsActive() && Blocking->IsActive()
-		&& Cancel->CleanupCalls == 0 && Blocking->CleanupCalls == 0 && Fixture.CompletionCalls == 0);
-	TestTrue(TEXT("Control and authoritative active Slot unchanged"), Fixture.IsControlled(0)
-		&& Fixture.Pawns[0]->UnpossessCalls == 0 && Fixture.Pawns[1]->PossessCalls == 0 && Fixture.Pawns[0]->ActiveCharacterNotices == 0);
-	TestTrue(TEXT("Input identity/component and held state not retired"), Fixture.Pawns[0]->GetInputComponentForTest() == OriginalInput
-		&& OriginalInput->GetActionEventBindings().Num() == BindingCount
-		&& Fixture.ASCs[0]->FindAbilitySpecFromHandle(CancelHandle)->InputPressed && Cancel->InputReleasedCalls == 0);
-	const GGYGOSquadSwitchTests::FPresentationSnapshot OldAfter(Fixture.Pawns[0]);
-	const GGYGOSquadSwitchTests::FPresentationSnapshot NewAfter(Fixture.Pawns[1]);
-	TestTrue(FString::Printf(TEXT("Old presentation exactly unchanged after rejection (before %s; after %s)"),
-		*OldPresentation.Describe(), *OldAfter.Describe()), OldAfter.HasSamePresentation(OldPresentation));
-	TestTrue(FString::Printf(TEXT("Standby presentation exactly unchanged after rejection (before %s; after %s)"),
-		*NewPresentation.Describe(), *NewAfter.Describe()), NewAfter.HasSamePresentation(NewPresentation));
-	TestTrue(TEXT("Rejection applies no switch tags"), Fixture.HasNoSwitchTags(0) && Fixture.HasNoSwitchTags(1));
-	TestTrue(TEXT("Rejection keeps the original binding resource"), Fixture.Resource(0).HasSameResource(OldResource));
+
+	if (!TestTrue(TEXT("An uncancelable GA no longer blocks the switch"), Fixture.Squad->SwitchToSlot(1))) { return false; }
+	TestTrue(TEXT("The cancelable GA was cancelled once"), !Cancel->IsActive() && Cancel->CleanupCalls == 1);
+	TestTrue(TEXT("The uncancelable GA keeps its original activation"), Blocking->IsActive() && Blocking->CleanupCalls == 0
+		&& Blocking->CaptureCurrentActivation().HasSameActivation(BlockingOriginal));
+	TestEqual(TEXT("The uncancelable GA is told control was lost, like a continuing ability"), Blocking->ControlLostCalls, 1);
+	TestEqual(TEXT("Old member lingers for the uncancelable GA"), Fixture.Squad->GetMemberState(0), EGGYGOSquadMemberState::Lingering);
+	TestTrue(TEXT("Lingering member stays on field, immune, without control"), Fixture.IsOnFieldWithoutControl(0) && Fixture.HasOffField(0));
+	TestTrue(TEXT("New member controlled"), Fixture.IsControlled(1));
+	TestTrue(TEXT("The uncancelable GA ends normally"), Blocking->EndForTest());
+	TestTrue(TEXT("Its end benches the lingering member"), Fixture.IsBenched(0));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOSquadSwitchPlayerRulesSmoke,
+	"GGYGO.Teams.SquadSwitch.PlayerCooldownAndDeathAutoSwitch", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOSquadSwitchPlayerRulesSmoke::RunTest(const FString& Parameters)
+{
+	GGYGOSquadSwitchTests::FFixture Fixture;
+	if (!Fixture.Initialize(*this, 3)) { return false; }
+	FGameplayAbilitySpecHandle EnterHandle;
+	UGGYGOSquadSwitchTestAbility* Enter = Fixture.Grant(*this, 2, UGGYGOSquadSwitchEnterTestAbility::StaticClass(), false, EnterHandle);
+	if (!Enter) { return false; }
+	// 冷却秒数是 Config 属性；私有世界的时间不前进，直接改实例值来分别覆盖两条规则。
+	FFloatProperty* CooldownProperty = FindFProperty<FFloatProperty>(UGGYGOSquadComponent::StaticClass(), TEXT("SwitchCooldownSeconds"));
+	if (!TestNotNull(TEXT("Cooldown is a reflected config property"), CooldownProperty)) { return false; }
+	CooldownProperty->SetPropertyValue_InContainer(Fixture.Squad, 100.0f);
+
+	TestEqual(TEXT("Initial entry starts no cooldown"), Fixture.Squad->GetSwitchCooldownRemaining(), 0.0f);
+	Fixture.Squad->ServerRequestSwitchToAdjacentSlot(1);
+	if (!TestTrue(TEXT("Player Next switches to member 2"), Fixture.IsControlled(1))) { return false; }
+	TestTrue(TEXT("A successful switch starts the cooldown"), Fixture.Squad->GetSwitchCooldownRemaining() > 0.0f);
+	Fixture.Squad->ServerRequestSwitchToAdjacentSlot(1);
+	TestTrue(TEXT("Player request during cooldown does nothing"), Fixture.IsControlled(1));
+	TestTrue(TEXT("Script switch is not limited by the player cooldown"), Fixture.Squad->SwitchToSlot(0) && Fixture.IsControlled(0));
+
+	CooldownProperty->SetPropertyValue_InContainer(Fixture.Squad, 0.0f);
+	UGGYGOHealthComponent* DyingHealth = Fixture.Pawns[0]->GetHealthComponent();
+	if (!TestNotNull(TEXT("Active member has a HealthComponent"), DyingHealth)) { return false; }
+	DyingHealth->StartDeath();
+	Fixture.Squad->ServerRequestSwitchToAdjacentSlot(1);
+	TestTrue(TEXT("Player cannot switch away while the active member is dying"), Fixture.Squad->GetActiveSlot() == Fixture.Slots[0]);
+
+	// 死亡自动换人不受玩家冷却限制，并跳过已倒下的队员向后找下一个。
+	CooldownProperty->SetPropertyValue_InContainer(Fixture.Squad, 100.0f);
+	Fixture.Squad->SwitchToSlot(1);
+	if (!TestTrue(TEXT("Script switch moves away from the dying member for the next case"), Fixture.IsControlled(1))) { return false; }
+	DyingHealth->FinishDeath();
+	TestTrue(TEXT("A benched member's death does not move the active member"), Fixture.IsControlled(1));
+	UGGYGOHealthComponent* ActiveHealth = Fixture.Pawns[1]->GetHealthComponent();
+	if (!TestNotNull(TEXT("Second member has a HealthComponent"), ActiveHealth)) { return false; }
+	ActiveHealth->StartDeath();
+	TestTrue(TEXT("Dying alone does not switch"), Fixture.IsControlled(1));
+	ActiveHealth->FinishDeath();
+	TestTrue(TEXT("Death finish switches to the next living member"), Fixture.IsControlled(2));
+	TestEqual(TEXT("The auto switch plays SwitchIn on the replacing member"), Enter->ActivationCalls, 1);
+	TestEqual(TEXT("The dead member leaves the field"), Fixture.Squad->GetMemberState(1), EGGYGOSquadMemberState::Benched);
 	return true;
 }
 
@@ -800,8 +827,16 @@ bool FGGYGOSquadSwitchReturnDuringExitSmoke::RunTest(const FString& Parameters)
 #include "GameFramework/Character.h"
 #include "Engine/GameInstance.h"
 #include "Engine/LocalPlayer.h"
+#include "EnhancedInputSubsystems.h"
+#include "EnhancedPlayerInput.h"
+#include "Animation/AnimInstance.h"
+#include "Engine/GameViewportClient.h"
 #include "GameFramework/PlayerInput.h"
+#include "ImageUtils.h"
 #include "InputCoreTypes.h"
+#include "Misc/FileHelper.h"
+#include "UnrealClient.h"
+#include "UserSettings/EnhancedInputUserSettings.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameModes/GGYGOExperienceDefinition.h"
 #include "GameModes/GGYGOGameMode.h"
@@ -844,7 +879,7 @@ namespace GGYGOSquadSwitchNetTests
 				return false;
 			}
 			if (!ResolveSides()) { return false; }
-			ReleaseHeldClientKey();
+			ReleaseHeldKey();
 			switch (Stage)
 			{
 			case EStage::Ready: ObserveReady(); break;
@@ -855,13 +890,21 @@ namespace GGYGOSquadSwitchNetTests
 			case EStage::HealthDamage: ObserveHealthDamage(); break;
 			case EStage::HealthMaxDrop: ObserveHealthMaxDrop(); break;
 			case EStage::HealthPoise: ObserveHealthPoise(); break;
+			case EStage::RebindPress: ObserveRebindPress(); break;
+			case EStage::Rebound: ObserveRebound(); break;
+			case EStage::Moved: ObserveMoved(); break;
+			case EStage::MovePress: ObserveMovePress(); break;
+			case EStage::Attacked: ObserveAttacked(); break;
+			case EStage::HostSwitched: ObserveHostSwitched(); break;
+			case EStage::Death: ObserveDeath(); break;
 			default: break;
 			}
 			return false;
 		}
 
 	private:
-		enum class EStage : uint8 { Start, Ready, Lingering, Returned, Released, Rebenched, HealthDamage, HealthMaxDrop, HealthPoise, Ending, Done };
+		enum class EStage : uint8 { Start, Ready, Lingering, Returned, Released, Rebenched, HealthDamage, HealthMaxDrop, HealthPoise,
+			RebindPress, Rebound, Attacked, HostSwitched, Death, MovePress, Moved, Ending, Done };
 
 		/** 一侧（服务器或客户端）上的同一名玩家与其编队。 */
 		struct FSide
@@ -899,32 +942,79 @@ namespace GGYGOSquadSwitchNetTests
 		}
 
 		/**
-		 * 经客户端 PlayerInput 发出真实按键，走 Controller 的 IMC 与换人绑定；
+		 * 经指定 Controller 的 PlayerInput 发出真实按键，走 Controller 的 IMC 与换人绑定；
 		 * 默认键位 Z 上一个、C 下一个。下一次 Update 抬起。
 		 */
-		void PressClientKey(const FKey& Key)
+		void PressKey(APlayerController* Controller, const FKey& Key, double HoldSeconds = 0.0)
 		{
-			UPlayerInput* Input = Client.Controller ? Client.Controller->PlayerInput.Get() : nullptr;
-			if (!Input) { Fail(TEXT("client Controller has no PlayerInput")); return; }
+			UPlayerInput* Input = Controller ? Controller->PlayerInput.Get() : nullptr;
+			if (!Input) { Fail(TEXT("Controller has no PlayerInput")); return; }
 			Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), Key, IE_Pressed,
 				1.0f, false, FPlatformTime::Cycles64()));
-			HeldClientKey = Key;
-			HeldClientKeyFrame = GFrameCounter;
+			HeldKeyController = Controller;
+			HeldKey = Key;
+			HeldKeyFrame = GFrameCounter;
+			HeldKeyReleaseSeconds = FPlatformTime::Seconds() + HoldSeconds;
 		}
 
-		void ReleaseHeldClientKey()
+		void ReleaseHeldKey()
 		{
-			if (!HeldClientKey.IsValid() || GFrameCounter == HeldClientKeyFrame) { return; }
-			if (UPlayerInput* Input = Client.Controller ? Client.Controller->PlayerInput.Get() : nullptr)
+			if (!HeldKey.IsValid() || GFrameCounter == HeldKeyFrame || FPlatformTime::Seconds() < HeldKeyReleaseSeconds) { return; }
+			if (UPlayerInput* Input = HeldKeyController.IsValid() ? HeldKeyController->PlayerInput.Get() : nullptr)
 			{
-				Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), HeldClientKey, IE_Released,
+				Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), HeldKey, IE_Released,
 					0.0f, false, FPlatformTime::Cycles64()));
 			}
-			HeldClientKey = FKey();
+			HeldKey = FKey();
+		}
+
+		/**
+		 * 真实 RHI 下给出 -GGYGOCaptureDir= 时，把客户端视口当前画面存成 PNG，供人工看画面；
+		 * NullRHI 或未给目录时不做任何事。只是证据，不参与断言。
+		 */
+		void CaptureClientView(const TCHAR* Name)
+		{
+			FString Directory;
+			if (!FParse::Value(FCommandLine::Get(), TEXT("GGYGOCaptureDir="), Directory) || !FApp::CanEverRender() || !Client.World) { return; }
+			UGameViewportClient* ViewportClient = Client.World->GetGameViewport();
+			FViewport* Viewport = ViewportClient ? ViewportClient->Viewport : nullptr;
+			TArray<FColor> Pixels;
+			const FIntPoint Size = Viewport ? Viewport->GetSizeXY() : FIntPoint::ZeroValue;
+			if (!Viewport || Size.X <= 0 || Size.Y <= 0 || !Viewport->ReadPixels(Pixels) || Pixels.Num() != Size.X * Size.Y)
+			{
+				Test.AddWarning(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] capture %s: client viewport pixels unavailable."), Name));
+				return;
+			}
+			for (FColor& Pixel : Pixels) { Pixel.A = 255; }
+			TArray64<uint8> Png;
+			FImageUtils::PNGCompressImageArray(Size.X, Size.Y, Pixels, Png);
+			const FString Path = Directory / (FString(Name) + TEXT(".png"));
+			if (FFileHelper::SaveArrayToFile(Png, *Path))
+			{
+				Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] capture %s -> %s (%dx%d)"), Name, *Path, Size.X, Size.Y));
+			}
+		}
+
+		/** 服务器世界里主机自己的本地 Controller 与编队。 */
+		APlayerController* HostController() const
+		{
+			for (FConstPlayerControllerIterator It = Server.World->GetPlayerControllerIterator(); It; ++It)
+			{
+				if (APlayerController* PC = It->Get(); PC && PC->IsLocalController()) { return PC; }
+			}
+			return nullptr;
+		}
+
+		UGGYGOSquadComponent* HostSquad() const
+		{
+			const APlayerController* PC = HostController();
+			const AGGYGOPlayerState* PlayerState = PC ? PC->GetPlayerState<AGGYGOPlayerState>() : nullptr;
+			return PlayerState ? PlayerState->GetSquadComponent() : nullptr;
 		}
 
 		void Advance(EStage Next, double Seconds = 15.0)
 		{
+			StageEnteredSeconds = FPlatformTime::Seconds();
 			Stage = Next;
 			LastUnmet.Reset();
 			Deadline = FPlatformTime::Seconds() + Seconds;
@@ -955,6 +1045,11 @@ namespace GGYGOSquadSwitchNetTests
 			Advance(EStage::Ready, 90.0);
 			// NullRHI 没有角色渲染需要的 R32f 深度格式，渲染组件按约定拒绝并停用；只属本运行环境，与切人无关。
 			Test.AddExpectedError(TEXT("当前RHI不支持配置的R32f深度输出/采样"), EAutomationExpectedErrorFlags::Contains, -1, false);
+			if (!FApp::CanEverRender())
+			{
+				// 普攻的必需 FX 在 NullRHI 下按约定拒绝（无渲染），能力随之结束；只属本运行环境。
+				Test.AddExpectedError(TEXT("Rendering is unavailable in this non-dedicated World"), EAutomationExpectedErrorFlags::Contains, -1, false);
+			}
 			UEditorEngine* Editor = Cast<UEditorEngine>(GEngine);
 			if (!Editor || Editor != GEditor) { Fail(TEXT("requires the Editor engine")); return; }
 			if (Editor->IsPlaySessionInProgress() || Editor->PlayWorld || CountPIEWorlds() != 0 || Editor->GetPlaySessionRequest().IsSet())
@@ -1085,6 +1180,7 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				Fail(TEXT("server could not activate the continuing fixture ability")); return;
 			}
+			CaptureClientView(TEXT("01_ready_member1"));
 			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Ready: production assembly replicated; client requests switch to slot 1."));
 			Client.Squad->ServerRequestSwitchToSlot(1);
 			Advance(EStage::Lingering);
@@ -1100,13 +1196,13 @@ namespace GGYGOSquadSwitchNetTests
 				|| !Require(IsOnField(Client.Avatar(0)), TEXT("client: lingering member visible and collidable"))
 				|| !Require(HasTag(Client.ASC(0), GGYGOGameplayTags::State_OffField)
 					&& !HasTag(Client.ASC(0), GGYGOGameplayTags::Gameplay_Damage_Immunity),
-					TEXT("client: OffField replicated, server-only immunity not replicated")))
+					TEXT("client: OffField replicated, server-only immunity not replicated"))
+				|| !Require(Server.Squad->GetSwitchCooldownRemaining() <= 0.0f, TEXT("server: player switch cooldown elapsed")))
 			{
 				return;
 			}
-			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Lingering replicated; client presses Z (previous member) to return to slot 0."));
-			PressClientKey(EKeys::Z);
-			Advance(EStage::Returned);
+			CaptureClientView(TEXT("02_member2_controlled_member1_lingering"));
+			Advance(EStage::MovePress);
 		}
 
 		void ObserveReturned()
@@ -1129,12 +1225,13 @@ namespace GGYGOSquadSwitchNetTests
 		void ObserveReleased()
 		{
 			if (!Require(!HasTag(Server.ASC(0), GGYGOGameplayTags::State_SwitchReturnPending), TEXT("server: ReturnPending removed after the ability ended"))
-				|| !Require(!HasTag(Client.ASC(0), GGYGOGameplayTags::State_SwitchReturnPending), TEXT("client: ReturnPending removal replicated")))
+				|| !Require(!HasTag(Client.ASC(0), GGYGOGameplayTags::State_SwitchReturnPending), TEXT("client: ReturnPending removal replicated"))
+				|| !Require(Server.Squad->GetSwitchCooldownRemaining() <= 0.0f, TEXT("server: player switch cooldown elapsed")))
 			{
 				return;
 			}
 			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] ReturnPending cleared; client presses C (next member) to switch to benched slot 1."));
-			PressClientKey(EKeys::C);
+			PressKey(Client.Controller, EKeys::C);
 			Advance(EStage::Rebenched);
 		}
 
@@ -1151,6 +1248,7 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				return;
 			}
+			CaptureClientView(TEXT("03_member2_reentered"));
 			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Benched member re-entered; server applies damage to the client's active member."));
 			// 生命复制：服务器结算，客户端只经复制收到数值与 HealthComponent 广播。
 			ServerHealth = UGGYGOHealthComponent::FindHealthComponent(Server.Avatar(1));
@@ -1178,7 +1276,7 @@ namespace GGYGOSquadSwitchNetTests
 		static bool Same(float A, float B) { return FMath::IsNearlyEqual(A, B, 0.01f); }
 
 		/** 主机的出战队员向客户端出战队员施加一次即时元属性 GE，与命中结算同一 HealthSet 路径。 */
-		bool ApplyInstantMeta(const FGameplayAttribute& Meta, float Magnitude)
+		bool ApplyInstantMeta(const FGameplayAttribute& Meta, float Magnitude, int32 TargetIndex = 1)
 		{
 			UGGYGOAbilitySystemComponent* Source = nullptr;
 			for (FConstPlayerControllerIterator It = Server.World->GetPlayerControllerIterator(); It; ++It)
@@ -1189,7 +1287,7 @@ namespace GGYGOSquadSwitchNetTests
 				const AGGYGOCharacterSlot* HostSlot = HostSquad ? HostSquad->GetActiveSlot() : nullptr;
 				Source = HostSlot ? HostSlot->GetGGYGOAbilitySystemComponent() : Source;
 			}
-			UGGYGOAbilitySystemComponent* Target = Server.ASC(1);
+			UGGYGOAbilitySystemComponent* Target = Server.ASC(TargetIndex);
 			if (!Source || !Target) { Fail(TEXT("host source or client target ASC missing on server")); return false; }
 			UGameplayEffect* Effect = NewObject<UGameplayEffect>(GetTransientPackage());
 			Effect->DurationPolicy = EGameplayEffectDurationType::Instant;
@@ -1273,6 +1371,149 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				return;
 			}
+			// 改键：客户端经 Enhanced Input 用户设置把“上一个角色”改到 X（不存档），重建后按 X。
+			const ULocalPlayer* LocalPlayer = Client.Controller->GetLocalPlayer();
+			UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer);
+			UEnhancedInputUserSettings* Settings = Subsystem ? Subsystem->GetUserSettings() : nullptr;
+			if (!Settings || !Settings->FindCurrentMappingForSlot(TEXT("SwitchCharacterPrevious"), EPlayerMappableKeySlot::First))
+			{
+				Fail(TEXT("client user settings or the registered SwitchCharacterPrevious mapping is missing")); return;
+			}
+			FMapPlayerKeyArgs Args;
+			Args.MappingName = TEXT("SwitchCharacterPrevious");
+			Args.Slot = EPlayerMappableKeySlot::First;
+			Args.NewKey = EKeys::X;
+			FGameplayTagContainer Failure;
+			Settings->MapPlayerKey(Args, Failure);
+			if (!Failure.IsEmpty()) { Fail(TEXT("MapPlayerKey rejected the rebinding")); return; }
+			Settings->ApplySettings();
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Health replicated; client rebinds Previous to X."));
+			Advance(EStage::RebindPress);
+		}
+
+		void ObserveRebindPress()
+		{
+			const UEnhancedInputLocalPlayerSubsystem* Subsystem =
+				ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(Client.Controller->GetLocalPlayer());
+			const UEnhancedInputUserSettings* Settings = Subsystem ? Subsystem->GetUserSettings() : nullptr;
+			const UInputAction* Previous = Settings ? Settings->FindInputActionForMapping(TEXT("SwitchCharacterPrevious")) : nullptr;
+			const bool bRebuilt = Previous && Subsystem->QueryKeysMappedToAction(Previous).Contains(EKeys::X)
+				&& !Subsystem->QueryKeysMappedToAction(Previous).Contains(EKeys::Z);
+			if (!Require(bRebuilt, TEXT("client: rebuilt mappings bind X (not Z) to SwitchCharacterPrevious"))
+				|| !Require(Server.Squad->GetSwitchCooldownRemaining() <= 0.0f, TEXT("server: player switch cooldown elapsed")))
+			{
+				return;
+			}
+			PressKey(Client.Controller, EKeys::X);
+			Advance(EStage::Rebound);
+		}
+
+		void ObserveRebound()
+		{
+			// 移动会话在新 Pawn 的 IMC 重建通知后才装配；装配前按下的 W 不算冷启动按下，需要先等它就绪。
+			if (!Require(Server.Squad->GetActiveSlot() == Server.Slot(0) && IsClientControlling(0), TEXT("client: rebound X switched back to member 1"))
+				|| !Require(FPlatformTime::Seconds() - StageEnteredSeconds > 0.5, TEXT("client: new member input session settles")))
+			{
+				return;
+			}
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Rebound key works; client clicks attack on the re-possessed member."));
+			// 只看服务器是否收到并激活了 Attack.Light 能力：NullRHI 下它的必需 FX 会失败并立即结束能力。
+			if (UGGYGOAbilitySystemComponent* ASC = Server.ASC(0))
+			{
+				AttackObservedASC = ASC;
+				AttackActivatedHandle = ASC->AbilityActivatedCallbacks.AddLambda([this](UGameplayAbility* Ability)
+				{
+					const FGameplayAbilitySpec* Spec = Ability ? Ability->GetCurrentAbilitySpec() : nullptr;
+					bServerAttackActivated |= Spec && Spec->GetDynamicSpecSourceTags().HasTagExact(GGYGOGameplayTags::InputTag_Attack_Light);
+				});
+			}
+			PressKey(Client.Controller, EKeys::LeftMouseButton);
+			Advance(EStage::Attacked);
+		}
+
+		/** 第二名队员是本客户端第一次附身它：等输入会话就绪后按住 W。 */
+		void ObserveMovePress()
+		{
+			if (!Require(FPlatformTime::Seconds() - StageEnteredSeconds > 0.5, TEXT("client: new member input session settles")))
+			{
+				return;
+			}
+			MoveStartLocation = Server.Avatar(1)->GetActorLocation();
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Lingering replicated; client holds W on its first-possessed second member."));
+			PressKey(Client.Controller, EKeys::W, 0.6);
+			Advance(EStage::Moved);
+		}
+
+		void ObserveMoved()
+		{
+			const APawn* ServerAvatar = Server.Avatar(1);
+			const APawn* ClientAvatar = Client.Avatar(1);
+			const double Moved = ServerAvatar ? FVector::Dist2D(ServerAvatar->GetActorLocation(), MoveStartLocation) : 0.0;
+			if (!Require(!HeldKey.IsValid(), TEXT("client: W released"))
+				|| !Require(Moved > 30.0, TEXT("server: client's held W moved its active member more than 30 cm"))
+				|| !Require(ClientAvatar && FVector::Dist2D(ClientAvatar->GetActorLocation(), ServerAvatar->GetActorLocation()) < 50.0,
+					TEXT("client: predicted position agrees with the server within 50 cm"))
+				|| !Require(ServerAvatar->GetVelocity().Size2D() < 1.0, TEXT("server: member stops after release")))
+			{
+				return;
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] Client move: server moved %.1f cm; client presses Z (previous member) to return to slot 0."), Moved));
+			PressKey(Client.Controller, EKeys::Z);
+			Advance(EStage::Returned);
+		}
+
+		void ObserveAttacked()
+		{
+			if (!Require(bServerAttackActivated, TEXT("server: client's attack click activated the Attack.Light ability")))
+			{
+				return;
+			}
+			ReleaseAttackObserver();
+			UGGYGOSquadComponent* Host = HostSquad();
+			if (!Host || Host->GetActiveSlot() != Host->GetSlot(0)) { Fail(TEXT("host squad not active on its first member")); return; }
+			// 主机本地按键：换人在主机输入回调里同步执行，旧 Pawn 的输入组件在派发中途被销毁。
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Client attack reached the server; host presses C on its own squad."));
+			PressKey(HostController(), EKeys::C);
+			Advance(EStage::HostSwitched);
+		}
+
+		void ObserveHostSwitched()
+		{
+			const UGGYGOSquadComponent* Host = HostSquad();
+			const APlayerController* PC = HostController();
+			const AGGYGOCharacterSlot* Slot = Host ? Host->GetSlot(1) : nullptr;
+			if (!Require(Host && Slot && Host->GetActiveSlot() == Slot && PC && PC->GetPawn() == Slot->GetAvatarPawn(),
+					TEXT("host: own key switched host squad to its second member")))
+			{
+				return;
+			}
+			// 死亡：服务器对客户端出战队员施加致死伤害；倒下动作播完后自动切到下一个存活队员。
+			DyingAvatar = Server.Avatar(0);
+			DeathStartedSeconds = FPlatformTime::Seconds();
+			CaptureClientView(TEXT("04_member1_before_death"));
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Host key works; server kills the client's active member."));
+			if (!ApplyInstantMeta(UGGYGOHealthSet::GetDamageAttribute(), 1.0e6f, 0)) { return; }
+			Advance(EStage::Death, 30.0);
+		}
+
+		void ObserveDeath()
+		{
+			if (!bCapturedDying && FPlatformTime::Seconds() - DeathStartedSeconds > 1.5)
+			{
+				bCapturedDying = true;
+				CaptureClientView(TEXT("05_member1_dying"));
+			}
+			const UGGYGOHealthComponent* DeadHealth = DyingAvatar.IsValid() ? UGGYGOHealthComponent::FindHealthComponent(DyingAvatar.Get()) : nullptr;
+			if (!Require(!DyingAvatar.IsValid() || (DeadHealth && DeadHealth->GetDeathState() == EGGYGODeathState::DeathFinished),
+					TEXT("server: killed member finished its death"))
+				|| !Require(Server.Squad->GetActiveSlot() == Server.Slot(1)
+					&& Server.Squad->GetMemberState(1) == EGGYGOSquadMemberState::Active
+					&& Server.Squad->GetMemberState(0) == EGGYGOSquadMemberState::Benched, TEXT("server: death auto-switched to the living member"))
+				|| !Require(IsClientControlling(1), TEXT("client: controls and views the replacing member after death")))
+			{
+				return;
+			}
+			CaptureClientView(TEXT("06_member2_after_death_switch"));
 			bPassed = true;
 			BeginEnding();
 		}
@@ -1296,8 +1537,15 @@ namespace GGYGOSquadSwitchNetTests
 			}
 		}
 
+		void ReleaseAttackObserver()
+		{
+			if (UGGYGOAbilitySystemComponent* ASC = AttackObservedASC.Get()) { ASC->AbilityActivatedCallbacks.Remove(AttackActivatedHandle); }
+			AttackObservedASC.Reset();
+		}
+
 		void BeginEnding()
 		{
+			ReleaseAttackObserver();
 			Stage = EStage::Ending;
 			LingerAbility.Reset();
 			if (ServerObserver.IsValid()) { ServerObserver->Release(); }
@@ -1318,7 +1566,8 @@ namespace GGYGOSquadSwitchNetTests
 			Test.TestTrue(TEXT("listen-server smoke released its PIE session"), !OwnsPIESession() && CountPIEWorlds() == 0);
 			if (bPassed && !bFailed)
 			{
-				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC and Z/C key switches, linger/return/bench replication, ")
+				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC and Z/C key switches, cooldown waits, rebinding, client move and attack, host key, ")
+					TEXT("death auto-switch, linger/return/bench replication, ")
 					TEXT("damage/MaxHealth drop/poise break replication with HealthComponent broadcasts, and PIE teardown observed. ")
 					TEXT("Production errors logged by other modules stay unfiltered and decide the Automation result."));
 			}
@@ -1332,12 +1581,22 @@ namespace GGYGOSquadSwitchNetTests
 		bool bFailed = false;
 		bool bPassed = false;
 		FString LastUnmet;
-		FKey HeldClientKey;
-		uint64 HeldClientKeyFrame = 0;
+		TWeakObjectPtr<APlayerController> HeldKeyController;
+		FKey HeldKey;
+		uint64 HeldKeyFrame = 0;
+		double HeldKeyReleaseSeconds = 0.0;
+		double StageEnteredSeconds = 0.0;
+		FVector MoveStartLocation = FVector::ZeroVector;
 		int32 RosterAssignments = 0;
 		FDelegateHandle PostLoginHandle;
 		TStrongObjectPtr<ULevelEditorPlaySettings> RequestSettings;
 		TWeakObjectPtr<UGGYGOSquadSwitchTestAbility> LingerAbility;
+		TWeakObjectPtr<APawn> DyingAvatar;
+		double DeathStartedSeconds = 0.0;
+		TWeakObjectPtr<UGGYGOAbilitySystemComponent> AttackObservedASC;
+		FDelegateHandle AttackActivatedHandle;
+		bool bServerAttackActivated = false;
+		bool bCapturedDying = false;
 		TWeakObjectPtr<UGGYGOHealthComponent> ServerHealth;
 		TWeakObjectPtr<UGGYGOHealthComponent> ClientHealth;
 		TStrongObjectPtr<UGGYGOSquadSwitchHealthObserver> ServerObserver;

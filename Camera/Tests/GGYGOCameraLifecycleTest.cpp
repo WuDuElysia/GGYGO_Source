@@ -1281,6 +1281,19 @@ bool FGGYGOCameraModeOwnershipAndAvatarReceiverTest::RunTest(const FString& Para
 		|| !TestNotNull(TEXT("new Avatar Pawn"), NewAvatarPawn)) { return false; }
 	UGGYGOCameraLifecycleTestComponent* OriginalCamera = OriginalPawn->GetCameraForTest();
 	UGGYGOCameraLifecycleTestComponent* NewAvatarCamera = NewAvatarPawn->GetCameraForTest();
+	// 生产 Hero 在 BeginPlay 把相机仲裁绑到自己，没有能力覆盖时返回 PawnData 的默认模式。
+	// 本测试世界不开局、Pawn 没有 PawnData：仲裁先问 Hero，再以 ModeA 代替 PawnData 默认模式。
+	const auto BindHeroArbiter = [](UGGYGOCameraLifecycleTestComponent* Camera, UGGYGOHeroComponent* Hero)
+	{
+		const TWeakObjectPtr<UGGYGOHeroComponent> WeakHero(Hero);
+		Camera->DetermineCameraModeDelegate.BindLambda([WeakHero]() -> TSubclassOf<UGGYGOCameraMode>
+		{
+			const TSubclassOf<UGGYGOCameraMode> Override = WeakHero.IsValid() ? WeakHero->DetermineCameraMode() : nullptr;
+			return Override ? Override : TSubclassOf<UGGYGOCameraMode>(UGGYGOCameraLifecycleTestModeA::StaticClass());
+		});
+	};
+	BindHeroArbiter(OriginalCamera, OriginalPawn->GetHeroForTest());
+	BindHeroArbiter(NewAvatarCamera, NewAvatarPawn->GetHeroForTest());
 	OriginalCamera->PushModeForTest(UGGYGOCameraLifecycleTestModeA::StaticClass());
 	NewAvatarCamera->PushModeForTest(UGGYGOCameraLifecycleTestModeA::StaticClass());
 
