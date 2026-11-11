@@ -288,6 +288,7 @@ public:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void StopMovementImmediately() override;
 	virtual void SetUpdatedComponent(USceneComponent* NewUpdatedComponent) override;
+	virtual void OnMovementModeChanged(EMovementMode PreviousMovementMode, uint8 PreviousCustomMode) override;
 
 	/** 保留 CMC 自身 Tick，只做 ActionMotion 资源回收；Locomotion 在 move 模拟入口推进。 */
 	virtual void TickComponent(float DeltaTime, enum ELevelTick TickType, FActorComponentTickFunction* ThisTickFunction) override;
@@ -374,6 +375,15 @@ public:
 	/** Receiver-owned teardown, including a failed Attach; does not assert physical release. */
 	bool InvalidateMovementInputSession(const FGGYGOMovementInputConsumerBindingId& Binding,
 		FName Reason, FString& OutError);
+
+	/** Authority 为原角色取得独占 Flying 模式。句柄跨动画段由调用方持有，模式被外部接管即退役。 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Movement|Action Motion")
+	bool AcquireFlyingMovementMode(ACharacter* OriginalCharacter, int32& OutHandle, FString& OutError);
+
+	/** 先结束/取消原动作再归还模式。bEnterFalling 显式进入 Falling，否则恢复原模式，原地面模式须有真实可走地面。
+	 *  已退役的原句柄可重复归还；归还不改变后继模式，不证明已经落地。 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Movement|Action Motion")
+	bool ReleaseFlyingMovementMode(int32 OriginalHandle, FString& OutError, bool bEnterFalling = false);
 
 	/** Authority-only ground action. Returns an owner token, or INDEX_NONE; rejects overlapping actions. */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Movement|Action Motion")
@@ -613,6 +623,13 @@ public:
 	void GetLocalVelocityBlend(float& OutBlendX, float& OutBlendY) const;
 
 private:
+	/** Authority CMC 唯一模式借用。保存原模式与角色直至精确归还或原生模式/组件退役，句柄不复用。 */
+	int32 LastFlyingMovementModeHandle = 0;
+	int32 ActiveFlyingMovementModeHandle = INDEX_NONE;
+	EMovementMode PreviousFlyingMovementMode = MOVE_None;
+	TWeakObjectPtr<ACharacter> FlyingMovementModeCharacter;
+	void RetireFlyingMovementMode();
+
 	struct FMovementOwnerSyncObserverRecord
 	{
 		FGGYGOMovementOwnerSyncObserverId Id;

@@ -4,6 +4,7 @@
 #include "AI/Boss/GGYGOBossActionSet.h"
 #include "AI/Boss/GGYGOBossDefinition.h"
 #include "AbilitySystem/GGYGOAbilitySet.h"
+#include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "Character/Data/GGYGOPawnData.h"
@@ -59,6 +60,14 @@ bool AGGYGOBossState::InitializeFromDefinition(const UGGYGOBossDefinition* InDef
 		return false;
 	}
 
+	FString CombatConfigurationError;
+	if (!InDefinition->ValidateCombatConfiguration(CombatConfigurationError))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("InitializeFromDefinition: 定义 [%s] 无效：%s"),
+			*GetNameSafe(InDefinition), *CombatConfigurationError);
+		return false;
+	}
+
 	// 各阶段 ActionSet 是静态数据资产，只在采纳定义时整表校验一次；之后选招、保存、消费与激活只按 ActionTag 查行。
 	for (const FGGYGOBossPhaseDefinition& Phase : InDefinition->Phases)
 	{
@@ -103,8 +112,41 @@ bool AGGYGOBossState::InitializeFromDefinition(const UGGYGOBossDefinition* InDef
 
 	SetReplicatedStateTag(CurrentFormTag, InDefinition->InitialFormTag);
 	SetReplicatedStateTag(CurrentPhaseTag, InDefinition->InitialPhaseTag);
+	PhaseHealthChanged = HealthSet->OnHealthChanged.AddUObject(this, &ThisClass::HandlePhaseHealthChanged);
+	PhaseMaxHealthChanged = HealthSet->OnMaxHealthChanged.AddUObject(this, &ThisClass::HandlePhaseHealthChanged);
 	ForceNetUpdate();
-	return true;
+	OnBossHealthChanged(HealthSet->GetHealth(), HealthSet->GetMaxHealth());
+	return IsValid(this) && !IsActorBeingDestroyed();
+}
+
+bool AGGYGOBossState::SetCurrentPhase(FGameplayTag NewPhaseTag)
+{
+	if (!HasAuthority() || !BossDefinition || !BossDefinition->FindPhase(NewPhaseTag)
+		|| HealthSet->GetHealth() <= 0.0f
+		|| AbilitySystemComponent->HasMatchingGameplayTag(GGYGOGameplayTags::State_Dying)
+		|| AbilitySystemComponent->HasMatchingGameplayTag(GGYGOGameplayTags::State_Dead))
+	{
+		return false;
+	}
+	SetReplicatedStateTag(CurrentPhaseTag, NewPhaseTag);
+	if (!IsValid(this) || IsActorBeingDestroyed()) { return false; }
+	ForceNetUpdate();
+	return CurrentPhaseTag == NewPhaseTag;
+}
+
+void AGGYGOBossState::HandlePhaseHealthChanged(AActor* EffectInstigator, AActor* Causer,
+	const FGameplayEffectSpec* Spec, float Magnitude, float OldValue, float NewValue)
+{
+	if (HasAuthority()) { OnBossHealthChanged(HealthSet->GetHealth(), HealthSet->GetMaxHealth()); }
+}
+
+void AGGYGOBossState::EndPlay(const EEndPlayReason::Type EndPlayReason)
+{
+	HealthSet->OnHealthChanged.Remove(PhaseHealthChanged);
+	HealthSet->OnMaxHealthChanged.Remove(PhaseMaxHealthChanged);
+	PhaseHealthChanged.Reset();
+	PhaseMaxHealthChanged.Reset();
+	Super::EndPlay(EndPlayReason);
 }
 
 const UGGYGOPawnData* AGGYGOBossState::GetInitialPawnData() const
@@ -153,15 +195,17 @@ void AGGYGOBossState::SetReplicatedStateTag(FGameplayTag& CurrentTag, FGameplayT
 		return;
 	}
 
-	if (CurrentTag.IsValid())
-	{
-		AbilitySystemComponent->SetLooseGameplayTagCount(
-			CurrentTag, 0, EGameplayTagReplicationState::TagAndCountToAll);
-	}
+	const FGameplayTag PreviousTag = CurrentTag;
 	CurrentTag = NewTag;
-	if (CurrentTag.IsValid())
+	if (PreviousTag.IsValid())
 	{
 		AbilitySystemComponent->SetLooseGameplayTagCount(
-			CurrentTag, 1, EGameplayTagReplicationState::TagAndCountToAll);
+			PreviousTag, 0, EGameplayTagReplicationState::TagAndCountToAll);
+	}
+	// Tag 观察者可再次切阶段或关闭宿主；原调用不再发布已被替换的新标签。
+	if (IsValid(this) && !IsActorBeingDestroyed() && CurrentTag == NewTag && NewTag.IsValid())
+	{
+		AbilitySystemComponent->SetLooseGameplayTagCount(
+			NewTag, 1, EGameplayTagReplicationState::TagAndCountToAll);
 	}
 }

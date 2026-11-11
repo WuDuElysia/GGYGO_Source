@@ -79,7 +79,7 @@ FGGYGOActionMotionExecution::FRetiredObservers FGGYGOActionMotionExecution::Clos
 
 bool FGGYGOActionMotionExecution::IsMontageActionMovementModeSupported() const
 {
-	return Movement.IsMovingOnGround() || Movement.IsFalling();
+	return Movement.IsMovingOnGround() || Movement.IsFalling() || Movement.IsFlying();
 }
 
 bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
@@ -104,7 +104,7 @@ bool FGGYGOActionMotionExecution::BeginMontageActionMotion(
 	if (!IsInGameThread() || !IsValid(Movement.CharacterOwner) || Movement.IsBeingDestroyed() || !IsMontageActionMovementModeSupported()
 		|| (!Movement.CharacterOwner->HasAuthority() && (Movement.CharacterOwner->GetLocalRole() != ROLE_AutonomousProxy
 			|| !Movement.CharacterOwner->IsLocallyControlled())) || Movement.CharacterOwner->bClientUpdating)
-		return Reject(TEXT("a live authority or original autonomous owner in Walking, NavWalking or Falling is required"));
+		return Reject(TEXT("a live authority or original autonomous owner in Walking, NavWalking, Falling or Flying is required"));
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(&Movement);
 	const TWeakObjectPtr<ACharacter> OriginalCharacter(Movement.CharacterOwner);
 	const auto OriginalOwnerContext = Movement.MovementOwnerSyncContext;
@@ -395,7 +395,7 @@ bool FGGYGOActionMotionExecution::ValidateMontageActionRuntime(
 	if (!IsValid(Movement.CharacterOwner) || !IsMontageActionMovementModeSupported() || !Source.OriginalBinding.IsValid()
 		|| Movement.CharacterOwner->IsPlayingRootMotion())
 	{
-		OutError = TEXT("original XYZ action requires Walking, NavWalking or Falling, its source and no native animation RootMotion conflict");
+		OutError = TEXT("original XYZ action requires Walking, NavWalking, Falling or Flying, its source and no native animation RootMotion conflict");
 		return false;
 	}
 	if (Source.Settings.HasFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate)

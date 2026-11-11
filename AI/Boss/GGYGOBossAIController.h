@@ -21,7 +21,7 @@ enum class EInitialBossPossessResult : uint8
 	TreeStarted
 };
 
-/** 持有 Brain、决策随机流/派生权重与一次性选招请求；目标/仇恨仍待阶段 D。 */
+/** 持有 Brain、决策随机流/派生权重与一次性选招请求；战斗目标只保存在 Blackboard。 */
 UCLASS(Blueprintable)
 class GGYGO_API AGGYGOBossAIController : public AAIController
 {
@@ -32,6 +32,21 @@ public:
 
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Boss")
 	AGGYGOBossState* GetBossState() const { return BossState; }
+
+	/** 读取 Blackboard 原目标并核存活事实；具体目标类型、保持与切换由服务蓝图决定。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Boss")
+	AActor* GetCombatTarget() const;
+
+	/** 目标策略由 BTService 蓝图决定；此接口只校验并发布 Blackboard 原目标。 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Boss")
+	bool SetCombatTarget(AActor* Target);
+
+	/** 范围最近点查询，不决定保持/切换目标，也不写 Blackboard。 */
+	UFUNCTION(BlueprintPure, Category = "GGYGO|Boss")
+	AActor* FindNearestCombatTarget(float MaxDistance) const;
+
+	/** 死亡入口停止决策和寻路；能力与其资源仍由 GAS 死亡链收尾。 */
+	void StopCombatLogic(const TCHAR* Reason);
 
 	/** Encounter 提供可复现的决策种子；仅服务器决策时消费。 */
 	void InitializeDecisionStream(int32 EncounterSeed);
@@ -81,6 +96,7 @@ private:
 	bool IsInitialPossessContextCurrent(const FInitialBossPossessContext& Context) const;
 	bool IsInitialPossessTreeCurrent(const FInitialBossPossessContext& Context) const;
 	void RetireInitialPossess(const TCHAR* Reason);
+	bool IsCombatTargetAlive(const AActor* Target) const;
 
 	// 来源全用弱引用；初始化、重选、消费、附身变化和结束时失效。
 	struct FPendingActionSelection

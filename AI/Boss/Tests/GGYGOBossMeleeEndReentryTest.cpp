@@ -147,6 +147,9 @@ bool UGGYGOBossMeleeLifecycleTestAbility::BeginMotionForTest(
 #include "Misc/AutomationTest.h"
 #if WITH_EDITOR
 #include "AbilitySystem/GGYGOAbilitySet.h"
+#include "BehaviorTree/BehaviorTree.h"
+#include "BehaviorTree/BlackboardComponent.h"
+#include "BehaviorTree/BlackboardData.h"
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
 #include "Animation/AnimData/IAnimationDataModel.h"
 #include "Components/CapsuleComponent.h"
@@ -841,9 +844,9 @@ namespace
 			bPassed &= Check(bSawCapsuleMove && (FinalLocation - Entry).Equals(ExpectedDelta, 1.0),
 				FString::Printf(TEXT("正式胶囊 XYZ 不符：实际 %s，资产期望 %s"),
 					*(FinalLocation - Entry).ToString(), *ExpectedDelta.ToString()));
-			bPassed &= Check(BeginCount == 1 && EndCount == 1 && OpenSamples >= 2 && ContactSamples >= 2 && EffectCount == 1,
-				FString::Printf(TEXT("实际窗口／重复接触去重不符：Begin=%d End=%d OpenSamples=%d ContactSamples=%d GE=%d"),
-					BeginCount, EndCount, OpenSamples, ContactSamples, EffectCount));
+			bPassed &= Check(BeginCount == 1 && EndCount == 1 && OpenSamples >= 2 && ContactSamples >= 2 && EffectCount == 1 && CooldownCount == 1,
+				FString::Printf(TEXT("实际窗口／重复接触去重不符：Begin=%d End=%d OpenSamples=%d ContactSamples=%d GE=%d Cooldown=%d"),
+					BeginCount, EndCount, OpenSamples, ContactSamples, EffectCount, CooldownCount));
 			bPassed &= Check(FMath::IsNearlyEqual(InitialHealth - TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetHealthAttribute()), Damage, 0.01f)
 				&& FMath::IsNearlyEqual(InitialPoise - TargetASC->GetNumericAttribute(UGGYGOHealthSet::GetPoiseAttribute()), PoiseDamage, 0.01f),
 				TEXT("正式 GE／Execution／AttributeSet 的生命或韧性结算不符"));
@@ -947,7 +950,7 @@ namespace
 			Check(EditorWorld.IsValid() && GWorld == OuterWorld && GEngine->GameViewport.Get() == OuterViewport
 				&& EditorWorld->GetPackage()->IsDirty() == bEditorMapDirty, TEXT("原 Editor World／Viewport／地图脏状态未恢复"));
 			if (!bFailed && bBehaviorVerified)
-				Test.AddInfo(TEXT("[BossAI.KevinIce01.ProductionSmoke] PASS：正式配置授予／实际 XYZ 胶囊／原生窗口 GE 去重结算／资源、自建 Actor 及自有 PIE 清理。仅 L_Movement_Test 受控 Falling 查询夹具，无地面实战／P3／原作命中框／联机声明。"));
+				Test.AddInfo(TEXT("[BossAI.KevinIce01.ProductionSmoke] PASS：正式配置授予／实际 XYZ 胶囊／原生窗口 GE 去重结算／资源、自建 Actor 及自有 PIE 清理。仅 L_Movement_Test 受控AssemblyOnly/Falling查询夹具，真实Cooldown单列；无AI选招／阶段／地面实战／P3／原作命中框／联机声明。"));
 			return true;
 		}
 
@@ -977,7 +980,7 @@ namespace
 				AGGYGOEncounterLifecycleTestEncounter::StaticClass(), Transform, Params);
 			if (!Encounter) return nullptr;
 			Encounters.Add(Encounter);
-			Encounter->ConfigureForTest(Definition.Get());
+			Encounter->ConfigureForTest(FixtureDefinition.Get());
 			Encounter->FinishSpawning(Transform);
 			if (!Encounter->SpawnBoss() || !IsReady(Encounter)) return nullptr;
 			CreatedActors.Add(Encounter->GetBossState()); CreatedActors.Add(Encounter->GetBossController());
@@ -995,47 +998,67 @@ namespace
 			if (!Check(Context && Context->WorldType == EWorldType::PIE, TEXT("缺少真实 PIE Context"))) return false;
 			WorldContext = Context->ContextHandle;
 			Deadline = FPlatformTime::Seconds() + 15.0;
-			FString ConfigText;
-			TSharedPtr<FJsonObject> Config;
-			const FString ConfigPath = FPaths::ProjectDir() / TEXT("AAADocs/Assets/BH3/KevinDemonBattle/BH3_Kevin_Combat_Wiring_Config.json");
-			if (!Check(FFileHelper::LoadFileToString(ConfigText, *ConfigPath)
-				&& FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(ConfigText), Config) && Config.IsValid(),
-				TEXT("正式 Wiring_Config 无效：") + ConfigPath)) return false;
-			const TSharedPtr<FJsonObject>* Assets = nullptr;
-			const TArray<TSharedPtr<FJsonValue>>* Actions = nullptr;
-			FString Trigger, DefinitionPath, AbilityPath, MontagePath, EffectPath, StartSocket, EndSocket, MeshPath;
-			if (!Check(Config->TryGetStringField(TEXT("attack_trigger"), Trigger) && Trigger == TEXT("automation_only")
-				&& Config->TryGetObjectField(TEXT("assets"), Assets) && (*Assets)->TryGetStringField(TEXT("definition"), DefinitionPath)
-				&& Config->TryGetArrayField(TEXT("actions"), Actions) && Actions->Num() == 1
-				&& Config->TryGetStringField(TEXT("damage_effect"), EffectPath)
-				&& Config->TryGetStringField(TEXT("mesh"), MeshPath)
-				&& Config->TryGetStringField(TEXT("trace_start_socket"), StartSocket)
-				&& Config->TryGetStringField(TEXT("trace_end_socket"), EndSocket), TEXT("正式配置必需字段缺失"))) return false;
-			const TSharedPtr<FJsonObject> Action = (*Actions)[0]->AsObject();
-			FString ActionId;
-			double ConfigDamage = 0.0, ConfigPoise = 0.0, ConfigRadius = 0.0;
-			if (!Check(Action.IsValid() && Action->TryGetStringField(TEXT("id"), ActionId) && ActionId == TEXT("Ice01")
-				&& Action->TryGetStringField(TEXT("ability"), AbilityPath) && Action->TryGetStringField(TEXT("montage"), MontagePath)
-				&& Action->TryGetNumberField(TEXT("damage"), ConfigDamage) && Action->TryGetNumberField(TEXT("poise_damage"), ConfigPoise)
-				&& Action->TryGetNumberField(TEXT("trace_radius"), ConfigRadius)
-				&& FMath::IsFinite(ConfigDamage) && ConfigDamage > 0 && FMath::IsFinite(ConfigPoise) && ConfigPoise > 0
-				&& FMath::IsFinite(ConfigRadius) && ConfigRadius >= 1, TEXT("正式 Ice01 路径或测试数值无效"))) return false;
-			Damage = static_cast<float>(ConfigDamage); PoiseDamage = static_cast<float>(ConfigPoise);
+			const auto ReadConfig = [this](const FString& Relative)
+			{
+				FString Text; TSharedPtr<FJsonObject> Result;
+				const FString Path = FPaths::ProjectDir() / Relative;
+				Check(FFileHelper::LoadFileToString(Text, *Path) && FJsonSerializer::Deserialize(TJsonReaderFactory<>::Create(Text), Result)
+					&& Result.IsValid(), TEXT("实际配置无效：") + Path);
+				return Result;
+			};
+			const auto Config = ReadConfig(TEXT("AAADocs/Assets/BH3/KevinDemonBattle/BH3_Kevin_Combat_Wiring_Config.json"));
+			const auto Abilities = ReadConfig(TEXT("AAADocs/Assets/BH3/KevinDemonBattle/BH3_Kevin_Ability_Config.json"));
+			const auto Animation = ReadConfig(TEXT("AAADocs/Assets/BH3/KevinDemonBattle/BH3_Kevin_Combat_Montage_Config.json"));
+			if (bFailed) return false;
+			const TSharedPtr<FJsonObject>* Assets = nullptr; const TSharedPtr<FJsonObject>* TraceConfig = nullptr;
+			const TArray<TSharedPtr<FJsonValue>>* Actions = nullptr; const TArray<TSharedPtr<FJsonValue>>* Skills = nullptr;
+			FString DefinitionPath, AbilityPath, MontagePath, EffectPath, CooldownPath, StartSocket, EndSocket, MeshPath;
+			if (!Check(Config->TryGetObjectField(TEXT("assets"), Assets) && (*Assets)->TryGetStringField(TEXT("definition"), DefinitionPath)
+				&& Config->TryGetStringField(TEXT("mesh"), MeshPath) && Abilities->TryGetStringField(TEXT("damage_effect"), EffectPath)
+				&& Abilities->TryGetObjectField(TEXT("trace"), TraceConfig) && (*TraceConfig)->TryGetStringField(TEXT("start_socket"), StartSocket)
+				&& (*TraceConfig)->TryGetStringField(TEXT("end_socket"), EndSocket) && Abilities->TryGetArrayField(TEXT("abilities"), Actions)
+				&& Animation->TryGetArrayField(TEXT("skill_assemblies"), Skills), TEXT("当前15招配置的必需字段缺失"))) return false;
+			TSharedPtr<FJsonObject> Action, Skill; int32 ActionMatches=0, SkillMatches=0;
+			for (const auto& Value:*Actions) { const auto Object=Value->AsObject(); FString Key;
+				if(Object && Object->TryGetStringField(TEXT("key"),Key) && Key==TEXT("Ice01")) {Action=Object;++ActionMatches;} }
+			for (const auto& Value:*Skills) { const auto Object=Value->AsObject(); FString Key;
+				if(Object && Object->TryGetStringField(TEXT("id"),Key) && Key==TEXT("Ice01")) {Skill=Object;++SkillMatches;} }
+			double ConfigDamage=0.0, ConfigPoise=0.0, ConfigRadius=0.0; bool bEnabled=false;
+			const TArray<TSharedPtr<FJsonValue>>* Windows=nullptr;
+			if (!Check(ActionMatches==1 && SkillMatches==1 && Action->TryGetBoolField(TEXT("enabled"),bEnabled) && bEnabled
+				&& Action->TryGetStringField(TEXT("ability"),AbilityPath) && Action->TryGetStringField(TEXT("cooldown_effect"),CooldownPath)
+				&& Skill->TryGetStringField(TEXT("montage"),MontagePath) && Skill->TryGetArrayField(TEXT("hit_windows"),Windows) && Windows->Num()==1
+				&& Action->TryGetNumberField(TEXT("damage"),ConfigDamage) && Action->TryGetNumberField(TEXT("poise_damage"),ConfigPoise)
+				&& (*TraceConfig)->TryGetNumberField(TEXT("radius"),ConfigRadius) && FMath::IsFinite(ConfigDamage) && ConfigDamage>0
+				&& FMath::IsFinite(ConfigPoise) && ConfigPoise>0 && FMath::IsFinite(ConfigRadius) && ConfigRadius>=1,
+				TEXT("当前Ice01实际路径、窗口或数值无效"))) return false;
+			FString BeginName, EndName;
+			if (!Check((*Windows)[0]->AsObject()->TryGetStringField(TEXT("begin_event_tag"),BeginName)
+				&& (*Windows)[0]->AsObject()->TryGetStringField(TEXT("end_event_tag"),EndName), TEXT("当前Ice01作者窗标签缺失"))) return false;
+			HitBeginTag=FGameplayTag::RequestGameplayTag(FName(*BeginName),false); HitEndTag=FGameplayTag::RequestGameplayTag(FName(*EndName),false);
+			if (!Check(HitBeginTag.IsValid() && HitEndTag.IsValid(),TEXT("当前Ice01窗口Tag未登记"))) return false;
+			Damage=static_cast<float>(ConfigDamage);PoiseDamage=static_cast<float>(ConfigPoise);
 			const auto ObjectPath = [](const FString& Package) { return Package + TEXT(".") + FPackageName::GetLongPackageAssetName(Package); };
 			Definition.Reset(LoadObject<UGGYGOBossDefinition>(nullptr, *ObjectPath(DefinitionPath)));
 			Montage.Reset(LoadObject<UAnimMontage>(nullptr, *ObjectPath(MontagePath)));
-			AbilityClass.Reset(LoadClass<UGGYGOBossMeleeAbility>(nullptr, *(ObjectPath(AbilityPath) + TEXT("_C"))));
+			AbilityClass.Reset(LoadClass<UGGYGOBossMeleeAbility>(nullptr, *AbilityPath));
+			CooldownClass.Reset(LoadClass<UGameplayEffect>(nullptr, *CooldownPath));
 			EffectClass.Reset(LoadClass<UGameplayEffect>(nullptr, *EffectPath));
 			MeshAsset.Reset(LoadObject<USkeletalMesh>(nullptr, *ObjectPath(MeshPath)));
-			if (!Check(Definition.IsValid() && Montage.IsValid() && AbilityClass.IsValid() && EffectClass.IsValid() && MeshAsset.IsValid(),
+			if (!Check(Definition.IsValid() && Montage.IsValid() && AbilityClass.IsValid() && EffectClass.IsValid() && CooldownClass.IsValid() && MeshAsset.IsValid(),
 				TEXT("正式落盘 Definition／GA／Montage／GE／Mesh 缺失，拒绝替换资产"))) return false;
 			const FGGYGOBossFormDefinition* Form = Definition->FindForm(Definition->InitialFormTag);
 			if (!Check(Form && Form->AvatarPawnData && Form->AvatarPawnData->AbilitySets.Num() == 1
 			&& Form->AvatarPawnData->MovementSet && Form->AvatarPawnData->MovementSet->bUseCurveDrivenSpeed
-				&& !Definition->BehaviorTree && Montage->GetNumSections() == 1 && Montage->GetSectionName(0) == TEXT("Main")
+				&& Definition->BehaviorTree && Definition->BehaviorTree->BlackboardAsset && Montage->GetNumSections() == 1 && Montage->GetSectionName(0) == TEXT("Main")
 				&& Montage->GetAnimCompositeSection(0).GetTime() == 0 && Montage->GetAnimCompositeSection(0).NextSectionName.IsNone()
 				&& Montage->SlotAnimTracks.Num() == 1 && Montage->SlotAnimTracks[0].AnimTrack.AnimSegments.Num() == 1,
 				TEXT("正式挂接／动画单段或正常曲线模式不符"))) return false;
+			// 保持本叶原有的受控数值范围：正式数据授予不变，仅瞬态副本明确关闭AI，不改生产定义/树。
+			FixtureDefinition.Reset(DuplicateObject<UGGYGOBossDefinition>(Definition.Get(), GetTransientPackage(),
+				MakeUniqueObjectName(GetTransientPackage(),Definition->GetClass(),TEXT("KevinSmokeAssemblyOnly"))));
+			if(!Check(FixtureDefinition.IsValid(),TEXT("受控AssemblyOnly定义副本创建失败")))return false;
+			FixtureDefinition->BehaviorTree=nullptr;FixtureDefinition->SetFlags(RF_Transient);FixtureDefinition->ClearFlags(RF_Public|RF_Standalone);
 			Sequence.Reset(Cast<UAnimSequence>(Montage->SlotAnimTracks[0].AnimTrack.AnimSegments[0].GetAnimReference()));
 			if (!Check(Sequence.IsValid() && Sequence->GetDataModel(), TEXT("正式派生 Sequence 无原生曲线模型"))) return false;
 			const FName CurveNames[] = {TEXT("RootMotion_PosX"), TEXT("RootMotion_PosY"), TEXT("RootMotion_PosZ")};
@@ -1049,7 +1072,9 @@ namespace
 			if (!Check(!CurveDelta.ContainsNaN(), TEXT("正式 XYZ 末值非法"))) return false;
 			for (const UObject* Input : {static_cast<const UObject*>(Definition.Get()), static_cast<const UObject*>(Montage.Get()),
 				static_cast<const UObject*>(Sequence.Get()), static_cast<const UObject*>(AbilityClass.Get()), static_cast<const UObject*>(EffectClass.Get()),
-				static_cast<const UObject*>(MeshAsset.Get()), static_cast<const UObject*>(MeshAsset->GetSkeleton()), static_cast<const UObject*>(Form->AvatarPawnData.Get()),
+				static_cast<const UObject*>(MeshAsset.Get()), static_cast<const UObject*>(MeshAsset->GetSkeleton()),
+				static_cast<const UObject*>(Definition->BehaviorTree.Get()), static_cast<const UObject*>(Definition->BehaviorTree->BlackboardAsset.Get()),
+				static_cast<const UObject*>(CooldownClass.Get()), static_cast<const UObject*>(Form->AvatarPawnData.Get()),
 				static_cast<const UObject*>(Form->AvatarPawnData->MovementSet.Get()), static_cast<const UObject*>(Form->AvatarPawnData->AbilitySets[0].Get())})
 			{
 				if (!Check(Input && !Input->GetPackage()->IsDirty(), TEXT("正式输入资产须由原作者保存冻结"))) return false;
@@ -1101,15 +1126,19 @@ namespace
 			int32 SpecCount = 0;
 			for (const FGameplayAbilitySpec& Granted : ASC->GetActivatableAbilities())
 				if (Granted.Ability && Granted.Ability->GetClass() == AbilityClass.Get()) { Selected = &Granted; ++SpecCount; }
-			if (!Check(SpecCount == 1 && Selected && Selected->SourceObject.Get() == Definition.Get(),
+			if (!Check(SpecCount == 1 && Selected && Selected->SourceObject.Get() == FixtureDefinition.Get(),
 				TEXT("正式 State 配置授予的唯一 Spec／来源不符；不手工补授予"))) return false;
+			UBlackboardComponent* Blackboard = nullptr;
+			if (!Check(SourceEncounter->GetBossController()->UseBlackboard(Definition->BehaviorTree->BlackboardAsset,Blackboard)
+				&& Blackboard && SourceEncounter->GetBossController()->SetCombatTarget(Target.Get()),
+				TEXT("受控源Controller未接受实际存活目标；不伪造Task或命中")))return false;
 			Ability = Cast<UGGYGOBossMeleeAbility>(Selected->GetPrimaryInstance());
 			FString AbilityError;
 			if (!Check(Ability.IsValid() && Ability->ValidateMeleeConfiguration(AbilityError), TEXT("正式 GA 配置失败：") + AbilityError)) return false;
 			OriginalTick = Mesh->VisibilityBasedAnimTickOption; bOriginalURO = Mesh->bEnableUpdateRateOptimizations;
 			Entry = Source->GetActorLocation(); ExpectedDelta = Source->GetActorQuat().RotateVector(CurveDelta * Mesh->GetComponentScale());
-			WindowEventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowBegin);
-			WindowEventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowEnd);
+			WindowEventTags.AddTag(HitBeginTag);
+			WindowEventTags.AddTag(HitEndTag);
 			WindowObserver = ASC->AddGameplayEventTagContainerDelegate(WindowEventTags,
 				FGameplayEventTagMulticastDelegate::FDelegate::CreateLambda(
 				[this, ConfigRadius](FGameplayTag Tag, const FGameplayEventData* Payload)
@@ -1124,10 +1153,10 @@ namespace
 						&& WindowSource.MontageInstanceId != INDEX_NONE, TEXT("正式窗口不是原 Notify 的真实发送来源"))) return;
 					if (WindowSource.Phase == EGGYGOMontageWindowPhase::End)
 					{
-						if (Tag == GGYGOGameplayTags::Event_Montage_HitWindowEnd) { ++EndCount; }
+						if (Tag == HitEndTag) { ++EndCount; }
 						return;
 					}
-					if (Tag != GGYGOGameplayTags::Event_Montage_HitWindowBegin) return;
+					if (Tag != HitBeginTag) return;
 					++BeginCount;
 					if (!Check(BeginCount == 1 && Mesh.IsValid() && Target.IsValid() && Probe.IsValid(), TEXT("窗口或目标夹具身份失效"))) return;
 					const FVector A = Mesh->GetSocketLocation(TraceStart), B = Mesh->GetSocketLocation(TraceEnd);
@@ -1139,6 +1168,12 @@ namespace
 			EffectObserver = ASC->OnGameplayEffectAppliedDelegateToTarget.AddLambda(
 				[this](UAbilitySystemComponent* Receiver, const FGameplayEffectSpec& Spec, FActiveGameplayEffectHandle)
 				{
+					if (Spec.Def && Spec.Def->GetClass()==CooldownClass.Get())
+					{
+						++CooldownCount;
+						Check(Receiver==ASC.Get() && Spec.GetContext().GetAbilityInstance_NotReplicated()==Ability.Get(),TEXT("正式Cooldown不是原GA给原ASC的真实提交"));
+						return;
+					}
 					++EffectCount;
 					if (!Check(ASC.IsValid() && TargetASC.IsValid() && Ability.IsValid() && Trace.IsValid(), TEXT("GE 回执时原接收者已失效"))) return;
 					const FGameplayEffectContextHandle& HitContext = Spec.GetContext();
@@ -1199,10 +1234,10 @@ namespace
 		UWorld* OuterWorld = nullptr;
 		UGameViewportClient* OuterViewport = nullptr;
 		FName WorldContext;
-		TStrongObjectPtr<UGGYGOBossDefinition> Definition;
+		TStrongObjectPtr<UGGYGOBossDefinition> Definition, FixtureDefinition;
 		TStrongObjectPtr<UAnimMontage> Montage;
 		TStrongObjectPtr<UAnimSequence> Sequence;
-		TStrongObjectPtr<UClass> AbilityClass, EffectClass;
+		TStrongObjectPtr<UClass> AbilityClass, EffectClass, CooldownClass;
 		TStrongObjectPtr<USkeletalMesh> MeshAsset;
 		TArray<TWeakObjectPtr<UPackage>> InputPackages;
 		TArray<TWeakObjectPtr<AGGYGOEncounterLifecycleTestEncounter>> Encounters;
@@ -1225,13 +1260,14 @@ namespace
 			return Extension ? Extension->GetCurrentLocalAbilitySystemResource() : FGGYGOPawnASCResourceHandle{};
 		}
 		FGameplayTagContainer WindowEventTags;
+		FGameplayTag HitBeginTag,HitEndTag;
 		FDelegateHandle WindowObserver, EffectObserver, CompletionObserver;
 		FName TraceStart, TraceEnd;
 		FVector Entry, FinalLocation, ExpectedDelta;
 		EVisibilityBasedAnimTickOption OriginalTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 		float Damage = 0.0f, PoiseDamage = 0.0f, InitialHealth = 0.0f, InitialPoise = 0.0f;
 		double Deadline = 0.0, HostDeadline = 0.0, EndDeadline = 0.0;
-		int32 BeginCount = 0, EndCount = 0, OpenSamples = 0, ContactSamples = 0, EffectCount = 0, CompletionCount = 0;
+		int32 BeginCount = 0, EndCount = 0, OpenSamples = 0, ContactSamples = 0, EffectCount = 0, CompletionCount = 0, CooldownCount = 0;
 		bool bStarted = false, bFailed = false, bCleaned = false, bCancelled = false, bSawCapsuleMove = false, bOriginalURO = false;
 		bool bAssetsStarted = false, bPIEStarted = false, bEnding = false, bBehaviorVerified = false, bEditorMapDirty = false;
 	};

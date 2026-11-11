@@ -9,9 +9,13 @@
 #include "AbilitySystem/Abilities/GGYGOCombatActionAbility.h"
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "Character/Components/GGYGOHealthComponent.h"
 #include "BehaviorTree/BehaviorTree.h"
 #include "BehaviorTree/BehaviorTreeComponent.h"
+#include "BehaviorTree/BlackboardComponent.h"
 #include "BrainComponent.h"
+#include "Engine/World.h"
+#include "GameFramework/PlayerController.h"
 #include "GameplayAbilitySpec.h"
 #include "Templates/UnrealTemplate.h"
 
@@ -22,7 +26,8 @@
 AGGYGOBossAIController::AGGYGOBossAIController(const FObjectInitializer& ObjectInitializer)
 	: Super(ObjectInitializer)
 {
-	PrimaryActorTick.bCanEverTick = false;
+	// 原生 AAIController::Tick 将 BT Focus 转成 ControlRotation，供 CMC 转向。
+	// 保留引擎 Tick；选招与能力执行仍由 BT／GAS 驱动。
 	bWantsPlayerState = false;
 
 	// 形态交接只暂停 Brain，不能走 AAIController 默认的 Cleanup；否则黑板与 BT 实例会被重建。
@@ -37,6 +42,75 @@ void AGGYGOBossAIController::InitializeDecisionStream(int32 EncounterSeed)
 	DecisionRandom.Initialize(EncounterSeed);
 	RuntimeActionWeights.Reset();
 	WeightSource.Reset();
+}
+
+bool AGGYGOBossAIController::IsCombatTargetAlive(const AActor* Target) const
+{
+	if (!IsValid(Target) || Target->IsActorBeingDestroyed() || Target == GetPawn()) { return false; }
+	const UGGYGOHealthComponent* Health = UGGYGOHealthComponent::FindHealthComponent(Target);
+	return Health && !Health->IsDeadOrDying() && Health->GetHealth() > 0.0f;
+}
+
+AActor* AGGYGOBossAIController::GetCombatTarget() const
+{
+	const UGGYGOBossDefinition* Definition = BossState ? BossState->GetBossDefinition() : nullptr;
+	const UBlackboardComponent* CurrentBlackboard = GetBlackboardComponent();
+	AActor* Target = Definition && CurrentBlackboard
+		? Cast<AActor>(CurrentBlackboard->GetValueAsObject(Definition->CombatTargetKey)) : nullptr;
+	return IsCombatTargetAlive(Target) ? Target : nullptr;
+}
+
+AActor* AGGYGOBossAIController::FindNearestCombatTarget(float MaxDistance) const
+{
+	APawn* Avatar = GetPawn();
+	if (!HasAuthority() || !IsValid(Avatar) || !FMath::IsFinite(MaxDistance) || MaxDistance <= 0.0f) { return nullptr; }
+	const UGGYGOHealthComponent* Health = UGGYGOHealthComponent::FindHealthComponent(Avatar);
+	if (!Health || Health->IsDeadOrDying() || Health->GetHealth() <= 0.0f) { return nullptr; }
+	AActor* Target = nullptr;
+	double BestDistanceSquared = FMath::Square(static_cast<double>(MaxDistance));
+	for (FConstPlayerControllerIterator It = GetWorld()->GetPlayerControllerIterator(); It; ++It)
+	{
+		const APlayerController* Player = It->Get();
+		APawn* Candidate = Player ? Player->GetPawn() : nullptr;
+		if (!IsCombatTargetAlive(Candidate)) { continue; }
+		const double DistanceSquared = FVector::DistSquared(Avatar->GetActorLocation(), Candidate->GetActorLocation());
+		if (DistanceSquared <= BestDistanceSquared)
+		{
+			BestDistanceSquared = DistanceSquared;
+			Target = Candidate;
+		}
+	}
+	return Target;
+}
+
+bool AGGYGOBossAIController::SetCombatTarget(AActor* Target)
+{
+	const UGGYGOBossDefinition* Definition = BossState ? BossState->GetBossDefinition() : nullptr;
+	UBlackboardComponent* CurrentBlackboard = GetBlackboardComponent();
+	if (!HasAuthority() || !Definition || !CurrentBlackboard || (Target && !IsCombatTargetAlive(Target))) { return false; }
+	if (CurrentBlackboard->GetValueAsObject(Definition->CombatTargetKey) != Target)
+	{
+		ClearActionSelection();
+		// Blackboard 广播可中止 BT；发布后不再写本轮选择或目标成员。
+		CurrentBlackboard->SetValueAsObject(Definition->CombatTargetKey, Target);
+	}
+	return true;
+}
+
+void AGGYGOBossAIController::StopCombatLogic(const TCHAR* Reason)
+{
+	ClearActionSelection();
+	const TWeakObjectPtr<APawn> OriginalPawn = GetPawn();
+	const TWeakObjectPtr<UBrainComponent> OriginalBrain = GetBrainComponent();
+	const UGGYGOBossDefinition* Definition = BossState ? BossState->GetBossDefinition() : nullptr;
+	if (UBlackboardComponent* CurrentBlackboard = GetBlackboardComponent(); CurrentBlackboard && Definition)
+	{
+		CurrentBlackboard->ClearValue(Definition->CombatTargetKey);
+	}
+	// 清 Blackboard 和停止 Brain 均可能同步进入 BT 回调；旧死亡调用不能停止后继 Pawn 的寻路。
+	if (!IsValid(this) || IsActorBeingDestroyed() || GetPawn() != OriginalPawn.Get()) { return; }
+	if (UBrainComponent* Brain = OriginalBrain.Get(); Brain && GetBrainComponent() == Brain) { Brain->StopLogic(Reason); }
+	if (IsValid(this) && !IsActorBeingDestroyed() && GetPawn() == OriginalPawn.Get()) { StopMovement(); }
 }
 
 struct AGGYGOBossAIController::FInitialBossPossessContext

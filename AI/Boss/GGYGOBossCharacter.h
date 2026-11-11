@@ -20,6 +20,8 @@ public:
 	UGGYGOMeleeTraceComponent* GetMeleeTraceComponent() const { return MeleeTraceComponent; }
 
 protected:
+	virtual void OnDeathStarted(AActor* OwningActor) override;
+
 	/** 只在判定窗口内 Tick，由 CombatActionAbility 控制。 */
 	UPROPERTY(VisibleAnywhere, BlueprintReadOnly, Category = "GGYGO|Boss")
 	TObjectPtr<UGGYGOMeleeTraceComponent> MeleeTraceComponent;

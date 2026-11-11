@@ -11,11 +11,12 @@
 
 class UGGYGOBossDefinition;
 class UGGYGOPawnData;
+struct FGameplayEffectSpec;
 
 /**
- * Boss 的持久战斗状态。阶段 B 只负责一次初始化与单形态装配；不包含 BT、仇恨或生成逻辑。
+ * Boss 的持久战斗状态；拥有阶段身份，消费 HealthSet 原始生命变化，不包含 BT 或生成逻辑。
  */
-UCLASS(BlueprintType, meta = (ShortTooltip = "Boss 的持久 ASC 与阶段/形态状态"))
+UCLASS(BlueprintType, Blueprintable, meta = (ShortTooltip = "Boss 的持久 ASC 与阶段/形态状态"))
 class GGYGO_API AGGYGOBossState : public AGGYGOCombatantState
 {
 	GENERATED_BODY()
@@ -40,8 +41,17 @@ public:
 	UFUNCTION(BlueprintPure, Category = "GGYGO|Boss")
 	FGameplayTag GetCurrentPhaseTag() const { return CurrentPhaseTag; }
 
+	/** 仅更换已声明的动作池；不会取消或替换 GAS 正在执行的能力。 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Boss")
+	bool SetCurrentPhase(FGameplayTag NewPhaseTag);
+
+	/** 初始化完成及 Health/MaxHealth 实变后通知当前事实；具体阶段条件由蓝图实现。 */
+	UFUNCTION(BlueprintImplementableEvent, Category = "GGYGO|Boss")
+	void OnBossHealthChanged(float Health, float MaxHealth);
+
 protected:
 	virtual void GetLifetimeReplicatedProps(TArray<FLifetimeProperty>& OutLifetimeProps) const override;
+	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 
 	void SetReplicatedStateTag(FGameplayTag& CurrentTag, FGameplayTag NewTag);
 
@@ -60,4 +70,8 @@ protected:
 private:
 	/** 从初始形态 PawnData 将规则配置应用到 ASC；可由初始化与复制回调重复调用。 */
 	void ApplyAbilitySystemConfiguration();
+	void HandlePhaseHealthChanged(AActor* Instigator, AActor* Causer, const FGameplayEffectSpec* Spec,
+		float Magnitude, float OldValue, float NewValue);
+	FDelegateHandle PhaseHealthChanged;
+	FDelegateHandle PhaseMaxHealthChanged;
 };

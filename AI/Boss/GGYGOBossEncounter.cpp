@@ -135,8 +135,14 @@ bool AGGYGOBossEncounter::SpawnBoss()
 
 	FActorSpawnParameters StateSpawnParams;
 	StateSpawnParams.Owner = this;
+	UClass* StateClass = SpawnDefinition->BossStateClass.Get();
+	if (!IsValid(StateClass) || StateClass->HasAnyClassFlags(CLASS_Abstract | CLASS_Deprecated))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("BossEncounter [%s] 的 BossStateClass 无效。"), *GetNameSafe(this));
+		return FailSpawn();
+	}
 	AGGYGOBossState* NewState = World->SpawnActor<AGGYGOBossState>(
-		AGGYGOBossState::StaticClass(), FTransform::Identity, StateSpawnParams);
+		StateClass, FTransform::Identity, StateSpawnParams);
 	CreatedBossState = NewState;
 	if (!CanContinueSpawn() || !IsValid(NewState) || !NewState->InitializeFromDefinition(SpawnDefinition))
 	{

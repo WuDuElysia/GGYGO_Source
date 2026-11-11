@@ -7,6 +7,8 @@
 #include "BehaviorTree/BehaviorTree.h"
 #include "BehaviorTree/BehaviorTreeComponent.h"
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
+#include "GameFramework/CharacterMovementComponent.h"
+#include "GameFramework/WorldSettings.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOBossEncounterBehaviorTreeTestTypes)
 
@@ -303,6 +305,8 @@ void UGGYGOEncounterBTLatentTask::CleanupMemory(UBehaviorTreeComponent& Owner, u
 #include "BehaviorTree/Composites/BTComposite_Sequence.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Engine/Engine.h"
+#include "Engine/GameInstance.h"
+#include "Engine/NetworkDelegates.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Misc/AutomationTest.h"
@@ -682,5 +686,112 @@ IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOEncounterBTInvalidRequiredTreeTest,
 bool FGGYGOEncounterBTInvalidRequiredTreeTest::RunTest(const FString& Parameters)
 {
 	return RunInvalidRequiredTreeScenario(*this);
+}
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOEncounterNativeFocusRotationTest,
+	"GGYGO.BossAI.Encounter.NativeFocusRotation",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+namespace
+{
+	class FEncounterFocusRotationCommand final : public IAutomationLatentCommand
+	{
+	public:
+		explicit FEncounterFocusRotationCommand(FAutomationTestBase& InTest) : Test(InTest) {}
+
+		virtual ~FEncounterFocusRotationCommand() override
+		{
+			Probe->bRecording = false;
+			if (World)
+			{
+				World->EndPlay(EEndPlayReason::Quit);
+				World->DestroyWorld(false);
+			}
+			if (GameInstance.IsValid())
+			{
+				GameInstance->Shutdown();
+				// 原生 GI Init／Shutdown 会改写全局网络委托；归还测试前的订阅。
+				FNetDelegates::OnReceivedNetworkEncryptionToken = SavedEncryptionToken;
+				FNetDelegates::OnReceivedNetworkEncryptionAck = SavedEncryptionAck;
+				FNetDelegates::OnReceivedNetworkEncryptionFailure = SavedEncryptionFailure;
+			}
+			if (World)
+			{
+				GEngine->DestroyWorldContext(World);
+				World->GetPackage()->SetDirtyFlag(false);
+			}
+		}
+
+		virtual bool Update() override
+		{
+			if (Frame == 0)
+			{
+				if (!Test.TestNotNull(TEXT("原 Engine"), GEngine)) { return true; }
+				GameInstance.Reset(NewObject<UGameInstance>(GEngine));
+				// 原生 GI 初始化提供 PawnExtension BeginPlay 所需的 ComponentManager。
+				GameInstance->InitializeStandalone(FName(TEXT("GGYGOEncounterFocusWorld")));
+				World = GameInstance->GetWorld();
+				if (!Test.TestNotNull(TEXT("GI 所属 Game World"), World)) { return true; }
+				World->InitializeActorsForPlay(FURL());
+				Config.Definition->BehaviorTree = nullptr;
+				AGGYGOEncounterBTTestEncounter* Encounter = World->SpawnActor<AGGYGOEncounterBTTestEncounter>();
+				if (!Test.TestNotNull(TEXT("Encounter"), Encounter)) { return true; }
+				Encounter->ConfigureForTest(Config.Definition.Get(), Probe.Get());
+				Probe->Encounter = Encounter;
+				if (!Test.TestTrue(TEXT("经正式 Encounter 装配"), Encounter->SpawnBoss())) { return true; }
+				Controller = Encounter->GetBossController();
+				Avatar = Encounter->GetBossAvatar();
+				if (!Test.TestNotNull(TEXT("原 Controller"), Controller)
+					|| !Test.TestNotNull(TEXT("原 Avatar"), Avatar)) { return true; }
+				UCharacterMovementComponent* Movement = Avatar->GetCharacterMovement();
+				Avatar->bUseControllerRotationYaw = false;
+				Movement->bUseControllerDesiredRotation = true;
+				Movement->bOrientRotationToMovement = false;
+				Movement->SetMovementMode(MOVE_Flying);
+				World->BeginPlay();
+				// 隔离 World 无 GameMode，使用原生 GameMode 的 Actor BeginPlay 分发入口。
+				World->GetWorldSettings()->NotifyBeginPlay();
+				if (!Test.TestTrue(TEXT("原 World 与 Controller 已开始原生运行"),
+					World->HasBegunPlay() && Controller->HasActorBegunPlay())) { return true; }
+				SetFocus(FVector::YAxisVector);
+			}
+			// Latent Command 每个引擎帧推进一次；不在同一 GFrameCounter 内循环 World Tick。
+			// 只提交 Focus，由原生 Controller Tick 和 CMC 消费，不写期望旋转。
+			World->Tick(LEVELTICK_All, BTTickDelta);
+			++Frame;
+			if (Frame == 90 || Frame == 180)
+			{
+				const FVector Direction = Frame == 90 ? FVector::YAxisVector : FVector::XAxisVector;
+				Test.TestTrue(TEXT("原生 Focus 推进 Controller 朝向"),
+					FVector::DotProduct(Controller->GetControlRotation().Vector(), Direction) > 0.999);
+				Test.TestTrue(TEXT("CMC 将胶囊转向目标，允许 RotateToFace 完成"),
+					FVector::DotProduct(Avatar->GetActorForwardVector(), Direction) > 0.999);
+				if (Frame == 90) { SetFocus(FVector::XAxisVector); }
+			}
+			return Frame == 180;
+		}
+
+	private:
+		void SetFocus(const FVector& Direction)
+		{
+			Controller->SetFocalPoint(Avatar->GetActorLocation() + Direction * 1000.0, EAIFocusPriority::Gameplay);
+		}
+
+		FAutomationTestBase& Test;
+		FEncounterBTConfig Config{false};
+		TStrongObjectPtr<UGameInstance> GameInstance;
+		TStrongObjectPtr<UGGYGOEncounterBTProbe> Probe{NewObject<UGGYGOEncounterBTProbe>()};
+		UWorld* World = nullptr;
+		AGGYGOBossAIController* Controller = nullptr;
+		AGGYGOBossCharacter* Avatar = nullptr;
+		int32 Frame = 0;
+		FNetDelegates::FReceivedNetworkEncryptionToken SavedEncryptionToken = FNetDelegates::OnReceivedNetworkEncryptionToken;
+		FNetDelegates::FReceivedNetworkEncryptionAck SavedEncryptionAck = FNetDelegates::OnReceivedNetworkEncryptionAck;
+		FNetDelegates::FReceivedNetworkEncryptionFailure SavedEncryptionFailure = FNetDelegates::OnReceivedNetworkEncryptionFailure;
+	};
+}
+
+bool FGGYGOEncounterNativeFocusRotationTest::RunTest(const FString& Parameters)
+{
+	FAutomationTestFramework::Get().EnqueueLatentCommand(MakeShared<FEncounterFocusRotationCommand>(*this));
+	return true;
 }
 #endif // WITH_DEV_AUTOMATION_TESTS

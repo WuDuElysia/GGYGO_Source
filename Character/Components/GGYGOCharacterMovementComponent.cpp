@@ -488,6 +488,7 @@ void UGGYGOCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewU
 	Super::SetUpdatedComponent(NewUpdatedComponent);
 	if (UpdatedComponent != OriginalComponent)
 	{
+		RetireFlyingMovementMode();
 		QueueLocomotionSourceRetirement(PreviousOrigin, EGGYGOMotionExecutionEndReason::Cancelled,
 			TEXT("UpdatedComponentChanged"), FString(), true);
 		QueueLocomotionSourceRetirement(PreviousCompletedOrigin, EGGYGOMotionExecutionEndReason::Cancelled,
@@ -517,6 +518,7 @@ void UGGYGOCharacterMovementComponent::BeginPlay()
 void UGGYGOCharacterMovementComponent::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
 	FLocomotionSourceRetirementScope RetirementScope(this);
+	RetireFlyingMovementMode();
 	QueueCurrentLocomotionSourceRetirement(EGGYGOMotionExecutionEndReason::Cancelled,
 		TEXT("OwnerRetired"), FString(), true);
 	CloseRemoteMotionPoseSegment(EGGYGORemoteMotionPoseReason::ResourceRetired);
@@ -2422,6 +2424,94 @@ bool UGGYGOCharacterMovementComponent::CancelMontageActionMotionForMovement(
 void UGGYGOCharacterMovementComponent::ResumeLocomotionAfterAction()
 {
 	ActionMotionExecution.ResumeLocomotionAfterAction();
+}
+
+void UGGYGOCharacterMovementComponent::RetireFlyingMovementMode()
+{
+	ActiveFlyingMovementModeHandle = INDEX_NONE;
+	PreviousFlyingMovementMode = MOVE_None;
+	FlyingMovementModeCharacter.Reset();
+}
+
+void UGGYGOCharacterMovementComponent::OnMovementModeChanged(EMovementMode PreviousMovementMode, uint8 PreviousCustomMode)
+{
+	if (MovementMode != MOVE_Flying) RetireFlyingMovementMode();
+	Super::OnMovementModeChanged(PreviousMovementMode, PreviousCustomMode);
+}
+
+bool UGGYGOCharacterMovementComponent::AcquireFlyingMovementMode(
+	ACharacter* OriginalCharacter, int32& OutHandle, FString& OutError)
+{
+	OutHandle = INDEX_NONE;
+	OutError.Reset();
+	if (!IsInGameThread() || !HasValidData() || !IsActive() || IsBeingDestroyed()
+		|| !IsValid(OriginalCharacter) || OriginalCharacter != CharacterOwner
+		|| OriginalCharacter->GetCharacterMovement() != this || !OriginalCharacter->HasAuthority())
+	{
+		OutError = TEXT("[Movement.FlyingMode] 需要 Authority 原角色的有效 CMC。");
+		return false;
+	}
+	if (ActiveFlyingMovementModeHandle != INDEX_NONE || LastFlyingMovementModeHandle == MAX_int32
+		|| !(IsMovingOnGround() || IsFalling() || IsFlying())
+		|| ActionMotionExecution.HasOwnedSlot()
+		|| (ActionMotionExecution.CompletedMontageActionResource.IsValid()
+			&& !ActionMotionExecution.bCompletedMontageActionNativeContributionConsumed))
+	{
+		OutError = TEXT("[Movement.FlyingMode] 模式已借用、句柄耗尽、原模式不支持或原动作尚未归还。");
+		return false;
+	}
+	const int32 Handle = ++LastFlyingMovementModeHandle;
+	ActiveFlyingMovementModeHandle = Handle;
+	PreviousFlyingMovementMode = MovementMode;
+	FlyingMovementModeCharacter = OriginalCharacter;
+	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
+	SetMovementMode(MOVE_Flying);
+	UGGYGOCharacterMovementComponent* Self = WeakSelf.Get();
+	// 原生模式回调可更换组件、销毁角色或取得后继借用，返栈只认证本次原句柄。
+	if (!Self || Self->IsBeingDestroyed() || !Self->HasValidData()
+		|| Self->ActiveFlyingMovementModeHandle != Handle || Self->CharacterOwner != OriginalCharacter
+		|| Self->FlyingMovementModeCharacter.Get() != OriginalCharacter || !Self->IsFlying())
+	{
+		OutError = TEXT("[Movement.FlyingMode] 原生模式切换返栈后，原角色或本次模式借用已退役。");
+		return false;
+	}
+	OutHandle = Handle;
+	return true;
+}
+
+bool UGGYGOCharacterMovementComponent::ReleaseFlyingMovementMode(int32 OriginalHandle, FString& OutError, bool bEnterFalling)
+{
+	OutError.Reset();
+	if (!IsInGameThread() || OriginalHandle <= 0 || OriginalHandle > LastFlyingMovementModeHandle)
+	{
+		OutError = TEXT("[Movement.FlyingMode] 归还需要本 CMC 已发行的原句柄。");
+		return false;
+	}
+	if (OriginalHandle != ActiveFlyingMovementModeHandle) return true;
+	if (!HasValidData() || IsBeingDestroyed() || !CharacterOwner->HasAuthority()
+		|| FlyingMovementModeCharacter.Get() != CharacterOwner || !IsFlying())
+	{
+		OutError = TEXT("[Movement.FlyingMode] 原角色、Authority 或 Flying 模式已失效。");
+		return false;
+	}
+	if (ActionMotionExecution.HasOwnedSlot()
+		|| (ActionMotionExecution.CompletedMontageActionResource.IsValid()
+			&& !ActionMotionExecution.bCompletedMontageActionNativeContributionConsumed))
+	{
+		OutError = TEXT("[Movement.FlyingMode] 须先归还原动作及其待消费的原生末区间。");
+		return false;
+	}
+	EMovementMode RestoredMode = bEnterFalling ? MOVE_Falling : PreviousFlyingMovementMode;
+	if (RestoredMode == MOVE_Walking || RestoredMode == MOVE_NavWalking)
+	{
+		FFindFloorResult Floor;
+		FindFloor(UpdatedComponent->GetComponentLocation(), Floor, false);
+		if (!Floor.IsWalkableFloor() || Floor.GetDistanceToFloor() > MAX_FLOOR_DIST) RestoredMode = MOVE_Falling;
+	}
+	// 原句柄先封口，随后原生 Falling/模式回调可接管后继。这里不另写位置或速度。
+	RetireFlyingMovementMode();
+	SetMovementMode(RestoredMode);
+	return true;
 }
 
 int32 UGGYGOCharacterMovementComponent::BeginActionMotion(const UGGYGOActionMotionProfile* Profile, float PlayRate)

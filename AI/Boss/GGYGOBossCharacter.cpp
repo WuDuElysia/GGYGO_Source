@@ -15,3 +15,13 @@ AGGYGOBossCharacter::AGGYGOBossCharacter(const FObjectInitializer& ObjectInitial
 	// Controller 的生命周期由 Encounter 管理，不能让每个新形态自行生成一只 Controller。
 	AutoPossessAI = EAutoPossessAI::Disabled;
 }
+
+void AGGYGOBossCharacter::OnDeathStarted(AActor* OwningActor)
+{
+	const TWeakObjectPtr<AGGYGOBossAIController> OriginalController = Cast<AGGYGOBossAIController>(GetController());
+	Super::OnDeathStarted(OwningActor);
+	if (AGGYGOBossAIController* BossController = OriginalController.Get(); BossController && BossController->GetPawn() == this)
+	{
+		BossController->StopCombatLogic(TEXT("Boss死亡"));
+	}
+}

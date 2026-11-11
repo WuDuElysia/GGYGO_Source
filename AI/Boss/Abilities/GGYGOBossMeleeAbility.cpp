@@ -43,6 +43,7 @@ struct UGGYGOBossMeleeAbility::FOriginalMeleeResources : FGGYGOMontageActionReso
 	bool bSavedUpdateRateOptimizations = false;
 	bool bRestoreMesh = false;
 	bool bRemovePrerequisite = false;
+	TArray<TSharedPtr<FGGYGOMontageActionResources>> FXWindows;
 };
 
 UGGYGOBossMeleeAbility::UGGYGOBossMeleeAbility(const FObjectInitializer& ObjectInitializer)
@@ -64,16 +65,17 @@ bool UGGYGOBossMeleeAbility::ValidateMeleeConfiguration(FString& OutError) const
 }
 
 bool UGGYGOBossMeleeAbility::ResolveMeleeConfiguration(FString& OutError,
-	FGGYGOActionMotionSourceBindingPtr& OutSource) const
+	FGGYGOActionMotionSourceBindingPtr& OutSource, TArray<FGGYGOMontageWindowDeclaration>* OutFXWindows) const
 {
 	OutSource.Reset();
+	OutError.Reset();
 	const TSubclassOf<UGameplayEffect> ResolvedDamageEffect = UGGYGOGameData::ResolveDamageGameplayEffect(
 		DamageEffect, bUseSharedDamageEffectWhenUnset);
-	if (!AttackMontage || !ResolvedDamageEffect || TraceStartSocket.IsNone() || TraceEndSocket.IsNone()
+	if (!AttackMontage || (RequiresDamage() && !ResolvedDamageEffect) || (UsesMeleeTrace() && (TraceStartSocket.IsNone() || TraceEndSocket.IsNone()))
 		|| !FMath::IsFinite(AttackMontage->GetPlayLength()) || AttackMontage->GetPlayLength() <= 0.0f
 		|| !FMath::IsFinite(AttackMontage->RateScale) || AttackMontage->RateScale <= 0.0f
 		|| !FMath::IsFinite(MontagePlayRate) || MontagePlayRate <= 0.0f
-		|| !FMath::IsFinite(TraceRadius) || TraceRadius < 1.0f
+		|| (UsesMeleeTrace() && (!FMath::IsFinite(TraceRadius) || TraceRadius < 1.0f))
 		|| !FMath::IsFinite(Damage) || Damage < 0.0f
 		|| !FMath::IsFinite(PoiseDamage) || PoiseDamage < 0.0f)
 	{
@@ -88,11 +90,14 @@ bool UGGYGOBossMeleeAbility::ResolveMeleeConfiguration(FString& OutError,
 				*GetPathNameSafe(AttackMontage), *GetPathNameSafe(ActionMotionProfile));
 			return false;
 		}
-		if (!GGYGOActionMotionSource::BuildSourceBinding(AttackMontage, MotionSlot, MotionSection, OutSource, OutError)) { return false; }
-		if (OutSource->SectionCount != 1 || OutSource->MontageStartSeconds != 0.0f
+		const bool bBuilt = MotionEndSection.IsNone()
+			? GGYGOActionMotionSource::BuildSourceBinding(AttackMontage, MotionSlot, MotionSection, OutSource, OutError)
+			: GGYGOActionMotionSource::BuildSourceBindingRange(AttackMontage, MotionSlot, MotionSection, MotionEndSection, OutSource, OutError);
+		if (!bBuilt) { return false; }
+		if ((MotionEndSection.IsNone() && OutSource->SectionCount != 1) || OutSource->MontageStartSeconds != 0.0f
 			|| OutSource->MontageEndSeconds != OutSource->MontageLength)
 		{
-			OutError = FString::Printf(TEXT("BossMelee Montage [%s] Slot [%s] Section [%s]: 本能力要求覆盖完整播放的单 Section。"),
+			OutError = FString::Printf(TEXT("BossMelee Montage [%s] Slot [%s] Section [%s]: 动作来源必须覆盖完整播放；多段须显式配置 MotionEndSection。"),
 				*GetPathNameSafe(AttackMontage), *MotionSlot.ToString(), *MotionSection.ToString());
 			OutSource.Reset();
 			return false;
@@ -113,7 +118,34 @@ bool UGGYGOBossMeleeAbility::ResolveMeleeConfiguration(FString& OutError,
 			return false;
 		}
 	}
-	OutError.Reset();
+	TSet<FGameplayTag> FXTags;
+	for (const FGGYGOBossWindowTags& Pair : HitWindowTags)
+	{
+		FGGYGOMontageWindowDeclaration Window;
+		if (FXTags.Contains(Pair.Begin) || FXTags.Contains(Pair.End)
+			|| !UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindowDeclaration(
+				AttackMontage, Pair.Begin, Pair.End, 0.0f, AttackMontage->GetPlayLength(), Window, OutError))
+		{
+			if (OutError.IsEmpty()) { OutError = TEXT("命中窗口标签重复。"); }
+			return false;
+		}
+		FXTags.Add(Pair.Begin); FXTags.Add(Pair.End);
+	}
+	TArray<FGGYGOMontageWindowDeclaration> FXDeclarations;
+	for (const FGGYGOComboStepFX& FX : MontageFXWindows)
+	{
+		FGGYGOMontageWindowDeclaration Declaration;
+		if (!FGGYGOMontageActionResources::ValidateFXConfiguration(AttackMontage, FX,
+			0.0f, AttackMontage->GetPlayLength(), OutError, &Declaration)) { return false; }
+		FXDeclarations.Add(Declaration);
+		if (FX.Mode == EGGYGOComboFXMode::Disabled) { continue; }
+		if (!bUseMontageSourceMotion || FXTags.Contains(FX.BeginEventTag) || FXTags.Contains(FX.EndEventTag))
+		{ OutError = TEXT("Boss FX 需要显式原 Montage 来源，且各表现相位必须使用独立事件对。"); return false; }
+		FXTags.Add(FX.BeginEventTag);
+		FXTags.Add(FX.EndEventTag);
+	}
+	if (!ValidateBossAttackConfiguration(OutError)) { return false; }
+	if (OutFXWindows) { *OutFXWindows = MoveTemp(FXDeclarations); }
 	return true;
 }
 
@@ -121,6 +153,7 @@ bool UGGYGOBossMeleeAbility::ResolveMeleeConfiguration(FString& OutError,
 EDataValidationResult UGGYGOBossMeleeAbility::IsDataValid(FDataValidationContext& Context) const
 {
 	const EDataValidationResult BaseResult = Super::IsDataValid(Context);
+	if (GetClass()->HasAnyClassFlags(CLASS_Abstract)) { return BaseResult; }
 	FString Error;
 	if (!ValidateMeleeConfiguration(Error))
 	{
@@ -318,7 +351,12 @@ void UGGYGOBossMeleeAbility::TryCompleteOriginalMontageMotion(const TSharedPtr<F
 			FailOriginalAction(Resources, Resources->Activation, TEXT("Montage Motion 完成"), TEXT("原播放和位移完成后接收者已失效/改变。"));
 			return;
 		}
-		RequestOriginalTermination(Resources->Activation, false, false);
+		Resources->ReleaseMotion(EGGYGOActionMotionReleaseReason::Completed);
+		if (IsOriginalResourcesCurrent(Resources, Resources->Activation))
+		{
+			Resources->ClearWatchdog();
+			OnOriginalMontageActionCompleted(Resources->Activation);
+		}
 	}
 }
 
@@ -415,15 +453,16 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 
 	ACharacter* Character = Cast<ACharacter>(Resources->Avatar.Get());
 	USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
-	UGGYGOMeleeTraceComponent* Trace = Character ? Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() : nullptr;
+	UGGYGOMeleeTraceComponent* Trace = UsesMeleeTrace() && Character ? Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() : nullptr;
 	Resources->Mesh = Mesh;
 	Resources->Trace = Trace;
 	Resources->Montage = AttackMontage;
 	// 资产配置在本次激活内只解析一次：这些属性对 BP 只读，Commit 也不会改写它们。
 	FString ConfigurationError;
-	if (!HasAuthority(&ActivationInfo) || !ResolveMeleeConfiguration(ConfigurationError, Resources->Source)
-		|| !IsValid(Mesh) || !Mesh->GetAnimInstance() || !IsValid(Trace)
-		|| !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket))
+	TArray<FGGYGOMontageWindowDeclaration> FXDeclarations;
+	if (!HasAuthority(&ActivationInfo) || !ResolveMeleeConfiguration(ConfigurationError, Resources->Source, &FXDeclarations)
+		|| !IsValid(Mesh) || !Mesh->GetAnimInstance()
+		|| (UsesMeleeTrace() && (!IsValid(Trace) || !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket))))
 	{
 		FailOriginalAction(Resources, Original, TEXT("配置"),
 			ConfigurationError.IsEmpty() ? TEXT("需要权威执行、有效 Mesh/AnimInstance/Trace 和两个 Socket。") : ConfigurationError);
@@ -445,9 +484,9 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	Resources->Movement = Movement;
 	float TaskPlayRate = 0.0f;
 	float EffectivePlayRate = 0.0f;
-	if (!IsValid(Mesh) || !IsValid(Trace)
-		|| Character->GetMesh() != Mesh || Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() != Trace
-		|| !Mesh->GetAnimInstance() || !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket)
+	if (!IsValid(Mesh) || Character->GetMesh() != Mesh || !Mesh->GetAnimInstance()
+		|| (UsesMeleeTrace() && (!IsValid(Trace) || Character->FindComponentByClass<UGGYGOMeleeTraceComponent>() != Trace
+			|| !Mesh->DoesSocketExist(TraceStartSocket) || !Mesh->DoesSocketExist(TraceEndSocket)))
 		|| !UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolvePlayRate(
 			AttackMontage, MontagePlayRate, TaskPlayRate, EffectivePlayRate)
 		|| !FMath::IsFinite(AttackMontage->GetPlayLength() / EffectivePlayRate + 2.0f)
@@ -460,13 +499,26 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	const TWeakObjectPtr<const UGGYGOActionMotionProfile> MotionProfile = ActionMotionProfile.Get();
 	Resources->TranslationScale = MotionTranslationScale;
 	const float MontageLength = AttackMontage->GetPlayLength();
+	for (int32 Index = 0; Index < MontageFXWindows.Num(); ++Index)
+	{
+		const FGGYGOComboStepFX& FX = MontageFXWindows[Index];
+		if (FX.Mode == EGGYGOComboFXMode::Disabled) { continue; }
+		TSharedPtr<FGGYGOMontageActionResources> Phase = MakeShared<FGGYGOMontageActionResources>();
+		Phase->Activation = Original;
+		Phase->AbilityPath = Resources->AbilityPath;
+		Phase->Source = Resources->Source;
+		Phase->FX = FX;
+		Phase->bExpectFXBegin = true;
+		Phase->FXWindow = FXDeclarations[Index];
+		Resources->FXWindows.Add(MoveTemp(Phase));
+	}
 
 	if (!PrepareOriginalMeleeMesh(Original, Mesh))
 	{
 		FailOriginalAction(Resources, Original, TEXT("Mesh 准备"), TEXT("原 Mesh 恢复资源不可用或已被本批次申请。"));
 		return;
 	}
-	Resources->bRemovePrerequisite = !Trace->PrimaryComponentTick.GetPrerequisites().ContainsByPredicate(
+	Resources->bRemovePrerequisite = Trace && !Trace->PrimaryComponentTick.GetPrerequisites().ContainsByPredicate(
 		[Mesh](const FTickPrerequisite& Prerequisite)
 		{
 			return Prerequisite.PrerequisiteObject.Get() == Mesh && Prerequisite.Get() == &Mesh->PrimaryComponentTick;
@@ -479,6 +531,14 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	FGameplayTagContainer EventTags;
 	EventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowBegin);
 	EventTags.AddTag(GGYGOGameplayTags::Event_Montage_HitWindowEnd);
+	for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows)
+	{
+		EventTags.AddTag(Phase->FX.BeginEventTag);
+		EventTags.AddTag(Phase->FX.EndEventTag);
+	}
+	for (const FGGYGOBossWindowTags& Pair : HitWindowTags)
+	{ EventTags.AddTag(Pair.Begin); EventTags.AddTag(Pair.End); }
+	AppendMontageEventTags(EventTags);
 	TArray<FGGYGOMontageWindowDeclaration> HitWindows;
 	FString WindowError;
 	if (!UGGYGOAbilityTask_PlayMontageAndWaitForEvent::ResolveOriginalMontageWindows(
@@ -510,6 +570,7 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 		FailOriginalAction(Resources, Original, TEXT("窗口配置"), WindowError);
 		return;
 	}
+	for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows) { Phase->Task = Task.Get(); }
 	Resources->EffectiveRate = Task->GetEffectivePlayRate();
 	const float WatchdogDuration = MontageLength / Resources->EffectiveRate + 2.0f;
 	if (!FMath::IsFinite(Resources->EffectiveRate) || Resources->EffectiveRate <= 0.0f
@@ -543,7 +604,7 @@ void UGGYGOBossMeleeAbility::ActivateAbilityBody(const FGGYGOAbilityActivationHa
 	{
 		if (const TSharedPtr<FOriginalMeleeResources> Pinned = WeakResources.Pin())
 		{
-			HandleOriginalHitWindow(Pinned, Original, OriginalTask, Fact);
+			HandleOriginalWindow(Pinned, Original, OriginalTask, Fact);
 		}
 	});
 	Callbacks.OnFailed.BindWeakLambda(this, [this, WeakResources, OriginalTask](const FGGYGOMontageTaskFailureFact& Fact)
@@ -623,6 +684,7 @@ void UGGYGOBossMeleeAbility::CleanupAbilityResourcesForTermination(const FGGYGOA
 			? EGGYGOActionMotionReleaseReason::Completed
 			: (Context.WasCancelled() ? EGGYGOActionMotionReleaseReason::Cancelled : EGGYGOActionMotionReleaseReason::OwnerInvalidated));
 		Resources->ReleaseTraceWindow();
+		for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows) { Phase->ReleaseFX(!Context.WasCancelled()); }
 		Resources->ClearWatchdog();
 		Resources->ReleaseTask(true);
 	}
@@ -647,6 +709,16 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
 	if (Kind == EMontageCallback::Completed)
 	{
+		for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows)
+		{
+			if (!Phase->bFXBeginConsumed)
+			{
+				FailOriginalAction(Resources, Original, TEXT("FX 完成"), TEXT("原播放完成但必需作者 FX Begin 未消费。"));
+				return;
+			}
+			Phase->ReleaseFX(true);
+			if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
+		}
 		if (Resources->Source.IsValid())
 		{
 			FString Error;
@@ -658,7 +730,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 			}
 			TryCompleteOriginalMontageMotion(Resources);
 		}
-		else { RequestOriginalTermination(Original, false, false); }
+		else { Resources->ClearWatchdog(); OnOriginalMontageActionCompleted(Original); }
 	}
 	else if (Kind == EMontageCallback::Interrupted)
 	{
@@ -667,6 +739,13 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 	}
 	else if (Kind == EMontageCallback::BlendOut && Resources->Source.IsValid())
 	{
+		for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows)
+		{
+			if (!Phase->bFXBeginConsumed)
+			{ FailOriginalAction(Resources, Original, TEXT("FX 混出"), TEXT("原自然混出开始但必需 FX Begin 未消费。")); return; }
+			Phase->ReleaseFX(true);
+			if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
+		}
 		FString Error;
 		if (!Resources->AcceptNaturalBlendOut(Error))
 		{
@@ -675,7 +754,7 @@ void UGGYGOBossMeleeAbility::HandleOriginalMontageCallback(
 	}
 }
 
-void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
+void UGGYGOBossMeleeAbility::HandleOriginalWindow(
 	const TSharedPtr<FOriginalMeleeResources>& Resources, const FGGYGOAbilityActivationHandle& Original,
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent>& OriginalTask,
 	const FGGYGOMontageWindowFact& Fact)
@@ -683,6 +762,32 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Sender = OriginalTask.Get();
 	if (!Sender || !Sender->IsOriginalMontageWindowFact(Fact)) { return; }
+	for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows)
+	{
+		if (Fact.Declaration.BeginEventTag != Phase->FX.BeginEventTag) { continue; }
+		const TWeakPtr<FOriginalMeleeResources> WeakResources(Resources);
+		const TWeakPtr<FGGYGOMontageActionResources> WeakPhase(Phase);
+		FGGYGOMontageFXLocalStartReadyDelegate Ready = FGGYGOMontageFXLocalStartReadyDelegate::CreateWeakLambda(
+			this, [this, WeakResources, WeakPhase](const FGGYGOMontageFXLocalStartReadyFact& ReadyFact)
+			{ HandleOriginalFXReady(WeakResources.Pin(), WeakPhase.Pin(), ReadyFact); });
+		FString Error;
+		if (!Phase->ConsumeFXWindow(this, GET_FUNCTION_NAME_CHECKED(ThisClass, HandleOriginalFXFailed),
+			Fact, MoveTemp(Ready), [this, Resources, Original]()
+			{ return IsOriginalResourcesCurrent(Resources, Original); }, Error))
+		{ FailOriginalAction(Resources, Original, TEXT("FX 窗口"), Error); }
+		return;
+	}
+	if (ConsumeAdditionalWindow(Original, Fact) || !UsesMeleeTrace()) { return; }
+	if (!IsOriginalTaskCurrent(Resources, Original, OriginalTask)) { return; }
+	ExecuteOriginalMeleeWindow(Original, Fact);
+}
+
+void UGGYGOBossMeleeAbility::ExecuteOriginalMeleeWindow(const FGGYGOAbilityActivationHandle& Original,
+	const FGGYGOMontageWindowFact& Fact)
+{
+	const TSharedPtr<FOriginalMeleeResources> Resources = OriginalResources;
+	if (!IsOriginalResourcesCurrent(Resources, Original)) { return; }
+	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask = Resources->Task;
 	UGGYGOMeleeTraceComponent* Trace = Resources->Trace.Get();
 	UAbilitySystemComponent* ASC = Resources->ASC.Get();
 	if (!Trace || !ASC || !ASC->IsOwnerActorAuthoritative())
@@ -692,14 +797,17 @@ void UGGYGOBossMeleeAbility::HandleOriginalHitWindow(
 	}
 	if (Fact.Phase == EGGYGOMontageWindowPhase::End)
 	{
-		if (Fact.Declaration.EndEventTag == GGYGOGameplayTags::Event_Montage_HitWindowEnd
-			&& Resources->TraceWindowSource.HasSameWindow(Fact.Declaration))
+		if (Resources->TraceWindowSource.HasSameWindow(Fact.Declaration))
 		{
 			CloseOriginalTraceWindow(Resources);
 		}
 		return;
 	}
-	if (Fact.Declaration.BeginEventTag != GGYGOGameplayTags::Event_Montage_HitWindowBegin) { return; }
+	const bool bHitWindow = HitWindowTags.IsEmpty()
+		? Fact.Declaration.BeginEventTag == GGYGOGameplayTags::Event_Montage_HitWindowBegin
+		: HitWindowTags.ContainsByPredicate([&Fact](const FGGYGOBossWindowTags& Pair)
+		{ return Pair.Begin == Fact.Declaration.BeginEventTag && Pair.End == Fact.Declaration.EndEventTag; });
+	if (!bHitWindow) { return; }
 	if (Resources->TraceWindow.HasWindow())
 	{
 		const EGGYGOMeleeTraceWindowQueryResult Query = Trace->QueryOwnedTraceWindow(Resources->TraceWindow);
@@ -829,9 +937,10 @@ void UGGYGOBossMeleeAbility::HandleOriginalMeleeHit(
 			*GetPathName());
 		return;
 	}
-	const float HitDamage = Damage;
-	const float HitPoiseDamage = PoiseDamage;
-	const FGameplayTag CueTag = HitCueTag;
+	float HitDamage = 0.0f;
+	float HitPoiseDamage = 0.0f;
+	GetWindowDamage(Resources->TraceWindowSource.BeginEventTag, HitDamage, HitPoiseDamage);
+	const FGameplayTag CueTag = GetWindowHitCue(Resources->TraceWindowSource.BeginEventTag);
 	const FVector Origin = Resources->Avatar->GetActorLocation();
 	FGGYGOHitEffectPayload HitPayload;
 	if (!BuildHitEffectPayload(OriginalTargetASC.Get(), ResolvedDamageEffect, GetAbilityLevel(), HitResult, Origin, HitPayload))
@@ -853,4 +962,47 @@ void UGGYGOBossMeleeAbility::HandleOriginalMeleeHit(
 	if (!IsOriginalHitCurrent() || !OriginalTargetASC.IsValid()) { return; }
 	// Immunity/application refusal does not discard a valid collision Cue payload.
 	if (CueTag.IsValid()) { OriginalTargetASC->ExecuteGameplayCue(CueTag, HitPayload.CueParameters); }
+}
+
+void UGGYGOBossMeleeAbility::HandleOriginalFXReady(const TSharedPtr<FOriginalMeleeResources>& Resources,
+	const TSharedPtr<FGGYGOMontageActionResources>& Phase, const FGGYGOMontageFXLocalStartReadyFact& Fact)
+{
+	if (!Resources || !Phase || !IsOriginalResourcesCurrent(Resources, Resources->Activation)) { return; }
+	FString Error;
+	if (!Phase->ContinueFXLocalStart(Fact, [this, Resources]()
+		{ return IsOriginalResourcesCurrent(Resources, Resources->Activation); }, Error))
+	{ FailOriginalAction(Resources, Resources->Activation, TEXT("FX 就绪"), Error); }
+}
+
+void UGGYGOBossMeleeAbility::HandleOriginalFXFailed(UGGYGOAbilityTask_PlayNiagaraEffect* Sender, const FString& Reason)
+{
+	const TSharedPtr<FOriginalMeleeResources> Resources = OriginalResources;
+	if (!Resources || !Sender) { return; }
+	for (const TSharedPtr<FGGYGOMontageActionResources>& Phase : Resources->FXWindows)
+	{
+		if (Phase->GetFXTask() == Sender)
+		{ FailOriginalAction(Resources, Resources->Activation, TEXT("FX Task"), Reason); return; }
+	}
+}
+
+void UGGYGOBossMeleeAbility::OnOriginalMontageActionCompleted(const FGGYGOAbilityActivationHandle& Original)
+{
+	RequestOriginalTermination(Original, false, false);
+}
+
+bool UGGYGOBossMeleeAbility::IsOriginalMontageActionComplete(const FGGYGOAbilityActivationHandle& Original) const
+{
+	return OriginalResources && OriginalResources->Activation.HasSameActivation(Original) && OriginalResources->IsComplete();
+}
+
+bool UGGYGOBossMeleeAbility::HasOriginalActionReceivers(const FGGYGOAbilityActivationHandle& Original) const
+{
+	return IsOriginalResourcesCurrent(OriginalResources, Original) && AreOriginalReceiversCurrent(OriginalResources);
+}
+
+bool UGGYGOBossMeleeAbility::IsOriginalActionWindow(const FGGYGOAbilityActivationHandle& Original,
+	const FGGYGOMontageWindowFact& Fact) const
+{
+	return OriginalResources && IsOriginalTaskCurrent(OriginalResources, Original, OriginalResources->Task)
+		&& OriginalResources->Task->IsOriginalMontageWindowFact(Fact);
 }
