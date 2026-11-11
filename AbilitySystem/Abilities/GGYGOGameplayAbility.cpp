@@ -10,6 +10,7 @@
 #include "AbilitySystem/GGYGOAbilitySystemComponent.h"
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
 #include "AbilitySystem/GGYGOGameplayEffectContext.h"
+#include "AbilitySystem/Private/GGYGOAbilityInputBuffer.h"
 #include "Camera/GGYGOCameraComponent.h"
 #include "Character/Components/GGYGOHeroComponent.h"
 #include "Physics/GGYGOPhysicalMaterialWithTags.h"
@@ -271,6 +272,7 @@ bool UGGYGOGameplayAbility::CanActivateAbility(const FGameplayAbilitySpecHandle 
 			*GetPathName(), *Handle.ToString());
 		return false;
 	}
+	FGGYGOAbilityInputBuffer::FScopedCanActivateAbility CanScope(*ASC->InputBuffer);
 	const FGameplayAbilitySpec* Spec = ASC->FindAbilitySpecFromHandle(Handle);
 	if (!Spec || Spec->PendingRemove) { return false; }
 	// InstancedPerActor 的同一 Spec 同时只有一次激活；AI 查询也经过这里，激活期间如实返回不可用。

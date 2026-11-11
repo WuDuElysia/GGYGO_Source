@@ -31,6 +31,18 @@ public:
 	FGGYGOAbilityInputBuffer(const FGGYGOAbilityInputBuffer&) = delete;
 	FGGYGOAbilityInputBuffer& operator=(const FGGYGOAbilityInputBuffer&) = delete;
 
+	/** 记录项目 GA 的实际 Can 调用层级；内层 raw Try 不能认领外层输入来源。 */
+	class FScopedCanActivateAbility final
+	{
+	public:
+		explicit FScopedCanActivateAbility(FGGYGOAbilityInputBuffer& InBuffer);
+		~FScopedCanActivateAbility();
+		FScopedCanActivateAbility(const FScopedCanActivateAbility&) = delete;
+		FScopedCanActivateAbility& operator=(const FScopedCanActivateAbility&) = delete;
+	private:
+		FGGYGOAbilityInputBuffer& Buffer;
+	};
+
 	FGGYGOAbilityInputRequestResult ReceiveAbilityInputRequest(const FGameplayTag& InputTag,
 		const FGGYGOAbilityInputRequestIdentity& PreviousIdentity, double OriginalDeadline);
 	FGGYGOAbilityInputRequestResult ReceiveAbilityInputRequest(const FGameplayTag& InputTag,
@@ -46,10 +58,11 @@ public:
 	void WakeQueuedAbilityInputRequests();
 	/** 失去控制：对按住的活动 Spec 派发一次真实释放，再 ClearAbilityInput。见 ASC 同名入口。 */
 	void ReleaseHeldInputForControlLoss();
-	/** Handle 是当前输入 Try 的 Spec，且本次结果尚未被激活或失败通知认领。 */
+	/** 当前 Can 直接属于输入 Try，且本次结果尚未被激活或失败通知认领。 */
 	bool IsInputActivationAttempt(FGameplayAbilitySpecHandle Handle) const
 	{
-		return CurrentInputAttempt && !CurrentInputAttempt->bClaimed && CurrentInputAttempt->Origin.Handle == Handle;
+		return CurrentInputAttempt && !CurrentInputAttempt->bClaimed && CurrentInputAttempt->Origin.Handle == Handle
+			&& CanActivateDepth == CurrentInputAttempt->EntryCanActivateDepth + 1;
 	}
 
 	enum class EAbilityActivationInputOrigin : uint8
@@ -114,7 +127,9 @@ private:
 	struct FAbilityInputActivationAttempt
 	{
 		FAbilityActivationFailureOrigin Origin{};
-		/** 同 Spec 的第一次激活或失败通知认领后，嵌套 Try 的结果不再归入本输入来源。 */
+		/** 输入 Try 进入时的 Can 层级；原生结果通知在其自身 Can 返栈后发生。 */
+		int32 EntryCanActivateDepth = 0;
+		/** 只允许同层原生结果认领一次，反馈中的嵌套 Try 不再借用来源。 */
 		bool bClaimed = false;
 	};
 
@@ -160,6 +175,7 @@ private:
 	TArray<FAbilityInputEdge> PendingAbilityInputEdges;
 	TArray<FGGYGOAbilityInputRetryRequest> PendingAbilityInputRetries;
 	FAbilityInputActivationAttempt* CurrentInputAttempt = nullptr;
+	int32 CanActivateDepth = 0;
 	uint64 AbilityInputRevision = 0;
 	bool bProcessingAbilityInput = false;
 	/**

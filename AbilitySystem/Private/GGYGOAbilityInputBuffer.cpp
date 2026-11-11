@@ -680,12 +680,24 @@ bool FGGYGOAbilityInputBuffer::IsAbilityActivationFailureOriginCurrent(
 	return false;
 }
 
+FGGYGOAbilityInputBuffer::FScopedCanActivateAbility::FScopedCanActivateAbility(FGGYGOAbilityInputBuffer& InBuffer)
+	: Buffer(InBuffer)
+{
+	++Buffer.CanActivateDepth;
+}
+
+FGGYGOAbilityInputBuffer::FScopedCanActivateAbility::~FScopedCanActivateAbility()
+{
+	--Buffer.CanActivateDepth;
+}
+
 FGGYGOAbilityInputBuffer::FScopedAbilityInputActivation::FScopedAbilityInputActivation(
 	FGGYGOAbilityInputBuffer& InBuffer, const FAbilityActivationFailureOrigin& Origin)
 	: Buffer(InBuffer), Previous(InBuffer.CurrentInputAttempt)
 {
 	check(IsInGameThread());
 	Attempt.Origin = Origin;
+	Attempt.EntryCanActivateDepth = InBuffer.CanActivateDepth;
 	InBuffer.CurrentInputAttempt = &Attempt;
 }
 
@@ -697,7 +709,8 @@ FGGYGOAbilityInputBuffer::FScopedAbilityInputActivation::~FScopedAbilityInputAct
 
 void FGGYGOAbilityInputBuffer::NotifyAbilityActivated(FGameplayAbilitySpecHandle Handle)
 {
-	if (CurrentInputAttempt && CurrentInputAttempt->Origin.Handle == Handle)
+	if (CurrentInputAttempt && CurrentInputAttempt->Origin.Handle == Handle
+		&& CanActivateDepth == CurrentInputAttempt->EntryCanActivateDepth)
 	{
 		CurrentInputAttempt->bClaimed = true; // 本次输入已激活；之后同 Spec 的失败通知不再排队。
 	}
@@ -709,8 +722,9 @@ FGGYGOAbilityInputBuffer::FQueuedFailure FGGYGOAbilityInputBuffer::ClaimQueuedFa
 {
 	check(IsInGameThread());
 	FQueuedFailure Result;
-	// 只有本次输入尝试对应 Spec 的第一次结果属于输入来源；嵌套 Try 的结果不借用它。
-	if (!CurrentInputAttempt || CurrentInputAttempt->bClaimed || CurrentInputAttempt->Origin.Handle != Handle)
+	// 原生在 Can 返栈后通知结果；外层 Can 尚在栈内时，通知来自内层 raw Try。
+	if (!CurrentInputAttempt || CurrentInputAttempt->bClaimed || CurrentInputAttempt->Origin.Handle != Handle
+		|| CanActivateDepth != CurrentInputAttempt->EntryCanActivateDepth)
 	{
 		return Result;
 	}
