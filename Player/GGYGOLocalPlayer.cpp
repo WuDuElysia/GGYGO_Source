@@ -370,12 +370,25 @@ void UGGYGOLocalPlayer::PlayerAdded(UGameViewportClient* InViewportClient, FPlat
 
 void UGGYGOLocalPlayer::PlayerRemoved()
 {
+	if (bInputMappingRemovalStarted)
+	{
+		return;
+	}
+	bInputMappingRemovalStarted = true;
+
 	UGGYGOMovementInputOriginResource* const OriginalResource = MovementInputOriginResource.Get();
 	if (IsValid(OriginalResource))
 	{
 		OriginalResource->NotifyPlayerRemoved(this);
 	}
+	// Super 会反初始化本地玩家子系统。此处原 PlayerInput 仍可归还映射计数。
+	InputMappingsRemoving.Broadcast(nullptr);
 	Super::PlayerRemoved();
+}
+
+void UGGYGOLocalPlayer::NotifyControllerInputMappingsRemoving(UEnhancedPlayerInput& PlayerInput)
+{
+	InputMappingsRemoving.Broadcast(&PlayerInput);
 }
 
 void UGGYGOLocalPlayer::ReceivedPlayerController(APlayerController* NewController)

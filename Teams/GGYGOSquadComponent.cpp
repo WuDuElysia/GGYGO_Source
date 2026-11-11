@@ -790,17 +790,49 @@ float UGGYGOSquadComponent::GetSwitchCooldownRemaining() const
 
 void UGGYGOSquadComponent::HandleMemberDeathFinished(AActor* OwningActor)
 {
-	// 客户端经 OnRep 也会广播；换人只在服务器。
+	// 客户端经 OnRep 也会广播；仅权威队伍发布替补所需的原死亡事实。
 	if (!GetOwner() || !GetOwner()->HasAuthority() || bSquadTerminationStarted || !OwningActor) { return; }
-	const AGGYGOCharacterSlot* ActiveSlot = GetActiveSlot();
-	if (!ActiveSlot || ActiveSlot->GetAvatarPawn() != OwningActor) { return; }
-	// 在 FinishDeath 广播内同步换人：角色在下一帧才销毁，此时附身关系与槽位绑定仍完整。
-	if (!SwitchToAdjacentSlot(1, EGGYGOSwitchSource::DeathAutoSwitch))
+	AGGYGOCharacterSlot* ActiveSlot = GetActiveSlot();
+	APawn* Avatar = ActiveSlot ? ActiveSlot->GetAvatarPawn() : nullptr;
+	if (Avatar != OwningActor) { return; }
+
+	FDeathFinishedRequestScope Scope{TWeakObjectPtr<AGGYGOCharacterSlot>(ActiveSlot), TWeakObjectPtr<APawn>(Avatar)};
+	FDeathFinishedRequestScope* PreviousScope = ActiveDeathFinishedRequest;
+	const TWeakObjectPtr<UGGYGOSquadComponent> OriginalSquad(this);
+	ActiveDeathFinishedRequest = &Scope;
+	ON_SCOPE_EXIT
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Log,
-			TEXT("[Teams] Squad=%s Dead=%s: no member could take the field after death (none alive, or switch in progress)."),
-			*GetPathName(), *GetPathNameSafe(OwningActor));
+		if (UGGYGOSquadComponent* Squad = OriginalSquad.Get()) { Squad->ActiveDeathFinishedRequest = PreviousScope; }
+	};
+	OnActiveMemberDeathFinished.Broadcast(ActiveSlot, Avatar);
+	if (const UGGYGOSquadComponent* Squad = OriginalSquad.Get(); Squad && !Squad->bSquadTerminationStarted && !Scope.bConsumed)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Teams] Squad=%s Dead=%s: no synchronous death auto-switch request consumed; check the shared PlayerState graph."),
+			*GetPathNameSafe(Squad), *GetPathNameSafe(Scope.Avatar.Get()));
 	}
+}
+
+bool UGGYGOSquadComponent::RequestNextAfterActiveMemberDeath(AGGYGOCharacterSlot* OriginalSlot, APawn* OriginalAvatar)
+{
+	FDeathFinishedRequestScope* Scope = ActiveDeathFinishedRequest;
+	if (!GetOwner() || !GetOwner()->HasAuthority() || bSquadTerminationStarted
+		|| !Scope || Scope->bConsumed || !IsValid(OriginalSlot) || !IsValid(OriginalAvatar)
+		|| Scope->Slot.Get() != OriginalSlot || Scope->Avatar.Get() != OriginalAvatar
+		|| GetActiveSlot() != OriginalSlot || OriginalSlot->GetAvatarPawn() != OriginalAvatar)
+	{
+		return false;
+	}
+
+	// 在真实切换及其同步回调之前消费，即使无人或切换失败也不能重试。
+	Scope->bConsumed = true;
+	const FString SquadPath = GetPathName();
+	const FString DeadPath = GetPathNameSafe(OriginalAvatar);
+	if (SwitchToAdjacentSlot(1, EGGYGOSwitchSource::DeathAutoSwitch)) { return true; }
+	UE_LOG(LogGGYGOAbilitySystem, Log,
+		TEXT("[Teams] Squad=%s Dead=%s: no member could take the field after death (none alive, or switch in progress)."),
+		*SquadPath, *DeadPath);
+	return false;
 }
 
 bool UGGYGOSquadComponent::SwitchToAdjacentSlot(int32 Direction, EGGYGOSwitchSource Source)

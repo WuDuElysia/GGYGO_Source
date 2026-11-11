@@ -15,6 +15,7 @@ struct FGGYGOFXSceneMaterialState;
 
 class UGGYGODistortionFieldComponent;
 class UGGYGOFXNiagaraComponent;
+class UGGYGONiagaraMaterialPreparation;
 
 DECLARE_MULTICAST_DELEGATE_TwoParams(FGGYGOFXEffectFailed,
 	UGGYGOFXNiagaraComponent*, const FString&);
@@ -69,13 +70,18 @@ public:
 	FGGYGOFXEffectFailed OnEffectFailed;
 	virtual void Activate(bool bReset = false) override;
 	virtual void Deactivate() override;
+	virtual void DeactivateImmediate() override;
 	virtual FBoxSphereBounds CalcBounds(const FTransform& LocalToWorld) const override;
 protected:
+	virtual bool RequiresGameThreadEndOfFrameUpdates() const override;
+	virtual bool RequiresGameThreadEndOfFrameRecreate() const override;
+	virtual void TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction) override;
 	virtual void OnUpdateTransform(EUpdateTransformFlags UpdateTransformFlags, ETeleportType Teleport) override;
 	virtual void OnUnregister() override;
 	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
 private:
 	friend class UGGYGONiagaraRuntimeFailureDataInterface;
+	bool HasEnabledProjectedDecalRenderer() const;
 	bool BindRuntimeFailureInstance(FNiagaraSystemInstance* Instance, FString& OutError);
 	void LatchRuntimeInitializationFailure(FNiagaraSystemInstance* Instance, const FString& Source, const FString& Reason);
 	void QueueRuntimeFailure(uint64 InstanceId, const FString& Reason);
@@ -88,7 +94,18 @@ private:
 	bool RegisterPointLightSource(FString& OutError);
 	EGGYGOCharacterLightSourceReadiness ReadPointLightFrame(FGGYGOCharacterPointLightFrame& OutFrame, FString& OutError);
 	void ReleasePointLightSource();
+	struct FFieldActivationRequest
+	{
+		TWeakObjectPtr<UNiagaraSystem> System;
+		TWeakObjectPtr<UWorld> World;
+		bool bReset = false;
+	};
 	void StartNativeEffect(bool bReset);
+	void TryStartFieldActivation(TSharedPtr<FFieldActivationRequest> Request);
+	void ActivateNativeEffect(bool bReset);
+	void ActivatePreparedEffect(bool bReset);
+	UFUNCTION() void HandleMaterialPreparationFinished(UGGYGONiagaraMaterialPreparation* Request);
+	void CancelMaterialPreparation();
 	bool ReadAdditionalWPOBoundsRadius(float& OutRadiusCM, FString& OutError) const;
 	bool IsSceneMaterialStateCurrent(const TSharedPtr<FGGYGOFXSceneMaterialState>& State) const;
 	void TryRegisterSceneMaterials(TSharedPtr<FGGYGOFXSceneMaterialState> State);
@@ -111,6 +128,11 @@ private:
 	bool bReadingPointLights = false;
 	UPROPERTY(Transient) FGGYGOFXFieldSettings FieldSettings;
 	UPROPERTY(Transient) TObjectPtr<UGGYGODistortionFieldComponent> FieldRegistration;
+	/** 原激活请求的短期等待，随本组件停止／归还取消。 */
+	TSharedPtr<FFieldActivationRequest> FieldActivation;
+	/** 最终参数已安装后的原资源请求；请求自身拥有就绪事实，组件只保取消权与原激活参数。 */
+	UPROPERTY(Transient) TObjectPtr<UGGYGONiagaraMaterialPreparation> MaterialPreparation;
+	bool bMaterialActivationReset = false;
 	/** 记录调用者已明确提交配置，随本组件失效；不是 ShaderMap ready 缓存。 */
 	bool bFieldSettingsConfigured = false;
 	/** 唯一首错供原所有者读取；异步通知只引用此事实，不另建失败权威。 */

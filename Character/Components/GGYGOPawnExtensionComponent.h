@@ -55,6 +55,7 @@ class APawn;
 class UGameFrameworkComponentManager;
 class UGGYGOAbilitySystemComponent;
 class UGGYGOPawnData;
+class UGGYGONiagaraMaterialPreparation;
 class UObject;
 struct FActorInitStateChangedParams;
 struct FFrame;
@@ -220,6 +221,23 @@ public:
 	/** 输入组件建立后由拥有者 Pawn 调用。 */
 	void SetupPlayerInputComponent();
 
+	/**
+	 * 只读消费 PawnData 指定输入的原渲染准备请求；不改变 ASC 绑定或 InitState。
+	 * @param InputTag 当前原 Action 的输入 Tag，按精确匹配决定是否需要准备。
+	 * @param OutReason 未就绪时的请求状态及可定位原因。
+	 * @return 无此资源前置，或本 Pawn 持有的原请求已 Ready。
+	 */
+	bool AreAbilityInputResourcesReady(FGameplayTag InputTag, FString& OutReason) const;
+
+	/**
+	 * 接收共享 Pawn 蓝图创建的原请求；Owner/Outer 必须为本 Extension。
+	 * 蓝图在成功接收后 Start，请求由本组件持有至 EndPlay 并 Cancel；同 Pawn 再附身不重建它。
+	 * 已有不同请求时拒绝并取消传入的本组件请求，不替换仍有效的准备资源。
+	 * @return 请求已由本组件持有。失败时蓝图不得 Start。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Pawn|Input Resources")
+	bool SetAbilityInputResourcePreparation(UGGYGONiagaraMaterialPreparation* Preparation);
+
 protected:
 	virtual void OnRegister() override;
 	virtual void OnUnregister() override;
@@ -253,6 +271,10 @@ protected:
 	TObjectPtr<const UGGYGOPawnData> PawnData;
 
 private:
+	/** 真实准备状态由 Rendering 请求独占；不复制 Ready，不关联 Controller 或 PlayerInput。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UGGYGONiagaraMaterialPreparation> AbilityInputResourcePreparation;
+
 	struct FPawnDataInitializationScope;
 	/** Borrowed only while the original stack scope exists; unregister/EndPlay invalidate it immediately. */
 	const FPawnDataInitializationScope* PawnDataInitializationScope = nullptr;

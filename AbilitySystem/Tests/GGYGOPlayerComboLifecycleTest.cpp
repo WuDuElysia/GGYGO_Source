@@ -46,11 +46,18 @@
 #include "UObject/Package.h"
 #include "UObject/UObjectGlobals.h"
 #include "NiagaraComponent.h"
+#include "NiagaraDataSet.h"
+#include "NiagaraEmitter.h"
+#include "NiagaraEmitterHandle.h"
+#include "NiagaraEmitterInstance.h"
+#include "NiagaraScript.h"
 #include "NiagaraSimCache.h"
 #include "NiagaraSimCacheFunctionLibrary.h"
 #include "NiagaraSystem.h"
+#include "NiagaraSystemInstance.h"
 #include "NiagaraSystemInstanceController.h"
 
+#include <initializer_list>
 #include <limits>
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOPlayerComboLifecycleTestTypes)
@@ -207,21 +214,35 @@ float UGGYGOPlayerComboLifecycleTestAnimInstance::Montage_PlayInternal(UAnimMont
 #include "Animation/Runtime/GGYGOMontageGuardAnimInstance.h"
 #include "Character/Components/GGYGOHeroComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
+#include "Dom/JsonObject.h"
 #include "Editor.h"
 #include "Editor/EditorEngine.h"
 #include "Engine/GameInstance.h"
 #include "Engine/GameViewportClient.h"
+#include "Engine/StaticMesh.h"
 #include "EnhancedInputSubsystems.h"
 #include "Framework/Application/SlateApplication.h"
 #include "GameFramework/GameModeBase.h"
 #include "GenericPlatform/GenericWindow.h"
+#include "Input/GGYGOInputComponent.h"
 #include "Input/GGYGOInputConfig.h"
 #include "Input/GGYGOMovementInputOriginResource.h"
 #include "Input/GGYGOPlayerInput.h"
+#include "InputKeyEventArgs.h"
+#include "MaterialShared.h"
+#include "Materials/MaterialInterface.h"
 #include "Player/GGYGOLocalPlayer.h"
 #include "Player/GGYGOPlayerController.h"
+#include "NiagaraDataSetAccessor.h"
+#include "NiagaraMeshRendererProperties.h"
 #include "PlayInEditorDataTypes.h"
+#include "Policies/CondensedJsonPrintPolicy.h"
+#include "SceneInterface.h"
+#include "SceneViewExtension.h"
+#include "Serialization/JsonSerializer.h"
 #include "Settings/LevelEditorPlaySettings.h"
+#include "StaticMeshResources.h"
+#include "UObject/StructOnScope.h"
 #include "UObject/StrongObjectPtr.h"
 #include "Widgets/SViewport.h"
 #include "Widgets/SWindow.h"
@@ -329,6 +350,10 @@ struct FGGYGOPlayerComboLifecycleFixture
 	static int32 ReadProductionLastInputRequest(const UGGYGOPlayerComboAbility* Production)
 	{
 		return Production ? Production->LastRequestId : 0;
+	}
+	static uint64 ReadProductionStepToken(const UGGYGOPlayerComboAbility* Production)
+	{
+		return Production ? Production->CurrentStepToken : 0;
 	}
 	static bool ReplayCompletedProductionPointForTest(UGGYGOPlayerComboAbility* Production,
 		UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask, const FGGYGOMontageNotifyFact& OriginalPoint,
@@ -2630,9 +2655,477 @@ bool FGGYGOPlayerComboRuntimeHitBuilderFailureTest::RunTest(const FString& Param
 namespace
 {
 	enum class EComboPoseFailureProbe : uint8 { None, StartupMissingDeclaration, RuntimeInvalidated };
-	enum class EComboEndAttackProbe : uint8 { None, Restart, Natural };
+	enum class EComboEndAttackProbe : uint8 { None, Restart, Natural, AuthoredRestart };
 	enum class EComboLocomotionObservation : uint8 { Immediate, RunHoldAndRelease };
 	enum class EComboFXProbe : uint8 { None, NaturalTail, WindowCancel, EarlyCancelRestart };
+	const FName FXNormal01System(TEXT("NS_Pyrios_Normal01_MainComposition_2a7c90937cab"));
+	const FName FXNormal01BrightLayers[2] = { TEXT("M00_root_Trail_rot_HighLight"), TEXT("M00_root_Trail_rot_Shining") };
+	const FName FXNormal01ControlLayer(TEXT("M00_root_Trail_rot_light_edge"));
+	const TCHAR* const FXDrawSamplePhases[] = { TEXT("birth"), TEXT("middle"), TEXT("fade") };
+
+	struct FComboFXMeshDrawObservation
+	{
+		TStrongObjectPtr<UObject> Probe;
+		TSharedPtr<FJsonObject> Result;
+		FName ArmIssue;
+		bool bConfirmed = false;
+	};
+
+	struct FComboFXBrightDrawView final : FSceneViewExtensionBase
+	{
+		FComboFXBrightDrawView(const FAutoRegister& Register, UWorld* InWorld, FViewport* InViewport, APawn* InPawn, int32 InPlayerIndex)
+			: FSceneViewExtensionBase(Register), World(InWorld), Viewport(InViewport), Pawn(InPawn), PlayerIndex(InPlayerIndex) {}
+
+		bool IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const override
+		{
+			return Context.Viewport == Viewport && World.IsValid() && Context.GetWorld() == World.Get() && Pawn.IsValid();
+		}
+
+		void BeginRenderViewFamily(FSceneViewFamily& Family) override
+		{
+			if (!IsInGameThread() || DrawFrame != GFrameCounter || !Family.bIsMainViewFamily || Family.RenderTarget != Viewport
+				|| !Family.Scene || !World.IsValid() || Family.Scene->GetWorld() != World.Get() || !Pawn.IsValid()) { return; }
+			bMatchedViewportFamily = true;
+			for (const FSceneView* View : Family.Views)
+			{
+				if (View && View->StereoPass == EStereoscopicPass::eSSP_FULL && View->PlayerIndex == PlayerIndex
+					&& View->ViewActor.ActorUniqueId == Pawn->GetUniqueID())
+				{
+					++Matches;
+					WorldToClip = View->ViewMatrices.GetViewProjectionMatrix();
+					Rect = View->UnscaledViewRect;
+				}
+			}
+		}
+
+		bool HasView() const
+		{
+			return DrawFrame == GFrameCounter && Matches == 1 && Rect.Width() > 0 && Rect.Height() > 0 && !WorldToClip.ContainsNaN();
+		}
+
+		TWeakObjectPtr<UWorld> World;
+		FViewport* const Viewport;
+		TWeakObjectPtr<APawn> Pawn;
+		const int32 PlayerIndex;
+		uint64 DrawFrame = MAX_uint64;
+		int32 Matches = 0;
+		bool bMatchedViewportFamily = false;
+		FMatrix WorldToClip = FMatrix::Identity;
+		FIntRect Rect;
+	};
+
+	TArray<TSharedPtr<FJsonValue>> FXDrawNumbers(std::initializer_list<double> Values)
+	{
+		TArray<TSharedPtr<FJsonValue>> Result;
+		for (double Value : Values) { Result.Add(MakeShared<FJsonValueNumber>(Value)); }
+		return Result;
+	}
+
+	void WriteFXDrawVector4(FJsonObject& Particle, const TCHAR* Field, const FVector4f& Value)
+	{
+		const bool bFinite = FMath::IsFinite(Value.X) && FMath::IsFinite(Value.Y)
+			&& FMath::IsFinite(Value.Z) && FMath::IsFinite(Value.W);
+		Particle.SetStringField(FString(Field) + TEXT("_coverage"), bFinite ? TEXT("PublishedCPU") : TEXT("NonFinite"));
+		if (bFinite) { Particle.SetArrayField(Field, FXDrawNumbers({Value.X, Value.Y, Value.Z, Value.W})); }
+	}
+
+	TSharedPtr<FJsonObject> ReadFXMeshDrawView(const UStruct* Type, const void* Value)
+	{
+		const auto View = MakeShared<FJsonObject>();
+		const TCHAR* const RectNames[] = {TEXT("UnscaledViewRect"), TEXT("RenderViewRect")};
+		const TCHAR* const RectFields[] = {TEXT("unscaled_view_rect"), TEXT("render_view_rect")};
+		for (int32 RectIndex = 0; RectIndex < UE_ARRAY_COUNT(RectNames); ++RectIndex)
+		{
+			const auto* Rect = FindFProperty<FStructProperty>(Type, RectNames[RectIndex]);
+			if (!Rect) { return nullptr; }
+			const void* RectValue = Rect->ContainerPtrToValuePtr<void>(Value);
+			int32 Coordinates[4];
+			int32 CoordinateIndex = 0;
+			for (const TCHAR* Corner : {TEXT("Min"), TEXT("Max")})
+			{
+				const auto* Point = FindFProperty<FStructProperty>(Rect->Struct, Corner);
+				const auto* X = Point ? FindFProperty<FIntProperty>(Point->Struct, TEXT("X")) : nullptr;
+				const auto* Y = Point ? FindFProperty<FIntProperty>(Point->Struct, TEXT("Y")) : nullptr;
+				if (!X || !Y) { return nullptr; }
+				const void* PointValue = Point->ContainerPtrToValuePtr<void>(RectValue);
+				Coordinates[CoordinateIndex++] = X->GetPropertyValue_InContainer(PointValue);
+				Coordinates[CoordinateIndex++] = Y->GetPropertyValue_InContainer(PointValue);
+			}
+			if (Coordinates[2] <= Coordinates[0] || Coordinates[3] <= Coordinates[1]) { return nullptr; }
+			View->SetArrayField(RectFields[RectIndex], FXDrawNumbers({
+				static_cast<double>(Coordinates[0]), static_cast<double>(Coordinates[1]),
+				static_cast<double>(Coordinates[2]), static_cast<double>(Coordinates[3])}));
+		}
+		const auto* Matrix = FindFProperty<FArrayProperty>(Type, TEXT("ViewProjectionMatrix"));
+		const auto* Element = Matrix ? CastField<FDoubleProperty>(Matrix->Inner) : nullptr;
+		if (!Element) { return nullptr; }
+		FScriptArrayHelper Array(Matrix, Matrix->ContainerPtrToValuePtr<void>(Value));
+		if (Array.Num() != 16) { return nullptr; }
+		TArray<TSharedPtr<FJsonValue>> Entries;
+		for (int32 Index = 0; Index < Array.Num(); ++Index)
+		{
+			const double Number = Element->GetPropertyValue(Array.GetRawPtr(Index));
+			if (!FMath::IsFinite(Number)) { return nullptr; }
+			Entries.Add(MakeShared<FJsonValueNumber>(Number));
+		}
+		View->SetArrayField(TEXT("view_projection_matrix_row_major"), MoveTemp(Entries));
+		View->SetStringField(TEXT("coverage"), TEXT("Covered"));
+		return View;
+	}
+
+	const UNiagaraMeshRendererProperties* FindFXDrawMeshRenderer(const FNiagaraEmitterInstance& Emitter)
+	{
+		const FVersionedNiagaraEmitterData* EmitterData = Emitter.GetVersionedEmitter().GetEmitterData();
+		if (!EmitterData) { return nullptr; }
+		const UNiagaraMeshRendererProperties* Renderer = nullptr;
+		for (const UNiagaraRendererProperties* Candidate : EmitterData->GetRenderers())
+		{
+			if (!Candidate || !Candidate->GetIsEnabled()) { continue; }
+			if (Renderer) { return nullptr; }
+			Renderer = Cast<UNiagaraMeshRendererProperties>(Candidate);
+			if (!Renderer) { return nullptr; }
+		}
+		return Renderer;
+	}
+
+	const UStaticMesh* FindFXDrawConfiguredMesh(const UNiagaraMeshRendererProperties& Renderer)
+	{
+		if (Renderer.MeshesBinding.ResolvedParameter.IsValid() || Renderer.Meshes.Num() != 1
+			|| Renderer.Meshes[0].MeshParameterBinding.ResolvedParameter.IsValid())
+		{
+			return nullptr;
+		}
+		return Renderer.Meshes[0].Mesh.Get();
+	}
+
+	UMaterialInterface* ReadFXDrawConfiguredMaterial(const UNiagaraMeshRendererProperties& Renderer,
+		const FNiagaraEmitterInstance& Emitter, const UStaticMesh& Mesh, const FStaticMeshRenderData& MeshData)
+	{
+		if (MeshData.LODResources.Num() != 1 || MeshData.LODResources[0].Sections.Num() != 1
+			|| MeshData.LODResources[0].Sections[0].MaterialIndex != 0)
+		{
+			return nullptr;
+		}
+		TArray<UMaterialInterface*> Materials{Mesh.GetMaterial(0)};
+		Renderer.ApplyMaterialOverrides(&Emitter, Materials);
+		return Materials[0];
+	}
+
+	TSharedPtr<FJsonObject> ReadFXMeshDrawCounts(const UStruct* Type, const void* Value)
+	{
+		const auto* MaterialPath = FindFProperty<FStrProperty>(Type, TEXT("MaterialPath"));
+		const auto* MeshBatches = FindFProperty<FIntProperty>(Type, TEXT("MeshBatches"));
+		const auto* PassCandidates = FindFProperty<FMapProperty>(Type, TEXT("PassCandidates"));
+		const auto* PassName = PassCandidates ? CastField<FStrProperty>(PassCandidates->KeyProp) : nullptr;
+		const auto* PassCount = PassCandidates ? CastField<FIntProperty>(PassCandidates->ValueProp) : nullptr;
+		if (!MaterialPath || !MeshBatches || !PassName || !PassCount) { return nullptr; }
+
+		const int32 Count = MeshBatches->GetPropertyValue_InContainer(Value);
+		if (Count < 0) { return nullptr; }
+		const auto Counts = MakeShared<FJsonObject>();
+		const auto Passes = MakeShared<FJsonObject>();
+		const FString Path = MaterialPath->GetPropertyValue_InContainer(Value);
+		if (!Path.IsEmpty()) { Counts->SetStringField(TEXT("material_path"), Path); }
+		Counts->SetNumberField(TEXT("mesh_batches"), Count);
+		FScriptMapHelper Map(PassCandidates, PassCandidates->ContainerPtrToValuePtr<void>(Value));
+		for (int32 Index = 0; Index < Map.GetMaxIndex(); ++Index)
+		{
+			if (Map.IsValidIndex(Index))
+			{
+				Passes->SetNumberField(PassName->GetPropertyValue(Map.GetKeyPtr(Index)),
+					PassCount->GetPropertyValue(Map.GetValuePtr(Index)));
+			}
+		}
+		Counts->SetObjectField(TEXT("pass_candidates"), Passes);
+		return Counts;
+	}
+
+	TSharedPtr<FJsonObject> ReadFXMeshDrawRTProxy(const UStruct* Type, const void* Value)
+	{
+		const auto* ProxyName = FindFProperty<FStrProperty>(Type, TEXT("ProxyName"));
+		const auto* ResourceStatus = FindFProperty<FNameProperty>(Type, TEXT("ResourceStatus"));
+		const auto* BlendMode = FindFProperty<FIntProperty>(Type, TEXT("BlendMode"));
+		const auto* MaterialDomain = FindFProperty<FIntProperty>(Type, TEXT("MaterialDomain"));
+		const auto* AfterDOF = FindFProperty<FBoolProperty>(Type, TEXT("bAfterDOF"));
+		const auto* AfterMotionBlur = FindFProperty<FBoolProperty>(Type, TEXT("bAfterMotionBlur"));
+		const auto* ShaderMapComplete = FindFProperty<FBoolProperty>(Type, TEXT("bShaderMapComplete"));
+		if (!ProxyName || !ResourceStatus || !BlendMode || !MaterialDomain || !AfterDOF || !AfterMotionBlur || !ShaderMapComplete)
+		{
+			return nullptr;
+		}
+
+		const FName Status = ResourceStatus->GetPropertyValue_InContainer(Value);
+		if (Status.IsNone()) { return nullptr; }
+		const auto Proxy = MakeShared<FJsonObject>();
+		Proxy->SetStringField(TEXT("proxy_name"), ProxyName->GetPropertyValue_InContainer(Value));
+		Proxy->SetStringField(TEXT("resource_status"), Status.ToString());
+		if (Status != TEXT("NoMaterialFromProxy"))
+		{
+			const int32 Blend = BlendMode->GetPropertyValue_InContainer(Value);
+			const int32 Domain = MaterialDomain->GetPropertyValue_InContainer(Value);
+			if (Blend == INDEX_NONE || Domain == INDEX_NONE) { return nullptr; }
+			Proxy->SetNumberField(TEXT("blend_mode"), Blend);
+			Proxy->SetNumberField(TEXT("material_domain"), Domain);
+			Proxy->SetBoolField(TEXT("after_dof"), AfterDOF->GetPropertyValue_InContainer(Value));
+			Proxy->SetBoolField(TEXT("after_motion_blur"), AfterMotionBlur->GetPropertyValue_InContainer(Value));
+			if (Status != TEXT("NoShaderMap"))
+			{
+				Proxy->SetBoolField(TEXT("shader_map_complete"), ShaderMapComplete->GetPropertyValue_InContainer(Value));
+			}
+		}
+		return Proxy;
+	}
+
+	TSharedPtr<FJsonObject> ReadFXMeshDrawRTMaterial(const UStruct* Type, const void* Value)
+	{
+		const auto* BatchStatus = FindFProperty<FNameProperty>(Type, TEXT("BatchStatus"));
+		const FName Status = BatchStatus ? BatchStatus->GetPropertyValue_InContainer(Value) : NAME_None;
+		if (Status.IsNone()) { return nullptr; }
+		const auto Report = MakeShared<FJsonObject>();
+		Report->SetStringField(TEXT("batch_status"), Status.ToString());
+		if (Status != TEXT("Read"))
+		{
+			Report->SetStringField(TEXT("coverage"), TEXT("Uncovered"));
+			return Report;
+		}
+
+		const auto* FeatureLevel = FindFProperty<FIntProperty>(Type, TEXT("FeatureLevel"));
+		const auto* ShaderPlatform = FindFProperty<FIntProperty>(Type, TEXT("ShaderPlatform"));
+		const auto* VertexFactoryType = FindFProperty<FNameProperty>(Type, TEXT("VertexFactoryType"));
+		const auto* UseForMaterial = FindFProperty<FBoolProperty>(Type, TEXT("bUseForMaterial"));
+		const auto* SupportsGPUScene = FindFProperty<FBoolProperty>(Type, TEXT("bVertexFactorySupportsGPUScene"));
+		const auto* Original = FindFProperty<FStructProperty>(Type, TEXT("Original"));
+		const auto* FallbackCandidates = FindFProperty<FArrayProperty>(Type, TEXT("FallbackCandidates"));
+		const auto* FallbackType = FallbackCandidates ? CastField<FStructProperty>(FallbackCandidates->Inner) : nullptr;
+		const auto* FallbackStatus = FindFProperty<FNameProperty>(Type, TEXT("FallbackStatus"));
+		const auto* ShaderKeyCoverage = FindFProperty<FNameProperty>(Type, TEXT("ShaderKeyCoverage"));
+		if (!FeatureLevel || !ShaderPlatform || !VertexFactoryType || !UseForMaterial || !SupportsGPUScene
+			|| !Original || !FallbackType || !FallbackStatus || !ShaderKeyCoverage)
+		{
+			return nullptr;
+		}
+
+		const auto OriginalProxy = ReadFXMeshDrawRTProxy(Original->Struct, Original->ContainerPtrToValuePtr<void>(Value));
+		if (!OriginalProxy) { return nullptr; }
+		FScriptArrayHelper FallbackArray(FallbackCandidates, FallbackCandidates->ContainerPtrToValuePtr<void>(Value));
+		TArray<TSharedPtr<FJsonValue>> Fallbacks;
+		for (int32 Index = 0; Index < FallbackArray.Num(); ++Index)
+		{
+			const auto Proxy = ReadFXMeshDrawRTProxy(FallbackType->Struct, FallbackArray.GetRawPtr(Index));
+			if (!Proxy) { return nullptr; }
+			Fallbacks.Add(MakeShared<FJsonValueObject>(Proxy));
+		}
+
+		Report->SetStringField(TEXT("coverage"), TEXT("Covered"));
+		Report->SetNumberField(TEXT("feature_level"), FeatureLevel->GetPropertyValue_InContainer(Value));
+		Report->SetNumberField(TEXT("shader_platform"), ShaderPlatform->GetPropertyValue_InContainer(Value));
+		Report->SetBoolField(TEXT("use_for_material"), UseForMaterial->GetPropertyValue_InContainer(Value));
+		const FName FactoryType = VertexFactoryType->GetPropertyValue_InContainer(Value);
+		if (!FactoryType.IsNone())
+		{
+			Report->SetStringField(TEXT("vertex_factory_type"), FactoryType.ToString());
+			Report->SetBoolField(TEXT("vertex_factory_supports_gpu_scene"), SupportsGPUScene->GetPropertyValue_InContainer(Value));
+		}
+		Report->SetObjectField(TEXT("original"), OriginalProxy);
+		Report->SetArrayField(TEXT("fallback_candidates"), MoveTemp(Fallbacks));
+		Report->SetStringField(TEXT("fallback_status"), FallbackStatus->GetPropertyValue_InContainer(Value).ToString());
+		Report->SetStringField(TEXT("shader_key_coverage"), ShaderKeyCoverage->GetPropertyValue_InContainer(Value).ToString());
+		return Report;
+	}
+
+	TSharedPtr<FJsonObject> ReadFXDrawRendererAdmissionGT(const FNiagaraEmitterInstance& Emitter,
+		const FNiagaraDataBuffer& Data, EShaderPlatform Platform)
+	{
+		const auto Report = MakeShared<FJsonObject>();
+		Report->SetStringField(TEXT("emitter_id"), Emitter.GetEmitterHandle().GetId().ToString());
+		Report->SetNumberField(TEXT("particles"), Data.GetNumInstances());
+		Report->SetBoolField(TEXT("waiting_for_pso"), Emitter.IsWaitingForPSOCaching());
+		const UNiagaraMeshRendererProperties* Renderer = FindFXDrawMeshRenderer(Emitter);
+		Report->SetStringField(TEXT("submitted_material_coverage"), TEXT("uncovered_rt_submission"));
+		if (!Renderer)
+		{
+			Report->SetStringField(TEXT("mesh_coverage"), TEXT("uncovered_renderer"));
+			return Report;
+		}
+		Report->SetStringField(TEXT("renderer"), Renderer->GetPathName());
+		Report->SetBoolField(TEXT("platform_active"), Renderer->GetIsActive());
+		const auto& Store = Emitter.GetRendererBoundVariables();
+		const auto& Enabled = Renderer->RendererEnabledBinding.GetParamMapBindableVariable();
+		Report->SetStringField(TEXT("enabled_binding"), Enabled.GetName().ToString());
+		if (const uint8* Value = Enabled.IsValid() ? Store.GetParameterData(Enabled) : nullptr)
+		{
+			FNiagaraBool Bound;
+			FMemory::Memcpy(&Bound, Value, sizeof(Bound));
+			Report->SetBoolField(TEXT("enabled_bound"), Bound.GetValue());
+		}
+
+		const auto& Visibility = Renderer->RendererVisibilityTagBinding;
+		Report->SetNumberField(TEXT("visibility_expected"), Renderer->RendererVisibility);
+		if (Visibility.CanBindToHostParameterMap())
+		{
+			if (const uint8* Value = Store.GetParameterData(Visibility.GetParamMapBindableVariable()))
+			{
+				int32 Bound = 0;
+				FMemory::Memcpy(&Bound, Value, sizeof(Bound));
+				Report->SetNumberField(TEXT("visibility_host_value"), Bound);
+			}
+		}
+		else
+		{
+			const auto Tags = FNiagaraDataSetAccessor<int32>::CreateReader(&Data, Visibility.GetDataSetBindableVariable().GetName());
+			if (Tags.IsValid())
+			{
+				int32 Matches = 0;
+				for (uint32 Index = 0; Index < Data.GetNumInstances(); ++Index)
+				{
+					Matches += uint32(Tags[Index]) == Renderer->RendererVisibility;
+				}
+				Report->SetNumberField(TEXT("visibility_particle_matches"), Matches);
+			}
+		}
+
+		const UNiagaraRendererProperties* RendererProperties = Renderer;
+		Report->SetBoolField(TEXT("needs_runtime_mids"), RendererProperties->NeedsMIDsForMaterials());
+		const UStaticMesh* Mesh = FindFXDrawConfiguredMesh(*Renderer);
+		if (!Mesh)
+		{
+			Report->SetStringField(TEXT("mesh_coverage"), TEXT("uncovered_static_mesh_configuration"));
+			return Report;
+		}
+		Report->SetStringField(TEXT("configured_mesh"), Mesh->GetPathName());
+		if (Mesh->IsCompiling())
+		{
+			Report->SetStringField(TEXT("mesh_coverage"), TEXT("uncovered_mesh_compiling"));
+			return Report;
+		}
+
+		const FStaticMeshRenderData* MeshData = Mesh->GetRenderData();
+		if (!MeshData || !MeshData->LODResources.IsValidIndex(0))
+		{
+			Report->SetStringField(TEXT("mesh_coverage"), TEXT("uncovered_mesh_render_data"));
+			return Report;
+		}
+		if (MeshData->HasValidNaniteData()
+			&& (Platform == EShaderPlatform::SP_NumPlatforms || !MeshData->HasNaniteFallbackMesh(Platform)))
+		{
+			Report->SetStringField(TEXT("mesh_coverage"), TEXT("uncovered_nanite_fallback"));
+			return Report;
+		}
+
+		Report->SetStringField(TEXT("mesh_coverage"), TEXT("configured_static_mesh_gt"));
+		Report->SetNumberField(TEXT("min_lod"), Mesh->GetMinLODIdx());
+		// 驻留来自 GT 缓存，LOD0 Section 来自资产，两者独立于本 Draw 的 RT 选 LOD。
+		const FStreamableRenderResourceState StreamingState = Mesh->GetStreamableResourceState();
+		if (StreamingState.IsValid() && StreamingState.NumResidentLODs > 0)
+		{
+			Report->SetNumberField(TEXT("gt_resident_lods"), StreamingState.NumResidentLODs);
+			Report->SetNumberField(TEXT("gt_requested_lods"), StreamingState.NumRequestedLODs);
+			Report->SetNumberField(TEXT("gt_first_resident_asset_lod"),
+				StreamingState.LODCountToAssetFirstLODIdx(StreamingState.NumResidentLODs));
+		}
+		const FStaticMeshLODResources& LOD0 = MeshData->LODResources[0];
+		TArray<TSharedPtr<FJsonValue>> Sections;
+		for (const FStaticMeshSection& Section : LOD0.Sections)
+		{
+			const auto Item = MakeShared<FJsonObject>();
+			Item->SetNumberField(TEXT("material_slot"), Section.MaterialIndex);
+			Item->SetNumberField(TEXT("triangles"), Section.NumTriangles);
+			Sections.Add(MakeShared<FJsonValueObject>(Item));
+		}
+		Report->SetArrayField(TEXT("lod0_sections"), MoveTemp(Sections));
+
+		const UMaterialInterface* ConfiguredMaterial = ReadFXDrawConfiguredMaterial(*Renderer, Emitter, *Mesh, *MeshData);
+		if (IsValid(ConfiguredMaterial))
+		{
+			const UMaterialInterface& Material = *ConfiguredMaterial;
+			Report->SetStringField(TEXT("configured_material"), Material.GetPathName());
+			Report->SetBoolField(TEXT("niagara_mesh_usage"), Material.GetUsageByFlag(MATUSAGE_NiagaraMeshParticles));
+			const FMaterialResource* Resource = Platform != EShaderPlatform::SP_NumPlatforms ? Material.GetMaterialResource(Platform) : nullptr;
+			const FMaterialShaderMap* Map = Resource ? Resource->GetGameThreadShaderMap() : nullptr;
+			if (Resource)
+			{
+				Report->SetNumberField(TEXT("gt_blend_mode"), Resource->GetBlendMode());
+				Report->SetBoolField(TEXT("gt_after_dof"), Resource->IsTranslucencyAfterDOFEnabled());
+				Report->SetBoolField(TEXT("gt_after_motion_blur"), Resource->IsTranslucencyAfterMotionBlurEnabled());
+			}
+			Report->SetBoolField(TEXT("gt_shader_map"), Map != nullptr);
+			const bool bMapComplete = Resource && Resource->IsGameThreadShaderMapComplete();
+			Report->SetBoolField(TEXT("gt_shader_map_complete"), bMapComplete);
+			if (Map && bMapComplete)
+			{
+				static const FHashedName MeshVF(TEXT("FNiagaraMeshVertexFactory"));
+				Report->SetBoolField(TEXT("gt_niagara_mesh_vf_shader_map"), Map->GetMeshShaderMap(MeshVF) != nullptr);
+			}
+		}
+		return Report;
+	}
+
+	const TCHAR* ProjectFXDrawMesh(const FComboFXBrightDrawView* View, const FNiagaraEmitterInstance& Emitter,
+		const FNiagaraDataBuffer* Data, int32 Index, const FTransform& ComponentToWorld,
+		const FVector& Position, const FQuat& Orientation, const FVector& Scale, FJsonObject& Particle)
+	{
+		if (!View || !View->HasView()) { return TEXT("uncovered_view"); }
+		const UNiagaraMeshRendererProperties* Renderer = FindFXDrawMeshRenderer(Emitter);
+		if (!Emitter.IsLocalSpace() || !Renderer || Renderer->SourceMode != ENiagaraRendererSourceDataMode::Particles
+			|| Renderer->FacingMode != ENiagaraMeshFacingMode::Default || Renderer->bLockedAxisEnable
+			|| Renderer->Meshes.Num() != 1 || Renderer->MeshesBinding.ResolvedParameter.IsValid())
+		{
+			return TEXT("uncovered_renderer_transform");
+		}
+		const FNiagaraMeshRendererMeshProperties& Mesh = Renderer->Meshes[0];
+		const auto MatchesParticleBinding = [](const FNiagaraVariableAttributeBinding& Binding, FName Name)
+		{
+			return !Binding.CanBindToHostParameterMap() && Binding.GetDataSetBindableVariable().GetName() == Name;
+		};
+		if (!Mesh.Mesh || Mesh.MeshParameterBinding.ResolvedParameter.IsValid()
+			|| (Mesh.PivotOffsetSpace != ENiagaraMeshPivotOffsetSpace::Mesh && !Mesh.PivotOffset.IsZero())
+			|| !MatchesParticleBinding(Renderer->PositionBinding, TEXT("Position"))
+			|| !MatchesParticleBinding(Renderer->MeshOrientationBinding, TEXT("MeshOrientation"))
+			|| !MatchesParticleBinding(Renderer->ScaleBinding, TEXT("Scale"))
+			|| Renderer->CameraOffsetBinding.CanBindToHostParameterMap() || Renderer->MeshIndexBinding.CanBindToHostParameterMap())
+		{
+			return TEXT("uncovered_renderer_transform");
+		}
+		const auto CameraOffset = FNiagaraDataSetAccessor<float>::CreateReader(Data, Renderer->CameraOffsetBinding.GetDataSetBindableVariable().GetName());
+		const auto MeshIndex = FNiagaraDataSetAccessor<int32>::CreateReader(Data, Renderer->MeshIndexBinding.GetDataSetBindableVariable().GetName());
+		if ((CameraOffset.IsValid() && CameraOffset[Index] != 0.0f) || (MeshIndex.IsValid() && MeshIndex[Index] != 0))
+		{
+			return TEXT("uncovered_renderer_transform");
+		}
+		const FBox Box = Mesh.Mesh->GetBoundingBox();
+		if (!Box.IsValid || Box.Min.ContainsNaN() || Box.Max.ContainsNaN() || Mesh.Rotation.ContainsNaN()
+			|| Mesh.Scale.ContainsNaN() || Mesh.PivotOffset.ContainsNaN() || ComponentToWorld.ContainsNaN())
+		{
+			return TEXT("uncovered_renderer_transform");
+		}
+		const FQuat MeshRotation = Orientation.GetNormalized() * Mesh.Rotation.Quaternion();
+		const FVector MeshScale = Scale * Mesh.Scale;
+		const FVector MeshOrigin = Position + MeshRotation.RotateVector(Mesh.PivotOffset * Scale);
+		const FMatrix MeshToWorld = FTransform(MeshRotation, MeshOrigin, MeshScale).ToMatrixWithScale() * ComponentToWorld.ToMatrixWithScale();
+		if (MeshToWorld.ContainsNaN()) { return TEXT("uncovered_renderer_transform"); }
+
+		TArray<TSharedPtr<FJsonValue>> Matrix;
+		for (int32 Row = 0; Row < 4; ++Row)
+		{
+			Matrix.Append(FXDrawNumbers({MeshToWorld.M[Row][0], MeshToWorld.M[Row][1], MeshToWorld.M[Row][2], MeshToWorld.M[Row][3]}));
+		}
+		Particle.SetStringField(TEXT("mesh"), Mesh.Mesh->GetPathName());
+		Particle.SetArrayField(TEXT("mesh_to_world_pre_wpo_row_major"), MoveTemp(Matrix));
+		FBox2D Pixels(ForceInit);
+		for (int32 Corner = 0; Corner < 8; ++Corner)
+		{
+			const FVector Point((Corner & 1) ? Box.Max.X : Box.Min.X, (Corner & 2) ? Box.Max.Y : Box.Min.Y, (Corner & 4) ? Box.Max.Z : Box.Min.Z);
+			FVector2D Pixel;
+			if (!FSceneView::ProjectWorldToScreen(FVector(MeshToWorld.TransformPosition(Point)), View->Rect, View->WorldToClip, Pixel)
+				|| Pixel.ContainsNaN()) { return TEXT("uncovered_clip"); }
+			Pixels += Pixel;
+		}
+		const FBox2D ViewPixels(FVector2D(View->Rect.Min.X, View->Rect.Min.Y), FVector2D(View->Rect.Max.X, View->Rect.Max.Y));
+		Particle.SetArrayField(TEXT("mesh_bounds_pixels"), FXDrawNumbers({Pixels.Min.X, Pixels.Min.Y, Pixels.Max.X, Pixels.Max.Y}));
+		Particle.SetBoolField(TEXT("mesh_bounds_intersects_view"), Pixels.Intersect(ViewPixels));
+		return TEXT("pre_wpo_mesh_bounds");
+	}
+
 	/** A finite production PIE smoke. Automation observes; UE alone runs input, animation and movement frames. */
 	class FComboEndProductionPIECommand : public IAutomationLatentCommand
 	{
@@ -2670,13 +3163,29 @@ namespace
 			if (Stage == EStage::Start) { StartPIE(); return false; }
 			if (Stage == EStage::Ending) { return UpdateEnding(); }
 			if (bFailed) { BeginEnding(); return false; }
-			if (FPlatformTime::Seconds() >= Deadline)
+			// NewPress 的 End 等待先核对原 PIE 世界，再分别检查游戏时间与墙钟。
+			if ((Stage != EStage::End || bHeldDuringMain) && FPlatformTime::Seconds() >= Deadline)
 			{
+				FString Reason = TEXT("bounded stage timeout; original input/section/cancellation/recovery condition not observed");
 				if (Stage == EStage::Locomotion || Stage == EStage::RunHold || Stage == EStage::RunRelease)
 				{
 					LogLocomotionSnapshot(TEXT("LocomotionTimeout"));
 				}
-				Fail(TEXT("bounded stage timeout; original input/section/cancellation/recovery condition not observed"));
+				else if (Stage == EStage::FXStartupFrame)
+				{
+					LogNativeInputBoundary(TEXT("ColdStartupFrameTimeoutBeforeInput"));
+					LogFXStartupReadiness(TEXT("ColdStartupFrameTimeoutBeforeInput"));
+				}
+				else if (Stage == EStage::Player && !InputResourceWaitReason.IsEmpty())
+				{
+					Test.AddInfo(TEXT("[Combat.PlayerCombo.ProductionSmoke] InputResourcesNotReadyBeforeFirstPress ") + InputResourceWaitReason);
+				}
+				else if (FXProbe != EComboFXProbe::None && !bFXVerified
+					&& (Stage == EStage::Natural || Stage == EStage::NaturalIdle))
+				{
+					Reason = TEXT("original FX authored End/tail observation timed out: ") + DescribeFXTailEvidence();
+				}
+				Fail(Reason);
 				BeginEnding();
 				return false;
 			}
@@ -2758,7 +3267,7 @@ namespace
 
 		enum class EStage : uint8 { Start, Player, Main, AdvanceEnd, MainAttackPress, MainAttackRejected, EndAttack, Natural, NaturalIdle,
 			End, Cancel, Locomotion, ResetRelease, Ending, Done, PoseWaitFailure, PoseSuccessorMain, PoseSuccessorEnd, PoseSuccessorPress,
-			RunHold, RunRelease, FXCancelWait, FXReady };
+			RunHold, RunRelease, FXCancelWait, FXStartupFrame };
 		void Fail(const FString& Reason)
 		{
 			if (bFailed) { return; }
@@ -3004,6 +3513,9 @@ namespace
 				}
 				return; // Existing 30-second deadline; observing Waiting neither grants Ready nor manufactures input.
 			}
+			// 所有生产叶都沿原启动截止等待生产资源 Ready；Pending 期间的按下按生产契约被 Hero 丢弃且不重放，
+			// 进程内首个 PIE 若提前按下，后续阶段永远等不到激活。首按仍只经原 Hero 输入链提交一次。
+			if (!Extension->AreAbilityInputResourcesReady(GGYGOGameplayTags::InputTag_Attack_Light, InputResourceWaitReason)) { return; }
 			AttackKey = NativeAttackKeys[0]; // An existing mapping of this same action; selected key is reported below.
 			for (const FKey& Key : { EKeys::W, AttackKey })
 			{
@@ -3072,7 +3584,8 @@ namespace
 			}
 			if (PoseProbe != EComboPoseFailureProbe::None && !PreparePoseProbe()) { return; }
 			if (FXProbe != EComboFXProbe::None && !PrepareFXProbe()) { return; }
-			if (PoseProbe == EComboPoseFailureProbe::None && (bHeldDuringMain || EndAttackProbe != EComboEndAttackProbe::None))
+			if (PoseProbe == EComboPoseFailureProbe::None
+				&& (bHeldDuringMain || (EndAttackProbe != EComboEndAttackProbe::None && !IsAuthoredRestartProbe())))
 			{
 				MainPointProbeIndex = bHeldDuringMain ? 0 : 2;
 				if (!FGGYGOPlayerComboLifecycleFixture::InstallProductionMainPointProbe(Combo, MainPointProbeIndex,
@@ -3084,27 +3597,25 @@ namespace
 					MainPointProbeIndex, *GetPathNameSafe(OriginalPointProbeStep.Montage), *GetPathNameSafe(MainPointProbe.Get())));
 			}
 			EndHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data) { ObserveAbilityEnd(Data); });
-			ActivatedHandle = ProductionASC->AbilityActivatedCallbacks.AddLambda([this](UGameplayAbility* Activated)
+			if (PoseProbe == EComboPoseFailureProbe::None)
 			{
-				if (const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Activated))
+				ActivatedHandle = ProductionASC->AbilityActivatedCallbacks.AddLambda([this](UGameplayAbility* Activated)
 				{
-					LastActivated = ProjectAbility->CaptureCurrentActivation();
-				}
-			});
-			CompletedHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data)
-			{
-				GGYGOPlayerComboTestLifecycle::FEnded Notice;
-				Notice.Original = FGGYGOAbilityTerminationContext(LastActivated, Data.bWasCancelled);
-				if (OriginalActivation.HasActivation() && Notice.GetOriginal().GetOriginalActivation().HasSameActivation(OriginalActivation))
+					if (const UGGYGOGameplayAbility* ProjectAbility = Cast<UGGYGOGameplayAbility>(Activated))
+					{
+						LastActivated = ProjectAbility->CaptureCurrentActivation();
+					}
+				});
+				CompletedHandle = ProductionASC->OnAbilityEnded.AddLambda([this](const FAbilityEndedData& Data)
 				{
-					++CompletedCount; Completion = Notice;
-				}
-				else if (PoseProbe != EComboPoseFailureProbe::None && PoseSuccessorActivation.HasActivation()
-					&& Notice.GetOriginal().GetOriginalActivation().HasSameActivation(PoseSuccessorActivation))
-				{
-					++PoseSuccessorCompletedCount; PoseSuccessorCompletion = Notice;
-				}
-			});
+					GGYGOPlayerComboTestLifecycle::FEnded Notice;
+					Notice.Original = FGGYGOAbilityTerminationContext(LastActivated, Data.bWasCancelled);
+					if (OriginalActivation.HasActivation() && Notice.GetOriginal().GetOriginalActivation().HasSameActivation(OriginalActivation))
+					{
+						++CompletedCount; Completion = Notice;
+					}
+				});
+			}
 			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NativeSlateRoute Map=%s GameMode=%s PC=%s Pawn=%s GA=%s Source=%s Origin=%s InputConfig=%s AttackKey=%s Scope=%llu. Automated native events; no HID/network/Cook claim."),
 				*EditorMap, *GetPathNameSafe(World->GetAuthGameMode()), *PC->GetPathName(), *Pawn->GetPathName(), *Combo->GetPathName(),
 				*Source->GetPathName(), *Origin->GetPathName(), *Config->GetPathName(), *AttackKey.ToString(), static_cast<unsigned long long>(Scope.GetScopeSerial())));
@@ -3114,20 +3625,30 @@ namespace
 			if (FXProbe != EComboFXProbe::None)
 			{
 				if (!InstallFXFrameObservation()) { return; }
-				Stage = EStage::FXReady;
+				InstallNewPressInputObservation(AttackAction, AttackKeys);
+				Stage = EStage::FXStartupFrame;
 				Deadline = FPlatformTime::Seconds() + 30.0;
 				return;
+			}
+			if (IsAuthoredRestartProbe() || (!bHeldDuringMain && LastMovementStep > 0
+				&& PoseProbe == EComboPoseFailureProbe::None && EndAttackProbe == EComboEndAttackProbe::None))
+			{
+				InstallNewPressInputObservation(AttackAction, AttackKeys);
+				if (IsAuthoredRestartProbe() && (!NewPressViewportKeyHandle.IsValid() || NewPressAttackObservationHandles.Num() != 3))
+				{
+					Fail(TEXT("原包 03→01 缺少原生攻击 Action 观察，未覆盖。")); return;
+				}
 			}
 			bAttackDown = true;
 			SendNativeKey(AttackKey, true);
 		}
 		bool InstallFXFrameObservation()
 		{
-			if (!World.IsValid() || !World->PersistentLevel || !Mesh.IsValid() || !Movement.IsValid()
+			if (!World.IsValid() || !World->PersistentLevel || !Viewport.IsValid() || !SceneViewport || !Mesh.IsValid() || !Movement.IsValid()
 				|| !Mesh->PrimaryComponentTick.IsTickFunctionRegistered() || !Mesh->PrimaryComponentTick.IsTickFunctionEnabled()
 				|| !Movement->PrimaryComponentTick.IsTickFunctionRegistered() || !Movement->PrimaryComponentTick.IsTickFunctionEnabled())
 			{
-				Fail(TEXT("原 FX 帧观察缺少已注册的生产 Mesh／CMC／Level。")); return false;
+				Fail(TEXT("原 FX 帧观察缺少已注册的生产 Mesh／CMC／Level／Viewport。")); return false;
 			}
 			FXFrameObservationTick.Command = this;
 			FXFrameObservationTick.AddPrerequisite(Mesh.Get(), Mesh->PrimaryComponentTick);
@@ -3137,10 +3658,60 @@ namespace
 			{
 				ReleaseFXFrameObservation(); Fail(TEXT("原 FX 帧观察注册失败。")); return false;
 			}
+			FXBeginDrawHandle = Viewport->OnBeginDraw().AddLambda([this]
+			{
+				bFXDrawInProgress = true;
+				bFXDrawSawWorldEndOfFrame = false;
+				if (FXBrightDrawView)
+				{
+					FXBrightDrawView->DrawFrame = GFrameCounter;
+					FXBrightDrawView->Matches = 0;
+					FXBrightDrawView->bMatchedViewportFamily = false;
+				}
+			});
+			FXWorldEndOfFrameHandle = FWorldDelegates::OnWorldPreSendAllEndOfFrameUpdates.AddLambda([this](UWorld* DrawWorld)
+			{
+				if (bFXDrawInProgress && DrawWorld == World.Get()) { bFXDrawSawWorldEndOfFrame = true; }
+			});
+			if (FXProbe == EComboFXProbe::NaturalTail && GetDefault<UGGYGOPlayerComboFXDrawTestBridge>()->OnBrightDraw.IsBound())
+			{
+				FXBrightDrawView = FSceneViewExtensions::NewExtension<FComboFXBrightDrawView>(
+					World.Get(), static_cast<FViewport*>(SceneViewport), Character.Get(), LocalPlayer->GetControllerId());
+				FXBrightDrawnHandle = Viewport->OnDrawn().AddRaw(this, &FComboEndProductionPIECommand::ObserveFXOriginalDrawn);
+			}
+			FXViewportRenderedHandle = UGameViewportClient::OnViewportRendered().AddRaw(this, &FComboEndProductionPIECommand::ObserveFXViewportRendered);
 			return true;
 		}
 		void ReleaseFXFrameObservation()
 		{
+			PollFXMeshDraw();
+			for (int32 Index = 0; Index < UE_ARRAY_COUNT(FXDrawSamplePhases); ++Index)
+			{
+				if (FXMeshDrawSamples[Index].Result)
+				{
+					FinishFXMeshDraw(FXMeshDrawSamples[Index], TEXT("Uncovered"), TEXT("CancelledBeforeTerminal"));
+				}
+				if (FXBrightDrawView && !bFXBrightDrawConsumed[Index])
+				{
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXBrightDraw] SampleCoverage={\"sample_index\":%d,\"sample_phase\":\"%s\",\"coverage\":\"Uncovered\",\"reason\":\"NaturalPhaseNotObserved\"}"),
+						Index, FXDrawSamplePhases[Index]));
+				}
+			}
+			CancelFXMeshDraw(FXMeshDrawCandidate);
+			if (Viewport.IsValid())
+			{
+				Viewport->OnBeginDraw().Remove(FXBeginDrawHandle);
+				Viewport->OnDrawn().Remove(FXBrightDrawnHandle);
+			}
+			FXBrightDrawnHandle.Reset();
+			FXBrightDrawView.Reset();
+			FWorldDelegates::OnWorldPreSendAllEndOfFrameUpdates.Remove(FXWorldEndOfFrameHandle);
+			UGameViewportClient::OnViewportRendered().Remove(FXViewportRenderedHandle);
+			FXBeginDrawHandle.Reset();
+			FXWorldEndOfFrameHandle.Reset();
+			FXViewportRenderedHandle.Reset();
+			bFXDrawInProgress = false;
+			bFXDrawSawWorldEndOfFrame = false;
 			if (!FXFrameObservationTick.Command && !FXFrameObservationTick.IsTickFunctionRegistered()) { return; }
 			FXFrameObservationTick.Command = nullptr;
 			FXFrameObservationTick.UnRegisterTickFunction();
@@ -3151,23 +3722,36 @@ namespace
 		{
 			if (bFailed || Stage == EStage::Ending || Stage == EStage::Done) { return; }
 			if (!IsProductionChainCurrent()) { Fail(TEXT("原生产链在真实 FX 帧观察中改变。")); return; }
-			if (Stage == EStage::FXReady)
+			if (Stage == EStage::FXStartupFrame)
 			{
 				for (const FFXUnitObservation& Unit : FXUnits)
 				{
-					if (!Unit.System.IsValid()) { Fail(TEXT("原 FX 单元在原生启动等待中失效。")); return; }
-					if (!Unit.System->IsReadyToRun()) { return; }
+					if (!Unit.System.IsValid())
+					{
+						LogFXStartupReadiness(TEXT("ColdStartupSystemUnavailableBeforeInput"));
+						Fail(TEXT("原 FX 单元在原生启动等待中失效。")); return;
+					}
 				}
-				if (FXReadyFrame == MAX_uint64)
+				if (FXStartupFrame == MAX_uint64)
 				{
-					FXReadyFrame = GFrameCounter; FXReadyWorldSeconds = World->GetTimeSeconds(); return;
+					FXStartupFrame = GFrameCounter;
+					FXStartupWorldSeconds = World->GetTimeSeconds();
+					LogNativeInputBoundary(TEXT("ColdStartupFrameObserved"));
+					return;
 				}
-				if (GFrameCounter <= FXReadyFrame || World->GetTimeSeconds() <= FXReadyWorldSeconds) { return; }
-				// 初始原生世界帧已真实完成；不改 DeltaTime、Montage、输入来源或播放速率。
+				if (GFrameCounter <= FXStartupFrame || World->GetTimeSeconds() <= FXStartupWorldSeconds) { return; }
+				// 原生帧已推进。就绪值仅用于诊断；让真实冷首击进入生产 FX 的准入与失败路径。
 				Stage = EStage::Main; Deadline = FPlatformTime::Seconds() + 3.0;
 				if (!InstallFXInputObservation()) { return; }
-				LogNativeInputBoundary(TEXT("StartupNativeFrameReady"));
-				bAttackDown = true; SendNativeKey(AttackKey, true);
+				LogFXStartupReadiness(TEXT("BeforeColdAttackKeyDown"));
+				LogNativeInputBoundary(TEXT("BeforeColdAttackKeyDown"));
+				bAttackDown = true;
+				const bool bSlateHandled = SendNativeKey(AttackKey, true);
+				if (!bFailed)
+				{
+					// Slate 的处理结果不等于 Controller 已消费输入。
+					LogNativeInputBoundary(bSlateHandled ? TEXT("ColdAttackKeyDownSlateHandled") : TEXT("ColdAttackKeyDownSlateUnhandled"));
+				}
 				return;
 			}
 			if (Stage == EStage::FXCancelWait) { VerifyFXCancellation(); return; }
@@ -3178,6 +3762,27 @@ namespace
 				if (bFailed) { return; }
 				if (Stage == EStage::Natural) { ObserveFullNaturalEnd(); }
 				else if (Stage == EStage::NaturalIdle) { ObserveNaturalIdle(); }
+			}
+		}
+		void LogFXStartupReadiness(const TCHAR* Boundary)
+		{
+			for (int32 Index = 0; Index < FXUnits.Num(); ++Index)
+			{
+				const UNiagaraSystem* System = FXUnits[Index].System.Get();
+				if (!System)
+				{
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] ReadinessBoundary=%s Frame=%llu Unit=%d SystemAvailable=0."),
+						Boundary, static_cast<unsigned long long>(GFrameCounter), Index));
+					continue;
+				}
+				const UNiagaraScript* Spawn = System->GetSystemSpawnScript();
+				const UNiagaraScript* Update = System->GetSystemUpdateScript();
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] ReadinessBoundary=%s Frame=%llu Unit=%d System=%s SystemAvailable=1 NiagaraReady=%d NiagaraValid=%d OutstandingCompilationIncludingGPU=%d SpawnScriptPending=%d UpdateScriptPending=%d EmitterHandles=%d CompiledEmitters=%d."),
+					Boundary, static_cast<unsigned long long>(GFrameCounter), Index, *System->GetPathName(),
+					System->IsReadyToRun(), System->IsValid(), System->HasOutstandingCompilationRequests(true),
+					Spawn ? static_cast<int32>(Spawn->IsScriptCompilationPending(false)) : INDEX_NONE,
+					Update ? static_cast<int32>(Update->IsScriptCompilationPending(false)) : INDEX_NONE,
+					System->GetEmitterHandles().Num(), System->GetEmitterCompiledData().Num()));
 			}
 		}
 		void LogNativeInputBoundary(const TCHAR* Boundary)
@@ -3225,10 +3830,19 @@ namespace
 		}
 		void ObserveFXAfterNativeInput()
 		{
+			if (IsAuthoredRestartProbe()) { ObserveAuthoredRestartAfterController(); return; }
 			if (!bFailed && Stage == EStage::Main)
 			{
 				if (!IsProductionChainCurrent()) { Fail(TEXT("original production chain changed at native FX input boundary")); }
-				else { TryCaptureMain(); }
+				else
+				{
+					if (!bLoggedColdFXControllerSample)
+					{
+						bLoggedColdFXControllerSample = true;
+						LogNativeInputBoundary(TEXT("ColdAfterOriginalControllerTick"));
+					}
+					TryCaptureMain();
+				}
 			}
 			if (bFailed || Stage != EStage::Main) { ReleaseFXInputObservation(); }
 		}
@@ -3329,7 +3943,20 @@ namespace
 						++FXBeginCounts.FindOrAdd(Snapshot.MontageInstanceId);
 						if (bFXRestarted && Snapshot.MontageInstanceId != FXCancelledInstanceId) { FXRestartBeginFrame = GFrameCounter; }
 					}
-					else if (Tag == GGYGOGameplayTags::Event_Montage_FXWindowEnd) { ++FXEndCounts.FindOrAdd(Snapshot.MontageInstanceId); }
+					else if (Tag == GGYGOGameplayTags::Event_Montage_FXWindowEnd)
+					{
+						const int32 Count = ++FXEndCounts.FindOrAdd(Snapshot.MontageInstanceId);
+						if (Count == 1 && bFXCaptured && Task == MontageTask.Get() && Snapshot.MontageInstanceId == InstanceId)
+						{
+							// 在原作者 End 观察点确认哪些原单元已经自然退休。
+							for (FFXUnitObservation& Unit : FXUnits)
+							{
+								Unit.bRetiredNaturallyBeforeEnd = Unit.NaturalCompletionCount == 1 && Unit.IsRetired();
+							}
+						}
+						Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Boundary=AuthoredEnd Instance=%d Task=%s Frame=%llu Position=%.6f Count=%d."),
+							Snapshot.MontageInstanceId, *GetPathNameSafe(Task), static_cast<unsigned long long>(GFrameCounter), Snapshot.PositionSeconds, Count));
+					}
 				}));
 			if (!FXEventHandle.IsValid()) { Fail(TEXT("original FX event observation could not register")); return false; }
 			return true;
@@ -3372,13 +3999,6 @@ namespace
 				return Unit.NaturalCompletionCount != 1 || !Unit.IsRetired();
 			});
 		}
-		bool FXNaturalExitsObserved() const
-		{
-			return !FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit)
-			{
-				return Unit.NaturalCompletionCount != 1 && !Unit.bDetached;
-			});
-		}
 		void ObserveFXNaturalCompletion(UGGYGOAbilityTask_PlayNiagaraEffect* Sender, UNiagaraComponent* Component)
 		{
 			if (Sender != FXTask.Get()) { return; }
@@ -3387,13 +4007,264 @@ namespace
 				if (Component && Unit.Component.Get(true) == Component)
 				{
 					++Unit.NaturalCompletionCount;
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Boundary=OwnedNaturalCompletion Instance=%d Task=%s Component=%s Frame=%llu AuthoredEndCount=%d Count=%d."),
+						InstanceId, *GetPathNameSafe(Sender), *GetPathNameSafe(Component), static_cast<unsigned long long>(GFrameCounter),
+						FXEndCounts.FindRef(InstanceId), Unit.NaturalCompletionCount));
 					return;
 				}
 			}
 			bFXUnknownNaturalCompletion = true;
 		}
+		FString DescribeFXTailEvidence() const
+		{
+			int32 NaturallyCompleted = 0, RetiredNaturallyBeforeEnd = 0, DetachedInactive = 0, Retired = 0;
+			for (const FFXUnitObservation& Unit : FXUnits)
+			{
+				NaturallyCompleted += Unit.NaturalCompletionCount == 1 ? 1 : 0;
+				RetiredNaturallyBeforeEnd += Unit.bRetiredNaturallyBeforeEnd ? 1 : 0;
+				DetachedInactive += Unit.bDetached ? 1 : 0;
+				Retired += bFXCaptured && Unit.IsRetired() ? 1 : 0;
+			}
+			return FString::Printf(TEXT("Begin=%d End=%d Captured=%d Particles=%d AllSimulations=%d NaturallyCompleted=%d RetiredNaturallyBeforeEnd=%d DetachedInactive=%d Retired=%d Units=%d TaskFinished=%d TaskReleased=%d."),
+				FXBeginCounts.FindRef(InstanceId), FXEndCounts.FindRef(InstanceId), bFXCaptured, bFXParticles, FXSimulationsCaptured(),
+				NaturallyCompleted, RetiredNaturallyBeforeEnd, DetachedInactive, Retired, FXUnits.Num(),
+				FXTask.Get() && FXTask->GetState() == EGameplayTaskState::Finished,
+				FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) == nullptr);
+		}
+		void CancelFXMeshDraw(FComboFXMeshDrawObservation& Observation)
+		{
+			if (UObject* Probe = Observation.Probe.Get())
+			{
+				if (UFunction* Cancel = Probe->FindFunction(TEXT("Cancel"))) { Probe->ProcessEvent(Cancel, nullptr); }
+				Observation.Probe.Reset();
+			}
+		}
+
+		void ArmFXMeshDraw()
+		{
+			// 上一次 Draw 未被原亮层样本选中。每个候选只观察下一次原 Draw。
+			CancelFXMeshDraw(FXMeshDrawCandidate);
+			FXMeshDrawCandidate = {};
+			FXMeshDrawCandidate.ArmIssue = TEXT("MissingOriginalNiagaraInstance");
+			const FFXUnitObservation* Unit = FXUnits.FindByPredicate([](const FFXUnitObservation& Entry)
+			{
+				return Entry.System.IsValid() && Entry.System->GetFName() == FXNormal01System;
+			});
+			UNiagaraComponent* Component = Unit ? Unit->Component.Get() : nullptr;
+			const auto NiagaraController = Component ? Component->GetSystemInstanceController() : nullptr;
+			if (!NiagaraController || !NiagaraController->IsValid()) { return; }
+			const FNiagaraSystemInstance* Instance = NiagaraController->GetSystemInstance_Unsafe();
+			if (!Instance || Instance->GetSystem() != Unit->System.Get()) { return; }
+			if (bFXBrightDrawConsumed[0] && static_cast<uint64>(Instance->GetId()) != FXBrightDrawNiagaraId) { return; }
+
+			FXMeshDrawCandidate.ArmIssue = TEXT("MissingEditorProbe");
+			UClass* ProbeClass = FindObject<UClass>(nullptr, TEXT("/Script/GGYGOEditor.GGYGONiagaraMeshDrawTestProbe"));
+			if (!ProbeClass) { return; }
+			UFunction* Begin = ProbeClass->FindFunctionByName(TEXT("BeginNextDraw"));
+			const auto* PlayerArg = Begin ? FindFProperty<FObjectProperty>(Begin, TEXT("Player")) : nullptr;
+			const auto* PawnArg = Begin ? FindFProperty<FObjectProperty>(Begin, TEXT("ViewPawn")) : nullptr;
+			const auto* ComponentArg = Begin ? FindFProperty<FObjectProperty>(Begin, TEXT("Component")) : nullptr;
+			const auto* MaterialsArg = Begin ? FindFProperty<FArrayProperty>(Begin, TEXT("Materials")) : nullptr;
+			const auto* MaterialArg = MaterialsArg ? CastField<FObjectProperty>(MaterialsArg->Inner) : nullptr;
+			const auto* Return = Begin ? CastField<FObjectProperty>(Begin->GetReturnProperty()) : nullptr;
+			FXMeshDrawCandidate.ArmIssue = TEXT("InvalidBeginNextDrawContract");
+			if (!PlayerArg || !PawnArg || !ComponentArg || !MaterialArg || !Return) { return; }
+
+			TArray<UMaterialInterface*> Materials;
+			for (FName Layer : {FXNormal01BrightLayers[0], FXNormal01BrightLayers[1], FXNormal01ControlLayer})
+			{
+				const FNiagaraEmitterInstanceRef* Match = Instance->GetEmitters().FindByPredicate(
+					[Layer](const FNiagaraEmitterInstanceRef& Emitter) { return Emitter->GetEmitterHandle().GetName() == Layer; });
+				const UNiagaraMeshRendererProperties* Renderer = Match ? FindFXDrawMeshRenderer(Match->Get()) : nullptr;
+				const UStaticMesh* ConfiguredMesh = Renderer ? FindFXDrawConfiguredMesh(*Renderer) : nullptr;
+				const FStaticMeshRenderData* MeshData = ConfiguredMesh && !ConfiguredMesh->IsCompiling()
+					? ConfiguredMesh->GetRenderData() : nullptr;
+				UMaterialInterface* Material = MeshData
+					? ReadFXDrawConfiguredMaterial(*Renderer, Match->Get(), *ConfiguredMesh, *MeshData) : nullptr;
+				if (!IsValid(Material))
+				{
+					FXMeshDrawCandidate.ArmIssue = TEXT("MissingConfiguredMaterial");
+					return;
+				}
+				Materials.Add(Material);
+			}
+
+			FStructOnScope Params(Begin);
+			void* Args = Params.GetStructMemory();
+			PlayerArg->SetObjectPropertyValue_InContainer(Args, LocalPlayer.Get());
+			PawnArg->SetObjectPropertyValue_InContainer(Args, Character.Get());
+			ComponentArg->SetObjectPropertyValue_InContainer(Args, Component);
+			FScriptArrayHelper MaterialArgs(MaterialsArg, MaterialsArg->ContainerPtrToValuePtr<void>(Args));
+			MaterialArgs.AddValues(Materials.Num());
+			for (int32 Index = 0; Index < Materials.Num(); ++Index)
+			{
+				MaterialArg->SetObjectPropertyValue(MaterialArgs.GetRawPtr(Index), Materials[Index]);
+			}
+			ProbeClass->GetDefaultObject()->ProcessEvent(Begin, Args);
+			FXMeshDrawCandidate.Probe.Reset(Return->GetObjectPropertyValue_InContainer(Args));
+			FXMeshDrawCandidate.ArmIssue = FXMeshDrawCandidate.Probe.Get() ? NAME_None : FName(TEXT("BeginNextDrawReturnedNull"));
+		}
+
+		void ConfirmFXMeshDraw(int32 SampleIndex, UNiagaraComponent& Component, FJsonObject& Draw)
+		{
+			FComboFXMeshDrawObservation& Observation = FXMeshDrawSamples[SampleIndex];
+			Observation = MoveTemp(FXMeshDrawCandidate);
+			FXMeshDrawCandidate = {};
+			Observation.Result = MakeShared<FJsonObject>();
+			for (const TCHAR* Field : {TEXT("draw_frame"), TEXT("world_path"), TEXT("world_object_id"), TEXT("viewport_identity"),
+				TEXT("game_viewport_client_object_id"), TEXT("montage_task"), TEXT("montage_instance_id"),
+				TEXT("fx_task"), TEXT("component"), TEXT("system"), TEXT("niagara_id"), TEXT("niagara_tick"), TEXT("sample_index"), TEXT("sample_phase")})
+			{
+				Observation.Result->SetField(Field, Draw.Values.FindChecked(Field));
+			}
+
+			UObject* Probe = Observation.Probe.Get();
+			UFunction* Confirm = Probe ? Probe->FindFunction(TEXT("ConfirmOriginalDraw")) : nullptr;
+			const auto* ComponentArg = Confirm ? FindFProperty<FObjectProperty>(Confirm, TEXT("Component")) : nullptr;
+			const auto* Return = Confirm ? CastField<FBoolProperty>(Confirm->GetReturnProperty()) : nullptr;
+			if (ComponentArg && Return)
+			{
+				FStructOnScope Params(Confirm);
+				void* Args = Params.GetStructMemory();
+				ComponentArg->SetObjectPropertyValue_InContainer(Args, &Component);
+				Probe->ProcessEvent(Confirm, Args);
+				Observation.bConfirmed = Return->GetPropertyValue_InContainer(Args);
+				Observation.ArmIssue = Observation.bConfirmed ? NAME_None : FName(TEXT("OriginalDrawNotConfirmed"));
+			}
+			else if (Probe)
+			{
+				Observation.ArmIssue = TEXT("InvalidConfirmOriginalDrawContract");
+			}
+			Draw.SetStringField(TEXT("mesh_draw_probe"), Observation.bConfirmed ? TEXT("Pending") : TEXT("Uncovered"));
+		}
+
+		void FinishFXMeshDraw(FComboFXMeshDrawObservation& Observation, const TCHAR* Coverage, FName Reason)
+		{
+			Observation.Result->SetStringField(TEXT("coverage"), Coverage);
+			if (!Reason.IsNone()) { Observation.Result->SetStringField(TEXT("reason"), Reason.ToString()); }
+			FString Json;
+			const auto Writer = TJsonWriterFactory<TCHAR, TCondensedJsonPrintPolicy<TCHAR>>::Create(&Json);
+			if (FJsonSerializer::Serialize(Observation.Result.ToSharedRef(), Writer))
+			{
+				Test.AddInfo(TEXT("[Combat.PlayerCombo.FXBrightDraw] MeshDrawResult=") + Json);
+			}
+			else
+			{
+				Test.AddInfo(TEXT("[Combat.PlayerCombo.FXBrightDraw] MeshDrawResult={\"coverage\":\"Uncovered\",\"reason\":\"ResultSerializationFailed\"}"));
+			}
+			Observation.Result.Reset();
+			CancelFXMeshDraw(Observation);
+		}
+
+		void PollFXMeshDraw()
+		{
+			for (FComboFXMeshDrawObservation& Observation : FXMeshDrawSamples) { PollFXMeshDrawSample(Observation); }
+		}
+
+		void PollFXMeshDrawSample(FComboFXMeshDrawObservation& Observation)
+		{
+			if (!Observation.Result) { return; }
+			UObject* Probe = Observation.Probe.Get();
+			if (!Probe)
+			{
+				FinishFXMeshDraw(Observation, TEXT("Uncovered"), Observation.ArmIssue.IsNone() ? FName(TEXT("ProbeNotArmed")) : Observation.ArmIssue);
+				return;
+			}
+
+			UFunction* Poll = Probe->FindFunction(TEXT("Poll"));
+			const auto* Return = Poll ? CastField<FStructProperty>(Poll->GetReturnProperty()) : nullptr;
+			const auto* Coverage = Return ? FindFProperty<FEnumProperty>(Return->Struct, TEXT("Coverage")) : nullptr;
+			if (!Coverage)
+			{
+				FinishFXMeshDraw(Observation, TEXT("Uncovered"), TEXT("InvalidPollContract"));
+				return;
+			}
+			FStructOnScope Params(Poll);
+			void* Args = Params.GetStructMemory();
+			Probe->ProcessEvent(Poll, Args);
+			const void* Result = Return->ContainerPtrToValuePtr<void>(Args);
+			const FString Status = Coverage->GetEnum()->GetNameStringByValue(
+				Coverage->GetUnderlyingProperty()->GetSignedIntPropertyValue(Coverage->ContainerPtrToValuePtr<void>(Result)));
+			if (Status == TEXT("Pending")) { return; }
+			if (Status == TEXT("Uncovered"))
+			{
+				const auto* Reason = FindFProperty<FNameProperty>(Return->Struct, TEXT("Reason"));
+				FinishFXMeshDraw(Observation, TEXT("Uncovered"), Reason ? Reason->GetPropertyValue_InContainer(Result) : Observation.ArmIssue);
+				return;
+			}
+			if (Status != TEXT("Covered") || !Observation.bConfirmed || !ReadCoveredFXMeshDraw(Return->Struct, Result, *Observation.Result))
+			{
+				FinishFXMeshDraw(Observation, TEXT("Uncovered"), TEXT("InvalidCoveredDrawResult"));
+				return;
+			}
+			FinishFXMeshDraw(Observation, TEXT("Covered"), NAME_None);
+		}
+
+		bool ReadCoveredFXMeshDraw(const UStruct* Type, const void* Value, FJsonObject& Report)
+		{
+			const auto ReadId = [Type, Value](FName Name)
+			{
+				const auto* Property = FindFProperty<FInt64Property>(Type, Name);
+				return Property ? LexToString(Property->GetPropertyValue_InContainer(Value)) : FString();
+			};
+			const auto* ResultViewport = FindFProperty<FStrProperty>(Type, TEXT("ViewportIdentity"));
+			const auto* ResultComponent = FindFProperty<FStrProperty>(Type, TEXT("ComponentPath"));
+			if (!ResultViewport || !ResultComponent
+				|| ReadId(TEXT("FrameCounter")) != Report.GetStringField(TEXT("draw_frame"))
+				|| ReadId(TEXT("WorldObjectId")) != Report.GetStringField(TEXT("world_object_id"))
+				|| ReadId(TEXT("NiagaraInstanceId")) != Report.GetStringField(TEXT("niagara_id"))
+				|| ResultViewport->GetPropertyValue_InContainer(Value) != Report.GetStringField(TEXT("viewport_identity"))
+				|| ResultComponent->GetPropertyValue_InContainer(Value) != Report.GetStringField(TEXT("component")))
+			{
+				return false;
+			}
+
+			const auto* ComponentBatches = FindFProperty<FIntProperty>(Type, TEXT("ComponentMeshBatches"));
+			const auto* Materials = FindFProperty<FArrayProperty>(Type, TEXT("Materials"));
+			const auto* BatchType = Materials ? CastField<FStructProperty>(Materials->Inner) : nullptr;
+			const auto* Unattributed = FindFProperty<FStructProperty>(Type, TEXT("Unattributed"));
+			if (!ComponentBatches || !BatchType || !Unattributed || ComponentBatches->GetPropertyValue_InContainer(Value) < 0) { return false; }
+			FScriptArrayHelper Array(Materials, Materials->ContainerPtrToValuePtr<void>(Value));
+			const FName Layers[] = {FXNormal01BrightLayers[0], FXNormal01BrightLayers[1], FXNormal01ControlLayer};
+			if (Array.Num() != UE_ARRAY_COUNT(Layers)) { return false; }
+			const auto* RTMaterial = FindFProperty<FStructProperty>(BatchType->Struct, TEXT("RTMaterial"));
+			TArray<TSharedPtr<FJsonValue>> ByMaterial;
+			for (int32 Index = 0; Index < Array.Num(); ++Index)
+			{
+				const void* Batch = Array.GetRawPtr(Index);
+				const auto Counts = ReadFXMeshDrawCounts(BatchType->Struct, Batch);
+				if (!Counts || !Counts->HasField(TEXT("material_path"))) { return false; }
+				Counts->SetStringField(TEXT("configured_layer"), Layers[Index].ToString());
+				auto Material = RTMaterial ? ReadFXMeshDrawRTMaterial(RTMaterial->Struct, RTMaterial->ContainerPtrToValuePtr<void>(Batch)) : nullptr;
+				if (!Material)
+				{
+					Material = MakeShared<FJsonObject>();
+					Material->SetStringField(TEXT("coverage"), TEXT("Uncovered"));
+					Material->SetStringField(TEXT("reason"), RTMaterial ? TEXT("InvalidRTMaterialContract") : TEXT("MissingRTMaterialField"));
+				}
+				Counts->SetObjectField(TEXT("rt_material"), Material);
+				ByMaterial.Add(MakeShared<FJsonValueObject>(Counts));
+			}
+			const auto Other = ReadFXMeshDrawCounts(Unattributed->Struct, Unattributed->ContainerPtrToValuePtr<void>(Value));
+			if (!Other) { return false; }
+			Report.SetStringField(TEXT("primitive_component_id"), ReadId(TEXT("PrimitiveComponentId")));
+			Report.SetNumberField(TEXT("component_mesh_batches"), ComponentBatches->GetPropertyValue_InContainer(Value));
+			Report.SetArrayField(TEXT("materials"), MoveTemp(ByMaterial));
+			Report.SetObjectField(TEXT("unattributed"), Other);
+			auto View = ReadFXMeshDrawView(Type, Value);
+			if (!View)
+			{
+				View = MakeShared<FJsonObject>();
+				View->SetStringField(TEXT("coverage"), TEXT("Uncovered"));
+				View->SetStringField(TEXT("reason"), TEXT("MissingOrInvalidViewContract"));
+			}
+			Report.SetObjectField(TEXT("rt_view"), View);
+			return true;
+		}
+
 		void ObserveFX()
 		{
+			PollFXMeshDraw();
 			if (bFXVerified || bFailed) { return; }
 			if (bFXUnknownNaturalCompletion || FXUnits.ContainsByPredicate([](const FFXUnitObservation& Unit)
 				{ return Unit.NaturalCompletionCount > 1; }))
@@ -3440,39 +4311,9 @@ namespace
 					{ ObserveFXNaturalCompletion(Sender, Component); });
 				bFXCaptured = true;
 			}
-			for (FFXUnitObservation& Unit : FXUnits)
+			if (FXBrightDrawView && !bFXBrightDrawConsumed[2] && Stage == EStage::Natural && Begins == 1 && Ends == 0)
 			{
-				UNiagaraComponent* Component = Unit.Component.Get();
-				if (!Component || (Unit.bSimulationCaptured && bFXParticles)) { continue; }
-				const auto NiagaraController = Component->GetSystemInstanceController();
-				if (NiagaraController.IsValid() && NiagaraController->IsValid()
-					&& !NiagaraController->IsPendingSpawn() && !NiagaraController->IsComplete() && NiagaraController->GetAge() > 0.0f)
-				{
-					if (!Unit.Cache.Get()) { Unit.Cache.Reset(NewObject<UNiagaraSimCache>(GetTransientPackage())); }
-					FNiagaraSimCacheCreateParameters Parameters;
-					Parameters.bAllowDataInterfaceCaching = false;
-					UNiagaraSimCache* Captured = nullptr;
-					// The exported capture validates the original simulation and current data
-					// through Niagara's native BeginWrite/WriteFrame before accepting a frame.
-					if (!UNiagaraSimCacheFunctionLibrary::CaptureNiagaraSimCacheImmediate(Unit.Cache.Get(), Parameters, Component, Captured, false)
-						|| Captured != Unit.Cache.Get() || Captured->GetSystem() != Unit.System.Get() || Captured->GetNumFrames() != 1
-						|| Captured->GetNumEmitters() != Unit.EmitterCount)
-					{
-						Fail(TEXT("native non-advancing particle capture failed; it cannot stand in for zero particles")); return;
-					}
-					Unit.bSimulationCaptured = true;
-					int32 Particles = 0;
-					for (int32 Emitter = 0; Emitter < Captured->GetNumEmitters(); ++Emitter)
-					{
-						Particles += Captured->GetEmitterNumInstances(Emitter, 0);
-					}
-					if (Particles > 0)
-					{
-						bFXParticles = true;
-						Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Component=%s ActualParticles=%d CaptureAdvance=0."),
-							static_cast<uint32>(FXProbe), InstanceId, *Component->GetPathName(), Particles));
-					}
-				}
+				ArmFXMeshDraw();
 			}
 			if (FXProbe == EComboFXProbe::WindowCancel && !bFXRestarted)
 			{
@@ -3497,28 +4338,40 @@ namespace
 			{
 				for (FFXUnitObservation& Unit : FXUnits)
 				{
-					if (Unit.NaturalCompletionCount == 1 && Unit.IsRetired()) { continue; }
+					if (Unit.bRetiredNaturallyBeforeEnd) { continue; }
 					UNiagaraComponent* Component = Unit.Component.Get();
 					if (!Component || Unit.bDetached) { continue; }
 					const auto NiagaraController = Component->GetSystemInstanceController();
-					if (Component->GetAttachParent() || FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get())
-						|| !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished
-						|| !NiagaraController.IsValid() || !NiagaraController->IsValid()
-						|| NiagaraController->GetRequestedExecutionState() != ENiagaraExecutionState::Inactive)
+					const bool bDetached = Component->GetAttachParent() == nullptr;
+					const bool bInactive = NiagaraController.IsValid() && NiagaraController->IsValid()
+						&& NiagaraController->GetRequestedExecutionState() == ENiagaraExecutionState::Inactive;
+					const bool bReleased = FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) == nullptr;
+					const bool bTaskFinished = FXTask.Get() && FXTask->GetState() == EGameplayTaskState::Finished;
+					if (!bDetached || !bInactive || !bReleased || !bTaskFinished)
 					{
-						Fail(TEXT("真实作者 End 未将原单元尾部脱离挂点并请求原生 Inactive。")); return;
+						Fail(FString::Printf(TEXT("真实作者 End 后原单元缺少尾部事实。Component=%s Detached=%d Inactive=%d Released=%d TaskFinished=%d."),
+							*GetPathNameSafe(Component), bDetached, bInactive, bReleased, bTaskFinished)); return;
 					}
 					Unit.bDetached = true;
-					bFXDetached = true;
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Boundary=DetachedInactive Instance=%d Task=%s Component=%s Frame=%llu."),
+						InstanceId, *GetPathNameSafe(FXTask.Get()), *GetPathNameSafe(Component), static_cast<unsigned long long>(GFrameCounter)));
 				}
 			}
-			if (FXComponentsRetired())
+			// 自然完成可早于 Montage 的作者 End。保留原播放观察直到收到 End 或到达原截止。
+			if (Ends == 1 && FXComponentsRetired())
 			{
-				if (Begins != 1 || Ends != 1 || !bFXParticles || !FXSimulationsCaptured() || !bFXDetached
-					|| !FXNaturalExitsObserved() || !FXTask.Get()
-					|| FXTask->GetState() != EGameplayTaskState::Finished)
+				int32 NaturalRetiredBeforeEndUnits = 0, TailDetachedUnits = 0;
+				for (const FFXUnitObservation& Unit : FXUnits)
 				{
-					Fail(TEXT("original tail retired without observed particles, authored End and native detach/inactive facts")); return;
+					if (Unit.bRetiredNaturallyBeforeEnd) { ++NaturalRetiredBeforeEndUnits; }
+					else if (Unit.bDetached) { ++TailDetachedUnits; }
+				}
+				if (Begins != 1 || !bFXParticles || !FXSimulationsCaptured()
+					|| NaturalRetiredBeforeEndUnits + TailDetachedUnits != FXUnits.Num()
+					|| !FXTask.Get() || FXTask->GetState() != EGameplayTaskState::Finished
+					|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()))
+				{
+					Fail(TEXT("original FX authored End was observed but terminal proof is incomplete: ") + DescribeFXTailEvidence()); return;
 				}
 				if (FXProbe == EComboFXProbe::WindowCancel && bFXNativePlaybackOverlap && FXCancelledEndFrame == MAX_uint64)
 				{
@@ -3532,16 +4385,304 @@ namespace
 						static_cast<unsigned long long>(FXRestartBeginFrame), static_cast<unsigned long long>(FXCancelledEndFrame), FXCancelledInstanceId, InstanceId));
 				}
 				bFXVerified = true;
-				int32 NaturalCompletedUnits = 0, TailDetachedUnits = 0;
-				for (const FFXUnitObservation& Unit : FXUnits)
-				{
-					NaturalCompletedUnits += Unit.NaturalCompletionCount == 1 ? 1 : 0;
-					TailDetachedUnits += Unit.bDetached ? 1 : 0;
-				}
-				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Begin=1 End=1 TailDetached=1 ActualComponentRetired=1 OldEventsRejected=%d Units=%d NaturalCompletedUnits=%d TailDetachedUnits=%d."),
-					static_cast<uint32>(FXProbe), InstanceId, FXRejectedOldEvents, FXUnits.Num(), NaturalCompletedUnits, TailDetachedUnits));
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Begin=1 End=1 ActualComponentRetired=1 OldEventsRejected=%d Units=%d NaturalRetiredBeforeEndUnits=%d TailDetachedUnits=%d LiveTailCoverage=%s."),
+					static_cast<uint32>(FXProbe), InstanceId, FXRejectedOldEvents, FXUnits.Num(), NaturalRetiredBeforeEndUnits,
+					TailDetachedUnits, TailDetachedUnits > 0 ? TEXT("OBSERVED") : TEXT("NOT_OBSERVED")));
 			}
 		}
+		int32 SelectFXBrightDrawSample(const FNiagaraDataBuffer* const (&Buffers)[3]) const
+		{
+			// 首样仍取原先首个合格 Draw；后两样只消费真实粒子寿命窗，不等待或推进模拟。
+			if (!bFXBrightDrawConsumed[0]) { return 0; }
+			const float MinimumAge[] = {0.0f, 0.25f, 0.82f};
+			const float MaximumAge[] = {1.0f, 0.65f, 1.0f};
+			for (int32 SampleIndex = 1; SampleIndex < UE_ARRAY_COUNT(FXDrawSamplePhases); ++SampleIndex)
+			{
+				if (bFXBrightDrawConsumed[SampleIndex]) { continue; }
+				bool bInPhase = true;
+				for (int32 LayerIndex = 0; LayerIndex < 2 && bInPhase; ++LayerIndex)
+				{
+					const FNiagaraDataBuffer* Data = Buffers[LayerIndex];
+					const auto Age = FNiagaraDataSetAccessor<float>::CreateReader(Data, TEXT("NormalizedAge"));
+					if (!Age.IsValid()) { return INDEX_NONE; }
+					for (int32 Index = 0; Index < static_cast<int32>(Data->GetNumInstances()); ++Index)
+					{
+						if (!FMath::IsFinite(Age[Index]) || Age[Index] < MinimumAge[SampleIndex] || Age[Index] >= MaximumAge[SampleIndex])
+						{
+							bInPhase = false; break;
+						}
+					}
+				}
+				if (bInPhase) { return SampleIndex; }
+			}
+			return INDEX_NONE;
+		}
+
+		void PublishFXBrightDraw(FViewport* DrawViewport, UNiagaraComponent& Component, const FNiagaraSystemInstance& NiagaraInstance,
+			const FGGYGOMontageSectionSnapshot& Snapshot, int32 SampleIndex, const FName (&LayerNames)[3],
+			const FNiagaraEmitterInstance* const (&Emitters)[3], const FNiagaraDataBuffer* const (&Buffers)[3])
+		{
+			const FTransform& Transform = Component.GetComponentTransform();
+			const FVector Location = Transform.GetLocation();
+			const FQuat Rotation = Transform.GetRotation();
+			const FVector ComponentScale = Transform.GetScale3D();
+			const TSharedPtr<FJsonObject> Report = MakeShared<FJsonObject>();
+			Report->SetNumberField(TEXT("sample_index"), SampleIndex);
+			Report->SetStringField(TEXT("sample_phase"), FXDrawSamplePhases[SampleIndex]);
+			Report->SetStringField(TEXT("draw_frame"), LexToString(GFrameCounter));
+			Report->SetStringField(TEXT("world_path"), World->GetPathName());
+			Report->SetStringField(TEXT("world_object_id"), LexToString(World->GetUniqueID()));
+			Report->SetStringField(TEXT("viewport_identity"), FString::Printf(TEXT("%p"), DrawViewport));
+			Report->SetStringField(TEXT("game_viewport_client_object_id"), LexToString(Viewport->GetUniqueID()));
+			Report->SetStringField(TEXT("montage_task"), MontageTask->GetPathName());
+			Report->SetNumberField(TEXT("montage_instance_id"), InstanceId);
+			Report->SetStringField(TEXT("fx_task"), FXTask->GetPathName());
+			Report->SetStringField(TEXT("component"), Component.GetPathName());
+			Report->SetStringField(TEXT("system"), NiagaraInstance.GetSystem()->GetPathName());
+			Report->SetStringField(TEXT("niagara_id"), LexToString(NiagaraInstance.GetId()));
+			Report->SetNumberField(TEXT("niagara_tick"), NiagaraInstance.GetTickCount());
+			Report->SetNumberField(TEXT("system_age_seconds"), NiagaraInstance.GetAge());
+			Report->SetStringField(TEXT("montage_section"), Snapshot.SectionName.ToString());
+			Report->SetNumberField(TEXT("montage_position_seconds"), Snapshot.PositionSeconds);
+			ConfirmFXMeshDraw(SampleIndex, Component, *Report);
+			if (!Transform.ContainsNaN())
+			{
+				const auto WorldTransform = MakeShared<FJsonObject>();
+				WorldTransform->SetArrayField(TEXT("position"), FXDrawNumbers({Location.X, Location.Y, Location.Z}));
+				WorldTransform->SetArrayField(TEXT("rotation_xyzw"), FXDrawNumbers({Rotation.X, Rotation.Y, Rotation.Z, Rotation.W}));
+				WorldTransform->SetArrayField(TEXT("scale"), FXDrawNumbers({ComponentScale.X, ComponentScale.Y, ComponentScale.Z}));
+				Report->SetObjectField(TEXT("component_world_transform"), WorldTransform);
+			}
+			const FComboFXBrightDrawView* View = FXBrightDrawView.Get();
+			if (View && View->HasView())
+			{
+				Report->SetArrayField(TEXT("view_rect"), FXDrawNumbers({
+					static_cast<double>(View->Rect.Min.X), static_cast<double>(View->Rect.Min.Y),
+					static_cast<double>(View->Rect.Max.X), static_cast<double>(View->Rect.Max.Y)}));
+			}
+
+			const EShaderPlatform Platform = World->Scene ? World->Scene->GetShaderPlatform() : EShaderPlatform::SP_NumPlatforms;
+			Report->SetBoolField(TEXT("component_rendering_enabled_gt"), Component.GetRenderingEnabled());
+			TArray<TSharedPtr<FJsonValue>> Layers;
+			for (int32 LayerIndex = 0; LayerIndex < UE_ARRAY_COUNT(LayerNames); ++LayerIndex)
+			{
+				const FNiagaraDataBuffer* Data = Buffers[LayerIndex];
+				const auto Layer = MakeShared<FJsonObject>();
+				Layer->SetStringField(TEXT("name"), LayerNames[LayerIndex].ToString());
+				if (!Emitters[LayerIndex] || !Data)
+				{
+					Layer->SetStringField(TEXT("coverage"), TEXT("Uncovered"));
+					Layer->SetStringField(TEXT("reason"), TEXT("MissingPublishedCPUBuffer"));
+					Layers.Add(MakeShared<FJsonValueObject>(Layer));
+					continue;
+				}
+				const FNiagaraEmitterInstance& Emitter = *Emitters[LayerIndex];
+				Layer->SetStringField(TEXT("emitter_id"), Emitter.GetEmitterHandle().GetId().ToString());
+				Layer->SetStringField(TEXT("coverage"), TEXT("PublishedCPU"));
+				const auto Admission = ReadFXDrawRendererAdmissionGT(Emitter, *Data, Platform);
+				Layer->SetObjectField(TEXT("renderer_admission_gt"), Admission);
+				if (LayerIndex == 2) { Report->SetObjectField(TEXT("light_edge_admission_gt"), Admission); }
+				Layer->SetNumberField(TEXT("particle_count"), Data->GetNumInstances());
+				Layer->SetStringField(TEXT("coordinate_space"), Emitter.IsLocalSpace() ? TEXT("local") : TEXT("world_lwc_simulation"));
+				const auto Age = FNiagaraDataSetAccessor<float>::CreateReader(Data, TEXT("NormalizedAge"));
+				const auto Color = FNiagaraDataSetAccessor<FLinearColor>::CreateReader(Data, TEXT("Color"));
+				const FNiagaraDataSetReaderFloat<FVector4f> DynamicParameters[] = {
+					FNiagaraDataSetAccessor<FVector4f>::CreateReader(Data, TEXT("DynamicMaterialParameter")),
+					FNiagaraDataSetAccessor<FVector4f>::CreateReader(Data, TEXT("DynamicMaterialParameter1")),
+					FNiagaraDataSetAccessor<FVector4f>::CreateReader(Data, TEXT("DynamicMaterialParameter2"))};
+				const TCHAR* const DynamicFields[] = {
+					TEXT("dynamic_material_parameter"), TEXT("dynamic_material_parameter1"), TEXT("dynamic_material_parameter2")};
+				const auto Position = FNiagaraDataSetAccessor<FNiagaraPosition>::CreateReader(Data, TEXT("Position"));
+				const auto Orientation = FNiagaraDataSetAccessor<FQuat4f>::CreateReader(Data, TEXT("MeshOrientation"));
+				const auto Scale = FNiagaraDataSetAccessor<FVector3f>::CreateReader(Data, TEXT("Scale"));
+				TArray<TSharedPtr<FJsonValue>> Particles;
+				for (int32 Index = 0; Index < static_cast<int32>(Data->GetNumInstances()); ++Index)
+				{
+					const auto Particle = MakeShared<FJsonObject>();
+					Particle->SetNumberField(TEXT("index"), Index);
+					if (Age.IsValid() && FMath::IsFinite(Age[Index])) { Particle->SetNumberField(TEXT("normalized_age"), Age[Index]); }
+					Particle->SetStringField(TEXT("normalized_age_coverage"), !Age.IsValid() ? TEXT("MissingAttribute")
+						: FMath::IsFinite(Age[Index]) ? TEXT("PublishedCPU") : TEXT("NonFinite"));
+					if (Color.IsValid() && FMath::IsFinite(Color[Index].A)) { Particle->SetNumberField(TEXT("color_alpha"), Color[Index].A); }
+					if (Color.IsValid())
+					{
+						const FLinearColor Value = Color[Index];
+						WriteFXDrawVector4(*Particle, TEXT("color_rgba"), FVector4f(Value.R, Value.G, Value.B, Value.A));
+					}
+					else { Particle->SetStringField(TEXT("color_rgba_coverage"), TEXT("MissingAttribute")); }
+					for (int32 ParameterIndex = 0; ParameterIndex < UE_ARRAY_COUNT(DynamicParameters); ++ParameterIndex)
+					{
+						if (DynamicParameters[ParameterIndex].IsValid())
+						{
+							WriteFXDrawVector4(*Particle, DynamicFields[ParameterIndex], DynamicParameters[ParameterIndex][Index]);
+						}
+						else { Particle->SetStringField(FString(DynamicFields[ParameterIndex]) + TEXT("_coverage"), TEXT("MissingAttribute")); }
+					}
+					const FVector P = Position.IsValid() ? FVector(Position[Index]) : FVector::ZeroVector;
+					const FQuat Q = Orientation.IsValid() ? FQuat(Orientation[Index]) : FQuat::Identity;
+					const FVector S = Scale.IsValid() ? FVector(Scale[Index]) : FVector::ZeroVector;
+					const bool bPosition = Position.IsValid() && !P.ContainsNaN();
+					const bool bOrientation = Orientation.IsValid() && !Q.ContainsNaN() && FMath::IsFinite(Q.SizeSquared()) && Q.SizeSquared() > UE_SMALL_NUMBER;
+					const bool bScale = Scale.IsValid() && !S.ContainsNaN();
+					if (bPosition) { Particle->SetArrayField(TEXT("simulation_position"), FXDrawNumbers({P.X, P.Y, P.Z})); }
+					if (bOrientation) { Particle->SetArrayField(TEXT("mesh_orientation_xyzw"), FXDrawNumbers({Q.X, Q.Y, Q.Z, Q.W})); }
+					if (bScale) { Particle->SetArrayField(TEXT("scale"), FXDrawNumbers({S.X, S.Y, S.Z})); }
+					Particle->SetStringField(TEXT("projection_status"), bPosition && bOrientation && bScale
+						? ProjectFXDrawMesh(View, Emitter, Data, Index, Transform, P, Q, S, *Particle) : TEXT("uncovered_particle_pose"));
+					Particles.Add(MakeShared<FJsonValueObject>(Particle));
+				}
+				Layer->SetArrayField(TEXT("particles"), MoveTemp(Particles));
+				Layers.Add(MakeShared<FJsonValueObject>(Layer));
+			}
+			Report->SetArrayField(TEXT("layers"), MoveTemp(Layers));
+			FString SampleJson;
+			bFXBrightDrawConsumed[SampleIndex] = true;
+			if (SampleIndex == 0) { FXBrightDrawNiagaraId = static_cast<uint64>(NiagaraInstance.GetId()); }
+			if (!FJsonSerializer::Serialize(Report, TJsonWriterFactory<>::Create(&SampleJson)))
+			{
+				FinishFXMeshDraw(FXMeshDrawSamples[SampleIndex], TEXT("Uncovered"), TEXT("OriginalDrawSerializationFailed"));
+				return;
+			}
+			GetMutableDefault<UGGYGOPlayerComboFXDrawTestBridge>()->OnBrightDraw.Broadcast(World.Get(), SampleJson);
+		}
+
+		void ObserveFXOriginalDrawn()
+		{
+			if (!FXBrightDrawView || FXBrightDrawView->DrawFrame != GFrameCounter || !FXBrightDrawView->bMatchedViewportFamily
+				|| bFXBrightDrawConsumed[2] || !bFXDrawInProgress || !bFXDrawSawWorldEndOfFrame || bFailed || bFXVerified || !bFXCaptured
+				|| Stage != EStage::Natural || !GetDefault<UGGYGOPlayerComboFXDrawTestBridge>()->OnBrightDraw.IsBound()
+				|| !IsProductionChainCurrent()) { return; }
+			RecordFXBrightLayersForDraw(static_cast<FViewport*>(SceneViewport), true);
+		}
+
+		void RecordFXBrightLayersForDraw(FViewport* DrawViewport, bool bPublishBrightDraw = false)
+		{
+			if (FXProbe != EComboFXProbe::NaturalTail || !MontageTask.Get() || !FXTask.Get()
+				|| !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation)
+				|| FGGYGOPlayerComboLifecycleFixture::GetProductionFXTask(Ability.Get()) != FXTask.Get()) { return; }
+
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!MontageTask->TryGetOriginalSectionSnapshot(Snapshot) || Snapshot.Montage != Montage.Get()
+				|| Snapshot.MontageInstanceId != InstanceId || Snapshot.SectionName != MainSection
+				|| Snapshot.PositionSeconds < FXWindowBegin || Snapshot.PositionSeconds >= FXWindowEnd) { return; }
+
+			if (bPublishBrightDraw && !FMath::IsFinite(Snapshot.PositionSeconds)) { return; }
+			for (const FFXUnitObservation& Unit : FXUnits)
+			{
+				UNiagaraComponent* Component = Unit.Component.Get();
+				if (!Component || Component->GetWorld() != World.Get() || Component->GetAttachParent() != Mesh.Get()
+					|| Component->GetAsset() != Unit.System.Get()) { continue; }
+
+				if (bPublishBrightDraw && (!Unit.System.IsValid() || Unit.System->GetFName() != FXNormal01System)) { continue; }
+				const auto NiagaraController = Component->GetSystemInstanceController();
+				if (!NiagaraController.IsValid() || !NiagaraController->IsValid()) { continue; }
+				const FNiagaraSystemInstance* NiagaraInstance = NiagaraController->GetSystemInstance_Unsafe();
+				if (NiagaraInstance->GetSystem() != Unit.System.Get()
+					|| NiagaraInstance->SystemInstanceState != ENiagaraSystemInstanceState::Running
+					|| NiagaraInstance->GetSystemInstanceIndex() < 0 || NiagaraInstance->HasPendingFinalize()
+					|| NiagaraInstance->IsComplete() || NiagaraInstance->GetTickCount() <= 0) { continue; }
+
+				const float Age = NiagaraInstance->GetAge();
+				if (!FMath::IsFinite(Age) || Age <= 0.0f) { continue; }
+				if (bPublishBrightDraw && bFXBrightDrawConsumed[0]
+					&& static_cast<uint64>(NiagaraInstance->GetId()) != FXBrightDrawNiagaraId) { continue; }
+				const FName LayerNames[] = {FXNormal01BrightLayers[0], FXNormal01BrightLayers[1], FXNormal01ControlLayer};
+				const FNiagaraEmitterInstance* BrightEmitters[3] = {};
+				const FNiagaraDataBuffer* BrightBuffers[3] = {};
+				for (int32 LayerIndex = 0; LayerIndex < UE_ARRAY_COUNT(LayerNames); ++LayerIndex)
+				{
+					if (!bPublishBrightDraw && LayerIndex == 2) { continue; }
+					const FName LayerName = LayerNames[LayerIndex];
+					const FNiagaraEmitterInstanceRef* Match = NiagaraInstance->GetEmitters().FindByPredicate(
+						[LayerName](const FNiagaraEmitterInstanceRef& Emitter) { return Emitter->GetEmitterHandle().GetName() == LayerName; });
+					const FNiagaraEmitterInstance* Emitter = Match ? &Match->Get() : nullptr;
+					const FNiagaraDataBuffer* Data = nullptr;
+					if (Emitter && Emitter->GetEmitterHandle().GetIsEnabled() && !Emitter->IsDisabled()
+						&& Emitter->AsStateful() && Emitter->GetSimTarget() == ENiagaraSimTarget::CPUSim)
+					{
+						Data = Emitter->GetParticleData().GetCurrentData();
+					}
+
+					if (bPublishBrightDraw)
+					{
+						BrightEmitters[LayerIndex] = Emitter;
+						BrightBuffers[LayerIndex] = Data;
+						continue;
+					}
+					Test.AddInfo(FString::Printf(
+						TEXT("[Combat.PlayerCombo.FXDrawLayer] DrawFrame=%llu WorldId=%u Viewport=%p MontageTask='%s' Instance=%d FXTask='%s' Component='%s' System='%s' NiagaraId=%llu Tick=%d MainPosition=%.9f Age=%.9f Layer='%s' EmitterId=%s Coverage=%s Particles=%lld SpawnAttempts=%d."),
+						static_cast<unsigned long long>(GFrameCounter), World->GetUniqueID(), DrawViewport,
+						*MontageTask->GetPathName(), InstanceId, *FXTask->GetPathName(), *Component->GetPathName(), *Unit.System->GetPathName(),
+						static_cast<unsigned long long>(NiagaraInstance->GetId()), NiagaraInstance->GetTickCount(),
+						Snapshot.PositionSeconds, Age, *LayerName.ToString(),
+						Emitter ? *Emitter->GetEmitterHandle().GetId().ToString() : TEXT("None"),
+						Data ? TEXT("PublishedCPU") : TEXT("Uncovered"),
+						Data ? static_cast<long long>(Data->GetNumInstances()) : -1LL,
+						Data ? Emitter->GetTotalSpawnedParticles() : INDEX_NONE));
+				}
+				if (bPublishBrightDraw && BrightBuffers[0] && BrightBuffers[1]
+					&& BrightBuffers[0]->GetNumInstances() > 0 && BrightBuffers[1]->GetNumInstances() > 0)
+				{
+					const int32 SampleIndex = SelectFXBrightDrawSample(BrightBuffers);
+					if (SampleIndex != INDEX_NONE)
+					{
+						PublishFXBrightDraw(DrawViewport, *Component, *NiagaraInstance, Snapshot, SampleIndex, LayerNames, BrightEmitters, BrightBuffers);
+					}
+					return;
+				}
+			}
+		}
+
+		void ObserveFXViewportRendered(FViewport* DrawViewport)
+		{
+			if (DrawViewport != SceneViewport) { return; }
+			const bool bPublishedDraw = bFXDrawInProgress && bFXDrawSawWorldEndOfFrame;
+			bFXDrawInProgress = false;
+			bFXDrawSawWorldEndOfFrame = false;
+			if (!bPublishedDraw || bFailed || bFXVerified || !bFXCaptured
+				|| (Stage != EStage::Natural && Stage != EStage::NaturalIdle)) { return; }
+			if (!IsProductionChainCurrent()) { Fail(TEXT("原生产链在 FX Draw 采样时改变。")); return; }
+
+			RecordFXBrightLayersForDraw(DrawViewport);
+
+			// 原 Draw 已完成本 World 的 Niagara 帧末发布，才读取原实例。
+			for (FFXUnitObservation& Unit : FXUnits)
+			{
+				UNiagaraComponent* Component = Unit.Component.Get();
+				if (!Component || (Unit.bSimulationCaptured && bFXParticles)) { continue; }
+				const auto NiagaraController = Component->GetSystemInstanceController();
+				if (!NiagaraController.IsValid() || !NiagaraController->IsValid()) { continue; }
+				const FNiagaraSystemInstance* NiagaraInstance = NiagaraController->GetSystemInstance_Unsafe();
+				if (NiagaraInstance->SystemInstanceState == ENiagaraSystemInstanceState::Running
+					&& NiagaraInstance->GetSystemInstanceIndex() >= 0 && !NiagaraInstance->HasPendingFinalize()
+					&& !NiagaraController->IsComplete() && NiagaraController->GetAge() > 0.0f)
+				{
+					if (!Unit.Cache.Get()) { Unit.Cache.Reset(NewObject<UNiagaraSimCache>(GetTransientPackage())); }
+					FNiagaraSimCacheCreateParameters Parameters;
+					Parameters.bAllowDataInterfaceCaching = false;
+					UNiagaraSimCache* Captured = nullptr;
+					if (!UNiagaraSimCacheFunctionLibrary::CaptureNiagaraSimCacheImmediate(Unit.Cache.Get(), Parameters, Component, Captured, false)
+						|| Captured != Unit.Cache.Get() || Captured->GetSystem() != Unit.System.Get() || Captured->GetNumFrames() != 1
+						|| Captured->GetNumEmitters() != Unit.EmitterCount)
+					{
+						Fail(TEXT("native non-advancing particle capture failed; it cannot stand in for zero particles")); return;
+					}
+					Unit.bSimulationCaptured = true;
+					int32 Particles = 0;
+					for (int32 Emitter = 0; Emitter < Captured->GetNumEmitters(); ++Emitter)
+					{
+						Particles += Captured->GetEmitterNumInstances(Emitter, 0);
+					}
+					if (Particles > 0)
+					{
+						bFXParticles = true;
+						Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.FXProductionSmoke] Probe=%u Instance=%d Component=%s ActualParticles=%d CaptureAdvance=0."),
+							static_cast<uint32>(FXProbe), InstanceId, *Component->GetPathName(), Particles));
+					}
+				}
+			}
+		}
+
 		void CancelFXOriginal()
 		{
 			bFXCancelledWithActiveNotify = FXProbe == EComboFXProbe::WindowCancel && HasOriginalActiveFXNotify(InstanceId);
@@ -3574,9 +4715,9 @@ namespace
 			for (FFXUnitObservation& Unit : FXUnits)
 			{
 				Unit.Component.Reset(); Unit.Cache.Reset(); Unit.bSimulationCaptured = false; Unit.bDetached = false;
-				Unit.NaturalCompletionCount = 0;
+				Unit.NaturalCompletionCount = 0; Unit.bRetiredNaturallyBeforeEnd = false;
 			}
-			bFXCaptured = false; bFXParticles = false; bFXDetached = false; bFXUnknownNaturalCompletion = false;
+			bFXCaptured = false; bFXParticles = false; bFXUnknownNaturalCompletion = false;
 			bFXRestarted = true; Stage = EStage::Main; Deadline = FPlatformTime::Seconds() + 3.0;
 			if (!InstallFXInputObservation()) { return; }
 			bAttackDown = true; SendNativeKey(AttackKey, true);
@@ -3626,7 +4767,92 @@ namespace
 			}
 			return true;
 		}
+		void LogNewPressInput(const TCHAR* Boundary, const FString& Detail)
+		{
+			const UGGYGOPlayerComboAbility* OriginalAbility = Ability.Get();
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.NewPressInput] Boundary=%s Frame=%llu Stage=%u Scope=%llu PlayerInput=%s GA=%s Spec=%s InputTask=%s OriginalInstance=%d Step=%d LastGARequest=%d AttackPressed=%d ActiveFixtureSubmission=%u LastFixtureSubmission=%u %s"),
+				Boundary, static_cast<unsigned long long>(GFrameCounter), static_cast<uint32>(Stage),
+				static_cast<unsigned long long>(Scope.GetScopeSerial()), *GetPathNameSafe(PlayerInput.Get()),
+				*GetPathNameSafe(OriginalAbility), *SpecHandle.ToString(),
+				*GetPathNameSafe(FGGYGOPlayerComboLifecycleFixture::GetProductionInputTask(OriginalAbility)), InstanceId,
+				OriginalAbility ? OriginalAbility->GetCurrentComboStep() : INDEX_NONE,
+				FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(OriginalAbility),
+				PlayerInput.IsValid() && PlayerInput->IsPressed(AttackKey), ActiveFixtureSubmission, LastFixtureSubmission, *Detail));
+		}
+		void InstallNewPressInputObservation(const UInputAction* AttackAction, const TArray<FKey>& AttackKeys)
+		{
+			NewPressObservedKeys = AttackKeys;
+			NewPressObservedKeys.AddUnique(EKeys::W);
+			NewPressViewportKeyHandle = Viewport->OnInputKey().AddLambda([this](const FInputKeyEventArgs& Args)
+			{
+				if (!NewPressObservedKeys.Contains(Args.Key) || !IsOwnedWorldCurrent()) { return; }
+				LogNewPressInput(TEXT("ViewportKey"), FString::Printf(TEXT("Key=%s Event=%s Device=%d OriginalScene=%d EngineSimulated=%d"),
+					*Args.Key.ToString(), *UEnum::GetValueAsString(Args.Event), Args.InputDevice.GetId(),
+					Args.Viewport == SceneViewport, Args.IsSimulatedInput()));
+			});
+			UGGYGOInputComponent* Component = Cast<UGGYGOInputComponent>(Character->InputComponent.Get());
+			const ETriggerEvent Events[] = { ETriggerEvent::Triggered, ETriggerEvent::Completed, ETriggerEvent::Canceled };
+			for (const ETriggerEvent Event : Events)
+			{
+				if (!Component || !Component->GetActionEventBindings().ContainsByPredicate([AttackAction, Event](const auto& Binding)
+				{
+					return Binding->GetAction() == AttackAction && Binding->GetTriggerEvent() == Event;
+				}))
+				{
+					LogNewPressInput(TEXT("ActionObservationUnavailable"),
+						FString::Printf(TEXT("Action=%s Component=%s MissingBinding=%s"),
+							*GetPathNameSafe(AttackAction), *GetPathNameSafe(Component), *UEnum::GetValueAsString(Event)));
+					return;
+				}
+			}
+			NewPressObservedInputComponent = Component;
+			for (const ETriggerEvent Event : Events)
+			{
+				// 仅旁听原组件已经接线的事件，避免为生产 Action 新增可消费的事件类型。
+				FEnhancedInputActionEventBinding& Binding = Component->BindActionInstanceLambda(AttackAction, Event,
+					[this](const FInputActionInstance& Instance)
+					{
+						if (!IsOwnedWorldCurrent() || !Controller.IsValid() || !PlayerInput.IsValid()
+							|| Controller->PlayerInput != PlayerInput.Get() || !Character.IsValid()
+							|| Character->InputComponent.Get() != NewPressObservedInputComponent.Get()) { return; }
+						LogNewPressInput(TEXT("AttackAction"), FString::Printf(TEXT("Action=%s Event=%s"),
+							*GetPathNameSafe(Instance.GetSourceAction().Get()), *UEnum::GetValueAsString(Instance.GetTriggerEvent())));
+						if (IsAuthoredRestartProbe() && Instance.GetTriggerEvent() == ETriggerEvent::Triggered)
+						{
+							ObserveAuthoredRestartAttackAction();
+						}
+					});
+				Binding.SetShouldConsume(false);
+				NewPressAttackObservationHandles.Add(Binding.GetHandle());
+			}
+			LogNewPressInput(TEXT("ActionObservationInstalled"),
+				FString::Printf(TEXT("Action=%s Component=%s ViewportObserved=%d Bindings=%d"), *GetPathNameSafe(AttackAction),
+					*GetPathNameSafe(Component), NewPressViewportKeyHandle.IsValid(), NewPressAttackObservationHandles.Num()));
+		}
+		void ReleaseNewPressInputObservation()
+		{
+			if (Viewport.IsValid()) { Viewport->OnInputKey().Remove(NewPressViewportKeyHandle); }
+			NewPressViewportKeyHandle.Reset();
+			if (UGGYGOInputComponent* Component = NewPressObservedInputComponent.Get())
+			{
+				for (const uint32 Handle : NewPressAttackObservationHandles) { Component->RemoveBindingByHandle(Handle); }
+			}
+			NewPressAttackObservationHandles.Reset();
+			NewPressObservedInputComponent.Reset();
+			NewPressObservedKeys.Reset();
+		}
 		bool SendNativeKey(const FKey& Key, bool bDown)
+		{
+			if (!NewPressObservedKeys.Contains(Key)) { return SendNativeKeyToSlate(Key, bDown); }
+			// 同栈标记只证明经夹具提交的调用；视口无此标记的事件不推断物理来源。
+			TGuardValue<uint32> Submission(ActiveFixtureSubmission, ++LastFixtureSubmission);
+			const FString Detail = FString::Printf(TEXT("Key=%s Down=%d"), *Key.ToString(), bDown);
+			LogNewPressInput(TEXT("FixtureSubmit"), Detail);
+			const bool bHandled = SendNativeKeyToSlate(Key, bDown);
+			LogNewPressInput(TEXT("FixtureReturn"), FString::Printf(TEXT("%s SlateHandled=%d"), *Detail, bHandled));
+			return bHandled;
+		}
+		bool SendNativeKeyToSlate(const FKey& Key, bool bDown)
 		{
 			FSlateApplication& Slate = FSlateApplication::Get();
 			if (Key.IsMouseButton())
@@ -3690,6 +4916,18 @@ namespace
 				{
 					Fail(TEXT("End attack did not retire the exact old Task/playback while retaining the original input task")); return;
 				}
+				if (IsAuthoredRestartProbe() && bRestartSent)
+				{
+					const uint64 NewToken = FGGYGOPlayerComboLifecycleFixture::ReadProductionStepToken(Ability.Get());
+					if (!bAuthoredAttackConsumed || ActualStep != 0 || NewToken == 0 || NewToken == AuthoredTerminalToken
+						|| Snapshot.Montage->GetPathName() != TEXT("/Game/Characters/Player/Pyrios/Animation/Attack/AM_Pyrios_Attack_Normal_01.AM_Pyrios_Attack_Normal_01"))
+					{
+						Fail(TEXT("原包 03→01 未在真实新请求后交付同激活的新 01 原包和段 token。")); return;
+					}
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.AuthoredRestart] OldToken=%llu NewToken=%llu OldInstance=%d NewInstance=%d Request=%d SameActivation=1 OldTaskFinished=1."),
+						static_cast<unsigned long long>(AuthoredTerminalToken), static_cast<unsigned long long>(NewToken),
+						ReplacedInstanceId, Snapshot.MontageInstanceId, MainAttackRequest + 1));
+				}
 				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] EndAttackReplacement OldStep=%d OldInstance=%d Remaining=%.6f NewStep=%d NewInstance=%d ResponseSeconds=%.6f SameActivation=1 OldTaskFinished=1 ActionActive=1."),
 					ReplacedStep, ReplacedInstanceId, ReplacedEndRemaining, ActualStep, Snapshot.MontageInstanceId,
 					World->GetTimeSeconds() - ReplacementRequestWorldTime));
@@ -3741,6 +4979,25 @@ namespace
 				{
 					Fail(TEXT("new original movement point identity or exact Main-end permission floor is invalid")); return;
 				}
+			}
+			if (IsAuthoredRestartProbe() && ActualStep == TargetStep)
+			{
+				const int32 MainIndex = Montage->GetSectionIndex(MainSection);
+				float MainStart = 0.0f, MainEnd = 0.0f;
+				if (MainIndex != INDEX_NONE) { Montage->GetSectionStartAndEndTime(MainIndex, MainStart, MainEnd); }
+				AuthoredTerminalToken = FGGYGOPlayerComboLifecycleFixture::ReadProductionStepToken(Ability.Get());
+				if (Montage->GetPathName() != TEXT("/Game/Characters/Player/Pyrios/Animation/Attack/AM_Pyrios_Attack_Normal_03.AM_Pyrios_Attack_Normal_03")
+					|| MainPointProbe.Get() || AuthoredTerminalToken == 0 || Step.NextStepIndex != 0
+					|| Step.MovementInterruptionMode != EGGYGOActionInterruptionMode::AuthoredNotify
+					|| MainIndex == INDEX_NONE || MainEnd != EndStart || OriginalMovementPoint.NotifyAuthoredPositionSeconds != MainEnd
+					|| !(MainStart < FMath::Min(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds)
+						&& FMath::Max(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds) < MainEnd))
+				{
+					Fail(TEXT("原包 03 缺少可区分的原攻击点、Main 末移动点或 01 接续配置，未覆盖。")); return;
+				}
+				Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.AuthoredRestart] Original03=%s Instance=%d Token=%llu AuthoredAttack=%.9f Trigger=%.9f MainEnd=%.9f."),
+					*Montage->GetPathName(), InstanceId, static_cast<unsigned long long>(AuthoredTerminalToken),
+					OriginalAuthorPoint.NotifyAuthoredPositionSeconds, AuthorPointPosition, EndStart));
 			}
 			NaturalEarliestEndWorldSeconds = World->GetTimeSeconds() + (EndEnd - Snapshot.PositionSeconds) / Task->GetEffectivePlayRate();
 			MontageTask.Reset(Task);
@@ -3812,7 +5069,7 @@ namespace
 			}
 			if (EndAttackProbe != EComboEndAttackProbe::None)
 			{
-				Stage = EndAttackProbe == EComboEndAttackProbe::Restart ? EStage::MainAttackPress : EStage::Natural;
+				Stage = (EndAttackProbe == EComboEndAttackProbe::Restart || IsAuthoredRestartProbe()) ? EStage::MainAttackPress : EStage::Natural;
 				Deadline = FPlatformTime::Seconds() + EndEnd + 5.0;
 				return;
 			}
@@ -3824,8 +5081,21 @@ namespace
 				Fail(TEXT("production step has no independent authored movement point; movement cancellation is not granted")); return;
 			}
 			Stage = EStage::End;
-			Deadline = FPlatformTime::Seconds() + 10.0;
-			if (bHeldDuringMain) { bWDown = true; SendNativeKey(EKeys::W, true); }
+			if (bHeldDuringMain)
+			{
+				Deadline = FPlatformTime::Seconds() + 10.0;
+				bWDown = true; SendNativeKey(EKeys::W, true);
+			}
+			else
+			{
+				if (!IsOwnedWorldCurrent()) { Fail(TEXT("original PIE world retired before NewPress End observation")); return; }
+				const double WallNow = FPlatformTime::Seconds();
+				const double GameNow = World->GetTimeSeconds();
+				// 保留 10 秒动作等待预算。独立墙钟上限负责无进展的 PIE。
+				NewPressEndWorldDeadline = GameNow + 10.0;
+				Deadline = WallNow + 30.0;
+				LogNewPressEndWait(TEXT("Started"), WallNow, GameNow, &Snapshot);
+			}
 		}
 		bool ReadOriginalPlayback(FGGYGOMontageSectionSnapshot& Snapshot)
 		{
@@ -3865,12 +5135,88 @@ namespace
 			if (!ReadOriginalPlayback(Snapshot) || Snapshot.SectionName != EndSection) { return; }
 			SendEndAttack(Snapshot, Ability->GetCurrentComboStep() + 1);
 		}
+		bool IsAuthoredRestartProbe() const { return EndAttackProbe == EComboEndAttackProbe::AuthoredRestart; }
+		void ObserveAuthoredRestartAttackAction()
+		{
+			const bool bBeforePoint = Stage == EStage::MainAttackRejected;
+			if (bFailed || AuthoredAttackInputFrame != MAX_uint64
+				|| (!bBeforePoint && !(Stage == EStage::Main && bRestartSent && !bRestartCaptured))) { return; }
+
+			FGGYGOMontageSectionSnapshot Snapshot;
+			if (!ReadOriginalPlayback(Snapshot)) { return; }
+			const bool bInAttackWindow = bBeforePoint
+				? Snapshot.PositionSeconds < FMath::Min(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds)
+				: Snapshot.PositionSeconds >= FMath::Max(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds);
+			const bool bAttackOpen = Ability->IsAttackContinuationOpen();
+			const bool bMoveOpen = Ability->IsMovementInterruptionOpen();
+			if (!bInAttackWindow || Snapshot.SectionName != MainSection || Snapshot.PositionSeconds >= EndStart)
+			{
+				Fail(TEXT("原 03 的真实攻击 Action 错过原点前或原点后至 Main 末的区间，未覆盖。")); return;
+			}
+			if (bAttackOpen == bBeforePoint || bMoveOpen || Ability->GetCurrentComboStep() != TargetStep
+				|| FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get()) != MontageTask.Get()
+				|| FGGYGOPlayerComboLifecycleFixture::ReadProductionStepToken(Ability.Get()) != AuthoredTerminalToken
+				|| FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get()) != MainAttackRequest)
+			{
+				Fail(TEXT("原 03 消费前的两道许可或原请求／段身份错误。")); return;
+			}
+			// 原 Action 在 Controller::PostProcessInput 消费 ASC 前触发。
+			AuthoredAttackInputFrame = GFrameCounter;
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.AuthoredRestart] BeforeASC Frame=%llu Instance=%d RequestBefore=%d Position=%.9f AttackOpen=%d MovementOpen=%d."),
+				static_cast<unsigned long long>(AuthoredAttackInputFrame), InstanceId, MainAttackRequest,
+				Snapshot.PositionSeconds, bAttackOpen, bMoveOpen));
+		}
+		void ObserveAuthoredRestartAfterController()
+		{
+			if (!bFailed && !IsProductionChainCurrent()) { Fail(TEXT("原包 03→01 在原 Controller 输入边界失去生产链身份。")); }
+			if (!bFailed && AuthoredAttackInputFrame == MAX_uint64)
+			{
+				FGGYGOMontageSectionSnapshot Snapshot;
+				const float Limit = Stage == EStage::MainAttackRejected
+					? FMath::Min(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds) : EndStart;
+				if (ReadOriginalPlayback(Snapshot) && (Snapshot.SectionName != MainSection || Snapshot.PositionSeconds >= Limit))
+				{
+					Fail(TEXT("原 03 的真实区间已过，未收到本次新攻击 Action，未覆盖。"));
+				}
+				if (!bFailed) { return; }
+			}
+			if (!bFailed)
+			{
+				const bool bBeforePoint = Stage == EStage::MainAttackRejected;
+				const int32 Request = FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get());
+				const uint64 Token = FGGYGOPlayerComboLifecycleFixture::ReadProductionStepToken(Ability.Get());
+				if (AuthoredAttackInputFrame != GFrameCounter || Request != MainAttackRequest + 1
+					|| !Ability->CaptureCurrentActivation().HasSameActivation(OriginalActivation)
+					|| (bBeforePoint ? (Ability->GetCurrentComboStep() != TargetStep || Token != AuthoredTerminalToken
+						|| FGGYGOPlayerComboLifecycleFixture::GetProductionMontageTask(Ability.Get()) != MontageTask.Get())
+						: (Ability->GetCurrentComboStep() != 0 || Token == 0 || Token == AuthoredTerminalToken)))
+				{
+					Fail(TEXT("原 Controller 同帧未交付原点前拒绝或原点后同激活 01 接续，未覆盖。"));
+				}
+				else
+				{
+					bAuthoredAttackConsumed = true;
+					Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.AuthoredRestart] AfterController Frame=%llu Request=%d Step=%d Token=%llu."),
+						static_cast<unsigned long long>(GFrameCounter), Request, Ability->GetCurrentComboStep(), static_cast<unsigned long long>(Token)));
+					if (bBeforePoint) { ObserveRejectedMainAttack(); }
+				}
+			}
+			ReleaseFXInputObservation();
+		}
 		void PressAttackDuringTerminalMain()
 		{
 			FGGYGOMontageSectionSnapshot Snapshot;
 			if (!ReadOriginalPlayback(Snapshot)) { return; }
 			if (Snapshot.SectionName != MainSection) { Fail(TEXT("terminal Main ended before its real rejection probe")); return; }
 			if (PlayerInput->IsPressed(AttackKey)) { return; } // The previously issued key-up must reach native input.
+			if (IsAuthoredRestartProbe())
+			{
+				if (Snapshot.PositionSeconds >= FMath::Min(AuthorPointPosition, OriginalAuthorPoint.NotifyAuthoredPositionSeconds))
+				{
+					Fail(TEXT("原 03 攻击点前已无可送入真实新按键的区间，未覆盖。")); return;
+				}
+				if (!InstallFXInputObservation()) { return; }
+			}
 			MainAttackRequest = FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get());
 			bAttackDown = true;
 			SendNativeKey(AttackKey, true);
@@ -3880,6 +5226,7 @@ namespace
 		{
 			FGGYGOMontageSectionSnapshot Snapshot;
 			if (!ReadOriginalPlayback(Snapshot)) { return; }
+			if (IsAuthoredRestartProbe() && !bAuthoredAttackConsumed) { return; }
 			if (FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get()) <= MainAttackRequest) { return; }
 			if (Ability->GetCurrentComboStep() != TargetStep || Snapshot.SectionName != MainSection
 				|| Snapshot.PositionSeconds >= AuthorPointPosition || Ability->IsInterruptionOpen()
@@ -3895,7 +5242,12 @@ namespace
 		void ObserveEndAttack()
 		{
 			FGGYGOMontageSectionSnapshot Snapshot;
-			if (!ReadOriginalPlayback(Snapshot) || !Ability->IsInterruptionOpen()) { return; }
+			if (!ReadOriginalPlayback(Snapshot)) { return; }
+			if (IsAuthoredRestartProbe() && (Snapshot.SectionName != MainSection || Snapshot.PositionSeconds >= EndStart))
+			{
+				Fail(TEXT("原 03 攻击点后至 Main 末的真实区间已过，未覆盖。")); return;
+			}
+			if (!Ability->IsInterruptionOpen()) { return; }
 			if (Ability->IsMovementInterruptionOpen() && Snapshot.SectionName == MainSection)
 			{
 				Fail(TEXT("attack continuation point opened movement interruption inside Main")); return;
@@ -3905,11 +5257,41 @@ namespace
 			{
 				Fail(TEXT("author point was not able to open attack replacement inside Main")); return;
 			}
+			if (IsAuthoredRestartProbe())
+			{
+				if (Snapshot.PositionSeconds < OriginalAuthorPoint.NotifyAuthoredPositionSeconds || PlayerInput->IsPressed(AttackKey)) { return; }
+				if (!InstallFXInputObservation()) { return; }
+				MainAttackRequest = FGGYGOPlayerComboLifecycleFixture::ReadProductionLastInputRequest(Ability.Get());
+				AuthoredAttackInputFrame = MAX_uint64;
+				bAuthoredAttackConsumed = false;
+			}
 			bRestartSent = true;
 			SendEndAttack(Snapshot, 0);
 		}
+		void LogNewPressEndWait(const TCHAR* Boundary, double WallNow, double GameNow, const FGGYGOMontageSectionSnapshot* Snapshot)
+		{
+			const FString Section = Snapshot ? Snapshot->SectionName.ToString() : TEXT("Unavailable");
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.EndProductionSmoke] NewPressEndWait=%s Frame=%llu WallSeconds=%.6f GameSeconds=%.6f GameDelta=%.6f WallRemaining=%.6f GameRemaining=%.6f Montage=%s OriginalInstance=%d ObservedInstance=%d Section=%s Position=%.6f MainEnd=%.6f."),
+				Boundary, static_cast<unsigned long long>(GFrameCounter), WallNow, GameNow, World->GetDeltaSeconds(),
+				Deadline - WallNow, NewPressEndWorldDeadline - GameNow, *GetPathNameSafe(Montage.Get()), InstanceId,
+				Snapshot ? Snapshot->MontageInstanceId : INDEX_NONE, *Section, Snapshot ? Snapshot->PositionSeconds : -1.0f, EndStart));
+		}
 		void ObserveNaturalEnd()
 		{
+			const double WallNow = FPlatformTime::Seconds();
+			const double GameNow = World->GetTimeSeconds();
+			const bool bWallExpired = WallNow >= Deadline;
+			if (!bHeldDuringMain && (bWallExpired || GameNow >= NewPressEndWorldDeadline))
+			{
+				FGGYGOMontageSectionSnapshot TimeoutSnapshot;
+				const bool bObserved = MontageTask.IsValid() && MontageTask->TryGetOriginalSectionSnapshot(TimeoutSnapshot);
+				LogNewPressEndWait(bWallExpired ? TEXT("WallTimeout") : TEXT("GameTimeout"),
+					WallNow, GameNow, bObserved ? &TimeoutSnapshot : nullptr);
+				Fail(bWallExpired ? TEXT("NewPress original End observation reached its wall-clock limit")
+					: TEXT("NewPress original End was not observed within the PIE game-time budget"));
+				BeginEnding();
+				return;
+			}
 			if (EndCount != 0 || CompletedCount != 0) { VerifyCancellation(); return; }
 			FGGYGOMontageSectionSnapshot Snapshot;
 			if (!Ability->IsActive() || !MontageTask.IsValid() || !MontageTask->TryGetOriginalSectionSnapshot(Snapshot)
@@ -3961,6 +5343,9 @@ namespace
 				{
 					Fail(TEXT("new-press case lacks its original Cold or real released/rearmed source state before End")); return;
 				}
+				LogNewPressEndWait(TEXT("EndObserved"), WallNow, GameNow, &Snapshot);
+				// 取消阶段沿用剩余等待预算的墙钟约束，并受宿主上限约束。
+				Deadline = FMath::Min(Deadline, WallNow + (NewPressEndWorldDeadline - GameNow));
 				bWDown = true; SendNativeKey(EKeys::W, true);
 			}
 			Stage = EStage::Cancel;
@@ -4220,7 +5605,8 @@ namespace
 				|| !FMath::IsFinite(NaturalEarliestEndWorldSeconds)
 				|| EndObservedWorldSeconds + FMath::Max(0.05f, World->GetDeltaSeconds()) < NaturalEarliestEndWorldSeconds
 				|| PlayerInput->IsPressed(AttackKey) || PlayerInput->IsPressed(EKeys::W)
-				|| (EndAttackProbe == EComboEndAttackProbe::Restart && (!bRestartCaptured || !bMainAttackRejected)))
+				|| ((EndAttackProbe == EComboEndAttackProbe::Restart || IsAuthoredRestartProbe())
+					&& (!bRestartCaptured || !bMainAttackRejected)))
 			{
 				Fail(TEXT("no-request natural End failed original completion/cleanup or restarted automatically")); return;
 			}
@@ -4305,10 +5691,19 @@ namespace
 			{
 				if (Activated != Ability.Get()) { return; }
 				const FGGYGOAbilityActivationHandle Captured = Ability->CaptureCurrentActivation();
-				if (!Captured.HasActivation()) { Fail(TEXT("native activated callback did not expose its issued original identity")); return; }
-				if (!OriginalActivation.HasActivation()) { OriginalActivation = Captured; }
-				else if (Stage == EStage::PoseSuccessorMain && !Captured.HasSameActivation(OriginalActivation)) { PoseSuccessorActivation = Captured; }
-				else { Fail(TEXT("unexpected activation replaced the pose probe's original or successor")); }
+				if (!Captured.HasActivation() || Activated->GetCurrentAbilitySpecHandle() != SpecHandle
+					|| Activated->GetAbilitySystemComponentFromActorInfo() != ASC.Get())
+				{
+					Fail(TEXT("native pose activation did not match the original GA/ASC/Spec")); return;
+				}
+				const bool bSuccessor = OriginalActivation.HasActivation();
+				if (!bSuccessor) { OriginalActivation = Captured; }
+				else if (Stage == EStage::PoseSuccessorMain && !PoseSuccessorActivation.HasActivation()
+					&& !Captured.HasSameActivation(OriginalActivation)) { PoseSuccessorActivation = Captured; }
+				else { Fail(TEXT("unexpected activation replaced the pose probe's original or successor")); return; }
+				// GAS 在每次 GA 原生 End 广播后清空该委托。于原激活回调中绑定，覆盖同步启动失败。
+				PoseGAEndHandle = Activated->OnGameplayAbilityEndedWithData.AddLambda(
+					[this, Captured, bSuccessor](const FAbilityEndedData& Data) { ObservePoseGAEnd(Data, Captured, bSuccessor); });
 			});
 			if (!PoseActivatedHandle.IsValid()) { Fail(TEXT("native activation observation installation failed")); return false; }
 			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated)
@@ -4381,17 +5776,41 @@ namespace
 				&& HasMeshPrerequisite() == bSavedPrerequisite && Character.IsValid()
 				&& Character->GetAnimRootMotionTranslationScale() == SavedRootScale;
 		}
+		void ObservePoseGAEnd(const FAbilityEndedData& Data, const FGGYGOAbilityActivationHandle& Captured, bool bSuccessor)
+		{
+			const FGGYGOAbilityActivationHandle& Expected = bSuccessor ? PoseSuccessorActivation : OriginalActivation;
+			if (Data.AbilityThatEnded != Ability.Get() || Data.AbilitySpecHandle != SpecHandle || !Captured.HasSameActivation(Expected))
+			{
+				Fail(TEXT("pose native GA End did not match its subscribed activation/Spec")); return;
+			}
+			if (bSuccessor) { ++PoseSuccessorEndCount; bPoseSuccessorCancelled = Data.bWasCancelled; }
+			else { ++EndCount; EndData = Data; }
+			Test.AddInfo(FString::Printf(TEXT("[Combat.PlayerCombo.PoseProductionSmoke] Case=%s Boundary=NativeGAEnd Successor=%d Cancelled=%d."),
+				PoseCaseName(), bSuccessor, Data.bWasCancelled));
+		}
 		void ObservePoseAbilityEnd(const FAbilityEndedData& Data)
 		{
-			if (Data.AbilitySpecHandle != SpecHandle) { Fail(TEXT("pose native End changed the original Spec")); return; }
+			if (Data.AbilitySpecHandle != SpecHandle || Ability->CaptureCurrentActivation().HasActivation())
+			{
+				Fail(TEXT("pose ASC End did not retire the original GA activation/Spec")); return;
+			}
 			if (Stage == EStage::PoseSuccessorMain || Stage == EStage::PoseSuccessorEnd)
 			{
-				++PoseSuccessorEndCount;
-				bPoseSuccessorCancelled = Data.bWasCancelled;
+				if (PoseSuccessorEndCount != 1 || bPoseSuccessorCancelled != Data.bWasCancelled)
+				{
+					Fail(TEXT("pose successor ASC End did not follow its exact native GA End")); return;
+				}
+				++PoseSuccessorCompletedCount;
+				PoseSuccessorCompletion.Original = FGGYGOAbilityTerminationContext(PoseSuccessorActivation, Data.bWasCancelled);
 				bPoseSuccessorResourcesAtEnd = ResourcesRestored();
 				return;
 			}
-			++EndCount; EndData = Data;
+			if (EndCount != 1 || EndData.bWasCancelled != Data.bWasCancelled)
+			{
+				Fail(TEXT("pose original ASC End did not follow its exact native GA End")); return;
+			}
+			++CompletedCount;
+			Completion.Original = FGGYGOAbilityTerminationContext(OriginalActivation, Data.bWasCancelled);
 			bResourcesRestoredAtEnd = PoseResourcesRestored();
 			if (PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated)
 			{
@@ -4414,28 +5833,51 @@ namespace
 		bool HasPoseFailureDiagnostics() const
 		{
 			FAutomationTestExecutionInfo Info;
-			Test.GetExecutionInfo(Info); // Read the unfiltered events; never remove/expect/suppress a production Error.
+			Test.GetExecutionInfo(Info); // 读取原始事件，保留生产 Error。
 			const FString Owner = FString::Printf(TEXT("Ability='%s'"), *GetPathNameSafe(Ability.Get()));
+			const FString OwnerASC = FString::Printf(TEXT(" ASC='%s'"), *GetPathNameSafe(ASC.Get()));
 			const FString Asset = FString::Printf(TEXT("Montage='%s'"), *GetPathNameSafe(Montage.Get()));
 			const FString Slot = FString::Printf(TEXT("Slot='%s'"), *SavedPoseSlot.ToString());
-			const FString StageText = FString::Printf(TEXT(" Stage=%d "), PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated ? 1 : 0);
+			const EGGYGOMontageTaskFailureStage FailureStage = PoseProbe == EComboPoseFailureProbe::RuntimeInvalidated
+				? EGGYGOMontageTaskFailureStage::Playback : EGGYGOMontageTaskFailureStage::Startup;
+			const FString StageText = FString::Printf(TEXT(" Stage=%d "), static_cast<int32>(FailureStage));
 			const FString InstanceSpace = FString::Printf(TEXT(" Instance=%d "), InstanceId);
 			const FString InstanceSemi = FString::Printf(TEXT(" Instance=%d;"), InstanceId);
-			int32 TaskFacts = 0, GAFacts = 0, EndResults = 0;
+			const FString Accepted = FString::Printf(TEXT(" Outcome=%d"), static_cast<int32>(EGGYGOAbilityTerminationOutcome::Accepted));
+			const FString OriginalTask = PoseOriginalTaskPath.IsEmpty()
+				? FString() : FString::Printf(TEXT(" Task='%s'"), *PoseOriginalTaskPath);
+			const FString* TaskFact = nullptr;
+			const FString* GAFact = nullptr;
+			const FString* EndResult = nullptr;
 			for (int32 Index = PoseDiagnosticStart; Index < Info.GetEntries().Num(); ++Index)
 			{
 				const FString& Message = Info.GetEntries()[Index].Event.Message;
 				if (!Message.Contains(Owner) || !Message.Contains(Asset) || !Message.Contains(Slot)
-					|| !Message.Contains(StageText) || (!Message.Contains(InstanceSpace) && !Message.Contains(InstanceSemi))) { continue; }
-				if (!PoseOriginalTaskPath.IsEmpty() && !Message.Contains(FString::Printf(TEXT("Task='%s'"), *PoseOriginalTaskPath))) { continue; }
-				if (Message.Contains(TEXT("[AbilitySystem.MontageTask.Pose]"))
-					&& (PoseProbe != EComboPoseFailureProbe::StartupMissingDeclaration || Message.Contains(TEXT("Call=0 ")))) { ++TaskFacts; }
-				if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RequiredDependencyFailed"))) { ++GAFacts; }
-				if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult"))
-					&& (Message.Contains(TEXT(" Outcome=1 ")) || Message.Contains(TEXT(" Outcome=2 "))
-						|| Message.Contains(TEXT(" Outcome=3 ")) || Message.Contains(TEXT(" Outcome=4 ")))) { ++EndResults; }
+					|| !Message.Contains(StageText) || (!Message.Contains(InstanceSpace) && !Message.Contains(InstanceSemi))
+					|| (!OriginalTask.IsEmpty() && !Message.Contains(OriginalTask))) { continue; }
+				if (Message.Contains(TEXT("[AbilitySystem.MontageTask.Pose]")))
+				{
+					if (TaskFact || !Message.Contains(OwnerASC)
+						|| (FailureStage == EGGYGOMontageTaskFailureStage::Startup && !Message.Contains(TEXT(" Call=0 ")))) { return false; }
+					TaskFact = &Message;
+				}
+				else if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=RequiredDependencyFailed")))
+				{
+					if (GAFact || !Message.Contains(TEXT(" SourceValid=1 "))) { return false; }
+					GAFact = &Message;
+				}
+				else if (Message.Contains(TEXT("[Combat.PlayerCombo.PoseFailure] Boundary=AbilityEndResult")))
+				{
+					if (EndResult || !Message.Contains(TEXT(" SourceValid=1 ")) || !Message.EndsWith(Accepted)) { return false; }
+					EndResult = &Message;
+				}
 			}
-			return TaskFacts == 1 && GAFacts == 1 && EndResults == 1;
+			// Startup 没有播放实例，仍要求两个 GA 回执与原 ASC 报告的同一 Task 匹配。
+			FString TaskField, TaskPath;
+			if (!TaskFact || !GAFact || !EndResult || !TaskFact->Split(TEXT(" Task='"), nullptr, &TaskField)
+				|| !TaskField.Split(TEXT("'"), &TaskPath, nullptr) || TaskPath.IsEmpty()) { return false; }
+			const FString ExactTask = FString::Printf(TEXT(" Task='%s'"), *TaskPath);
+			return GAFact->Contains(ExactTask) && EndResult->Contains(ExactTask);
 		}
 		void RestorePoseProbeConfiguration()
 		{
@@ -4579,12 +6021,15 @@ namespace
 		}
 		void ReleaseGameplayObservations()
 		{
+			ON_SCOPE_EXIT { ReleaseNewPressInputObservation(); };
 			ReleaseFXInputObservation();
 			ReleaseFXFrameObservation();
 			if (NativeWindow.IsValid()) { NativeWindow->GetOnWindowDeactivatedEvent().Remove(WindowDeactivatedHandle); }
 			WindowDeactivatedHandle.Reset();
 			if (PoseProbe != EComboPoseFailureProbe::None)
 			{
+				if (Ability.IsValid()) { Ability->OnGameplayAbilityEndedWithData.Remove(PoseGAEndHandle); }
+				PoseGAEndHandle.Reset();
 				RestorePoseProbeConfiguration();
 				if (ASC.IsValid()) { ASC->AbilityActivatedCallbacks.Remove(PoseActivatedHandle); }
 				PoseActivatedHandle.Reset();
@@ -4721,8 +6166,18 @@ namespace
 		const EComboFXProbe FXProbe;
 		FFXInputObservationTick FXInputObservationTick;
 		FFXFrameObservationTick FXFrameObservationTick;
-		uint64 FXReadyFrame = MAX_uint64;
-		float FXReadyWorldSeconds = 0.0f;
+		FDelegateHandle FXBeginDrawHandle, FXWorldEndOfFrameHandle, FXViewportRenderedHandle, FXBrightDrawnHandle;
+		TSharedPtr<FComboFXBrightDrawView, ESPMode::ThreadSafe> FXBrightDrawView;
+		FComboFXMeshDrawObservation FXMeshDrawCandidate;
+		FComboFXMeshDrawObservation FXMeshDrawSamples[UE_ARRAY_COUNT(FXDrawSamplePhases)];
+		bool bFXBrightDrawConsumed[UE_ARRAY_COUNT(FXDrawSamplePhases)] = {};
+		uint64 FXBrightDrawNiagaraId = 0;
+		bool bFXDrawInProgress = false;
+		bool bFXDrawSawWorldEndOfFrame = false;
+		uint64 FXStartupFrame = MAX_uint64;
+		float FXStartupWorldSeconds = 0.0f;
+		FString InputResourceWaitReason;
+		bool bLoggedColdFXControllerSample = false;
 		FDelegateHandle WindowDeactivatedHandle;
 		struct FFXUnitObservation
 		{
@@ -4732,6 +6187,7 @@ namespace
 			int32 EmitterCount = 0;
 			int32 NaturalCompletionCount = 0;
 			bool bSimulationCaptured = false;
+			bool bRetiredNaturallyBeforeEnd = false;
 			bool bDetached = false;
 			bool IsRetired() const
 			{
@@ -4750,12 +6206,14 @@ namespace
 		uint64 FXCancelFrame = MAX_uint64, FXRestartPlaybackFrame = MAX_uint64;
 		uint64 FXRestartBeginFrame = MAX_uint64, FXCancelledEndFrame = MAX_uint64;
 		float FXWindowBegin = 0.0f, FXWindowEnd = 0.0f;
-		bool bFXCaptured = false, bFXParticles = false, bFXDetached = false, bFXVerified = false, bFXRestarted = false;
+		bool bFXCaptured = false, bFXParticles = false, bFXVerified = false, bFXRestarted = false;
 		bool bFXUnknownNaturalCompletion = false;
 		bool bFXCancelledWithActiveNotify = false, bFXNativePlaybackOverlap = false;
 		int32 TargetStep = 0, ExpectedStep = 0, ReplacedStep = INDEX_NONE, ReplacedInstanceId = INDEX_NONE, MainAttackRequest = 0;
 		int32 NaturalInputRequestId = 0;
 		bool bRestartSent = false, bRestartCaptured = false, bMainAttackRejected = false;
+		uint64 AuthoredTerminalToken = 0, AuthoredAttackInputFrame = MAX_uint64;
+		bool bAuthoredAttackConsumed = false;
 		bool bCheckingMovementReset = false, bFinalResetAttack = false;
 		bool bObservedCompletedWait = false;
 		bool bRunReleaseObserved = false;
@@ -4778,12 +6236,18 @@ namespace
 		bool bEndSnapshotAvailable = false, bStoppedAtEnd = false, bResourcesRestoredAtEnd = false;
 		bool bSavedURO = false, bSavedPrerequisite = false;
 		double Deadline = 0.0;
+		double NewPressEndWorldDeadline = 0.0;
 		float SavedRootScale = 0.0f, EndStart = 0.0f, EndEnd = 0.0f, EndPosition = 0.0f;
 		int32 InstanceId = INDEX_NONE, EndCount = 0, CompletedCount = 0;
 		EVisibilityBasedAnimTickOption SavedTick = EVisibilityBasedAnimTickOption::OnlyTickPoseWhenRendered;
 		FString EditorMap;
 		FName ContextHandle, MainSection, EndSection, EndedSection;
 		FKey AttackKey;
+		FDelegateHandle NewPressViewportKeyHandle;
+		TWeakObjectPtr<UGGYGOInputComponent> NewPressObservedInputComponent;
+		TArray<uint32> NewPressAttackObservationHandles;
+		TArray<FKey> NewPressObservedKeys;
+		uint32 ActiveFixtureSubmission = 0, LastFixtureSubmission = 0;
 		FVector PositionAtEnd = FVector::ZeroVector;
 		FGameplayAbilitySpecHandle SpecHandle;
 		FGGYGOAbilityActivationHandle OriginalActivation;
@@ -4811,7 +6275,7 @@ namespace
 		bool bPoseSuccessorCancelled = false, bPoseSuccessorResourcesAtEnd = false, bPoseSuccessorSawContinuousEnd = false;
 		int32 PoseDiagnosticStart = 0, PoseSuccessorEndCount = 0, PoseSuccessorCompletedCount = 0;
 		int32 PoseSuccessorInstanceId = INDEX_NONE;
-		FDelegateHandle PoseActivatedHandle;
+		FDelegateHandle PoseActivatedHandle, PoseGAEndHandle;
 		FDelegateHandle PreHandle, PostHandle, EndHandle, CompletedHandle;
 		TWeakObjectPtr<UEditorEngine> Editor;
 		TWeakObjectPtr<ULevelEditorPlaySettings> RequestSettings;
@@ -4891,6 +6355,15 @@ bool FGGYGOPlayerComboEndAttackProductionTest::RunTest(const FString& Parameters
 {
 	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0, EComboEndAttackProbe::Restart));
 	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0, EComboEndAttackProbe::Natural));
+	return true;
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboAuthoredRestartProductionTest,
+	"GGYGO.AbilitySystem.PlayerCombo.Interruption.ProductionNativeAuthored03To01",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+bool FGGYGOPlayerComboAuthoredRestartProductionTest::RunTest(const FString& Parameters)
+{
+	ADD_LATENT_AUTOMATION_COMMAND(FComboEndProductionPIECommand(*this, false, EComboPoseFailureProbe::None, 0, EComboEndAttackProbe::AuthoredRestart));
 	return true;
 }
 

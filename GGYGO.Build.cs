@@ -17,6 +17,8 @@ public class GGYGO : ModuleRules
 			"AnimGraphRuntime",
 			"InputCore",
 			"EnhancedInput",
+			// 改键页和选键控件公开 UMG 基类。
+			"UMG",
 			"GameplayAbilities",
 			"GameplayTags",
 			"GameplayTasks",
@@ -44,6 +46,8 @@ public class GGYGO : ModuleRules
 			// Native输入测试夹具直接使用Slate窗口/控件，须显式声明所属模块链接依赖。
 			"Slate",
 			"SlateCore",
+			// 改键菜单直接订阅原输入设备的连接及归属事件。
+			"ApplicationCore",
 			// GameFeature 依赖分类：IPluginManager / IPlugin 的公开接口来自 Projects。
 			"Projects",
 			// 解耦的 Gameplay 消息广播；模块来自 Plugins/GameplayMessageRouter。

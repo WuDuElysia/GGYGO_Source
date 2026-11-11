@@ -124,7 +124,7 @@ public:
 
 	UPROPERTY(BlueprintAssignable)
 	FGGYGONiagaraEffectFailedDelegate OnFailed;
-	/** 原组件已取得并调用原生 Activate；编译／PSO 等待由组件处理，不表示模拟或画面已完成。 */
+	/** 原组件已取得并请求 Activate；最终材质／编译／PSO 等待归原组件，不表示模拟或画面已完成。 */
 	UPROPERTY(BlueprintAssignable)
 	FGGYGONiagaraEffectSpawnedDelegate OnSpawned;
 	/** 原 owned 单元无失败地触发 OnSystemFinished 后、销毁前发出；显式 Stop/取消不发出。 */

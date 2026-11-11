@@ -17,10 +17,14 @@
 class APawn;
 class AController;
 class AActor;
+class SWidget;
 class UInputAction;
 class UInputComponent;
 class UEnhancedInputLocalPlayerSubsystem;
+class UEnhancedInputUserSettings;
+class UGGYGOLocalPlayer;
 class UGGYGOMovementInputOriginResource;
+struct FKeyEvent;
 
 /** One immutable session per native delegate subscription, including callbacks already in flight. */
 UCLASS(Transient)
@@ -53,6 +57,13 @@ class GGYGO_API UGGYGOPlayerInput : public UEnhancedPlayerInput
 	GENERATED_BODY()
 
 public:
+	/** 仅从原游戏视口进入本菜单时接续键盘观察，直到原视口取回焦点。 */
+	void BeginKeyBindingMenuObservation(const UEnhancedInputUserSettings& Settings, const TSharedRef<SWidget>& Menu);
+	/** 归还菜单焦点；旧移动会话已退役时请求原生重建，由现有观察器重新装配。 */
+	void BeginKeyBindingMenuClose(const UEnhancedInputUserSettings& Settings, const SWidget& Menu);
+	/** 记录原改键选择器消费的实际 KeyUp，供后继映射读取原设备释放证明。 */
+	void ObserveKeyBindingMenuRelease(const UEnhancedInputUserSettings& Settings, const FKeyEvent& KeyUp);
+
 	bool BeginMovementInputSession(APawn* Pawn, UInputComponent* Component, const UInputAction* Action,
 		FGGYGOMovementInputSessionIdentity& OutSession, FString& OutError);
 	bool AttachMovementInputReceiver(const FGGYGOMovementInputSessionIdentity& Session,
@@ -206,16 +217,21 @@ private:
 	 *  @return Whether the original session is still live after fact delivery. */
 	bool CommitPhysicalRequest(EGGYGOMovementInputStartProof Proof,
 		const FGGYGOMovementInputSessionIdentity& ExpectedSession);
+	ESourceProof ReadPhysicalSourceProof(const FPhysicalSource& Source) const;
 	ESourceProof ReadSourceProof() const;
 	FString DescribeSourceProof() const;
 	bool IsMappedMovementSource(const FKey& Key) const;
 	void AdoptKnownMovementSources();
-	void EstablishMovementReleaseBarrier(FName Reason);
+	void EstablishMovementReleaseBarrier(FName Reason, bool bPreserveProvenNeutral = false);
 	const FPhysicalSource* FindPhysicalSource(const FKey& Key, FInputDeviceId Device) const;
+	FPhysicalSource& FindOrAddPhysicalSource(const FKey& Key, FInputDeviceId Device);
+	static void RecordDigitalRelease(FPhysicalSource& Source, uint64 Revision);
 	const FMovementSourceObligation* FindMovementSourceObligation(const FPhysicalSource& Source) const;
 	FMovementSourceObligation& FindOrAddMovementSourceObligation(const FPhysicalSource& Source);
 	bool IsMovementReleaseRequired(const FPhysicalSource& Source) const;
-	void InvalidatePhysicalInputObservations(FName Reason);
+	void InvalidatePhysicalInputObservations(FName Reason, FInputDeviceId ContinuedKeyboard = INPUTDEVICEID_NONE);
+	const UGGYGOLocalPlayer* FindKeyBindingMenuLocalPlayer(const UEnhancedInputUserSettings& Settings) const;
+	void ObserveKeyBindingMenuKey(const FKeyEvent& KeyEvent, EInputEvent Event);
 	FNativePhysicalObservation ObservePhysicalInput(const FInputKeyEventArgs& Params);
 	FPhysicalObservation ProjectMovementObservation(const FNativePhysicalObservation& Native,
 		ESourceProof Before, bool bHadParticipantsBefore);
@@ -230,6 +246,8 @@ private:
 
 	// Native device observations survive session teardown/flush; synthetic releases never clear them.
 	TArray<FPhysicalSource> PhysicalSources;
+	struct FKeyBindingMenuObservation;
+	TSharedPtr<FKeyBindingMenuObservation> KeyBindingMenuObservation;
 	TArray<FMovementSourceObligation> MovementSourceObligations;
 	TArray<FRouteMapping> RouteMappings;
 	TWeakObjectPtr<APawn> SessionPawn;

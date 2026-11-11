@@ -11,14 +11,24 @@
 #include "CoreGlobals.h"
 #include "EnhancedActionKeyMapping.h"
 #include "EnhancedInputSubsystems.h"
+#include "Engine/GameViewportClient.h"
 #include "Engine/LocalPlayer.h"
+#include "Framework/Application/IInputProcessor.h"
+#include "Framework/Application/SlateApplication.h"
+#include "Framework/Application/SlateUser.h"
+#include "GameFramework/InputDeviceLibrary.h"
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
+#include "GenericPlatform/GenericPlatformInputDeviceMapper.h"
+#include "Input/Events.h"
 #include "InputAction.h"
 #include "InputModifiers.h"
 #include "InputTriggers.h"
 #include "Misc/ScopeExit.h"
 #include "UObject/Class.h"
+#include "UserSettings/EnhancedInputUserSettings.h"
+#include "Widgets/SViewport.h"
+#include "Widgets/SWindow.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGOMovementInput, Log, All);
 
@@ -42,7 +52,240 @@ namespace
 	{
 		return Key.IsAxis3D() ? 0b111 : Key.IsAxis2D() ? 0b011 : 0b001;
 	}
+
+	bool IsKeyboardDigitalKey(const FKey& Key)
+	{
+		return Key.IsValid() && Key.IsDigital() && !Key.IsGamepadKey() && !Key.IsMouseButton() && !Key.IsTouch();
+	}
+
+	bool IsConnectedInputDeviceForUser(FInputDeviceId Device, FPlatformUserId User)
+	{
+		return Device.IsValid() && User.IsValid() && UInputDeviceLibrary::GetUserForInputDevice(Device) == User
+			&& UInputDeviceLibrary::GetInputDeviceConnectionState(Device) == EInputDeviceConnectionState::Connected;
+	}
+
+	bool IsActiveKeyBindingWindow(const FSlateApplication& Slate, const TSharedPtr<SWindow>& Window)
+	{
+		const TSharedPtr<FGenericWindow> NativeWindow = Window ? Window->GetNativeWindow() : nullptr;
+		return NativeWindow && Slate.IsActive() && Window->IsActive() && NativeWindow->IsForegroundWindow();
+	}
 }
+
+/** 只接续同一视口、菜单和键盘用户之间的物理观察。观察器始终让 Slate 正常分发事件。 */
+struct UGGYGOPlayerInput::FKeyBindingMenuObservation final
+	: IInputProcessor, TSharedFromThis<FKeyBindingMenuObservation>
+{
+	enum class EPhase : uint8 { AwaitingFocus, Entering, Menu, Closing, Finished };
+
+	FKeyBindingMenuObservation(UGGYGOPlayerInput& InProducer, const UEnhancedInputUserSettings& InSettings,
+		const TSharedRef<SWidget>& InMenu, const TSharedRef<SViewport>& InViewport, const TSharedRef<SWindow>& InWindow,
+		int32 InSlateUser, FPlatformUserId InPlatformUser, FInputDeviceId InKeyboardDevice)
+		: Producer(&InProducer), Settings(&InSettings), Menu(InMenu), Viewport(InViewport), Window(InWindow),
+		  SlateUser(InSlateUser), PlatformUser(InPlatformUser), KeyboardDevice(InKeyboardDevice)
+	{
+	}
+
+	bool Start()
+	{
+		FSlateApplication& Slate = FSlateApplication::Get();
+		const TSharedRef<FKeyBindingMenuObservation> Self = AsShared();
+		// 先于可能消费按键的处理器观察，返回 false 保留原 Slate 路由。
+		if (!Slate.RegisterInputPreProcessor(Self, FInputPreprocessorRegistrationKey{EInputPreProcessorType::Overlay, 0}))
+		{
+			return false;
+		}
+		FocusHandle = Slate.OnFocusChanging().AddSP(Self, &FKeyBindingMenuObservation::OnFocusChanging);
+		WindowHandle = Window.Pin()->GetOnWindowDeactivatedEvent().AddSP(Self, &FKeyBindingMenuObservation::OnWindowDeactivated);
+		IPlatformInputDeviceMapper& Mapper = IPlatformInputDeviceMapper::Get();
+		ConnectionHandle = Mapper.GetOnInputDeviceConnectionChange().AddSP(Self, &FKeyBindingMenuObservation::OnConnectionChanged);
+		PairingHandle = Mapper.GetOnInputDevicePairingChange().AddSP(Self, &FKeyBindingMenuObservation::OnPairingChanged);
+		return true;
+	}
+
+	FInputDeviceId ConsumeViewportFocusFlush()
+	{
+		if (Phase != EPhase::Entering || !IsOriginalWindowActive()
+			|| FSlateApplication::Get().GetUserFocusedWidget(SlateUser) != Menu.Pin() || !GetOriginalProducer()
+			|| !IsConnectedInputDeviceForUser(KeyboardDevice, PlatformUser))
+		{
+			return INPUTDEVICEID_NONE;
+		}
+		// SetUserFocus 先提交新焦点，随后才通知旧 SViewport::OnFocusLost。只消费这一条转换。
+		Phase = EPhase::Menu;
+		return KeyboardDevice;
+	}
+
+	void BeginClose(const SWidget& ClosingMenu)
+	{
+		if (Phase == EPhase::Menu && Menu.Pin().Get() == &ClosingMenu)
+		{
+			Phase = EPhase::Closing;
+		}
+	}
+
+	void Finish(FName GapReason = NAME_None)
+	{
+		if (Phase == EPhase::Finished) { return; }
+		const TSharedRef<FKeyBindingMenuObservation> Self = AsShared();
+		Phase = EPhase::Finished;
+		if (FSlateApplication::IsInitialized())
+		{
+			FSlateApplication& Slate = FSlateApplication::Get();
+			Slate.OnFocusChanging().Remove(FocusHandle);
+			Slate.UnregisterInputPreProcessor(Self);
+		}
+		if (const TSharedPtr<SWindow> OriginalWindow = Window.Pin())
+		{
+			OriginalWindow->GetOnWindowDeactivatedEvent().Remove(WindowHandle);
+		}
+		IPlatformInputDeviceMapper& Mapper = IPlatformInputDeviceMapper::Get();
+		Mapper.GetOnInputDeviceConnectionChange().Remove(ConnectionHandle);
+		Mapper.GetOnInputDevicePairingChange().Remove(PairingHandle);
+		if (UGGYGOPlayerInput* Input = Producer.Get(); Input && Input->KeyBindingMenuObservation.Get() == this)
+		{
+			Input->KeyBindingMenuObservation.Reset();
+			if (!GapReason.IsNone())
+			{
+				Input->InvalidatePhysicalInputObservations(GapReason);
+				Input->EstablishMovementReleaseBarrier(GapReason);
+			}
+		}
+	}
+
+	void Tick(float, FSlateApplication& Slate, TSharedRef<ICursor>) override
+	{
+		// 关闭先移除菜单，再由原 GameOnly Slate 操作归还焦点，观察覆盖这一小段。
+		if (!Window.IsValid() || !Viewport.IsValid() || (Phase != EPhase::Closing && !Menu.IsValid()))
+		{
+			Finish(TEXT("KeyBindingMenuFocusGap"));
+		}
+		else if (Phase == EPhase::Closing && Slate.GetUserFocusedWidget(SlateUser) == Viewport.Pin())
+		{
+			const bool bContinuous = IsOriginalWindowActive() && GetOriginalProducer()
+				&& IsConnectedInputDeviceForUser(KeyboardDevice, PlatformUser);
+			Finish(bContinuous ? NAME_None : FName(TEXT("KeyBindingMenuInputGap")));
+		}
+		else if (Phase == EPhase::Entering && Slate.GetUserFocusedWidget(SlateUser) == Menu.Pin())
+		{
+			Phase = EPhase::Menu;
+		}
+	}
+
+	bool HandleKeyDownEvent(FSlateApplication& Slate, const FKeyEvent& KeyEvent) override
+	{
+		ObserveKey(Slate, KeyEvent, KeyEvent.IsRepeat() ? IE_Repeat : IE_Pressed);
+		return false;
+	}
+
+	bool HandleKeyUpEvent(FSlateApplication& Slate, const FKeyEvent& KeyEvent) override
+	{
+		ObserveKey(Slate, KeyEvent, IE_Released);
+		return false;
+	}
+
+private:
+	bool IsOriginalWindowActive() const
+	{
+		return FSlateApplication::IsInitialized() && IsActiveKeyBindingWindow(FSlateApplication::Get(), Window.Pin());
+	}
+
+	UGGYGOPlayerInput* GetOriginalProducer() const
+	{
+		UGGYGOPlayerInput* Input = Producer.Get();
+		const UEnhancedInputUserSettings* OriginalSettings = Settings.Get();
+		const UGGYGOLocalPlayer* LocalPlayer = Input && OriginalSettings
+			? Input->FindKeyBindingMenuLocalPlayer(*OriginalSettings) : nullptr;
+		return LocalPlayer && LocalPlayer->GetPlatformUserId() == PlatformUser ? Input : nullptr;
+	}
+
+	void ObserveKey(FSlateApplication& Slate, const FKeyEvent& KeyEvent, EInputEvent Event)
+	{
+		if (Phase == EPhase::Finished || KeyEvent.GetUserIndex() != SlateUser || !IsKeyboardDigitalKey(KeyEvent.GetKey()))
+		{
+			return;
+		}
+		if (Phase == EPhase::AwaitingFocus || Phase == EPhase::Entering)
+		{
+			// 原生焦点交接还没完成。若此时穿插键盘事件，本次不延续旧证明。
+			Finish(TEXT("KeyBindingMenuFocusGap"));
+			return;
+		}
+		UGGYGOPlayerInput* Input = GetOriginalProducer();
+		if (!Input || !IsOriginalWindowActive() || KeyEvent.GetInputDeviceId() != KeyboardDevice
+			|| !IsConnectedInputDeviceForUser(KeyboardDevice, PlatformUser))
+		{
+			Finish(TEXT("KeyBindingMenuInputGap"));
+			return;
+		}
+		if (Phase == EPhase::Closing && Slate.GetUserFocusedWidget(SlateUser) == Viewport.Pin())
+		{
+			Finish();
+			return; // 原视口已接管，本事件由原生 PlayerInput 处理。
+		}
+		Input->ObserveKeyBindingMenuKey(KeyEvent, Event);
+	}
+
+	void OnFocusChanging(const FFocusEvent& Event, const FWeakWidgetPath& PreviousPath,
+		const TSharedPtr<SWidget>& Previous, const FWidgetPath& NextPath, const TSharedPtr<SWidget>& Next)
+	{
+		if (Event.GetUser() != SlateUser) { return; }
+		const TSharedPtr<SWindow> OriginalWindow = Window.Pin();
+		const TSharedPtr<SWidget> OriginalMenu = Menu.Pin();
+		const bool bNextInWindow = NextPath.IsValid() && NextPath.GetWindow() == OriginalWindow;
+		if (Phase == EPhase::AwaitingFocus && Event.GetCause() == EFocusCause::SetDirectly
+			&& OriginalMenu && Next == OriginalMenu && Previous == Viewport.Pin() && PreviousPath.Window.Pin() == OriginalWindow
+			&& bNextInWindow && IsOriginalWindowActive())
+		{
+			Phase = EPhase::Entering;
+			return;
+		}
+		if ((Phase == EPhase::Menu || Phase == EPhase::Closing) && OriginalMenu && bNextInWindow
+			&& NextPath.ContainsWidget(OriginalMenu.Get()))
+		{
+			return;
+		}
+		if (Phase == EPhase::Closing && (!NextPath.IsValid() || (bNextInWindow && Next == Viewport.Pin())))
+		{
+			return;
+		}
+		Finish(TEXT("KeyBindingMenuFocusGap"));
+	}
+
+	void OnWindowDeactivated()
+	{
+		Finish(TEXT("KeyBindingMenuFocusGap"));
+	}
+
+	void OnConnectionChanged(EInputDeviceConnectionState State, FPlatformUserId User, FInputDeviceId Device)
+	{
+		if (Device == KeyboardDevice && (State != EInputDeviceConnectionState::Connected || User != PlatformUser))
+		{
+			Finish(TEXT("KeyBindingMenuDeviceGap"));
+		}
+	}
+
+	void OnPairingChanged(FInputDeviceId Device, FPlatformUserId NewUser, FPlatformUserId)
+	{
+		if (Device == KeyboardDevice && NewUser != PlatformUser)
+		{
+			Finish(TEXT("KeyBindingMenuDeviceGap"));
+		}
+	}
+
+	TWeakObjectPtr<UGGYGOPlayerInput> Producer;
+	TWeakObjectPtr<const UEnhancedInputUserSettings> Settings;
+	TWeakPtr<SWidget> Menu;
+	TWeakPtr<SViewport> Viewport;
+	TWeakPtr<SWindow> Window;
+	int32 SlateUser;
+	FPlatformUserId PlatformUser;
+	FInputDeviceId KeyboardDevice;
+	EPhase Phase = EPhase::AwaitingFocus;
+	FDelegateHandle FocusHandle;
+	FDelegateHandle WindowHandle;
+	FDelegateHandle ConnectionHandle;
+	FDelegateHandle PairingHandle;
+};
 
 void UGGYGOPlayerInput::PostInitProperties()
 {
@@ -449,6 +692,30 @@ const UGGYGOPlayerInput::FPhysicalSource* UGGYGOPlayerInput::FindPhysicalSource(
 	});
 }
 
+UGGYGOPlayerInput::FPhysicalSource& UGGYGOPlayerInput::FindOrAddPhysicalSource(const FKey& Key, FInputDeviceId Device)
+{
+	if (FPhysicalSource* Existing = PhysicalSources.FindByPredicate([&](const FPhysicalSource& Source)
+	{
+		return Source.Key == Key && Source.Device == Device;
+	}))
+	{
+		return *Existing;
+	}
+	FPhysicalSource& Added = PhysicalSources.AddDefaulted_GetRef();
+	Added.Key = Key;
+	Added.Device = Device;
+	return Added;
+}
+
+void UGGYGOPlayerInput::RecordDigitalRelease(FPhysicalSource& Source, uint64 Revision)
+{
+	Source.bDigitalDown = false;
+	Source.bUnproven = false;
+	Source.LastRealReleaseRevision = Revision;
+	Source.LastRealReleaseProofStartRevision = Revision;
+	Source.UnprovenReason = NAME_None;
+}
+
 const UGGYGOPlayerInput::FMovementSourceObligation* UGGYGOPlayerInput::FindMovementSourceObligation(const FPhysicalSource& Source) const
 {
 	return MovementSourceObligations.FindByPredicate([&](const FMovementSourceObligation& Obligation)
@@ -484,6 +751,18 @@ bool UGGYGOPlayerInput::HasParticipatingMovementSources() const
 	return MovementSourceObligations.ContainsByPredicate([](const FMovementSourceObligation& Obligation) { return Obligation.bParticipant; });
 }
 
+UGGYGOPlayerInput::ESourceProof UGGYGOPlayerInput::ReadPhysicalSourceProof(const FPhysicalSource& Source) const
+{
+	const bool bAnalog = Source.Key.IsAnalog();
+	if (!Source.Device.IsValid() || Source.bUnproven || Source.HasNativeReleaseGap()
+		|| IsMovementReleaseRequired(Source) || (bAnalog && Source.ObservedAxes != RequiredAxes(Source.Key)))
+	{
+		return ESourceProof::Unknown;
+	}
+	const bool bHeld = bAnalog ? Source.RawValue.SizeSquared() > 0 : Source.bDigitalDown;
+	return bHeld ? ESourceProof::Held : ESourceProof::Neutral;
+}
+
 UGGYGOPlayerInput::ESourceProof UGGYGOPlayerInput::ReadSourceProof() const
 {
 	bool bAnyParticipant = false;
@@ -496,14 +775,13 @@ UGGYGOPlayerInput::ESourceProof UGGYGOPlayerInput::ReadSourceProof() const
 		}
 		bAnyParticipant = true;
 		const FPhysicalSource* Source = FindPhysicalSource(Obligation.Key, Obligation.Device);
-		if (!Source || !Source->Device.IsValid() || Source->bUnproven || Source->HasNativeReleaseGap()
-			|| IsMovementReleaseRequired(*Source)
-			|| (Source->Key.IsAnalog() && Source->ObservedAxes != RequiredAxes(Source->Key)))
+		const ESourceProof Proof = Source ? ReadPhysicalSourceProof(*Source) : ESourceProof::Unknown;
+		if (Proof == ESourceProof::Unknown)
 		{
 			return ESourceProof::Unknown;
 		}
 		// Native per-key level is read from its sole owner, never copied into the obligation.
-		bAnyHeld |= Source->Key.IsAnalog() ? Source->RawValue.SizeSquared() > 0 : Source->bDigitalDown;
+		bAnyHeld |= Proof == ESourceProof::Held;
 	}
 	return !bAnyParticipant ? ESourceProof::Unknown : bAnyHeld ? ESourceProof::Held : ESourceProof::Neutral;
 }
@@ -567,18 +845,22 @@ void UGGYGOPlayerInput::AdoptKnownMovementSources()
 	}
 }
 
-void UGGYGOPlayerInput::EstablishMovementReleaseBarrier(FName Reason)
+void UGGYGOPlayerInput::EstablishMovementReleaseBarrier(FName Reason, bool bPreserveProvenNeutral)
 {
 	for (const FPhysicalSource& Source : PhysicalSources)
 	{
-		// Even a later mapped source must prove a complete real release after this boundary.
+		// 会话退役可复用同一原生来源的可信中立。仍按住或存在证明缺口时，后继必须再取得真实释放。
+		if (bPreserveProvenNeutral && ReadPhysicalSourceProof(Source) == ESourceProof::Neutral)
+		{
+			continue;
+		}
 		FMovementSourceObligation& Obligation = FindOrAddMovementSourceObligation(Source);
 		Obligation.ReleaseAfterObservationRevision = ObservationRevision;
 		Obligation.ReleaseReason = Reason;
 	}
 }
 
-void UGGYGOPlayerInput::InvalidatePhysicalInputObservations(FName Reason)
+void UGGYGOPlayerInput::InvalidatePhysicalInputObservations(FName Reason, FInputDeviceId ContinuedKeyboard)
 {
 	if (PhysicalSources.IsEmpty())
 	{
@@ -588,6 +870,15 @@ void UGGYGOPlayerInput::InvalidatePhysicalInputObservations(FName Reason)
 	const bool bHasRevision = AllocateSerial(ObservationRevision, GapRevision);
 	for (FPhysicalSource& Source : PhysicalSources)
 	{
+		if (bHasRevision && ContinuedKeyboard.IsValid() && Source.Device == ContinuedKeyboard
+			&& IsKeyboardDigitalKey(Source.Key) && Source.LastRealReleaseRevision != 0
+			&& ReadPhysicalSourceProof(Source) == ESourceProof::Neutral)
+		{
+			UE_LOG(LogGGYGOMovementInput, Verbose,
+				TEXT("[Input.PhysicalObservation] PlayerInput=%s Key=%s Device=%d Reason=KeyBindingMenuNeutralContinued"),
+				*GetPathName(), *Source.Key.ToString(), Source.Device.GetId());
+			continue;
+		}
 		// A real native flush loses continuity, not the recorded historical raw level.
 		Source.NativeProofGapRevision = bHasRevision ? GapRevision : ObservationRevision;
 		Source.bUnproven = true;
@@ -966,7 +1257,8 @@ void UGGYGOPlayerInput::EndMovementInputSession(const FGGYGOMovementInputSession
 	}
 	if (!bInsideFlush)
 	{
-		EstablishMovementReleaseBarrier(Reason.IsNone() ? FName(TEXT("ExplicitSessionEnd")) : Reason);
+		EstablishMovementReleaseBarrier(Reason.IsNone() ? FName(TEXT("ExplicitSessionEnd")) : Reason,
+			/*bPreserveProvenNeutral=*/true);
 	}
 	FGGYGOMovementInputFact Fact;
 	Fact.Request.Session = Session;
@@ -1339,6 +1631,106 @@ void UGGYGOPlayerInput::UnsubscribeMovementInputEvaluation(const FGGYGOMovementI
 	}
 }
 
+const UGGYGOLocalPlayer* UGGYGOPlayerInput::FindKeyBindingMenuLocalPlayer(const UEnhancedInputUserSettings& Settings) const
+{
+	const APlayerController* Controller = GetOuterAPlayerController();
+	const UGGYGOLocalPlayer* LocalPlayer = IsValid(Controller) ? Cast<UGGYGOLocalPlayer>(Controller->GetLocalPlayer()) : nullptr;
+	if (bEndingInput || !IsValid(LocalPlayer) || LocalPlayer->IsInputMappingRemovalStarted() || Settings.GetLocalPlayer() != LocalPlayer
+		|| Controller->IsActorBeingDestroyed() || Controller->PlayerInput != this)
+	{
+		return nullptr;
+	}
+	const UEnhancedInputLocalPlayerSubsystem* Subsystem = LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>();
+	return Subsystem && Subsystem->GetUserSettings() == &Settings && Subsystem->GetPlayerInput() == this ? LocalPlayer : nullptr;
+}
+
+void UGGYGOPlayerInput::BeginKeyBindingMenuObservation(const UEnhancedInputUserSettings& Settings, const TSharedRef<SWidget>& Menu)
+{
+	if (!FSlateApplication::IsInitialized() || bInsideFlush) { return; }
+	if (KeyBindingMenuObservation)
+	{
+		KeyBindingMenuObservation->Finish(TEXT("KeyBindingMenuFocusGap"));
+	}
+	const UGGYGOLocalPlayer* LocalPlayer = FindKeyBindingMenuLocalPlayer(Settings);
+	const UGameViewportClient* ViewportClient = LocalPlayer ? LocalPlayer->ViewportClient.Get() : nullptr;
+	const TSharedPtr<SViewport> Viewport = ViewportClient ? ViewportClient->GetGameViewportWidget() : nullptr;
+	if (!Viewport) { return; }
+	FSlateApplication& Slate = FSlateApplication::Get();
+	const int32 KeyboardUserIndex = Slate.GetUserIndexForKeyboard();
+	const TSharedPtr<FSlateUser> KeyboardUser = Slate.GetUser(KeyboardUserIndex);
+	const FPlatformUserId PlatformUser = LocalPlayer->GetPlatformUserId();
+	// 与 Slate 原生键盘入口的 FKeyEvent(UserIndex) 使用相同的设备身份，逐事件核验。
+	const FInputDeviceId KeyboardDevice = FInputDeviceId::CreateFromInternalId(KeyboardUserIndex);
+	const TSharedPtr<SWindow> Window = Slate.FindWidgetWindow(Viewport.ToSharedRef());
+	if (!KeyboardUser || KeyboardUser->GetPlatformUserId() != PlatformUser || !IsConnectedInputDeviceForUser(KeyboardDevice, PlatformUser)
+		|| KeyboardUser->GetFocusedWidget() != Viewport || !IsActiveKeyBindingWindow(Slate, Window))
+	{
+		return;
+	}
+	const TSharedRef<FKeyBindingMenuObservation> Observation = MakeShared<FKeyBindingMenuObservation>(
+		*this, Settings, Menu, Viewport.ToSharedRef(), Window.ToSharedRef(), KeyboardUserIndex, PlatformUser, KeyboardDevice);
+	if (Observation->Start())
+	{
+		KeyBindingMenuObservation = Observation;
+	}
+}
+
+void UGGYGOPlayerInput::BeginKeyBindingMenuClose(const UEnhancedInputUserSettings& Settings, const SWidget& Menu)
+{
+	if (KeyBindingMenuObservation)
+	{
+		KeyBindingMenuObservation->BeginClose(Menu);
+	}
+	const UGGYGOLocalPlayer* LocalPlayer = FindKeyBindingMenuLocalPlayer(Settings);
+	if (LocalPlayer && CurrentSession.SessionSerial == 0)
+	{
+		// 无改键也可能因视口 Flush 退役。由真实重建通知现有装配链，仍使用默认的按住需松开选项。
+		LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>()->RequestRebuildControlMappings();
+	}
+}
+
+void UGGYGOPlayerInput::ObserveKeyBindingMenuKey(const FKeyEvent& KeyEvent, EInputEvent Event)
+{
+	if (bInsideFlush) { return; }
+	InvalidatePendingMovementInputEvaluation(TEXT("改键界面收到实际按键事件，原评价不再连续。"));
+	if (bEvaluatingMovementAction) { bMovementActionEvaluationInterrupted = true; }
+	const ESourceProof Before = ReadSourceProof();
+	const bool bHadParticipants = HasParticipatingMovementSources();
+	const FNativePhysicalObservation Native = ObservePhysicalInput(FInputKeyEventArgs(
+		nullptr, KeyEvent.GetInputDeviceId(), KeyEvent.GetKey(), Event, 1.0f, false, KeyEvent.GetEventTimestamp()));
+	if (Event != IE_Released)
+	{
+		for (const FNativePhysicalSourceObservation& Source : Native.Sources)
+		{
+			FMovementSourceObligation& Obligation = FindOrAddMovementSourceObligation(*FindPhysicalSource(Source.Key, Source.Device));
+			Obligation.ReleaseAfterObservationRevision = Native.Revision;
+			Obligation.ReleaseReason = TEXT("HeldInKeyBindingMenu");
+		}
+	}
+	// 菜单观察只更新物理事实，不派发玩法键或移动请求。
+	ProjectMovementObservation(Native, Before, bHadParticipants);
+}
+
+void UGGYGOPlayerInput::ObserveKeyBindingMenuRelease(const UEnhancedInputUserSettings& Settings, const FKeyEvent& KeyUp)
+{
+	const FKey Key = KeyUp.GetKey().GetVirtualKey();
+	const FInputDeviceId Device = KeyUp.GetInputDeviceId();
+	const UGGYGOLocalPlayer* LocalPlayer = FindKeyBindingMenuLocalPlayer(Settings);
+	if (bInsideFlush || KeyUp.IsRepeat() || !Key.IsValid() || !Key.IsDigital()
+		|| !LocalPlayer || !IsConnectedInputDeviceForUser(Device, LocalPlayer->GetPlatformUserId()))
+	{
+		return;
+	}
+	const FPhysicalSource* Source = FindPhysicalSource(Key, Device);
+	if (!Source || ReadPhysicalSourceProof(*Source) != ESourceProof::Neutral)
+	{
+		ObserveKeyBindingMenuKey(KeyUp, IE_Released);
+	}
+	UE_LOG(LogGGYGOMovementInput, Verbose,
+		TEXT("[Input.PhysicalObservation] PlayerInput=%s Key=%s Device=%d Revision=%llu Reason=SlateBindingKeyUp"),
+		*GetPathName(), *Key.ToString(), Device.GetId(), static_cast<unsigned long long>(ObservationRevision));
+}
+
 UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysicalInput(const FInputKeyEventArgs& Params)
 {
 	FNativePhysicalObservation Observation;
@@ -1352,21 +1744,6 @@ UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysical
 		return Observation;
 	}
 	Observation.Revision = Revision;
-	auto FindSource = [this, &Params](const FKey& Key) -> FPhysicalSource&
-	{
-		FPhysicalSource* Existing = PhysicalSources.FindByPredicate([&](const FPhysicalSource& Source)
-		{
-			return Source.Key == Key && Source.Device == Params.InputDevice;
-		});
-		if (Existing)
-		{
-			return *Existing;
-		}
-		FPhysicalSource& Added = PhysicalSources.AddDefaulted_GetRef();
-		Added.Key = Key;
-		Added.Device = Params.InputDevice;
-		return Added;
-	};
 	auto AddSourceObservation = [&Observation, &Params](const FKey& Key) -> FNativePhysicalSourceObservation&
 	{
 		FNativePhysicalSourceObservation& Added = Observation.Sources.AddDefaulted_GetRef();
@@ -1377,7 +1754,7 @@ UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysical
 	const FKey Key = Params.Key.GetVirtualKey();
 	if (Key.IsDigital())
 	{
-		FPhysicalSource& Source = FindSource(Key);
+		FPhysicalSource& Source = FindOrAddPhysicalSource(Key, Params.InputDevice);
 		FNativePhysicalSourceObservation& SourceObservation = AddSourceObservation(Key);
 		if (!Params.InputDevice.IsValid())
 		{
@@ -1399,11 +1776,7 @@ UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysical
 			Source.bDigitalDown = true;
 			break;
 		case IE_Released:
-			Source.bDigitalDown = false;
-			Source.bUnproven = false;
-			Source.LastRealReleaseRevision = Revision;
-			Source.LastRealReleaseProofStartRevision = Revision;
-			Source.UnprovenReason = NAME_None;
+			RecordDigitalRelease(Source, Revision);
 			SourceObservation.bRealRelease = true;
 			break;
 		case IE_Repeat:
@@ -1423,9 +1796,9 @@ UGGYGOPlayerInput::FNativePhysicalObservation UGGYGOPlayerInput::ObservePhysical
 		}
 		return Observation;
 	}
-	auto ObserveAxis = [&FindSource, &AddSourceObservation, &Params, Revision](const FKey& AxisKey, uint8 Mask, int32 Component)
+	auto ObserveAxis = [this, &AddSourceObservation, &Params, Revision](const FKey& AxisKey, uint8 Mask, int32 Component)
 	{
-		FPhysicalSource& Source = FindSource(AxisKey);
+		FPhysicalSource& Source = FindOrAddPhysicalSource(AxisKey, Params.InputDevice);
 		FNativePhysicalSourceObservation& SourceObservation = AddSourceObservation(AxisKey);
 		if (!Params.InputDevice.IsValid() || Params.NumSamples != 1 || !FMath::IsFinite(Params.AmountDepressed)
 			|| Mask == 0 || Component == INDEX_NONE)
@@ -1649,10 +2022,12 @@ void UGGYGOPlayerInput::FlushPressedKeys()
 	InvalidatePendingMovementInputEvaluation(TEXT("原输入已 Flush，评价来源不再连续。"));
 	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalProducer(this);
 	const bool bWasInsideFlush = bInsideFlush;
+	const FInputDeviceId ContinuedKeyboard = !bWasInsideFlush && KeyBindingMenuObservation
+		? KeyBindingMenuObservation->ConsumeViewportFocusFlush() : INPUTDEVICEID_NONE;
 	bInsideFlush = true;
 	RetireOriginalQualification(TEXT("InputFlushed"));
-	InvalidatePhysicalInputObservations(TEXT("InputFlushedObservationGap"));
-	EstablishMovementReleaseBarrier(TEXT("InputFlushedObservationGap"));
+	InvalidatePhysicalInputObservations(TEXT("InputFlushedObservationGap"), ContinuedKeyboard);
+	EstablishMovementReleaseBarrier(TEXT("InputFlushedObservationGap"), ContinuedKeyboard.IsValid());
 	EndMovementInputSession(CurrentSession, TEXT("InputFlushed"));
 	if (!OriginalProducer.IsValid())
 	{
@@ -1782,6 +2157,11 @@ void UGGYGOPlayerInput::EvaluateBlockedInputComponent(UInputComponent* Component
 void UGGYGOPlayerInput::BeginDestroy()
 {
 	bEndingInput = true;
+	if (KeyBindingMenuObservation)
+	{
+		KeyBindingMenuObservation->Finish();
+		KeyBindingMenuObservation.Reset();
+	}
 	if (CurrentSession.SessionSerial == 0)
 	{
 		RetireOriginalQualification(TEXT("ProducerDestroyed"));

@@ -8,6 +8,20 @@
 
 class UAnimMontage;
 class UFunction;
+class UWorld;
+
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGOPlayerComboFXBrightDraw, UWorld*, World, const FString&, SampleJson);
+
+/** 原生生产冒烟的同步 Draw 观察入口，订阅者使用此类的默认对象。 */
+UCLASS(Transient, BlueprintType)
+class UGGYGOPlayerComboFXDrawTestBridge : public UObject
+{
+	GENERATED_BODY()
+
+public:
+	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Tests")
+	FGGYGOPlayerComboFXBrightDraw OnBrightDraw;
+};
 
 /** Native fixture that routes the real GAS Blueprint activation dispatch through ProcessEvent. */
 UCLASS(Transient)

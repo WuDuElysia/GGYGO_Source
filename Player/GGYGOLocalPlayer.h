@@ -25,6 +25,8 @@
 
 #include "GGYGOLocalPlayer.generated.h"
 
+class AGGYGOPlayerController;
+class UEnhancedPlayerInput;
 class UGameInstance;
 class UGGYGOSquadPresets;
 class UGGYGOMovementInputOriginResource;
@@ -53,6 +55,13 @@ public:
 	/** Pure read: real PlayerAdded alone creates the resource; removal retains it retired. */
 	UGGYGOMovementInputOriginResource* GetMovementInputOriginResource() const;
 
+	DECLARE_EVENT_OneParam(UGGYGOLocalPlayer, FInputMappingsRemoving, UEnhancedPlayerInput*)
+
+	/** PlayerRemoved 已封闭本地玩家的活动映射准入。 */
+	bool IsInputMappingRemovalStarted() const { return bInputMappingRemovalStarted; }
+	/** 通知映射持有者归还注册。非空仅对应原 PlayerInput；空值表示原 LocalPlayer 移除。 */
+	FInputMappingsRemoving& OnInputMappingsRemoving() { return InputMappingsRemoving; }
+
 	virtual void PlayerAdded(UGameViewportClient* InViewportClient, int32 InControllerID) override;
 	virtual void PlayerAdded(UGameViewportClient* InViewportClient, FPlatformUserId InUserId) override;
 	virtual void PlayerRemoved() override;
@@ -61,6 +70,10 @@ public:
 	virtual void BeginDestroy() override;
 
 private:
+	friend class AGGYGOPlayerController;
+	/** 原 Controller 清除 PlayerInput 前通知该输入对象的映射持有者。 */
+	void NotifyControllerInputMappingsRemoving(UEnhancedPlayerInput& PlayerInput);
+
 	UGGYGOMovementInputOriginResource* PrepareMovementInputOriginForPlayerAdded();
 	void FinishMovementInputOriginPlayerAdded(
 		const TWeakObjectPtr<UGGYGOMovementInputOriginResource>& OriginalResource,
@@ -71,6 +84,9 @@ private:
 	/** One original resource, including after Removed; never reset to recover qualification. */
 	UPROPERTY(Transient)
 	TObjectPtr<UGGYGOMovementInputOriginResource> MovementInputOriginResource;
+
+	FInputMappingsRemoving InputMappingsRemoving;
+	bool bInputMappingRemovalStarted = false;
 
 	/**
 	 * 编队预设缓存。

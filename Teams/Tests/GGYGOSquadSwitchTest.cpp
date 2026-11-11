@@ -10,6 +10,7 @@
 #include "GameplayEffectComponents/TargetTagsGameplayEffectComponent.h"
 #include "Input/GGYGOInputComponent.h"
 #include "Input/Tests/GGYGOInputTestTypes.h"
+#include "Misc/ScopeExit.h"
 #include "NativeGameplayTags.h"
 #include "Player/GGYGOPlayerState.h"
 #include "System/GGYGOGameplayTags.h"
@@ -47,6 +48,13 @@ void AGGYGOSquadSwitchTestPawn::UnPossessed()
 {
 	Super::UnPossessed();
 	++UnpossessCalls;
+}
+
+void AGGYGOSquadSwitchTestPawn::RequestDeathReplacementForTest(AGGYGOCharacterSlot* OriginalSlot, APawn* OriginalAvatar)
+{
+	++DeathPolicyCallsForTest;
+	UGGYGOSquadComponent* Squad = DeathPolicySquadForTest.Get();
+	bDeathPolicyResultForTest = Squad && Squad->RequestNextAfterActiveMemberDeath(OriginalSlot, OriginalAvatar);
 }
 
 void AGGYGOSquadSwitchTestPawn::ObserveActiveCharacterForTest(AGGYGOCharacterBase* NewCharacter)
@@ -628,6 +636,13 @@ bool FGGYGOSquadSwitchPlayerRulesSmoke::RunTest(const FString& Parameters)
 {
 	GGYGOSquadSwitchTests::FFixture Fixture;
 	if (!Fixture.Initialize(*this, 3)) { return false; }
+	AGGYGOSquadSwitchTestPawn* Policy = Fixture.Pawns[2];
+	Policy->DeathPolicySquadForTest = Fixture.Squad;
+	Fixture.Squad->OnActiveMemberDeathFinished.AddUniqueDynamic(Policy, &AGGYGOSquadSwitchTestPawn::RequestDeathReplacementForTest);
+	ON_SCOPE_EXIT
+	{
+		Fixture.Squad->OnActiveMemberDeathFinished.RemoveDynamic(Policy, &AGGYGOSquadSwitchTestPawn::RequestDeathReplacementForTest);
+	};
 	FGameplayAbilitySpecHandle EnterHandle;
 	UGGYGOSquadSwitchTestAbility* Enter = Fixture.Grant(*this, 2, UGGYGOSquadSwitchEnterTestAbility::StaticClass(), false, EnterHandle);
 	if (!Enter) { return false; }
@@ -657,6 +672,7 @@ bool FGGYGOSquadSwitchPlayerRulesSmoke::RunTest(const FString& Parameters)
 	if (!TestTrue(TEXT("Script switch moves away from the dying member for the next case"), Fixture.IsControlled(1))) { return false; }
 	DyingHealth->FinishDeath();
 	TestTrue(TEXT("A benched member's death does not move the active member"), Fixture.IsControlled(1));
+	TestEqual(TEXT("Benched death does not publish an active-member death fact"), Policy->DeathPolicyCallsForTest, 0);
 	UGGYGOHealthComponent* ActiveHealth = Fixture.Pawns[1]->GetHealthComponent();
 	if (!TestNotNull(TEXT("Second member has a HealthComponent"), ActiveHealth)) { return false; }
 	ActiveHealth->StartDeath();
@@ -665,6 +681,18 @@ bool FGGYGOSquadSwitchPlayerRulesSmoke::RunTest(const FString& Parameters)
 	TestTrue(TEXT("Death finish switches to the next living member"), Fixture.IsControlled(2));
 	TestEqual(TEXT("The auto switch plays SwitchIn on the replacing member"), Enter->ActivationCalls, 1);
 	TestEqual(TEXT("The dead member leaves the field"), Fixture.Squad->GetMemberState(1), EGGYGOSquadMemberState::Benched);
+	TestTrue(TEXT("The test policy consumed one synchronous replacement request"), Policy->DeathPolicyCallsForTest == 1 && Policy->bDeathPolicyResultForTest);
+
+	UGGYGOHealthComponent* LastHealth = Policy->GetHealthComponent();
+	if (!TestNotNull(TEXT("Last member has a HealthComponent"), LastHealth)) { return false; }
+	LastHealth->StartDeath();
+	LastHealth->FinishDeath();
+	APlayerController* PC = Fixture.Input.GetController();
+	TestTrue(TEXT("No surviving candidate keeps the original control and reports failure"),
+		Policy->DeathPolicyCallsForTest == 2 && !Policy->bDeathPolicyResultForTest
+		&& Fixture.Squad->GetActiveSlot() == Fixture.Slots[2] && PC->GetPawn() == Policy && Policy->GetController() == PC);
+	TestFalse(TEXT("An original Slot and Avatar cannot submit after the death broadcast returns"),
+		Fixture.Squad->RequestNextAfterActiveMemberDeath(Fixture.Slots[2], Policy));
 	return true;
 }
 
@@ -835,21 +863,87 @@ bool FGGYGOSquadSwitchReturnDuringExitSmoke::RunTest(const FString& Parameters)
 #include "ImageUtils.h"
 #include "InputCoreTypes.h"
 #include "Misc/FileHelper.h"
+#include "SceneInterface.h"
+#include "SceneView.h"
+#include "SceneViewExtension.h"
 #include "UnrealClient.h"
 #include "UserSettings/EnhancedInputUserSettings.h"
 #include "GameFramework/GameModeBase.h"
 #include "GameModes/GGYGOExperienceDefinition.h"
 #include "GameModes/GGYGOGameMode.h"
+#include "Camera/PlayerCameraManager.h"
+#include "HAL/IConsoleManager.h"
+#include "Materials/MaterialInstanceDynamic.h"
 #include "PlayInEditorDataTypes.h"
 #include "Settings/LevelEditorPlaySettings.h"
 
 namespace GGYGOSquadSwitchNetTests
 {
+	/** 从原客户端自然 Draw 取已经构造的 SceneView，不重新计算相机或驱动绘制。 */
+	class FDyingViewObserver final : public FSceneViewExtensionBase
+	{
+	public:
+		FDyingViewObserver(const FAutoRegister& AutoRegister, UGameViewportClient* InViewportClient,
+			APlayerController* InController, APawn* InAvatar)
+			: FSceneViewExtensionBase(AutoRegister), ViewportClient(InViewportClient), Controller(InController),
+			  Avatar(InAvatar), Viewport(InViewportClient->Viewport)
+		{
+		}
+
+		virtual bool IsActiveThisFrame_Internal(const FSceneViewExtensionContext& Context) const override
+		{
+			return IsInGameThread() && Context.Viewport == Viewport && ViewportClient.IsValid()
+				&& Context.GetWorld() == ViewportClient->GetWorld();
+		}
+
+		virtual void SetupView(FSceneViewFamily& Family, FSceneView& View) override
+		{
+			if (Family.RenderTarget != Viewport || !Family.Scene || !ViewportClient.IsValid()
+				|| Family.Scene->GetWorld() != ViewportClient->GetWorld()) { return; }
+			const APlayerController* PC = Controller.Get();
+			const APawn* DyingPawn = Avatar.Get();
+			if (!PC || !DyingPawn || PC->GetWorld() != Family.Scene->GetWorld()
+				|| DyingPawn->GetWorld() != PC->GetWorld()) { return; }
+			const UGGYGOHealthComponent* Health = UGGYGOHealthComponent::FindHealthComponent(DyingPawn);
+			if (!Health || Health->GetDeathState() != EGGYGODeathState::DeathStarted) { return; }
+
+			const ACharacter* Character = Cast<ACharacter>(DyingPawn);
+			const USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+			const FString MeshEvidence = Mesh ? FString::Printf(
+				TEXT("Mesh=%s Visible=%d BoundsOrigin=%s BoundsExtent=%s BoundsRadius=%.2f"),
+				*Mesh->GetPathName(), Mesh->IsVisible(), *Mesh->Bounds.Origin.ToString(),
+				*Mesh->Bounds.BoxExtent.ToString(), Mesh->Bounds.SphereRadius) : TEXT("Mesh=missing");
+			SampleFrame = GFrameCounter;
+			Sample = FString::Printf(TEXT("DrawFrame=%llu ClientDeathState=Dying DyingAvatar=%s Pawn=%s ViewTarget=%s ")
+				TEXT("POVLocation=%s POVRotation=%s FOV=%.3f AvatarHidden=%d %s"),
+				static_cast<unsigned long long>(SampleFrame), *GetPathNameSafe(DyingPawn), *GetPathNameSafe(PC->GetPawn()),
+				*GetPathNameSafe(PC->GetViewTarget()), *View.ViewLocation.ToString(), *View.ViewRotation.ToString(),
+				View.FOV, DyingPawn->IsHidden(), *MeshEvidence);
+		}
+
+		FString ConsumeRenderedSample(FViewport* RenderedViewport)
+		{
+			if (RenderedViewport != Viewport) { return FString(); }
+			FString Evidence = MoveTemp(Sample);
+			Sample.Reset();
+			const UGameViewportClient* Original = ViewportClient.Get();
+			return Original && Original->Viewport == Viewport && SampleFrame == GFrameCounter ? MoveTemp(Evidence) : FString();
+		}
+
+	private:
+		TWeakObjectPtr<UGameViewportClient> ViewportClient;
+		TWeakObjectPtr<APlayerController> Controller;
+		TWeakObjectPtr<APawn> Avatar;
+		FViewport* Viewport;
+		FString Sample;
+		uint64 SampleFrame = 0;
+	};
+
 	/**
 	 * 监听服务器＋1 客户端的同进程 PIE：生产 GameMode／Experience／Squad 装配，客户端经 Server RPC 切人。
 	 * 编队用 Experience 首位角色的两份实例（测试编队），在 PostLogin 与装配之间写入 Roster；
 	 * 续放能力是测试夹具 GA（无生产续放能力），进退场能力缺省时按既定规则立即进场／待命。
-	 * 只读复制结果，不驱动输入、动画或镜头；画面、Montage／FX 表现与真实设备不在本例范围。
+	 * 原生 PlayerInput 驱动按键，读取两端行为；可选取证只观察自然 Draw，不代替画面或真实设备验收。
 	 */
 	class FListenServerSwitchCommand : public IAutomationLatentCommand
 	{
@@ -858,7 +952,7 @@ namespace GGYGOSquadSwitchNetTests
 
 		virtual ~FListenServerSwitchCommand() override
 		{
-			FGameModeEvents::GameModePostLoginEvent.Remove(PostLoginHandle);
+			ReleaseScenarioObservers();
 			if (Stage != EStage::Done)
 			{
 				Fail(TEXT("automation aborted before owned PIE cleanup"));
@@ -892,11 +986,14 @@ namespace GGYGOSquadSwitchNetTests
 			case EStage::HealthPoise: ObserveHealthPoise(); break;
 			case EStage::RebindPress: ObserveRebindPress(); break;
 			case EStage::Rebound: ObserveRebound(); break;
+			case EStage::ReboundMovePress: ObserveReboundMovePress(); break;
+			case EStage::ReboundMoved: ObserveReboundMoved(); break;
 			case EStage::Moved: ObserveMoved(); break;
 			case EStage::MovePress: ObserveMovePress(); break;
 			case EStage::Attacked: ObserveAttacked(); break;
 			case EStage::HostSwitched: ObserveHostSwitched(); break;
 			case EStage::Death: ObserveDeath(); break;
+			case EStage::Settle: ObserveSettle(); break;
 			default: break;
 			}
 			return false;
@@ -904,7 +1001,7 @@ namespace GGYGOSquadSwitchNetTests
 
 	private:
 		enum class EStage : uint8 { Start, Ready, Lingering, Returned, Released, Rebenched, HealthDamage, HealthMaxDrop, HealthPoise,
-			RebindPress, Rebound, Attacked, HostSwitched, Death, MovePress, Moved, Ending, Done };
+			RebindPress, Rebound, ReboundMovePress, ReboundMoved, Attacked, HostSwitched, Death, Settle, MovePress, Moved, Ending, Done };
 
 		/** 一侧（服务器或客户端）上的同一名玩家与其编队。 */
 		struct FSide
@@ -941,31 +1038,31 @@ namespace GGYGOSquadSwitchNetTests
 			return bCondition;
 		}
 
-		/**
-		 * 经指定 Controller 的 PlayerInput 发出真实按键，走 Controller 的 IMC 与换人绑定；
-		 * 默认键位 Z 上一个、C 下一个。下一次 Update 抬起。
-		 */
-		void PressKey(APlayerController* Controller, const FKey& Key, double HoldSeconds = 0.0)
+		static bool SendKey(APlayerController* Controller, const FKey& Key, EInputEvent Event, float Amount)
 		{
 			UPlayerInput* Input = Controller ? Controller->PlayerInput.Get() : nullptr;
-			if (!Input) { Fail(TEXT("Controller has no PlayerInput")); return; }
-			Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), Key, IE_Pressed,
-				1.0f, false, FPlatformTime::Cycles64()));
+			if (!Input) { return false; }
+			Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), Key, Event,
+				Amount, false, FPlatformTime::Cycles64()));
+			return true;
+		}
+
+		/** 经原生 PlayerInput 按键，随后按原测试时序释放。 */
+		void PressKey(APlayerController* Controller, const FKey& Key, double HoldSeconds = 0.0)
+		{
+			if (!SendKey(Controller, Key, IE_Pressed, 1.0f)) { Fail(TEXT("Controller has no PlayerInput")); return; }
 			HeldKeyController = Controller;
 			HeldKey = Key;
 			HeldKeyFrame = GFrameCounter;
 			HeldKeyReleaseSeconds = FPlatformTime::Seconds() + HoldSeconds;
 		}
 
-		void ReleaseHeldKey()
+		void ReleaseHeldKey(bool bForce = false)
 		{
-			if (!HeldKey.IsValid() || GFrameCounter == HeldKeyFrame || FPlatformTime::Seconds() < HeldKeyReleaseSeconds) { return; }
-			if (UPlayerInput* Input = HeldKeyController.IsValid() ? HeldKeyController->PlayerInput.Get() : nullptr)
-			{
-				Input->InputKey(FInputKeyEventArgs(nullptr, FInputDeviceId::CreateFromInternalId(0), HeldKey, IE_Released,
-					0.0f, false, FPlatformTime::Cycles64()));
-			}
+			if (!HeldKey.IsValid() || (!bForce && (GFrameCounter == HeldKeyFrame || FPlatformTime::Seconds() < HeldKeyReleaseSeconds))) { return; }
+			SendKey(HeldKeyController.Get(), HeldKey, IE_Released, 0.0f);
 			HeldKey = FKey();
+			HeldKeyController.Reset();
 		}
 
 		/**
@@ -977,13 +1074,17 @@ namespace GGYGOSquadSwitchNetTests
 			FString Directory;
 			if (!FParse::Value(FCommandLine::Get(), TEXT("GGYGOCaptureDir="), Directory) || !FApp::CanEverRender() || !Client.World) { return; }
 			UGameViewportClient* ViewportClient = Client.World->GetGameViewport();
-			FViewport* Viewport = ViewportClient ? ViewportClient->Viewport : nullptr;
+			WriteClientCapture(ViewportClient ? ViewportClient->Viewport : nullptr, Directory, Name);
+		}
+
+		bool WriteClientCapture(FViewport* Viewport, const FString& Directory, const TCHAR* Name)
+		{
 			TArray<FColor> Pixels;
 			const FIntPoint Size = Viewport ? Viewport->GetSizeXY() : FIntPoint::ZeroValue;
 			if (!Viewport || Size.X <= 0 || Size.Y <= 0 || !Viewport->ReadPixels(Pixels) || Pixels.Num() != Size.X * Size.Y)
 			{
 				Test.AddWarning(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] capture %s: client viewport pixels unavailable."), Name));
-				return;
+				return false;
 			}
 			for (FColor& Pixel : Pixels) { Pixel.A = 255; }
 			TArray64<uint8> Png;
@@ -992,7 +1093,44 @@ namespace GGYGOSquadSwitchNetTests
 			if (FFileHelper::SaveArrayToFile(Png, *Path))
 			{
 				Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] capture %s -> %s (%dx%d)"), Name, *Path, Size.X, Size.Y));
+				return true;
 			}
+			Test.AddWarning(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] capture %s: could not save %s."), Name, *Path));
+			return false;
+		}
+
+		void ObserveClientDyingDraw()
+		{
+			bDyingCaptureRequested = FApp::CanEverRender()
+				&& FParse::Value(FCommandLine::Get(), TEXT("GGYGOCaptureDir="), DyingCaptureDirectory);
+			if (!bDyingCaptureRequested) { return; }
+			UGameViewportClient* ViewportClient = Client.World->GetGameViewport();
+			APawn* Avatar = Client.Avatar(0);
+			const UGameInstance* Instance = Client.World->GetGameInstance();
+			if (!ViewportClient || !ViewportClient->Viewport || !Avatar || !Instance || Instance->GetLocalPlayers().Num() != 1
+				|| Instance->GetFirstGamePlayer() != Client.Controller->GetLocalPlayer() || !GEngine || !GEngine->ViewExtensions) { return; }
+			DyingView = FSceneViewExtensions::NewExtension<FDyingViewObserver>(ViewportClient, Client.Controller, Avatar);
+			DyingRenderedHandle = UGameViewportClient::OnViewportRendered().AddRaw(this, &FListenServerSwitchCommand::OnDyingViewportRendered);
+		}
+
+		void OnDyingViewportRendered(FViewport* Viewport)
+		{
+			if (Stage != EStage::Death || !DyingView.IsValid()) { return; }
+			const FString Evidence = DyingView->ConsumeRenderedSample(Viewport);
+			if (Evidence.IsEmpty()) { return; }
+			ReleaseDyingDrawObserver();
+			bCapturedDying = WriteClientCapture(Viewport, DyingCaptureDirectory, TEXT("05_member1_dying"));
+			Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] 05_member1_dying Saved=%d %s"), bCapturedDying, *Evidence));
+		}
+
+		void ReleaseDyingDrawObserver()
+		{
+			if (DyingRenderedHandle.IsValid())
+			{
+				UGameViewportClient::OnViewportRendered().Remove(DyingRenderedHandle);
+				DyingRenderedHandle.Reset();
+			}
+			DyingView.Reset();
 		}
 
 		/** 服务器世界里主机自己的本地 Controller 与编队。 */
@@ -1159,6 +1297,18 @@ namespace GGYGOSquadSwitchNetTests
 
 		void ObserveReady()
 		{
+			const AGameModeBase* Mode = Server.World->GetAuthGameMode();
+			const UClass* PlayerStateClass = Mode ? Mode->PlayerStateClass.Get() : nullptr;
+			const APlayerState* ServerPlayerState = Server.Controller->GetPlayerState<APlayerState>();
+			const APlayerState* ClientPlayerState = Client.Controller->GetPlayerState<APlayerState>();
+			if (!Require(Mode && Mode->GetClass()->GetPathName() == TEXT("/Game/BP/GamePlay/BP_GameMode.BP_GameMode_C")
+				&& PlayerStateClass && PlayerStateClass->GetPathName() == TEXT("/Game/BP/GamePlay/BP_PlayerState.BP_PlayerState_C")
+				&& ServerPlayerState && ServerPlayerState->GetClass() == PlayerStateClass
+				&& ClientPlayerState && ClientPlayerState->GetClass() == PlayerStateClass,
+				TEXT("production GameMode spawns the shared PlayerState class on authority and owning client")))
+			{
+				return;
+			}
 			if (!Require(RosterAssignments == 2, TEXT("test roster written for both players before assembly"))
 				|| !Require(Server.Squad->GetActiveSlot() == Server.Slot(0)
 					&& Server.Squad->GetMemberState(0) == EGGYGOSquadMemberState::Active
@@ -1180,6 +1330,7 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				Fail(TEXT("server could not activate the continuing fixture ability")); return;
 			}
+			InitialServerAvatar = Server.Avatar(0);
 			CaptureClientView(TEXT("01_ready_member1"));
 			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Ready: production assembly replicated; client requests switch to slot 1."));
 			Client.Squad->ServerRequestSwitchToSlot(1);
@@ -1416,7 +1567,65 @@ namespace GGYGOSquadSwitchNetTests
 			{
 				return;
 			}
-			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Rebound key works; client clicks attack on the re-possessed member."));
+			if (!IsRepossessedMemberControlled()) { return; }
+			if (!SendKey(Client.Controller, EKeys::W, IE_Released, 0.0f))
+			{
+				Fail(TEXT("re-possessed member has no native PlayerInput for W release"));
+				return;
+			}
+			UPlayerInput* Input = Client.Controller->PlayerInput.Get();
+			const FKeyState* W = Input ? Input->GetKeyState(EKeys::W) : nullptr;
+			if (!W || W->EventAccumulator[IE_Released].IsEmpty())
+			{
+				Fail(TEXT("native W release was not queued for the re-possessed member"));
+				return;
+			}
+			ReboundPlayerInput = Input;
+			ReboundReleaseFrame = GFrameCounter;
+			Advance(EStage::ReboundMovePress);
+		}
+
+		bool IsRepossessedMemberControlled()
+		{
+			return Require(InitialServerAvatar.IsValid() && Server.Avatar(0) == InitialServerAvatar.Get()
+				&& Server.Controller->GetPawn() == InitialServerAvatar.Get() && Server.Squad->GetActiveSlot() == Server.Slot(0)
+				&& IsClientControlling(0), TEXT("both sides still control the original re-possessed member"));
+		}
+
+		void ObserveReboundMovePress()
+		{
+			if (!IsRepossessedMemberControlled()) { return; }
+			const UPlayerInput* Input = Client.Controller->PlayerInput.Get();
+			const FKeyState* W = Input ? Input->GetKeyState(EKeys::W) : nullptr;
+			// 等原 PlayerInput 自然处理释放，避免释放和新按进入同一个输入批次。
+			if (!Require(GFrameCounter > ReboundReleaseFrame && Input == ReboundPlayerInput.Get()
+				&& W && W->EventAccumulator[IE_Released].IsEmpty() && !Input->IsPressed(EKeys::W),
+				TEXT("client: original PlayerInput consumed W release and sees W up on a later frame"))) { return; }
+			ReboundServerMoveStart = Server.Avatar(0)->GetActorLocation();
+			ReboundClientMoveStart = Client.Avatar(0)->GetActorLocation();
+			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Native W release sent; client holds a fresh W on the re-possessed first member."));
+			PressKey(Client.Controller, EKeys::W, 0.6);
+			Advance(EStage::ReboundMoved);
+		}
+
+		void ObserveReboundMoved()
+		{
+			if (!IsRepossessedMemberControlled()) { return; }
+			const APawn* ServerAvatar = Server.Avatar(0);
+			const APawn* ClientAvatar = Client.Avatar(0);
+			const double ServerMoved = FVector::Dist2D(ServerAvatar->GetActorLocation(), ReboundServerMoveStart);
+			const double ClientMoved = FVector::Dist2D(ClientAvatar->GetActorLocation(), ReboundClientMoveStart);
+			if (!Require(!HeldKey.IsValid(), TEXT("client: re-possessed W released"))
+				|| !Require(ServerMoved > 30.0, TEXT("server: fresh W moved the re-possessed member more than 30 cm"))
+				|| !Require(ClientMoved > 30.0, TEXT("client: fresh W moved the re-possessed member more than 30 cm"))
+				|| !Require(FVector::Dist2D(ClientAvatar->GetActorLocation(), ServerAvatar->GetActorLocation()) < 50.0,
+					TEXT("client: re-possessed position agrees with the server within 50 cm"))
+				|| !Require(ServerAvatar->GetVelocity().Size2D() < 1.0, TEXT("server: re-possessed member stops after release")))
+			{
+				return;
+			}
+			Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] Re-possessed move: server %.1f cm, client %.1f cm; client clicks attack."),
+				ServerMoved, ClientMoved));
 			// 只看服务器是否收到并激活了 Attack.Light 能力：NullRHI 下它的必需 FX 会失败并立即结束能力。
 			if (UGGYGOAbilitySystemComponent* ASC = Server.ASC(0))
 			{
@@ -1489,8 +1698,8 @@ namespace GGYGOSquadSwitchNetTests
 			}
 			// 死亡：服务器对客户端出战队员施加致死伤害；倒下动作播完后自动切到下一个存活队员。
 			DyingAvatar = Server.Avatar(0);
-			DeathStartedSeconds = FPlatformTime::Seconds();
 			CaptureClientView(TEXT("04_member1_before_death"));
+			ObserveClientDyingDraw();
 			Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Host key works; server kills the client's active member."));
 			if (!ApplyInstantMeta(UGGYGOHealthSet::GetDamageAttribute(), 1.0e6f, 0)) { return; }
 			Advance(EStage::Death, 30.0);
@@ -1498,11 +1707,6 @@ namespace GGYGOSquadSwitchNetTests
 
 		void ObserveDeath()
 		{
-			if (!bCapturedDying && FPlatformTime::Seconds() - DeathStartedSeconds > 1.5)
-			{
-				bCapturedDying = true;
-				CaptureClientView(TEXT("05_member1_dying"));
-			}
 			const UGGYGOHealthComponent* DeadHealth = DyingAvatar.IsValid() ? UGGYGOHealthComponent::FindHealthComponent(DyingAvatar.Get()) : nullptr;
 			if (!Require(!DyingAvatar.IsValid() || (DeadHealth && DeadHealth->GetDeathState() == EGGYGODeathState::DeathFinished),
 					TEXT("server: killed member finished its death"))
@@ -1514,8 +1718,91 @@ namespace GGYGOSquadSwitchNetTests
 				return;
 			}
 			CaptureClientView(TEXT("06_member2_after_death_switch"));
+			FString Directory;
+			if (!FApp::CanEverRender() || !FParse::Value(FCommandLine::Get(), TEXT("GGYGOCaptureDir="), Directory))
+			{
+				bPassed = true;
+				BeginEnding();
+				return;
+			}
+			// 真实 RHI 取证：换人瞬间的画面含视角跳变，另取稳定帧并关运动模糊对照，区分拖影来源与阴影本身。
+			SettleCameraLocation.Reset();
+			SettleStableFrames = 0;
+			SettleCapturedFrame = 0;
+			Advance(EStage::Settle, 15.0);
+		}
+
+		/** 记录客户端出战角色私有 MID 的同帧阴影投影参数，供与单机基准人工比对。 */
+		FString DescribeShadowInputs(const APawn* Avatar) const
+		{
+			const ACharacter* Character = Cast<ACharacter>(Avatar);
+			const USkeletalMeshComponent* Mesh = Character ? Character->GetMesh() : nullptr;
+			if (!Mesh) { return TEXT("Mesh=missing"); }
+			FString Text = FString::Printf(TEXT("Mesh=%s BoundsScale=%.2f BoundsRadius=%.2f"),
+				*Mesh->GetPathName(), Mesh->BoundsScale, Mesh->Bounds.SphereRadius);
+			for (int32 Index = 0; Index < Mesh->GetNumMaterials(); ++Index)
+			{
+				const UMaterialInstanceDynamic* Material = Cast<UMaterialInstanceDynamic>(Mesh->GetMaterial(Index));
+				if (!Material) { continue; }
+				const auto Scalar = [Material](const TCHAR* Name)
+				{
+					float Value = -1.0f;
+					Material->GetScalarParameterValue(FHashedMaterialParameterInfo(Name), Value);
+					return Value;
+				};
+				FLinearColor Forward, Origin;
+				Material->GetVectorParameterValue(FHashedMaterialParameterInfo(TEXT("ShadowForward")), Forward);
+				Material->GetVectorParameterValue(FHashedMaterialParameterInfo(TEXT("ShadowOrigin0")), Origin);
+				Text += FString::Printf(TEXT(" | Slot%d Use=%.0f Strength=%.3f ObjectWidth=%.2f Forward=(%.4f,%.4f,%.4f) LocalOrigin0=(%.1f,%.1f,%.1f)"),
+					Index, Scalar(TEXT("UseCharacterShadowCaptures")), Scalar(TEXT("ShadowStrength")),
+					Scalar(TEXT("ShadowObjectWidth")), Forward.R, Forward.G, Forward.B, Origin.R, Origin.G, Origin.B);
+			}
+			return Text;
+		}
+
+		void ObserveSettle()
+		{
+			if (!Require(Server.Squad->GetActiveSlot() == Server.Slot(1) && IsClientControlling(1),
+					TEXT("client: still controls the replacing member while settling")))
+			{
+				return;
+			}
+			const APlayerCameraManager* Camera = Client.Controller->PlayerCameraManager;
+			if (!Camera) { Fail(TEXT("client camera manager missing while settling")); return; }
+			const FVector Location = Camera->GetCameraLocation();
+			SettleStableFrames = SettleCameraLocation.IsSet() && FVector::Dist(*SettleCameraLocation, Location) < 0.1 ? SettleStableFrames + 1 : 0;
+			SettleCameraLocation = Location;
+			if (SettleCapturedFrame == 0)
+			{
+				if (!Require(FPlatformTime::Seconds() - StageEnteredSeconds > 1.5 && SettleStableFrames >= 10,
+						TEXT("client: camera unchanged for 10 frames at least 1.5 s after the death switch"))) { return; }
+				CaptureClientView(TEXT("07_member2_settled"));
+				Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] 07_member2_settled Frame=%llu POV=%s %s"),
+					GFrameCounter, *Location.ToString(), *DescribeShadowInputs(Client.Avatar(1))));
+				IConsoleVariable* MotionBlur = IConsoleManager::Get().FindConsoleVariable(TEXT("r.MotionBlurQuality"));
+				if (!MotionBlur) { Fail(TEXT("r.MotionBlurQuality is not registered")); return; }
+				SavedMotionBlurQuality = MotionBlur->GetInt();
+				MotionBlur->Set(0, ECVF_SetByConsole);
+				SettleCapturedFrame = GFrameCounter;
+				return;
+			}
+			if (!Require(GFrameCounter >= SettleCapturedFrame + 10, TEXT("client: motion blur off for 10 frames"))) { return; }
+			CaptureClientView(TEXT("08_member2_settled_motionblur_off"));
+			Test.AddInfo(FString::Printf(TEXT("[Teams.SquadSwitch.ListenServer] 08_member2_settled_motionblur_off Frame=%llu POV=%s %s"),
+				GFrameCounter, *Location.ToString(), *DescribeShadowInputs(Client.Avatar(1))));
+			RestoreMotionBlur();
 			bPassed = true;
 			BeginEnding();
+		}
+
+		void RestoreMotionBlur()
+		{
+			if (!SavedMotionBlurQuality.IsSet()) { return; }
+			if (IConsoleVariable* MotionBlur = IConsoleManager::Get().FindConsoleVariable(TEXT("r.MotionBlurQuality")))
+			{
+				MotionBlur->Set(*SavedMotionBlurQuality, ECVF_SetByConsole);
+			}
+			SavedMotionBlurQuality.Reset();
 		}
 
 		void EndOwnedPIE(bool bSynchronous)
@@ -1543,13 +1830,30 @@ namespace GGYGOSquadSwitchNetTests
 			AttackObservedASC.Reset();
 		}
 
-		void BeginEnding()
+		void ReleaseScenarioObservers()
 		{
+			RestoreMotionBlur();
+			ReleaseDyingDrawObserver();
+			ReleaseHeldKey(true);
+			if (PostLoginHandle.IsValid())
+			{
+				FGameModeEvents::GameModePostLoginEvent.Remove(PostLoginHandle);
+				PostLoginHandle.Reset();
+			}
 			ReleaseAttackObserver();
-			Stage = EStage::Ending;
 			LingerAbility.Reset();
 			if (ServerObserver.IsValid()) { ServerObserver->Release(); }
 			if (ClientObserver.IsValid()) { ClientObserver->Release(); }
+		}
+
+		void BeginEnding()
+		{
+			Stage = EStage::Ending;
+			ReleaseScenarioObservers();
+			if (bDyingCaptureRequested && !bCapturedDying)
+			{
+				Test.AddWarning(TEXT("[Teams.SquadSwitch.ListenServer] 05_member1_dying unavailable: no saved capture from a matching client Dying draw."));
+			}
 			Deadline = FPlatformTime::Seconds() + 15.0;
 			// 无人值守的 -Cmd 会话中排队的 RequestEndPlayMap 不会在本命令等待期间处理；在 latent 更新里同步结束。
 			EndOwnedPIE(true);
@@ -1566,7 +1870,7 @@ namespace GGYGOSquadSwitchNetTests
 			Test.TestTrue(TEXT("listen-server smoke released its PIE session"), !OwnsPIESession() && CountPIEWorlds() == 0);
 			if (bPassed && !bFailed)
 			{
-				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC and Z/C key switches, cooldown waits, rebinding, client move and attack, host key, ")
+				Test.AddInfo(TEXT("[Teams.SquadSwitch.ListenServer] Behavior PASS: client RPC and Z/C key switches, cooldown waits, rebinding, client first and re-possessed move, attack, host key, ")
 					TEXT("death auto-switch, linger/return/bench replication, ")
 					TEXT("damage/MaxHealth drop/poise break replication with HealthComponent broadcasts, and PIE teardown observed. ")
 					TEXT("Production errors logged by other modules stay unfiltered and decide the Automation result."));
@@ -1587,16 +1891,28 @@ namespace GGYGOSquadSwitchNetTests
 		double HeldKeyReleaseSeconds = 0.0;
 		double StageEnteredSeconds = 0.0;
 		FVector MoveStartLocation = FVector::ZeroVector;
+		TWeakObjectPtr<APawn> InitialServerAvatar;
+		TWeakObjectPtr<UPlayerInput> ReboundPlayerInput;
+		uint64 ReboundReleaseFrame = 0;
+		FVector ReboundServerMoveStart = FVector::ZeroVector;
+		FVector ReboundClientMoveStart = FVector::ZeroVector;
 		int32 RosterAssignments = 0;
 		FDelegateHandle PostLoginHandle;
 		TStrongObjectPtr<ULevelEditorPlaySettings> RequestSettings;
 		TWeakObjectPtr<UGGYGOSquadSwitchTestAbility> LingerAbility;
 		TWeakObjectPtr<APawn> DyingAvatar;
-		double DeathStartedSeconds = 0.0;
+		TSharedPtr<FDyingViewObserver, ESPMode::ThreadSafe> DyingView;
+		FDelegateHandle DyingRenderedHandle;
+		FString DyingCaptureDirectory;
+		bool bDyingCaptureRequested = false;
 		TWeakObjectPtr<UGGYGOAbilitySystemComponent> AttackObservedASC;
 		FDelegateHandle AttackActivatedHandle;
 		bool bServerAttackActivated = false;
 		bool bCapturedDying = false;
+		TOptional<FVector> SettleCameraLocation;
+		int32 SettleStableFrames = 0;
+		uint64 SettleCapturedFrame = 0;
+		TOptional<int32> SavedMotionBlurQuality;
 		TWeakObjectPtr<UGGYGOHealthComponent> ServerHealth;
 		TWeakObjectPtr<UGGYGOHealthComponent> ClientHealth;
 		TStrongObjectPtr<UGGYGOSquadSwitchHealthObserver> ServerObserver;

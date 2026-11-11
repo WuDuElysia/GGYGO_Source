@@ -21,8 +21,13 @@
 #include "GGYGOPlayerController.generated.h"
 
 class APawn;
+class SWidget;
+class UGameViewportClient;
 class UEnhancedInputLocalPlayerSubsystem;
+class UEnhancedPlayerInput;
 class UGGYGOAbilitySystemComponent;
+class UGGYGOKeySettingsPage;
+class UGGYGOLocalPlayer;
 class UInputAction;
 class UInputComponent;
 class UInputMappingContext;
@@ -39,6 +44,7 @@ public:
 
 	/** Native creation only; rejection lasts for this Actor and never grants input qualification. */
 	virtual void InitInputSystem() override;
+	virtual void Destroyed() override;
 
 	/** 取当前操控角色的 ASC。未附身或角色没有 ASC 时返回 nullptr。 */
 	UFUNCTION(BlueprintPure, Category = "GGYGO|PlayerController")
@@ -97,7 +103,7 @@ public:
 	/**
 	 * 打开本地玩家的键盘改键界面：列出已登记 IMC 中可改键的映射，改动立即生效并存档
 	 * （Enhanced Input 用户设置）。打开期间输入只给界面。已打开时不重复创建。
-	 * 菜单入口尚未接入，现在经控制台 `GGYGOOpenKeySettings` 调用。
+	 * 使用生产 Controller 蓝图配置的共享页面，控制台 `GGYGOOpenKeySettings` 也走此入口。
 	 */
 	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
 	void OpenKeySettings();
@@ -141,9 +147,18 @@ protected:
 	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input")
 	TArray<TObjectPtr<const UInputMappingContext>> PlayerMappableInputMappings;
 
+	/** 由生产 Controller 蓝图选择共享改键页。 */
+	UPROPERTY(EditDefaultsOnly, Category = "GGYGO|Input")
+	TSubclassOf<UGGYGOKeySettingsPage> KeySettingsPageClass;
+
 private:
+	void ReleaseKeySettingsPage(bool bReturnToGame);
+	void HandleKeySettingsInputRemoving(UEnhancedPlayerInput* OriginalInput, TWeakObjectPtr<UGGYGOKeySettingsPage> OriginalPage);
 	/** 本地 Controller 的 InputComponent 建好后绑定换人键并注册 IMC；同一 InputComponent 只安装一次。 */
 	void InstallSquadSwitchInput();
+	/** 在原 LocalPlayer 退役或 Controller EndPlay 时归还本 Controller 的 IMC。 */
+	void ReleaseSquadSwitchMapping();
+	void HandleInputMappingsRemoving(UEnhancedPlayerInput* OriginalInput);
 	/** 把 PlayerMappableInputMappings 登记到本地玩家的用户设置；设置未启用时诊断一次，按默认键位运行。 */
 	void RegisterPlayerMappableInput();
 	void Input_SwitchToPreviousMember();
@@ -153,13 +168,26 @@ private:
 
 	/** 已绑定换人键的 InputComponent；InitInputSystem 可重复进入 SetupInputComponent。 */
 	TWeakObjectPtr<UInputComponent> SquadSwitchBoundComponent;
-	/** 本 Controller 自己注册的那一份 IMC，EndPlay 时归还。 */
-	TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> SquadSwitchMappingSubsystem;
-	TWeakObjectPtr<const UInputMappingContext> RegisteredSquadSwitchMapping;
+	/** AddMappingContext 对原 PlayerInput 的一份注册，随原 LocalPlayer 或本 Controller 退役。 */
+	struct FSquadSwitchMappingRegistration
+	{
+		TWeakObjectPtr<UGGYGOLocalPlayer> LocalPlayer;
+		TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> Subsystem;
+		TWeakObjectPtr<UEnhancedPlayerInput> PlayerInput;
+		TWeakObjectPtr<const UInputMappingContext> Mapping;
+		FDelegateHandle RemovalHandle;
+	};
+	FSquadSwitchMappingRegistration SquadSwitchMappingRegistration;
+	bool bEndingSquadSwitchInput = false;
 
-	/** 打开中的改键界面；它不持有 Controller，关闭或 EndPlay 时从视口移除。 */
-	TSharedPtr<class SGGYGOKeyBindingMenu> KeyBindingMenu;
-	TWeakObjectPtr<ULocalPlayer> KeyBindingMenuPlayer;
+	/** 原页面和它在原视口中的 Slate 根，只由 Controller 归还。 */
+	UPROPERTY(Transient)
+	TObjectPtr<UGGYGOKeySettingsPage> KeySettingsPage;
+	TSharedPtr<SWidget> KeySettingsRoot;
+	TWeakObjectPtr<UGGYGOLocalPlayer> KeySettingsPlayer;
+	TWeakObjectPtr<UGameViewportClient> KeySettingsViewport;
+	FDelegateHandle KeySettingsRemovalHandle;
+	bool bOpeningKeySettings = false;
 	bool bReportedUserSettingsUnavailable = false;
 
 	enum class ENativeInputInitializationStage : uint8 { Idle, Running, Rejected };

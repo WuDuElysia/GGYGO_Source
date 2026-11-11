@@ -200,14 +200,16 @@ namespace
 		Binding.Identity.Producer = Producer; Binding.Identity.Character = Character; Binding.Identity.Mesh = Mesh;
 		Binding.Identity.LifecycleGeneration = 1; Binding.Identity.ConfigurationGeneration = ++Producer->PublicationGeneration;
 		Binding.Status = EGGYGOLocomotionSourceStatus::Available;
-		const auto Source = [](const UGGYGOLocomotionMotionProfile* Profile, EGGYGOLocomotionMotionType Type, FName Key)
+		// 模拟独立动画资产。原发布和原生位移快照仍持有强引用，资产 Outer 不能反向保活夹具 World。
+		UPackage* AnimationPackage = GetTransientPackage();
+		const auto Source = [AnimationPackage](const UGGYGOLocomotionMotionProfile* Profile, EGGYGOLocomotionMotionType Type, FName Key)
 		{
 			FGGYGOLocomotionSequenceSource Result;
 			Result.MotionType = Type; Result.RouteKey = Key;
 			if (Profile)
 			{
 				// Preserve the original strict fixture values/tangents; only adapt their public evaluation boundary.
-				UGGYGOLocomotionTestSequence* Sequence = NewObject<UGGYGOLocomotionTestSequence>(const_cast<UGGYGOLocomotionMotionProfile*>(Profile));
+				UGGYGOLocomotionTestSequence* Sequence = NewObject<UGGYGOLocomotionTestSequence>(AnimationPackage, NAME_None, RF_Transient);
 				Sequence->TestLength = Profile->Duration; Sequence->RateScale = 1.0f;
 				Sequence->TestCurves.Add(TEXT("RootMotion_Speed"), *Profile->SpeedCurve.GetRichCurveConst());
 				Sequence->TestCurves.Add(TEXT("RootMotion_DirX"), *Profile->DirectionXCurve.GetRichCurveConst());
@@ -230,7 +232,7 @@ namespace
 		Walk.SampleIndex = 0; Walk.SampleRateScale = 1.0f;
 		Run.SampleIndex = 1; Run.SampleRateScale = 1.0f; Run.SampleValue = FVector(1.0, 0.0, 0.0);
 		FString FixtureError;
-		UBlendSpace1D* BS = MakeGGYGOLocomotionTestBlendSpace(Character, Walk.Source.Sequence.Get(), Run.Source.Sequence.Get(), FixtureError);
+		UBlendSpace1D* BS = MakeGGYGOLocomotionTestBlendSpace(AnimationPackage, Walk.Source.Sequence.Get(), Run.Source.Sequence.Get(), FixtureError);
 		if (!BS)
 		{
 			if (OutError) *OutError = FixtureError;

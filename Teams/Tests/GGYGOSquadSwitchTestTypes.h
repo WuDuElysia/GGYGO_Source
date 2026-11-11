@@ -6,7 +6,9 @@
 
 #include "GGYGOSquadSwitchTestTypes.generated.h"
 
+class AGGYGOCharacterSlot;
 class UGGYGOHealthComponent;
+class UGGYGOSquadComponent;
 class UGGYGOInputComponent;
 class UGGYGOInputTestHeroComponent;
 
@@ -27,6 +29,13 @@ public:
 	TWeakObjectPtr<AGGYGOCharacterBase> LastActiveCharacter;
 	UFUNCTION()
 	void ObserveActiveCharacterForTest(AGGYGOCharacterBase* NewCharacter);
+
+	/** 私有世界的测试策略接线，不用于生产联机用例。 */
+	TWeakObjectPtr<UGGYGOSquadComponent> DeathPolicySquadForTest;
+	int32 DeathPolicyCallsForTest = 0;
+	bool bDeathPolicyResultForTest = false;
+	UFUNCTION()
+	void RequestDeathReplacementForTest(AGGYGOCharacterSlot* OriginalSlot, APawn* OriginalAvatar);
 
 protected:
 	virtual UInputComponent* CreatePlayerInputComponent() override;

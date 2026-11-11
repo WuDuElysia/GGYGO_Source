@@ -1,47 +1,126 @@
 /**
  * @file GGYGOKeyBindingMenu.h
- * @brief 键盘改键界面（Slate）：读写 Enhanced Input 用户设置里的玩家键位
+ * @brief 共享 UMG 改键页使用的原设置事务和真实选键控件。
  */
 #pragma once
 
-#include "Widgets/SCompoundWidget.h"
+#include "Blueprint/UserWidget.h"
+#include "Components/Widget.h"
+#include "GameplayTagContainer.h"
+#include "InputCoreTypes.h"
 
-class SVerticalBox;
-class STextBlock;
+#include "GGYGOKeyBindingMenu.generated.h"
+
 class UEnhancedInputUserSettings;
+class UGGYGOKeyBindingSelector;
+class UGGYGOPlayerInput;
 struct FInputChord;
+struct FKeyEvent;
 
-/**
- * 改键界面。行来自当前键位档案里已登记的可改键映射（GetPlayerMappingRows），只改第一槽位。
- *
- * 选中新键：已被别的映射占用时拒绝并提示，否则 MapPlayerKey，随后 ApplySettings 让映射重建、
- * AsyncSaveSettings 存档。恢复默认对当前档案执行 ResetKeyProfileToDefault。
- * 界面只持有用户设置的弱引用；关闭由所有者（PlayerController）经 OnCloseRequested 执行。
- */
-class GGYGO_API SGGYGOKeyBindingMenu : public SCompoundWidget
+UENUM(BlueprintType)
+enum class EGGYGOKeyBindingResult : uint8
 {
+	Unavailable,
+	Applied,
+	Conflict,
+	Rejected
+};
+
+USTRUCT(BlueprintType)
+struct FGGYGOKeyBindingRow
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FName MappingName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FText Category;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FText DisplayName;
+};
+
+USTRUCT(BlueprintType)
+struct FGGYGOKeyBindingResult
+{
+	GENERATED_BODY()
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	EGGYGOKeyBindingResult Status = EGGYGOKeyBindingResult::Unavailable;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FKey Key;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FText ConflictingDisplayName;
+
+	UPROPERTY(BlueprintReadOnly, Category = "GGYGO|Input")
+	FGameplayTagContainer Failure;
+};
+
+UCLASS(Abstract, Blueprintable)
+class GGYGO_API UGGYGOKeySettingsPage : public UUserWidget
+{
+	GENERATED_BODY()
+
 public:
-	SLATE_BEGIN_ARGS(SGGYGOKeyBindingMenu) {}
-		SLATE_ARGUMENT(TWeakObjectPtr<UEnhancedInputUserSettings>, Settings)
-		SLATE_EVENT(FSimpleDelegate, OnCloseRequested)
-	SLATE_END_ARGS()
+	/** Controller 在构造页面的 Slate 根之前注入原输入上下文。 */
+	void InitializeBindingContext(UEnhancedInputUserSettings& Settings, UGGYGOPlayerInput& PlayerInput,
+		FSimpleDelegate CloseRequested);
+	bool BeginBindingObservation(const TSharedRef<SWidget>& OriginalRoot);
+	UGGYGOPlayerInput* GetOriginalPlayerInput() const;
+	bool PrepareReturnToGame(const SWidget& OriginalRoot);
+	void ReleaseBindingContext();
 
-	void Construct(const FArguments& InArgs);
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	bool ReadKeyBindingRows(TArray<FGGYGOKeyBindingRow>& Rows) const;
 
-	virtual bool SupportsKeyboardFocus() const override { return true; }
-	virtual FReply OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent) override;
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	FGGYGOKeyBindingResult ResetKeyBindings();
+
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	void RequestKeySettingsClose();
+
+protected:
+	UFUNCTION(BlueprintImplementableEvent, Category = "GGYGO|Input")
+	void OnKeyBindingResult(const FGGYGOKeyBindingResult& Result);
 
 private:
-	void RebuildRows();
-	FInputChord GetCurrentChord(FName MappingName) const;
-	void HandleKeySelected(const FInputChord& Chord, FName MappingName);
-	FReply HandleResetClicked();
-	FReply HandleCloseClicked();
-	/** 应用到映射并存档；改键与恢复默认共用。 */
-	void ApplyAndSave(UEnhancedInputUserSettings* Settings);
+	friend class UGGYGOKeyBindingSelector;
 
-	TWeakObjectPtr<UEnhancedInputUserSettings> WeakSettings;
+	UEnhancedInputUserSettings* FindOriginalSettings() const;
+	FInputChord ReadCurrentChord(FName MappingName) const;
+	void CommitNativeSelection(FName MappingName, const FInputChord& Chord, const FKeyEvent* KeyUp);
+
+	// 只借用打开本页时的原设置和原输入对象，关页时撤销访问。
+	TWeakObjectPtr<UEnhancedInputUserSettings> OriginalSettings;
+	TWeakObjectPtr<UGGYGOPlayerInput> OriginalPlayerInput;
 	FSimpleDelegate OnCloseRequested;
-	TSharedPtr<SVerticalBox> RowBox;
-	TSharedPtr<STextBlock> StatusText;
+};
+
+UCLASS()
+class GGYGO_API UGGYGOKeyBindingSelector : public UWidget
+{
+	GENERATED_BODY()
+
+public:
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Input")
+	void BindKeyBindingRow(UGGYGOKeySettingsPage* Page, FName MappingName);
+
+protected:
+	virtual TSharedRef<SWidget> RebuildWidget() override;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = Appearance)
+	FText KeySelectionText;
+
+	UPROPERTY(EditAnywhere, BlueprintReadOnly, Category = Appearance)
+	FText NoKeySpecifiedText;
+
+private:
+	FInputChord ReadCurrentChord() const;
+	void HandleNativeSelection(const FInputChord& Chord, const FKeyEvent* KeyUp);
+
+	TWeakObjectPtr<UGGYGOKeySettingsPage> BindingPage;
+	FName BoundMappingName;
 };

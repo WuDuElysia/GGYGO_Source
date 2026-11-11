@@ -1,26 +1,69 @@
 /**
  * @file GGYGOKeyBindingMenu.cpp
- * @brief 键盘改键界面实现
+ * @brief 原用户设置事务和 Slate 真实选键转接。
  */
 #include "Input/GGYGOKeyBindingMenu.h"
 
 #include "AbilitySystem/GGYGOAbilitySystemLog.h"
+#include "EnhancedInputSubsystems.h"
 #include "Framework/Commands/InputChord.h"
-#include "GameplayTagContainer.h"
-#include "Styling/CoreStyle.h"
+#include "GameFramework/PlayerController.h"
+#include "Input/Events.h"
+#include "Input/GGYGOPlayerInput.h"
+#include "Player/GGYGOLocalPlayer.h"
 #include "UserSettings/EnhancedInputUserSettings.h"
-#include "Widgets/Input/SButton.h"
 #include "Widgets/Input/SInputKeySelector.h"
-#include "Widgets/Layout/SBorder.h"
-#include "Widgets/Layout/SBox.h"
-#include "Widgets/Layout/SScrollBox.h"
-#include "Widgets/SBoxPanel.h"
-#include "Widgets/Text/STextBlock.h"
 
-#define LOCTEXT_NAMESPACE "GGYGOKeyBindingMenu"
+#include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOKeyBindingMenu)
 
 namespace
 {
+	DECLARE_DELEGATE_TwoParams(FOnBindingKeySelected, const FInputChord&, const FKeyEvent*);
+
+	/** 保留 SInputKeySelector 同栈消费的实际 KeyUp，供改键成功后登记原释放。 */
+	class SGGYGOKeySelector final : public SInputKeySelector
+	{
+	public:
+		SLATE_BEGIN_ARGS(SGGYGOKeySelector) {}
+			SLATE_ATTRIBUTE(FInputChord, SelectedKey)
+			SLATE_ARGUMENT(FText, KeySelectionText)
+			SLATE_ARGUMENT(FText, NoKeySpecifiedText)
+			SLATE_EVENT(FOnBindingKeySelected, OnKeySelected)
+		SLATE_END_ARGS()
+
+		void Construct(const FArguments& InArgs)
+		{
+			OnBindingKeySelected = InArgs._OnKeySelected;
+			SInputKeySelector::FArguments Args;
+			Args
+				.SelectedKey(InArgs._SelectedKey)
+				.OnKeySelected(this, &SGGYGOKeySelector::ForwardSelection)
+				.AllowModifierKeys(false)
+				.AllowGamepadKeys(false)
+				.EscapeCancelsSelection(true);
+			if (!InArgs._KeySelectionText.IsEmpty()) { Args.KeySelectionText(InArgs._KeySelectionText); }
+			if (!InArgs._NoKeySpecifiedText.IsEmpty()) { Args.NoKeySpecifiedText(InArgs._NoKeySpecifiedText); }
+			SInputKeySelector::Construct(Args);
+		}
+
+		virtual FReply OnKeyUp(const FGeometry& Geometry, const FKeyEvent& Event) override
+		{
+			TGuardValue<const FKeyEvent*> OriginalKeyUp(SelectionKeyUp, &Event);
+			return SInputKeySelector::OnKeyUp(Geometry, Event);
+		}
+
+	private:
+		void ForwardSelection(const FInputChord& Chord)
+		{
+			// 鼠标按下选键照常改键，只在原键盘 KeyUp 同栈选择相同键时传递释放。
+			const FKeyEvent* KeyUp = SelectionKeyUp && SelectionKeyUp->GetKey() == Chord.Key ? SelectionKeyUp : nullptr;
+			OnBindingKeySelected.ExecuteIfBound(Chord, KeyUp);
+		}
+
+		FOnBindingKeySelected OnBindingKeySelected;
+		const FKeyEvent* SelectionKeyUp = nullptr;
+	};
+
 	const FPlayerKeyMapping* FindFirstSlotMapping(const FKeyMappingRow& Row)
 	{
 		for (const FPlayerKeyMapping& Mapping : Row.Mappings)
@@ -29,206 +72,216 @@ namespace
 		}
 		return nullptr;
 	}
+
+	void ApplyAndSave(UEnhancedInputUserSettings& Settings)
+	{
+		const TWeakObjectPtr<UEnhancedInputUserSettings> Original(&Settings);
+		Settings.ApplySettings();
+		if (UEnhancedInputUserSettings* StillOriginal = Original.Get()) { StillOriginal->AsyncSaveSettings(); }
+	}
 }
 
-void SGGYGOKeyBindingMenu::Construct(const FArguments& InArgs)
+void UGGYGOKeySettingsPage::InitializeBindingContext(UEnhancedInputUserSettings& Settings,
+	UGGYGOPlayerInput& PlayerInput, FSimpleDelegate CloseRequested)
 {
-	WeakSettings = InArgs._Settings;
-	OnCloseRequested = InArgs._OnCloseRequested;
-
-	ChildSlot
-	.HAlign(HAlign_Center)
-	.VAlign(VAlign_Center)
-	[
-		SNew(SBorder)
-		.BorderImage(FCoreStyle::Get().GetBrush("GenericWhiteBox"))
-		.BorderBackgroundColor(FLinearColor(0.02f, 0.02f, 0.03f, 0.9f))
-		.Padding(24.0f)
-		[
-			SNew(SBox)
-			.WidthOverride(560.0f)
-			.MaxDesiredHeight(640.0f)
-			[
-				SNew(SVerticalBox)
-				+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 0.0f, 0.0f, 12.0f)
-				[
-					SNew(STextBlock)
-					.Text(LOCTEXT("Title", "按键设置"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Bold", 20))
-				]
-				+ SVerticalBox::Slot().FillHeight(1.0f)
-				[
-					SNew(SScrollBox)
-					+ SScrollBox::Slot()
-					[
-						SAssignNew(RowBox, SVerticalBox)
-					]
-				]
-				+ SVerticalBox::Slot().AutoHeight().Padding(0.0f, 12.0f, 0.0f, 0.0f)
-				[
-					SAssignNew(StatusText, STextBlock)
-					.Text(LOCTEXT("Hint", "点击按键后按下新键；Esc 取消选择。"))
-					.Font(FCoreStyle::GetDefaultFontStyle("Regular", 11))
-				]
-				+ SVerticalBox::Slot().AutoHeight().HAlign(HAlign_Right).Padding(0.0f, 12.0f, 0.0f, 0.0f)
-				[
-					SNew(SHorizontalBox)
-					+ SHorizontalBox::Slot().AutoWidth().Padding(0.0f, 0.0f, 8.0f, 0.0f)
-					[
-						SNew(SButton)
-						.Text(LOCTEXT("Reset", "恢复默认"))
-						.OnClicked(this, &SGGYGOKeyBindingMenu::HandleResetClicked)
-					]
-					+ SHorizontalBox::Slot().AutoWidth()
-					[
-						SNew(SButton)
-						.Text(LOCTEXT("Close", "关闭"))
-						.OnClicked(this, &SGGYGOKeyBindingMenu::HandleCloseClicked)
-					]
-				]
-			]
-		]
-	];
-	RebuildRows();
+	OriginalSettings = &Settings;
+	OriginalPlayerInput = &PlayerInput;
+	OnCloseRequested = MoveTemp(CloseRequested);
 }
 
-void SGGYGOKeyBindingMenu::RebuildRows()
+bool UGGYGOKeySettingsPage::BeginBindingObservation(const TSharedRef<SWidget>& OriginalRoot)
 {
-	RowBox->ClearChildren();
-	const UEnhancedInputUserSettings* Settings = WeakSettings.Get();
-	const UEnhancedPlayerMappableKeyProfile* Profile = Settings ? Settings->GetCurrentKeyProfile() : nullptr;
+	UEnhancedInputUserSettings* Settings = FindOriginalSettings();
+	if (!Settings)
+	{
+		return false;
+	}
+	OriginalPlayerInput->BeginKeyBindingMenuObservation(*Settings, OriginalRoot);
+	return true;
+}
+
+UGGYGOPlayerInput* UGGYGOKeySettingsPage::GetOriginalPlayerInput() const
+{
+	return OriginalPlayerInput.Get();
+}
+
+bool UGGYGOKeySettingsPage::PrepareReturnToGame(const SWidget& OriginalRoot)
+{
+	UEnhancedInputUserSettings* Settings = FindOriginalSettings();
+	if (!Settings)
+	{
+		return false;
+	}
+	OriginalPlayerInput->BeginKeyBindingMenuClose(*Settings, OriginalRoot);
+	return true;
+}
+
+void UGGYGOKeySettingsPage::ReleaseBindingContext()
+{
+	OnCloseRequested.Unbind();
+	OriginalSettings.Reset();
+	OriginalPlayerInput.Reset();
+}
+
+UEnhancedInputUserSettings* UGGYGOKeySettingsPage::FindOriginalSettings() const
+{
+	UEnhancedInputUserSettings* Settings = OriginalSettings.Get();
+	const UGGYGOPlayerInput* Input = OriginalPlayerInput.Get();
+	const UGGYGOLocalPlayer* LocalPlayer = GetOwningLocalPlayer<UGGYGOLocalPlayer>();
+	const APlayerController* Controller = GetOwningPlayer();
+	if (!Settings || !Input || !LocalPlayer || LocalPlayer->IsInputMappingRemovalStarted()
+		|| Settings->GetLocalPlayer() != LocalPlayer || !IsValid(Controller) || Controller->IsActorBeingDestroyed()
+		|| LocalPlayer->PlayerController != Controller || Controller->PlayerInput != Input)
+	{
+		return nullptr;
+	}
+	const UEnhancedInputLocalPlayerSubsystem* Subsystem = LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>();
+	return Subsystem && Subsystem->GetUserSettings() == Settings && Subsystem->GetPlayerInput() == Input ? Settings : nullptr;
+}
+
+bool UGGYGOKeySettingsPage::ReadKeyBindingRows(TArray<FGGYGOKeyBindingRow>& Rows) const
+{
+	Rows.Reset();
+	const UEnhancedInputUserSettings* Settings = FindOriginalSettings();
+	const UEnhancedPlayerMappableKeyProfile* Profile = Settings ? Settings->GetActiveKeyProfile() : nullptr;
 	if (!Profile)
 	{
-		StatusText->SetText(LOCTEXT("NoProfile", "没有可用的键位档案，无法改键。"));
-		return;
+		return false;
 	}
-
-	struct FRowView { FName MappingName; FText Category; FText DisplayName; };
-	TArray<FRowView> Views;
 	for (const TPair<FName, FKeyMappingRow>& Pair : Profile->GetPlayerMappingRows())
 	{
 		if (const FPlayerKeyMapping* Mapping = FindFirstSlotMapping(Pair.Value))
 		{
-			Views.Add({ Pair.Key, Mapping->GetDisplayCategory(), Mapping->GetDisplayName() });
+			FGGYGOKeyBindingRow& Row = Rows.AddDefaulted_GetRef();
+			Row.MappingName = Pair.Key;
+			Row.Category = Mapping->GetDisplayCategory();
+			Row.DisplayName = Mapping->GetDisplayName();
 		}
 	}
-	Views.Sort([](const FRowView& A, const FRowView& B)
+	Rows.Sort([](const FGGYGOKeyBindingRow& A, const FGGYGOKeyBindingRow& B)
 	{
 		const int32 ByCategory = A.Category.CompareTo(B.Category);
 		return ByCategory != 0 ? ByCategory < 0 : A.MappingName.LexicalLess(B.MappingName);
 	});
-	for (const FRowView& View : Views)
-	{
-		const FName MappingName = View.MappingName;
-		RowBox->AddSlot().AutoHeight().Padding(0.0f, 3.0f)
-		[
-			SNew(SHorizontalBox)
-			+ SHorizontalBox::Slot().FillWidth(1.0f).VAlign(VAlign_Center)
-			[
-				SNew(STextBlock)
-				.Text(View.Category.IsEmpty() ? View.DisplayName
-					: FText::Format(LOCTEXT("RowLabel", "{0} · {1}"), View.Category, View.DisplayName))
-				.Font(FCoreStyle::GetDefaultFontStyle("Regular", 13))
-			]
-			+ SHorizontalBox::Slot().AutoWidth()
-			[
-				SNew(SBox)
-				.WidthOverride(180.0f)
-				[
-					SNew(SInputKeySelector)
-					.SelectedKey(this, &SGGYGOKeyBindingMenu::GetCurrentChord, MappingName)
-					.OnKeySelected(this, &SGGYGOKeyBindingMenu::HandleKeySelected, MappingName)
-					.AllowModifierKeys(false)
-					.AllowGamepadKeys(false)
-					.EscapeCancelsSelection(true)
-				]
-			]
-		];
-	}
+	return true;
 }
 
-FInputChord SGGYGOKeyBindingMenu::GetCurrentChord(FName MappingName) const
+FInputChord UGGYGOKeySettingsPage::ReadCurrentChord(FName MappingName) const
 {
-	const UEnhancedInputUserSettings* Settings = WeakSettings.Get();
+	const UEnhancedInputUserSettings* Settings = FindOriginalSettings();
 	const FPlayerKeyMapping* Mapping = Settings
 		? Settings->FindCurrentMappingForSlot(MappingName, EPlayerMappableKeySlot::First) : nullptr;
 	return Mapping ? FInputChord(Mapping->GetCurrentKey()) : FInputChord();
 }
 
-void SGGYGOKeyBindingMenu::HandleKeySelected(const FInputChord& Chord, FName MappingName)
+void UGGYGOKeySettingsPage::CommitNativeSelection(FName MappingName, const FInputChord& Chord, const FKeyEvent* KeyUp)
 {
-	UEnhancedInputUserSettings* Settings = WeakSettings.Get();
-	UEnhancedPlayerMappableKeyProfile* Profile = Settings ? Settings->GetCurrentKeyProfile() : nullptr;
-	if (!Profile || !Chord.Key.IsValid()) { return; }
+	UEnhancedInputUserSettings* Settings = FindOriginalSettings();
+	const UEnhancedPlayerMappableKeyProfile* Profile = Settings ? Settings->GetActiveKeyProfile() : nullptr;
+	if (!Profile || !Chord.Key.IsValid() || !Settings->FindCurrentMappingForSlot(MappingName, EPlayerMappableKeySlot::First))
+	{
+		return;
+	}
 
-	// 一个键只服务一个映射：被占用时不改，避免一键同时触发两个动作。
+	FGGYGOKeyBindingResult Result;
+	Result.Key = Chord.Key;
 	TArray<FName> Users;
 	Profile->GetMappingNamesForKey(Chord.Key, Users);
 	Users.Remove(MappingName);
 	if (!Users.IsEmpty())
 	{
 		const FPlayerKeyMapping* Other = Settings->FindCurrentMappingForSlot(Users[0], EPlayerMappableKeySlot::First);
-		StatusText->SetText(FText::Format(LOCTEXT("KeyInUse", "{0} 已被「{1}」使用，未修改。"),
-			Chord.Key.GetDisplayName(), Other ? Other->GetDisplayName() : FText::FromName(Users[0])));
+		Result.Status = EGGYGOKeyBindingResult::Conflict;
+		Result.ConflictingDisplayName = Other ? Other->GetDisplayName() : FText::FromName(Users[0]);
+		OnKeyBindingResult(Result);
 		return;
 	}
 
+	const bool bChangedKey = ReadCurrentChord(MappingName).Key != Chord.Key;
+	const TWeakObjectPtr<UEnhancedInputUserSettings> WriteTarget(Settings);
 	FMapPlayerKeyArgs Args;
 	Args.MappingName = MappingName;
 	Args.Slot = EPlayerMappableKeySlot::First;
 	Args.NewKey = Chord.Key;
-	FGameplayTagContainer Failure;
-	Settings->MapPlayerKey(Args, Failure);
-	if (!Failure.IsEmpty())
+	Settings->MapPlayerKey(Args, Result.Failure);
+	if (!Result.Failure.IsEmpty())
 	{
+		Result.Status = EGGYGOKeyBindingResult::Rejected;
 		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("[Input/KeyBinding] Mapping=%s Key=%s rejected: %s"),
-			*MappingName.ToString(), *Chord.Key.ToString(), *Failure.ToStringSimple());
-		StatusText->SetText(LOCTEXT("MapFailed", "改键失败，详见日志。"));
-		return;
+			*MappingName.ToString(), *Chord.Key.ToString(), *Result.Failure.ToStringSimple());
 	}
-	ApplyAndSave(Settings);
-	StatusText->SetText(FText::Format(LOCTEXT("Mapped", "已改为 {0}。"), Chord.Key.GetDisplayName()));
-}
-
-FReply SGGYGOKeyBindingMenu::HandleResetClicked()
-{
-	if (UEnhancedInputUserSettings* Settings = WeakSettings.Get())
+	else if (UEnhancedInputUserSettings* Original = WriteTarget.Get())
 	{
-		FGameplayTagContainer Failure;
-		Settings->ResetKeyProfileToDefault(Settings->GetCurrentKeyProfileIdentifier(), Failure);
-		if (!Failure.IsEmpty())
+		if (KeyUp && bChangedKey && FindOriginalSettings() == Original)
 		{
-			UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("[Input/KeyBinding] Reset rejected: %s"), *Failure.ToStringSimple());
-			StatusText->SetText(LOCTEXT("ResetFailed", "恢复默认失败，详见日志。"));
-			return FReply::Handled();
+			OriginalPlayerInput->ObserveKeyBindingMenuRelease(*Original, *KeyUp);
 		}
-		ApplyAndSave(Settings);
-		StatusText->SetText(LOCTEXT("ResetDone", "已恢复默认键位。"));
+		ApplyAndSave(*Original);
+		Result.Status = EGGYGOKeyBindingResult::Applied;
 	}
-	return FReply::Handled();
-}
-
-FReply SGGYGOKeyBindingMenu::HandleCloseClicked()
-{
-	OnCloseRequested.ExecuteIfBound();
-	return FReply::Handled();
-}
-
-FReply SGGYGOKeyBindingMenu::OnKeyDown(const FGeometry& MyGeometry, const FKeyEvent& InKeyEvent)
-{
-	// 选键中的 Esc 由 SInputKeySelector 自己处理；这里只在界面本身有焦点时关闭。
-	if (InKeyEvent.GetKey() == EKeys::Escape)
+	if (FindOriginalSettings())
 	{
-		OnCloseRequested.ExecuteIfBound();
-		return FReply::Handled();
+		OnKeyBindingResult(Result);
 	}
-	return SCompoundWidget::OnKeyDown(MyGeometry, InKeyEvent);
 }
 
-void SGGYGOKeyBindingMenu::ApplyAndSave(UEnhancedInputUserSettings* Settings)
+FGGYGOKeyBindingResult UGGYGOKeySettingsPage::ResetKeyBindings()
 {
-	Settings->ApplySettings();
-	Settings->AsyncSaveSettings();
+	FGGYGOKeyBindingResult Result;
+	UEnhancedInputUserSettings* Settings = FindOriginalSettings();
+	if (!Settings)
+	{
+		return Result;
+	}
+	const FString ProfileId = Settings->GetActiveKeyProfileId();
+	const TWeakObjectPtr<UEnhancedInputUserSettings> WriteTarget(Settings);
+	Settings->ResetKeyProfileIdToDefault(ProfileId, Result.Failure);
+	if (!Result.Failure.IsEmpty())
+	{
+		Result.Status = EGGYGOKeyBindingResult::Rejected;
+		UE_LOG(LogGGYGOAbilitySystem, Warning, TEXT("[Input/KeyBinding] Reset rejected: %s"), *Result.Failure.ToStringSimple());
+	}
+	else if (UEnhancedInputUserSettings* Original = WriteTarget.Get())
+	{
+		ApplyAndSave(*Original);
+		Result.Status = EGGYGOKeyBindingResult::Applied;
+	}
+	return Result;
 }
 
-#undef LOCTEXT_NAMESPACE
+void UGGYGOKeySettingsPage::RequestKeySettingsClose()
+{
+	// 关闭可能撤销成员委托；先保留本次原请求。
+	const FSimpleDelegate CloseRequested = OnCloseRequested;
+	CloseRequested.ExecuteIfBound();
+}
+
+void UGGYGOKeyBindingSelector::BindKeyBindingRow(UGGYGOKeySettingsPage* Page, FName MappingName)
+{
+	BindingPage = Page;
+	BoundMappingName = MappingName;
+}
+
+TSharedRef<SWidget> UGGYGOKeyBindingSelector::RebuildWidget()
+{
+	return SNew(SGGYGOKeySelector)
+		.SelectedKey(TAttribute<FInputChord>::Create(
+			TAttribute<FInputChord>::FGetter::CreateUObject(this, &ThisClass::ReadCurrentChord)))
+		.KeySelectionText(KeySelectionText)
+		.NoKeySpecifiedText(NoKeySpecifiedText)
+		.OnKeySelected(FOnBindingKeySelected::CreateUObject(this, &ThisClass::HandleNativeSelection));
+}
+
+FInputChord UGGYGOKeyBindingSelector::ReadCurrentChord() const
+{
+	const UGGYGOKeySettingsPage* Page = BindingPage.Get();
+	return Page ? Page->ReadCurrentChord(BoundMappingName) : FInputChord();
+}
+
+void UGGYGOKeyBindingSelector::HandleNativeSelection(const FInputChord& Chord, const FKeyEvent* KeyUp)
+{
+	if (UGGYGOKeySettingsPage* Page = BindingPage.Get())
+	{
+		Page->CommitNativeSelection(BoundMappingName, Chord, KeyUp);
+	}
+}

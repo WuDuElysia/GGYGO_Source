@@ -10,12 +10,14 @@
 #include "Character/Components/GGYGOCharacterMovementComponent.h"
 #include "Character/Data/GGYGOPawnData.h"
 #include "Character/Interfaces/GGYGOAvatarBindingHostInterface.h"
+#include "Niagara/GGYGONiagaraMaterialPreparation.h"
+#include "System/GGYGOGameplayTags.h"
+
 #include "Components/GameFrameworkComponentManager.h"
 #include "Engine/World.h"
 #include "GameFramework/Controller.h"
 #include "GameFramework/Pawn.h"
 #include "Net/UnrealNetwork.h"
-#include "System/GGYGOGameplayTags.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOPawnExtensionComponent)
 
@@ -214,6 +216,10 @@ void UGGYGOPawnExtensionComponent::EndPlay(const EEndPlayReason::Type EndPlayRea
 {
 	bPawnDataInitializationClosed = true;
 	PawnDataInitializationScope = nullptr;
+	// 先关闭本 Pawn 的消费并摘下原请求；Cancel 的终态通知可同步执行外部蓝图。
+	UGGYGONiagaraMaterialPreparation* OriginalPreparation = AbilityInputResourcePreparation;
+	AbilityInputResourcePreparation = nullptr;
+	if (OriginalPreparation) { OriginalPreparation->Cancel(); }
 	// 宿主监听 Pawn 的 OnEndPlay，先于组件 EndPlay 释放绑定。仍有资源说明宿主未执行释放，
 	// 这里只让本地消费方清理自身状态，不写 ASC。
 	if (LocalAbilitySystemResource.HasResource())
@@ -310,6 +316,55 @@ void UGGYGOPawnExtensionComponent::SetupPlayerInputComponent()
 	CheckDefaultInitialization();
 }
 
+bool UGGYGOPawnExtensionComponent::SetAbilityInputResourcePreparation(
+	UGGYGONiagaraMaterialPreparation* Preparation)
+{
+	if (!IsValid(Preparation) || Preparation->GetOuter() != this)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Character/InputResources] Extension=%s 拒绝非本组件所有的准备请求=%s。"),
+			*GetPathName(), *GetPathNameSafe(Preparation));
+		return false;
+	}
+	const APawn* Pawn = GetPawn<APawn>();
+	if (bPawnDataInitializationClosed || !IsRegistered() || !Pawn || Pawn->IsActorBeingDestroyed()
+		|| (AbilityInputResourcePreparation && AbilityInputResourcePreparation != Preparation))
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Character/InputResources] Extension=%s 已退役或已有请求=%s，拒绝新请求=%s。"),
+			*GetPathName(), *GetPathNameSafe(AbilityInputResourcePreparation), *GetPathNameSafe(Preparation));
+		Preparation->Cancel();
+		return false;
+	}
+	AbilityInputResourcePreparation = Preparation;
+	return true;
+}
+
+bool UGGYGOPawnExtensionComponent::AreAbilityInputResourcesReady(FGameplayTag InputTag, FString& OutReason) const
+{
+	OutReason.Reset();
+	if (bPawnDataInitializationClosed || !PawnData)
+	{
+		OutReason = FString::Printf(TEXT("Extension=%s PawnData=%s 装配未就绪或已退役。"),
+			*GetPathName(), *GetPathNameSafe(PawnData));
+		return false;
+	}
+	if (!PawnData->InputTagsRequiringRenderResources.HasTagExact(InputTag)) { return true; }
+	if (!AbilityInputResourcePreparation)
+	{
+		OutReason = FString::Printf(TEXT("Extension=%s PawnData=%s 缺少 Pawn 蓝图提交的渲染准备请求。"),
+			*GetPathName(), *GetPathNameSafe(PawnData));
+		return false;
+	}
+	const EGGYGONiagaraMaterialPreparationState State = AbilityInputResourcePreparation->GetState();
+	if (State == EGGYGONiagaraMaterialPreparationState::Ready) { return true; }
+	OutReason = FString::Printf(TEXT("Request=%s State=%s Reason=%s"),
+		*GetPathNameSafe(AbilityInputResourcePreparation),
+		*StaticEnum<EGGYGONiagaraMaterialPreparationState>()->GetNameStringByValue(static_cast<int64>(State)),
+		*AbilityInputResourcePreparation->GetError());
+	return false;
+}
+
 void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 {
 	const FPawnDataInitializationScope InitializationScope(*this);
@@ -332,8 +387,7 @@ void UGGYGOPawnExtensionComponent::ApplyPawnDataToConsumers()
 		}
 	}
 
-	// 预热该角色的特效。Cue 是按需异步加载的，不预热则第一次触发时
-	// 资产还没就位，表现为"第一刀没有火花"。
+	// 只提前加载 Cue 类；实际 Niagara／Renderer 准备由 Pawn 蓝图提交独立资源请求。
 	if (UGGYGOGameplayCueManager* CueManager = UGGYGOGameplayCueManager::Get())
 	{
 		CueManager->PreloadCuesForTags(PawnData->CuesToPreload);

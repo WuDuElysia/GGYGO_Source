@@ -107,6 +107,15 @@ public:
 	TObjectPtr<const UGGYGOInputConfig> InputConfig;
 
 	/**
+	 * 必须等本 Pawn 渲染资源准备完成后才能提交的能力输入 Tag，按精确 Tag 匹配。
+	 * 共享 Pawn 蓝图选择实际资源并将准备请求交给 PawnExtension；本配置不选择或启动特效。
+	 * 空集合表示该 Pawn 没有这项输入前置。Pending 时的按下由 Hero 锁存到原 Action 释放，
+	 * Ready 不补发旧按下，也不重建输入会话。
+	 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "Input", meta = (Categories = "InputTag"))
+	FGameplayTagContainer InputTagsRequiringRenderResources;
+
+	/**
 	 * 默认相机模式，作为相机模式栈的栈底。
 	 *
 	 * 每个角色可以不同：武器长度与体型决定了合适的镜头距离。
@@ -119,9 +128,8 @@ public:
 	/**
 	 * 该角色会用到的 GameplayCue，在初始化时预加载。
 	 *
-	 * Cue 资产是按需异步加载的，不预热则第一次触发时特效还没就位 ——
-	 * 表现为"第一刀没有火花"。把角色的命中、闪避、技能特效列在这里，
-	 * 战斗开始前它们就已经加载完毕。
+	 * 此处只预载 Cue 类，不证明 Niagara System、Renderer 材质或当前 RHI 资源已就绪。
+	 * 需要首击资源前置的输入另由 InputTagsRequiringRenderResources 和 Pawn 蓝图准备请求控制。
 	 *
 	 * 留空是合法的，只是失去了提前量。
 	 */

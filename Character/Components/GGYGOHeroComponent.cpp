@@ -13,6 +13,7 @@
 #include "Character/Data/GGYGOPawnData.h"
 #include "Input/GGYGOInputComponent.h"
 #include "Input/GGYGOPlayerInput.h"
+#include "Player/GGYGOLocalPlayer.h"
 #include "System/GGYGOGameplayTags.h"
 
 #include "Components/GameFrameworkComponentManager.h"
@@ -37,9 +38,10 @@ const FName UGGYGOHeroComponent::NAME_ActorFeatureName("Hero");
 // Each record follows one resource lifetime; none owns physical held or ASC execution.
 struct UGGYGOHeroComponent::FPlayerInputSession
 {
-	FPlayerInputSession(UGGYGOInputComponent* InComponent, UEnhancedInputLocalPlayerSubsystem* InSubsystem,
+	FPlayerInputSession(UGGYGOInputComponent* InComponent, UGGYGOLocalPlayer* InLocalPlayer,
+		UEnhancedInputLocalPlayerSubsystem* InSubsystem,
 		UEnhancedPlayerInput* InPlayerInput, UGGYGOCharacterMovementComponent* InForceWalkMovement, uint64 InGeneration)
-		: Component(InComponent), Subsystem(InSubsystem), PlayerInput(InPlayerInput),
+		: Component(InComponent), LocalPlayer(InLocalPlayer), Subsystem(InSubsystem), PlayerInput(InPlayerInput),
 		  ForceWalkMovement(InForceWalkMovement), Generation(InGeneration)
 	{}
 
@@ -50,10 +52,12 @@ struct UGGYGOHeroComponent::FPlayerInputSession
 	};
 
 	const TWeakObjectPtr<UGGYGOInputComponent> Component;
+	const TWeakObjectPtr<UGGYGOLocalPlayer> LocalPlayer;
 	const TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> Subsystem;
 	const TWeakObjectPtr<UEnhancedPlayerInput> PlayerInput;
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> ForceWalkMovement;
 	const uint64 Generation;
+	FDelegateHandle MappingRemovalHandle;
 	TArray<uint32> BindHandles;
 	TArray<FRegisteredMapping> Mappings;
 	TArray<TSharedPtr<FAbilityActionBinding>> ActionBindings;
@@ -627,16 +631,25 @@ void UGGYGOHeroComponent::InitializePlayerInputBindings(UInputComponent* PlayerI
 	}
 
 	const APlayerController* PC = GetController<APlayerController>();
-	if (!PC)
+	if (!PC || PC->IsActorBeingDestroyed())
 	{
 		return;
 	}
 
-	const ULocalPlayer* LP = PC->GetLocalPlayer();
-	if (!LP)
+	ULocalPlayer* LocalPlayer = PC->GetLocalPlayer();
+	if (!LocalPlayer)
 	{
 		return;
 	}
+	UGGYGOLocalPlayer* LP = Cast<UGGYGOLocalPlayer>(LocalPlayer);
+	if (!LP)
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("InitializePlayerInput: [%s] 的 LocalPlayer [%s] 缺少项目输入映射退役入口。"),
+			*GetPathNameSafe(Pawn), *GetPathNameSafe(LocalPlayer));
+		return;
+	}
+	if (LP->IsInputMappingRemovalStarted()) { return; }
 
 	UEnhancedInputLocalPlayerSubsystem* Subsystem = LP->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>();
 	if (!Subsystem)
@@ -724,8 +737,19 @@ void UGGYGOHeroComponent::InitializePlayerInputBindings(UInputComponent* PlayerI
 
 	const uint64 SessionGeneration = InputSessionGeneration;
 	const TSharedPtr<FPlayerInputSession> OriginalSession = MakeShared<FPlayerInputSession>(
-		GGYGOIC, Subsystem, EnhancedPlayerInput, ForceWalkAction ? MovementConsumer : nullptr, SessionGeneration);
+		GGYGOIC, LP, Subsystem, EnhancedPlayerInput, ForceWalkAction ? MovementConsumer : nullptr, SessionGeneration);
 	PlayerInputSession = OriginalSession;
+	// 在首次注册 IMC 前订阅原 LocalPlayer 的退役通知。Controller 销毁时只归还其原 PlayerInput 的计数。
+	const TWeakPtr<FPlayerInputSession> WeakSession(OriginalSession);
+	OriginalSession->MappingRemovalHandle = LP->OnInputMappingsRemoving().AddWeakLambda(this, [this, WeakSession](UEnhancedPlayerInput* RemovingInput)
+	{
+		const TSharedPtr<FPlayerInputSession> Session = WeakSession.Pin();
+		if (Session.IsValid() && PlayerInputSession == Session
+			&& (!RemovingInput || Session->PlayerInput.Get() == RemovingInput))
+		{
+			ReleasePlayerInput();
+		}
+	});
 
 	const TSharedPtr<FGGYGOHeroMovementInputScope> OriginalMovementScope = MakeShared<FGGYGOHeroMovementInputScope>(
 		this, GetPawn<APawn>(), GGYGOIC, MovementSource, Subsystem, MovementConsumer, MoveAction,
@@ -833,6 +857,10 @@ void UGGYGOHeroComponent::ReleasePlayerInput()
 	if (PreviousSession.IsValid())
 	{
 		PreviousSession->bRetired = true;
+		if (UGGYGOLocalPlayer* LocalPlayer = PreviousSession->LocalPlayer.Get())
+		{
+			LocalPlayer->OnInputMappingsRemoving().Remove(PreviousSession->MappingRemovalHandle);
+		}
 		for (const TSharedPtr<FAbilityActionBinding>& Binding : PreviousSession->ActionBindings)
 		{
 			Binding->bRetired = true;
@@ -1427,6 +1455,20 @@ void UGGYGOHeroComponent::Input_AbilityActionTriggered(const FInputActionInstanc
 	{
 		return; // 首次被拒、ASC 未就绪或关联已变化：本次按住不重试。
 	}
+	// 两个输入安装入口都落到此处。先保留原按下锁存，再消费 Pawn 持有的实际准备请求；
+	// Pending/Failed 不签发 ASC 身份，Ready 后也不把这次按住变成新的按下。
+	const UGGYGOPawnExtensionComponent* PawnExtension = LocalASCSubscription.GetExtension();
+	FString PreparationReason;
+	if (!PawnExtension || !PawnExtension->AreAbilityInputResourcesReady(Request.InputTag, PreparationReason))
+	{
+		// 撤销身份后后续 Held 从上方返回；每次新按下保留最新原因，避免先前 Pending 吞掉真实 Failed。
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("Input/Hero Trigger rejected: Hero=%s Action=%s Tag=%s Reason=RenderResourcesNotReady %s"),
+			*GetPathName(), *Binding->SourceActionPath, *Request.InputTag.ToString(),
+			PawnExtension ? *PreparationReason : TEXT("PawnExtension missing"));
+		InvalidateCurrentAbilityInputRequest(*Binding);
+		return;
+	}
 	UGGYGOAbilitySystemComponent* ASC = GetInputSessionAbilitySystem();
 	if (!ASC || (!bFirstTrigger && !Request.Identity.SourceASC.HasSameIndexAndSerialNumber(ASC)))
 	{
@@ -1484,9 +1526,10 @@ bool UGGYGOHeroComponent::HasValidPlayerInputSession() const
 	if (!Session.IsValid() || Session->bRetired || Session->Generation != InputSessionGeneration) { return false; }
 	const APawn* Pawn = GetPawn<APawn>();
 	const APlayerController* PC = GetController<APlayerController>();
-	const ULocalPlayer* LocalPlayer = PC ? PC->GetLocalPlayer() : nullptr;
+	const UGGYGOLocalPlayer* LocalPlayer = Session->LocalPlayer.Get();
 	const UEnhancedInputLocalPlayerSubsystem* Subsystem = Session->Subsystem.Get();
-	return !bEndingPlay && Pawn && Pawn->IsLocallyControlled() && LocalPlayer
+	return !bEndingPlay && Pawn && Pawn->IsLocallyControlled() && LocalPlayer && PC && !PC->IsActorBeingDestroyed()
+		&& PC->GetLocalPlayer() == LocalPlayer && !LocalPlayer->IsInputMappingRemovalStarted()
 		&& Session->Component.IsValid() && Pawn->InputComponent == Session->Component.Get()
 		&& Subsystem && Session->PlayerInput.IsValid()
 		&& LocalPlayer->GetSubsystem<UEnhancedInputLocalPlayerSubsystem>() == Subsystem

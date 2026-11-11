@@ -58,6 +58,9 @@ struct FAbilityEndedData;
 /** 出战角色变更。@param NewCharacter 新出战角色的 Pawn，可能为 nullptr。 */
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FGGYGOActiveCharacterChanged, AGGYGOCharacterBase*, NewCharacter);
 
+/** 权威出战队员死亡演出完成；参数仅标识本次原生广播中的原槽位与 Pawn。 */
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FGGYGOActiveMemberDeathFinished, AGGYGOCharacterSlot*, OriginalSlot, APawn*, OriginalAvatar);
+
 /** 队员在编队中的场上状态。见文件头"队员状态"。 */
 UENUM(BlueprintType)
 enum class EGGYGOSquadMemberState : uint8
@@ -205,6 +208,14 @@ public:
 	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Squad")
 	FGGYGOActiveCharacterChanged OnActiveCharacterChanged;
 
+	/** 原 Health 死亡完成广播内同步发布；共享队伍流程决定是否提交下一位请求。 */
+	UPROPERTY(BlueprintAssignable, Category = "GGYGO|Squad")
+	FGGYGOActiveMemberDeathFinished OnActiveMemberDeathFinished;
+
+	/** 同一原死亡通知内最多执行一次向后候选请求；返回原权威切换结果。 */
+	UFUNCTION(BlueprintCallable, BlueprintAuthorityOnly, Category = "GGYGO|Squad")
+	bool RequestNextAfterActiveMemberDeath(AGGYGOCharacterSlot* OriginalSlot, APawn* OriginalAvatar);
+
 protected:
 	virtual void EndPlay(const EEndPlayReason::Type EndPlayReason) override;
 	virtual void OnComponentDestroyed(bool bDestroyingHierarchy) override;
@@ -314,12 +325,18 @@ private:
 	/** 上次替换在场队员的换人成功时的世界时间（服务器）；只供玩家换人冷却读取。 */
 	TOptional<double> LastSwitchWorldTime;
 
-	/**
-	 * 队员死亡演出结束（HealthComponent::OnDeathFinished）。仅服务器：出战队员倒下后
-	 * 以 DeathAutoSwitch 切到下一个可出战的队员；没有可出战的队员时保持现状并记录。
-	 */
+	/** 权威端核对当前出战身份，并同步发布原 Health 的死亡完成事实。 */
 	UFUNCTION()
 	void HandleMemberDeathFinished(AActor* OwningActor);
+
+	struct FDeathFinishedRequestScope
+	{
+		TWeakObjectPtr<AGGYGOCharacterSlot> Slot;
+		TWeakObjectPtr<APawn> Avatar;
+		bool bConsumed = false;
+	};
+	/** 仅借用当前死亡广播栈上的资格，嵌套广播返回时恢复外层。 */
+	FDeathFinishedRequestScope* ActiveDeathFinishedRequest = nullptr;
 
 	/** 一个槽位的场上状态与本组件施加的资源；与 Slots 同序，仅服务器。 */
 	struct FSlotRuntime

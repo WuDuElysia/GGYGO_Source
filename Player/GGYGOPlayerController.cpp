@@ -13,8 +13,10 @@
 #include "Player/GGYGOPlayerState.h"
 #include "Teams/GGYGOSquadComponent.h"
 #include "Input/GGYGOKeyBindingMenu.h"
+#include "Input/GGYGOPlayerInput.h"
 #include "EnhancedInputComponent.h"
 #include "EnhancedInputSubsystems.h"
+#include "EnhancedPlayerInput.h"
 #include "Engine/GameViewportClient.h"
 #include "Engine/Level.h"
 #include "Engine/LocalPlayer.h"
@@ -26,6 +28,7 @@
 #include "InputAction.h"
 #include "InputMappingContext.h"
 #include "Misc/ScopeExit.h"
+#include "Templates/UnrealTemplate.h"
 #include "UObject/Class.h"
 #include "UObject/UnrealType.h"
 #include "UserSettings/EnhancedInputUserSettings.h"
@@ -317,25 +320,57 @@ void AGGYGOPlayerController::SetupInputComponent()
 	RegisterPlayerMappableInput();
 }
 
+void AGGYGOPlayerController::Destroyed()
+{
+	bEndingSquadSwitchInput = true;
+	UGGYGOLocalPlayer* LocalPlayer = Cast<UGGYGOLocalPlayer>(GetLocalPlayer());
+	UEnhancedPlayerInput* Input = Cast<UEnhancedPlayerInput>(PlayerInput);
+	if (LocalPlayer && Input)
+	{
+		// 原生 Destroyed 在派发 EndPlay 前清空 PlayerInput，映射持有者须在此归还原计数。
+		LocalPlayer->NotifyControllerInputMappingsRemoving(*Input);
+	}
+	Super::Destroyed();
+}
+
 void AGGYGOPlayerController::EndPlay(const EEndPlayReason::Type EndPlayReason)
 {
-	CloseKeySettings();
-	// 只归还本 Controller 注册的那一份；CountRegistrations 下其它注册者的计数不受影响。
-	UEnhancedInputLocalPlayerSubsystem* Subsystem = SquadSwitchMappingSubsystem.Get();
-	const UInputMappingContext* Mapping = RegisteredSquadSwitchMapping.Get();
-	SquadSwitchMappingSubsystem.Reset();
-	RegisteredSquadSwitchMapping.Reset();
+	bEndingSquadSwitchInput = true;
+	ReleaseKeySettingsPage(false);
 	SquadSwitchBoundComponent.Reset();
-	if (Subsystem && Mapping)
+	ReleaseSquadSwitchMapping();
+	Super::EndPlay(EndPlayReason);
+}
+
+void AGGYGOPlayerController::ReleaseSquadSwitchMapping()
+{
+	const FSquadSwitchMappingRegistration Original = SquadSwitchMappingRegistration;
+	SquadSwitchMappingRegistration = {};
+	if (UGGYGOLocalPlayer* LocalPlayer = Original.LocalPlayer.Get())
+	{
+		LocalPlayer->OnInputMappingsRemoving().Remove(Original.RemovalHandle);
+	}
+	UEnhancedInputLocalPlayerSubsystem* Subsystem = Original.Subsystem.Get();
+	UEnhancedPlayerInput* Input = Original.PlayerInput.Get();
+	const UInputMappingContext* Mapping = Original.Mapping.Get();
+	// Remove 会广播。原记录和订阅已摘除，且只向原 PlayerInput 归还这一份计数。
+	if (Subsystem && Input && Mapping && Subsystem->GetPlayerInput() == Input)
 	{
 		Subsystem->RemoveMappingContext(Mapping);
 	}
-	Super::EndPlay(EndPlayReason);
+}
+
+void AGGYGOPlayerController::HandleInputMappingsRemoving(UEnhancedPlayerInput* OriginalInput)
+{
+	if (!OriginalInput || SquadSwitchMappingRegistration.PlayerInput.Get() == OriginalInput)
+	{
+		ReleaseSquadSwitchMapping();
+	}
 }
 
 void AGGYGOPlayerController::InstallSquadSwitchInput()
 {
-	if (!IsLocalController() || !InputComponent || SquadSwitchBoundComponent.Get() == InputComponent)
+	if (bEndingSquadSwitchInput || !IsLocalController() || !InputComponent)
 	{
 		return;
 	}
@@ -344,35 +379,60 @@ void AGGYGOPlayerController::InstallSquadSwitchInput()
 		return; // 本 Controller 不提供换人键。
 	}
 	UEnhancedInputComponent* EnhancedInput = Cast<UEnhancedInputComponent>(InputComponent);
-	UEnhancedInputLocalPlayerSubsystem* Subsystem =
-		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(GetLocalPlayer());
-	if (!SquadSwitchInputMapping || !SwitchToPreviousMemberAction || !SwitchToNextMemberAction || !EnhancedInput || !Subsystem)
+	UGGYGOLocalPlayer* LocalPlayer = Cast<UGGYGOLocalPlayer>(GetLocalPlayer());
+	if (LocalPlayer && LocalPlayer->IsInputMappingRemovalStarted())
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error,
-			TEXT("[Input/Squad] Controller=%s Mapping=%s Previous=%s Next=%s InputComponent=%s Subsystem=%s: 换人输入配置不完整，或输入组件／子系统不是 Enhanced Input；换人键未安装。"),
-			*GetPathNameSafe(this), *GetPathNameSafe(SquadSwitchInputMapping), *GetPathNameSafe(SwitchToPreviousMemberAction),
-			*GetPathNameSafe(SwitchToNextMemberAction), *GetPathNameSafe(InputComponent), *GetPathNameSafe(Subsystem));
 		return;
 	}
-	// Started 每次按下只触发一次；按住不连续切人。
-	SquadSwitchBoundComponent = InputComponent;
-	EnhancedInput->BindAction(SwitchToPreviousMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToPreviousMember);
-	EnhancedInput->BindAction(SwitchToNextMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToNextMember);
-	if (RegisteredSquadSwitchMapping.IsValid())
+	UEnhancedInputLocalPlayerSubsystem* Subsystem =
+		ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer);
+	UEnhancedPlayerInput* Input = Subsystem ? Subsystem->GetPlayerInput() : nullptr;
+	if (!SquadSwitchInputMapping || !SwitchToPreviousMemberAction || !SwitchToNextMemberAction || !EnhancedInput
+		|| !Input || Input != PlayerInput)
 	{
-		if (SquadSwitchMappingSubsystem.Get() == Subsystem)
+		UE_LOG(LogGGYGOAbilitySystem, Error,
+			TEXT("[Input/Squad] Controller=%s Mapping=%s Previous=%s Next=%s InputComponent=%s LocalPlayer=%s Subsystem=%s PlayerInput=%s: 换人配置或原 Enhanced Input 路由不完整，换人键未安装。"),
+			*GetPathNameSafe(this), *GetPathNameSafe(SquadSwitchInputMapping), *GetPathNameSafe(SwitchToPreviousMemberAction),
+			*GetPathNameSafe(SwitchToNextMemberAction), *GetPathNameSafe(InputComponent), *GetPathNameSafe(LocalPlayer),
+			*GetPathNameSafe(Subsystem), *GetPathNameSafe(Input));
+		return;
+	}
+	const bool bSameRegistration = SquadSwitchMappingRegistration.LocalPlayer.Get() == LocalPlayer
+		&& SquadSwitchMappingRegistration.Subsystem.Get() == Subsystem
+		&& SquadSwitchMappingRegistration.PlayerInput.Get() == Input
+		&& SquadSwitchMappingRegistration.Mapping.Get() == SquadSwitchInputMapping;
+	if (!bSameRegistration && SquadSwitchMappingRegistration.RemovalHandle.IsValid())
+	{
+		const TWeakObjectPtr<UGGYGOLocalPlayer> OriginalPlayer(LocalPlayer);
+		const TWeakObjectPtr<UEnhancedInputLocalPlayerSubsystem> OriginalSubsystem(Subsystem);
+		const TWeakObjectPtr<UEnhancedPlayerInput> OriginalInput(Input);
+		ReleaseSquadSwitchMapping();
+		// 旧映射移除的广播可能已结束本 Controller、移除原玩家或安装后继注册。
+		if (bEndingSquadSwitchInput || IsActorBeingDestroyed() || SquadSwitchMappingRegistration.RemovalHandle.IsValid()
+			|| !OriginalPlayer.IsValid() || GetLocalPlayer() != LocalPlayer || LocalPlayer->IsInputMappingRemovalStarted()
+			|| !OriginalSubsystem.IsValid() || !OriginalInput.IsValid() || Subsystem->GetPlayerInput() != Input
+			|| PlayerInput != Input || InputComponent != EnhancedInput)
 		{
-			return; // 换了 InputComponent 只需重绑；IMC 仍是本 Controller 在同一子系统上注册的那一份。
-		}
-		// 换了 LocalPlayer：先归还旧子系统上的那一份，再在新子系统上注册。
-		if (UEnhancedInputLocalPlayerSubsystem* OldSubsystem = SquadSwitchMappingSubsystem.Get())
-		{
-			OldSubsystem->RemoveMappingContext(RegisteredSquadSwitchMapping.Get());
+			return;
 		}
 	}
-	SquadSwitchMappingSubsystem = Subsystem;
-	RegisteredSquadSwitchMapping = SquadSwitchInputMapping;
-	Subsystem->AddMappingContext(SquadSwitchInputMapping, SquadSwitchInputMappingPriority);
+	if (SquadSwitchBoundComponent.Get() != EnhancedInput)
+	{
+		// Started 每次按下只触发一次。重建组件只重绑，原 IMC 计数继续由本 Controller 持有。
+		SquadSwitchBoundComponent = EnhancedInput;
+		EnhancedInput->BindAction(SwitchToPreviousMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToPreviousMember);
+		EnhancedInput->BindAction(SwitchToNextMemberAction, ETriggerEvent::Started, this, &ThisClass::Input_SwitchToNextMember);
+	}
+	if (!bSameRegistration)
+	{
+		SquadSwitchMappingRegistration.LocalPlayer = LocalPlayer;
+		SquadSwitchMappingRegistration.Subsystem = Subsystem;
+		SquadSwitchMappingRegistration.PlayerInput = Input;
+		SquadSwitchMappingRegistration.Mapping = SquadSwitchInputMapping;
+		SquadSwitchMappingRegistration.RemovalHandle = LocalPlayer->OnInputMappingsRemoving().AddUObject(
+			this, &ThisClass::HandleInputMappingsRemoving);
+		Subsystem->AddMappingContext(SquadSwitchInputMapping, SquadSwitchInputMappingPriority);
+	}
 }
 
 void AGGYGOPlayerController::RegisterPlayerMappableInput()
@@ -412,46 +472,135 @@ void AGGYGOPlayerController::RegisterPlayerMappableInput()
 
 void AGGYGOPlayerController::OpenKeySettings()
 {
-	if (KeyBindingMenu.IsValid() || !IsLocalController()) { return; }
-	ULocalPlayer* LocalPlayer = GetLocalPlayer();
+	if (KeySettingsPage || bOpeningKeySettings || !IsLocalController() || IsActorBeingDestroyed())
+	{
+		return;
+	}
+	const TGuardValue<bool> OpeningGuard(bOpeningKeySettings, true);
+	UGGYGOLocalPlayer* LocalPlayer = Cast<UGGYGOLocalPlayer>(GetLocalPlayer());
 	UGameViewportClient* Viewport = LocalPlayer ? LocalPlayer->ViewportClient.Get() : nullptr;
 	UEnhancedInputLocalPlayerSubsystem* Subsystem = ULocalPlayer::GetSubsystem<UEnhancedInputLocalPlayerSubsystem>(LocalPlayer);
 	UEnhancedInputUserSettings* Settings = Subsystem ? Subsystem->GetUserSettings() : nullptr;
-	if (!Viewport || !Settings)
+	UGGYGOPlayerInput* Input = Subsystem ? Cast<UGGYGOPlayerInput>(Subsystem->GetPlayerInput()) : nullptr;
+	if (!KeySettingsPageClass || !Viewport || !Settings || !Input || LocalPlayer->IsInputMappingRemovalStarted())
 	{
 		UE_LOG(LogGGYGOAbilitySystem, Warning,
-			TEXT("[Input/KeyBinding] Controller=%s Viewport=%s Settings=%s: 没有视口或 Enhanced Input 用户设置，改键界面未打开。"),
-			*GetPathNameSafe(this), *GetPathNameSafe(Viewport), *GetPathNameSafe(Settings));
+			TEXT("[Input/KeyBinding] Controller=%s PageClass=%s Viewport=%s Settings=%s Input=%s: 改键页缺少原输入上下文或页面配置。"),
+			*GetPathName(), *GetPathNameSafe(KeySettingsPageClass.Get()), *GetPathNameSafe(Viewport),
+			*GetPathNameSafe(Settings), *GetPathNameSafe(Input));
 		return;
 	}
-	const TWeakObjectPtr<AGGYGOPlayerController> WeakThis(this);
-	KeyBindingMenu = SNew(SGGYGOKeyBindingMenu)
-		.Settings(Settings)
-		.OnCloseRequested(FSimpleDelegate::CreateLambda([WeakThis]()
-		{
-			if (AGGYGOPlayerController* Controller = WeakThis.Get()) { Controller->CloseKeySettings(); }
-		}));
-	KeyBindingMenuPlayer = LocalPlayer;
-	Viewport->AddViewportWidgetForPlayer(LocalPlayer, KeyBindingMenu.ToSharedRef(), 100);
+
+	const TWeakObjectPtr<UGGYGOLocalPlayer> OriginalPlayer(LocalPlayer);
+	const TWeakObjectPtr<UGameViewportClient> OriginalViewport(Viewport);
+	const TWeakObjectPtr<UEnhancedInputUserSettings> OriginalSettings(Settings);
+	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalInput(Input);
+	UGGYGOKeySettingsPage* Page = CreateWidget<UGGYGOKeySettingsPage>(this, KeySettingsPageClass);
+	if (!Page || !Page->IsFocusable())
+	{
+		UE_LOG(LogGGYGOAbilitySystem, Warning,
+			TEXT("[Input/KeyBinding] Controller=%s PageClass=%s: 改键页创建失败或根不支持键盘焦点。"),
+			*GetPathName(), *GetPathNameSafe(KeySettingsPageClass.Get()));
+		return;
+	}
+	LocalPlayer = OriginalPlayer.Get();
+	Viewport = OriginalViewport.Get();
+	Settings = OriginalSettings.Get();
+	Input = OriginalInput.Get();
+	if (!LocalPlayer || GetLocalPlayer() != LocalPlayer || LocalPlayer->PlayerController != this
+		|| !Viewport || LocalPlayer->ViewportClient.Get() != Viewport || !Settings || !Input || PlayerInput != Input
+		|| LocalPlayer->IsInputMappingRemovalStarted())
+	{
+		return;
+	}
+
+	const TWeakObjectPtr<UGGYGOKeySettingsPage> OriginalPage(Page);
+	Page->InitializeBindingContext(*Settings, *Input, FSimpleDelegate::CreateWeakLambda(this, [this, OriginalPage]()
+	{
+		if (KeySettingsPage && KeySettingsPage.Get() == OriginalPage.Get()) { CloseKeySettings(); }
+	}));
+	KeySettingsPage = Page;
+	KeySettingsPlayer = LocalPlayer;
+	KeySettingsViewport = Viewport;
+	KeySettingsRemovalHandle = LocalPlayer->OnInputMappingsRemoving().AddUObject(
+		this, &ThisClass::HandleKeySettingsInputRemoving, OriginalPage);
+
+	// Construct 图可读原设置；原视口仍持有焦点，先登记观察再挂载这一份根。
+	const TSharedRef<SWidget> Root = Page->TakeWidget();
+	if (KeySettingsPage.Get() != Page)
+	{
+		return;
+	}
+	if (!OriginalViewport.IsValid() || OriginalPlayer.Get() != GetLocalPlayer()
+		|| !OriginalPlayer.IsValid() || OriginalPlayer->ViewportClient.Get() != OriginalViewport.Get()
+		|| !Page->BeginBindingObservation(Root))
+	{
+		ReleaseKeySettingsPage(false);
+		return;
+	}
+	KeySettingsRoot = Root;
+	OriginalViewport->AddViewportWidgetForPlayer(OriginalPlayer.Get(), Root, 100);
 	FInputModeUIOnly Mode;
-	Mode.SetWidgetToFocus(KeyBindingMenu);
+	Mode.SetWidgetToFocus(Root);
 	SetInputMode(Mode);
 	SetShowMouseCursor(true);
 }
 
 void AGGYGOPlayerController::CloseKeySettings()
 {
-	if (!KeyBindingMenu.IsValid()) { return; }
-	const TSharedRef<SGGYGOKeyBindingMenu> Menu = KeyBindingMenu.ToSharedRef();
-	KeyBindingMenu.Reset();
-	ULocalPlayer* LocalPlayer = KeyBindingMenuPlayer.Get();
-	KeyBindingMenuPlayer.Reset();
-	if (UGameViewportClient* Viewport = LocalPlayer ? LocalPlayer->ViewportClient.Get() : nullptr)
+	ReleaseKeySettingsPage(true);
+}
+
+void AGGYGOPlayerController::HandleKeySettingsInputRemoving(UEnhancedPlayerInput* OriginalInput,
+	TWeakObjectPtr<UGGYGOKeySettingsPage> OriginalPage)
+{
+	if (KeySettingsPage && KeySettingsPage.Get() == OriginalPage.Get()
+		&& (!OriginalInput || KeySettingsPage->GetOriginalPlayerInput() == OriginalInput))
 	{
-		Viewport->RemoveViewportWidgetForPlayer(LocalPlayer, Menu);
+		ReleaseKeySettingsPage(false);
 	}
-	SetInputMode(FInputModeGameOnly());
-	SetShowMouseCursor(false);
+}
+
+void AGGYGOPlayerController::ReleaseKeySettingsPage(bool bReturnToGame)
+{
+	UGGYGOKeySettingsPage* Page = KeySettingsPage.Get();
+	if (!Page)
+	{
+		return;
+	}
+	const TSharedPtr<SWidget> Root = MoveTemp(KeySettingsRoot);
+	const TWeakObjectPtr<UGGYGOLocalPlayer> OriginalPlayer = KeySettingsPlayer;
+	const TWeakObjectPtr<UGameViewportClient> OriginalViewport = KeySettingsViewport;
+	const TWeakObjectPtr<UGGYGOPlayerInput> OriginalInput(Page->GetOriginalPlayerInput());
+	const FDelegateHandle RemovalHandle = KeySettingsRemovalHandle;
+	KeySettingsPage = nullptr;
+	KeySettingsPlayer.Reset();
+	KeySettingsViewport.Reset();
+	KeySettingsRemovalHandle.Reset();
+
+	UGGYGOLocalPlayer* LocalPlayer = OriginalPlayer.Get();
+	if (LocalPlayer)
+	{
+		LocalPlayer->OnInputMappingsRemoving().Remove(RemovalHandle);
+	}
+	if (bReturnToGame && Root && OriginalPlayer.Get() == GetLocalPlayer())
+	{
+		Page->PrepareReturnToGame(*Root);
+	}
+	Page->ReleaseBindingContext();
+	if (UGameViewportClient* Viewport = OriginalViewport.Get(); Viewport && LocalPlayer && Root)
+	{
+		Viewport->RemoveViewportWidgetForPlayer(LocalPlayer, Root.ToSharedRef());
+	}
+	// 仅归还原 Controller 仍持有的输入模式，原 LocalPlayer 已移交时不操作当前视口。
+	LocalPlayer = OriginalPlayer.Get();
+	if (Root && !KeySettingsPage && LocalPlayer && LocalPlayer == GetLocalPlayer() && LocalPlayer->PlayerController == this
+		&& OriginalViewport.IsValid() && LocalPlayer->ViewportClient.Get() == OriginalViewport.Get()
+		&& OriginalInput.IsValid() && PlayerInput == OriginalInput.Get())
+	{
+		SetInputMode(FInputModeGameOnly());
+		SetShowMouseCursor(false);
+	}
 }
 
 void AGGYGOPlayerController::GGYGOOpenKeySettings()

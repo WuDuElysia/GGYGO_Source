@@ -1320,8 +1320,6 @@ namespace
 	private:
 		bool Finish()
 		{
-			// 先归还日志观察，再清理夹具；后续清理不属于这项负例。
-			ExpectedFreshProof.Reset();
 			Probe->Cleanup();
 			return true;
 		}
@@ -1355,10 +1353,6 @@ namespace
 			BeforeRebuildCount = Hero->GetNativeMappingRebuildCountForTest();
 			BeforeBindingSerial = Movement->GetMovementInputBindingSerial();
 			Hero->ConfigureMappingForTest(Mapping, 0);
-			if (!bUseAlreadyAppliedMapping)
-			{
-				ExpectedFreshProof = MakeUnique<FScopedExpectedMovementProof>(*Probe, false, TEXT("HeroInputReleased"));
-			}
 			HeroDeadline = FPlatformTime::Seconds() + 10.0;
 			Hero->InitializePlayerInput(Pawn->GetInputComponentForTest());
 			return Probe->Test.TestTrue(TEXT("Hero installation registers its IMC and defers compilation/binding to the real engine frame"),
@@ -1375,8 +1369,8 @@ namespace
 				&& Movement->GetMovementOwnerSyncScope(OutScope, Error))) { return false; }
 			FGGYGOQualifiedMovementIntent Intent;
 			const EGGYGOQualifiedMovementIntentQueryResult Query = Movement->QueryQualifiedMovementIntent(OutScope, Intent, Error);
-			return Probe->Test.TestTrue(TEXT("public CMC query confirms real Source Attach without inventing a Held grant"),
-				Query == EGGYGOQualifiedMovementIntentQueryResult::AwaitingPhysicalProof || Query == EGGYGOQualifiedMovementIntentQueryResult::NotHeld);
+			return Probe->Test.TestTrue(TEXT("new Hero Source Attach preserves the same PlayerInput's proven neutral as NotHeld"),
+				Query == EGGYGOQualifiedMovementIntentQueryResult::NotHeld);
 		}
 
 		bool UpdateHeroRebuild()
@@ -1399,7 +1393,6 @@ namespace
 				}
 				FGGYGOMovementOwnerSyncScopeId CurrentScope;
 				if (!CheckAttachedHero(CurrentScope)) { return Finish(); }
-				ExpectedFreshProof.Reset();
 				UGGYGOInputComponent* Input = Pawn->GetInputComponentForTest();
 				UGGYGOCharacterMovementComponent* Movement = Cast<UGGYGOCharacterMovementComponent>(Pawn->GetCharacterMovement());
 				UEnhancedInputLocalPlayerSubsystem* Subsystem = Probe->Fixture.GetInputSubsystem();
@@ -1453,7 +1446,6 @@ namespace
 		EStage Stage = EStage::OriginalSource;
 		TStrongObjectPtr<UGGYGOInputTestMappingContext> FreshMapping;
 		TArray<TUniquePtr<FEnhancedInputActionEventBinding>> OldMoveBindings;
-		TUniquePtr<FScopedExpectedMovementProof> ExpectedFreshProof;
 	};
 
 #if WITH_EDITOR

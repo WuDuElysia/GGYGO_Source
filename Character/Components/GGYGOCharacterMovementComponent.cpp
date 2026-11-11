@@ -761,6 +761,14 @@ void UGGYGOCharacterMovementComponent::PublishMovementOwnerSyncNotice(
 	Notice.bInitialSynchronizationEligible = bInitialEligible && !bInvalidated;
 	Notice.Reason = Reason;
 	Context->Notice = Notice;
+	if (State == EGGYGOMovementOwnerSyncState::Ready && Context->bRequiresNativeResponse)
+	{
+		UE_LOG(LogGGYGOMovement, Verbose,
+			TEXT("[Movement.OwnerSync] CMC='%s', Pawn='%s', Reason='%s', Scope=%llu, Nonce=%llu, Generation=%llu, Binding=%llu, Initial=%d"),
+			*GetPathName(), *GetPathNameSafe(Context->Scope.OriginalPawn.Get()), *Reason.ToString(),
+			static_cast<unsigned long long>(Context->Scope.ScopeSerial), static_cast<unsigned long long>(Nonce),
+			static_cast<unsigned long long>(Generation), static_cast<unsigned long long>(Context->ObservedBindingSerial), bInitialEligible);
+	}
 	const TWeakObjectPtr<UGGYGOCharacterMovementComponent> WeakSelf(this);
 	for (const auto& Record : Dispatch.Records)
 	{
@@ -1194,13 +1202,27 @@ EGGYGOQualifiedMovementIntentQueryResult UGGYGOCharacterMovementComponent::Query
 		return Reject(EResult::Unavailable, TEXT("historical movement replay has no live input grant"));
 	FGGYGOQualifiedMovementIntent Candidate;
 	Candidate.Scope = OriginalScope;
-	const bool bNativeRemote = CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled()
-		&& Cast<APlayerController>(CharacterOwner->GetController());
-	if (bNativeRemote)
+	const APlayerController* RemotePC = CharacterOwner->HasAuthority() && !CharacterOwner->IsLocallyControlled()
+		? Cast<APlayerController>(CharacterOwner->GetController()) : nullptr;
+	if (RemotePC)
 	{
 		const TSharedPtr<const FMovementInputNativeSource> Source = MovementInputNativeSource;
-		if (!Source.IsValid() || !IsMovementOwnerSyncReceiptCurrent(Source->Receipt)
-			|| Source->OwnerScope != OriginalScope || Source->ExecutionRequestSerial != LocomotionRequestSerial
+		const bool bCurrentSource = Source.IsValid() && IsMovementOwnerSyncReceiptCurrent(Source->Receipt)
+			&& Source->OwnerScope == OriginalScope;
+		const bool bNoRequest = Source.IsValid()
+			? bCurrentSource && Source->ExecutionRequestSerial == 0 && MovementInputSourceCheckpoint.RequestSerial == 0
+				&& !MovementInputSourceCheckpoint.bConsumerInvalidated
+			: !MovementInputSourceCheckpoint.bPresent;
+		if (bNoRequest && Context->Notice.State == EGGYGOMovementOwnerSyncState::Ready
+			&& Context->bConnectionCaptured && RemotePC->AcknowledgedPawn == CharacterOwner
+			&& MovementInputBindingSerial == 0 && MovementInputRequestOwnerScope.GetScopeSerial() == 0
+			&& (LocomotionRequestAdmission == ELocomotionRequestAdmission::None
+				|| LocomotionRequestAdmission == ELocomotionRequestAdmission::Revoked))
+		{
+			// 原连接已就绪，尚未观察到移动请求。这里不发请求，也不证明物理中立。
+			return Reject(EResult::AwaitingPhysicalProof, TEXT("当前原远端尚无已认证移动请求"));
+		}
+		if (!bCurrentSource || Source->ExecutionRequestSerial != LocomotionRequestSerial
 			|| Source->ExecutionRequestSerial == 0 || MovementInputRequestOwnerScope != OriginalScope)
 			return Reject(EResult::Unavailable, TEXT("original authenticated native request is unavailable"));
 		if (LocomotionRequestAdmission == ELocomotionRequestAdmission::Failed)
@@ -5443,15 +5465,19 @@ void UGGYGOCharacterMovementComponent::ClientHandleMoveResponse(const FCharacter
 		&& CharacterOwner->IsLocallyControlled() && CharacterOwner->GetLocalRole() == ROLE_AutonomousProxy;
 	if (bNativeClient)
 	{
-		if (!IsMovementOwnerSyncContextCurrent(Context) || !Context->bRequiresNativeResponse
-			|| !Context->bConnectionCaptured || !Context->bOwnerPairCaptured
-			|| Context->Scope.OriginalPlayerController->AcknowledgedPawn != CharacterOwner
-			|| !OwnerResponse.bHasMovementOwnerSync
-			|| OwnerResponse.MovementOwnerSyncNonce != Context->Scope.ResponseNonce
-			|| OwnerResponse.ServerOwnerGeneration == 0)
+		const bool bScopeCurrent = IsMovementOwnerSyncContextCurrent(Context);
+		const bool bNativeRouteReady = bScopeCurrent && Context->bRequiresNativeResponse
+			&& Context->bConnectionCaptured && Context->bOwnerPairCaptured
+			&& Context->Scope.OriginalPlayerController->AcknowledgedPawn == CharacterOwner;
+		const uint64 ExpectedNonce = Context.IsValid() ? Context->Scope.ResponseNonce : 0;
+		if (!bNativeRouteReady || !OwnerResponse.bHasMovementOwnerSync
+			|| ResponseNonce != ExpectedNonce || ResponseGeneration == 0)
 		{
-			ReportMovementOwnerSyncOnce(FName(TEXT("StaleNativeResponse")),
-				TEXT("Native response has no matching original owner scope/PC/nonce; discarded."));
+			ReportMovementOwnerSyncOnce(FName(TEXT("StaleNativeResponse")), FString::Printf(
+				TEXT("已丢弃原生响应。TimeStamp=%.9g ScopeCurrent=%d NativeRouteReady=%d HasOwnerSync=%d ExpectedNonce=%llu ResponseNonce=%llu ResponseGeneration=%llu"),
+				MoveResponse.ClientAdjustment.TimeStamp, bScopeCurrent, bNativeRouteReady, OwnerResponse.bHasMovementOwnerSync,
+				static_cast<unsigned long long>(ExpectedNonce), static_cast<unsigned long long>(ResponseNonce),
+				static_cast<unsigned long long>(ResponseGeneration)));
 			return;
 		}
 		const uint64 Known = Context->Notice.ServerOwnerGeneration != 0

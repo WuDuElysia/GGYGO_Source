@@ -13,6 +13,8 @@
 #include "Materials/MaterialInterface.h"
 #include "Misc/ScopeExit.h"
 #include "UObject/StrongObjectPtr.h"
+#include "Niagara/GGYGOProjectedDecalRendererProperties.h"
+#include "Niagara/GGYGONiagaraMaterialPreparation.h"
 #include "NiagaraDataInterfaceUtilities.h"
 #include "NiagaraEmitter.h"
 #include "NiagaraMeshRendererProperties.h"
@@ -338,6 +340,7 @@ void UGGYGOFXNiagaraComponent::QueueRuntimeFailure(uint64 InstanceId, const FStr
 void UGGYGOFXNiagaraComponent::HandleOriginalSystemFinished(UNiagaraComponent* Component)
 {
 	if (Component != this) { return; }
+	FieldActivation.Reset();
 	bRuntimeFailureObservationOpen = false;
 	AdditionalWPOBoundsRadiusCM = 0.0f;
 	ReleasePointLightSource();
@@ -487,6 +490,37 @@ UGGYGOFXNiagaraComponent::UGGYGOFXNiagaraComponent()
 	OnSystemFinished.AddDynamic(this, &ThisClass::HandleOriginalSystemFinished);
 }
 
+bool UGGYGOFXNiagaraComponent::HasEnabledProjectedDecalRenderer() const
+{
+	const UNiagaraSystem* System = GetAsset();
+	if (!IsValid(System)) { return false; }
+	for (const FNiagaraEmitterHandle& Handle : System->GetEmitterHandles())
+	{
+		if (!Handle.GetIsEnabled()) { continue; }
+		bool bHasProjection = false;
+		Handle.ForEachEnabledRendererWithIndex([&](const UNiagaraRendererProperties* Properties, int32)
+		{
+			const auto* Projection = Cast<UGGYGOProjectedDecalRendererProperties>(Properties);
+			bHasProjection |= Projection && Projection->GetIsActive()
+				&& IsValid(Projection->NativeDecal) && Projection->NativeDecal->GetIsEnabled();
+		});
+		if (bHasProjection) { return true; }
+	}
+	return false;
+}
+
+bool UGGYGOFXNiagaraComponent::RequiresGameThreadEndOfFrameUpdates() const
+{
+	// 投影可能在原提交入口为当前粒子数据建立私有 MID；沿引擎已有 EOF 队列选择 GT。
+	return Super::RequiresGameThreadEndOfFrameUpdates() || HasEnabledProjectedDecalRenderer();
+}
+
+bool UGGYGOFXNiagaraComponent::RequiresGameThreadEndOfFrameRecreate() const
+{
+	// 新 RenderState 也会立即提交动态数据，包括 Cooked 的重建路径。
+	return Super::RequiresGameThreadEndOfFrameRecreate() || HasEnabledProjectedDecalRenderer();
+}
+
 bool UGGYGOFXNiagaraComponent::ConfigureField(const FGGYGOFXFieldSettings& Settings, FString& OutError)
 {
 	if (!Settings.ValidateConfiguration(OutError)) { return false; }
@@ -541,7 +575,7 @@ bool UGGYGOFXNiagaraComponent::IsSceneMaterialStateCurrent(const TSharedPtr<FGGY
 
 bool UGGYGOFXNiagaraComponent::AreSceneMaterialsApplied() const
 {
-	return EffectFailure.IsEmpty() && (!SceneMaterials.IsValid()
+	return EffectFailure.IsEmpty() && !MaterialPreparation && (!SceneMaterials.IsValid()
 		|| (SceneMaterials->HostHandle != 0 && SceneMaterials->bInstalled && !SceneMaterials->bRenderingSuppressed));
 }
 
@@ -619,6 +653,13 @@ void UGGYGOFXNiagaraComponent::HandleSceneMaterialsInvalidated(uint64 Handle,
 	if (Readiness != EGGYGOCharacterLightingReadiness::WaitingForRegistration
 		&& Readiness != EGGYGOCharacterLightingReadiness::SourceFailed)
 	{ RejectEffect(FString::Printf(TEXT("FX场景MID登记失效：%s"), *Reason)); return; }
+	if (MaterialPreparation)
+	{
+		// 材质等待尚未启动模拟；灯登记恢复后仍由原场景请求继续本次激活。
+		State->bActivationPending = true;
+		State->bResetWhenReady |= bMaterialActivationReset;
+		CancelMaterialPreparation();
+	}
 	ObserveSceneMaterialReadiness(State);
 	if (!State->bRenderingSuppressed)
 	{
@@ -630,6 +671,7 @@ void UGGYGOFXNiagaraComponent::HandleSceneMaterialsInvalidated(uint64 Handle,
 
 void UGGYGOFXNiagaraComponent::ReleaseSceneMaterials()
 {
+	CancelMaterialPreparation();
 	const auto State = MoveTemp(SceneMaterials);
 	SceneMaterials.Reset();
 	if (!State.IsValid()) { return; }
@@ -699,6 +741,128 @@ void UGGYGOFXNiagaraComponent::Activate(bool bReset)
 }
 
 void UGGYGOFXNiagaraComponent::StartNativeEffect(bool bReset)
+{
+#if GGYGO_WITH_DISTORTION_FIELD
+	if (FieldSettings.Mode == EGGYGOFXFieldMode::DualSignedField && !GetSystemInstanceController().IsValid())
+	{
+		UWorld* const World = GetWorld();
+		if (!IsValid(World) || World->bIsTearingDown)
+		{ RejectEffect(TEXT("双场 Niagara 激活缺原活动 World。")); return; }
+		if (!World->IsNetMode(NM_DedicatedServer))
+		{
+			if (FieldActivation.IsValid()) { FieldActivation->bReset |= bReset; return; }
+			FieldActivation = MakeShared<FFieldActivationRequest>();
+			FieldActivation->System = GetAsset();
+			FieldActivation->World = World;
+			FieldActivation->bReset = bReset;
+			TryStartFieldActivation(FieldActivation);
+			return;
+		}
+	}
+#endif
+	ActivateNativeEffect(bReset);
+}
+
+void UGGYGOFXNiagaraComponent::TickComponent(float DeltaTime, ELevelTick TickType, FActorComponentTickFunction* TickFunction)
+{
+	if (FieldActivation.IsValid()) { TryStartFieldActivation(FieldActivation); return; }
+	Super::TickComponent(DeltaTime, TickType, TickFunction);
+}
+
+void UGGYGOFXNiagaraComponent::TryStartFieldActivation(TSharedPtr<FFieldActivationRequest> Request)
+{
+	const TWeakObjectPtr<ThisClass> Original(this);
+	UWorld* const World = Request->World.Get();
+	const auto HasOriginalScope = [&]()
+	{
+		return IsRegistered() && Request->World.IsValid() && GetWorld() == World && !World->bIsTearingDown
+			&& Request->System.IsValid() && GetAsset() == Request->System.Get()
+			&& !GetSystemInstanceController().IsValid();
+	};
+	if (!HasOriginalScope())
+	{ RejectEffect(TEXT("双场材质等待时原 Niagara／World 已改变。")); return; }
+	bool bPendingCompilation = false;
+	for (UMaterialInterface* Material : FieldSettings.FieldMaterials)
+	{
+		FString Reason;
+		const auto Role = UGGYGODistortionFieldComponent::PrepareMaterialFieldRole(Material, World, Reason);
+		if (!Original.IsValid() || FieldActivation != Request) { return; }
+		if (!HasOriginalScope())
+		{ RejectEffect(TEXT("准备双场材质时原 Niagara／World 已改变。")); return; }
+		if (Role == EGGYGODistortionMaterialRole::PendingCompilation) { bPendingCompilation = true; }
+		else if (Role != EGGYGODistortionMaterialRole::DualSignedField)
+		{
+			RejectEffect(FString::Printf(TEXT("原双场材质 %s 未通过激活资格：%s"), *GetPathNameSafe(Material), *Reason));
+			return;
+		}
+	}
+	// 等待期间原灯宿主也可能撤销登记；仍由原灯回调重新登记。
+	if (bPendingCompilation || (SceneMaterials.IsValid() && !SceneMaterials->HostHandle))
+	{
+		// 使用原组件 Tick；远端在原 publication 资格与 age 更新之后才进入此处。
+		SetComponentTickEnabled(true);
+		return;
+	}
+	FieldActivation.Reset();
+	ActivateNativeEffect(Request->bReset);
+}
+
+void UGGYGOFXNiagaraComponent::ActivateNativeEffect(bool bReset)
+{
+	if (MaterialPreparation)
+	{
+		bMaterialActivationReset |= bReset;
+		return;
+	}
+	// 此处沿原场材质资格与场景 MID 安装之后进入；不提前创建 Niagara 模拟器。
+	MaterialPreparation = UGGYGONiagaraMaterialPreparation::CreateForComponents(this, {this});
+	if (!MaterialPreparation)
+	{ RejectEffect(TEXT("最终 Niagara 材质准备未返回原请求。")); return; }
+	bMaterialActivationReset = bReset;
+	MaterialPreparation->OnFinished.AddDynamic(this, &ThisClass::HandleMaterialPreparationFinished);
+	const TStrongObjectPtr<UGGYGONiagaraMaterialPreparation> Request(MaterialPreparation);
+	Request->Start();
+}
+
+void UGGYGOFXNiagaraComponent::HandleMaterialPreparationFinished(UGGYGONiagaraMaterialPreparation* Request)
+{
+	if (MaterialPreparation != Request) { return; }
+	const auto State = Request->GetState();
+	const bool bReset = bMaterialActivationReset;
+	const FString Error = Request->GetError();
+	Request->OnFinished.RemoveDynamic(this, &ThisClass::HandleMaterialPreparationFinished);
+	MaterialPreparation = nullptr;
+	bMaterialActivationReset = false;
+	if (State == EGGYGONiagaraMaterialPreparationState::Cancelled) { return; }
+	if (State != EGGYGONiagaraMaterialPreparationState::Ready)
+	{ RejectEffect(FString::Printf(TEXT("最终 Niagara 材质准备失败：%s"), *Error)); return; }
+	if (!IsRegistered() || !GetWorld() || GetWorld()->bIsTearingDown || !EffectFailure.IsEmpty()) { return; }
+	if (SceneMaterials.IsValid())
+	{
+		if (!IsSceneMaterialStateCurrent(SceneMaterials) || !SceneMaterials->HostHandle || !SceneMaterials->bInstalled)
+		{ RejectEffect(TEXT("最终材质就绪时原场景 MID 登记已失效。")); return; }
+		if (SceneMaterials->bRenderingSuppressed)
+		{
+			SceneMaterials->bRenderingSuppressed = false;
+			SetRenderingEnabled(SceneMaterials->bOriginalRendering);
+		}
+	}
+	ActivatePreparedEffect(bReset);
+}
+
+void UGGYGOFXNiagaraComponent::CancelMaterialPreparation()
+{
+	const TStrongObjectPtr<UGGYGONiagaraMaterialPreparation> Request(MaterialPreparation);
+	MaterialPreparation = nullptr;
+	bMaterialActivationReset = false;
+	if (Request.IsValid())
+	{
+		Request->OnFinished.RemoveDynamic(this, &ThisClass::HandleMaterialPreparationFinished);
+		Request->Cancel();
+	}
+}
+
+void UGGYGOFXNiagaraComponent::ActivatePreparedEffect(bool bReset)
 {
 	float RadiusCM = 0.0f;
 	FString Error;
@@ -814,10 +978,24 @@ FBoxSphereBounds UGGYGOFXNiagaraComponent::CalcBounds(const FTransform& LocalToW
 
 void UGGYGOFXNiagaraComponent::Deactivate()
 {
+	CancelMaterialPreparation();
 	// 尚未启动的等待也属于原窗口；取消后移除订阅，不能在后继Ready迟播。
+	if (FieldActivation.IsValid())
+	{
+		FieldActivation.Reset();
+		SetComponentTickEnabled(false);
+	}
 	if (SceneMaterials.IsValid() && (SceneMaterials->bActivationPending || !GetSystemInstanceController().IsValid()))
 	{ ReleaseSceneMaterials(); }
 	Super::Deactivate();
+}
+
+void UGGYGOFXNiagaraComponent::DeactivateImmediate()
+{
+	CancelMaterialPreparation();
+	FieldActivation.Reset();
+	ReleaseSceneMaterials();
+	Super::DeactivateImmediate();
 }
 
 void UGGYGOFXNiagaraComponent::OnUpdateTransform(EUpdateTransformFlags Flags, ETeleportType Teleport)
@@ -870,10 +1048,10 @@ bool UGGYGOFXNiagaraComponent::RefreshFieldBinding(FString& OutError)
 		if (Seen.Contains(Material)) { continue; }
 		Seen.Add(Material);
 		FString Reason;
-		// 普通模式只核完整声明；真实异步材质状态交原 Niagara。双场仍要求完整编译资格。
-		const auto Role = FieldSettings.Mode == EGGYGOFXFieldMode::NoCustomField
-			? UGGYGODistortionFieldComponent::QueryMaterialFieldDeclaration(Material, World, Reason)
-			: UGGYGODistortionFieldComponent::QueryMaterialFieldRole(Material, World, Reason);
+		// 显式 field 成员要求完整编译资格；集外须核原材质声明，确认普通后沿 Niagara 原异步渲染。
+		const auto Role = FieldSettings.FieldMaterials.Contains(Material)
+			? UGGYGODistortionFieldComponent::QueryMaterialFieldRole(Material, World, Reason)
+			: UGGYGODistortionFieldComponent::QueryMaterialFieldDeclaration(Material, World, Reason);
 		if (!Original.IsValid() || !IsRegistered() || !IsValid(World) || GetWorld() != World || World->bIsTearingDown
 			|| GetSystemInstanceController() != Controller)
 		{ OutError = TEXT("查询材质资格时原 World／Controller 已改变。"); return false; }
@@ -949,6 +1127,7 @@ void UGGYGOFXNiagaraComponent::DispatchEffectFailure()
 {
 	if (EffectFailure.IsEmpty() || bEffectFailureDispatched) { return; }
 	bEffectFailureDispatched = true;
+	FieldActivation.Reset();
 	const FString OriginalReason = EffectFailure;
 	const TWeakObjectPtr<ThisClass> Original(this);
 	const TWeakObjectPtr<UNiagaraSystem> OriginalSystem(GetAsset());
@@ -975,6 +1154,7 @@ void UGGYGOFXNiagaraComponent::DispatchEffectFailure()
 
 void UGGYGOFXNiagaraComponent::OnUnregister()
 {
+	FieldActivation.Reset();
 	bRuntimeFailureObservationOpen = false;
 	AdditionalWPOBoundsRadiusCM = 0.0f;
 	ReleasePointLightSource();
@@ -985,6 +1165,7 @@ void UGGYGOFXNiagaraComponent::OnUnregister()
 
 void UGGYGOFXNiagaraComponent::OnComponentDestroyed(bool bDestroyingHierarchy)
 {
+	FieldActivation.Reset();
 	bRuntimeFailureObservationOpen = false;
 	AdditionalWPOBoundsRadiusCM = 0.0f;
 	ReleasePointLightSource();

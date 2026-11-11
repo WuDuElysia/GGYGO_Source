@@ -379,7 +379,7 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 	for (const FGGYGONiagaraEffectUnit& Unit : RequestedUnits)
 	{
 		UNiagaraSystem* const System = Unit.System;
-		// Ready 会完成原生加载，并包含编译与 PSO 的合法暂态；无效编译结果须独立拒绝。
+		// System 就绪不代表最终 Renderer 材质就绪；后者由原组件在安装覆盖后、模拟前准备。
 		const bool bSystemReady = System->IsReadyToRun();
 		const bool bSystemValid = System->IsValid();
 		const bool bCompilationPending = HasPendingNiagaraCompilation(System);
@@ -472,7 +472,7 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 			|| !ActivationAvatar.IsValid() || !IsValid(LiveTask->Ability) || !LiveTask->Ability->IsActive()
 			|| LiveTask->Ability->GetAvatarActorFromActorInfo() != ActivationAvatar.Get())
 		{ LiveTask->FailAndEndTask(TEXT("激活组合单元前原 FX 作用域或组件已失效。")); return; }
-		// 合法编译／PSO 等待仍是请求已发出；不以 IsActive 或首粒子反推启动事实。
+		// 最终材质及原生编译／PSO 等待仍是请求已发出；不以 IsActive 或首粒子反推启动事实。
 		LiveTask->StartResult = EGGYGONiagaraEffectStartResult::SpawnAndActivationRequested;
 		CreatedComponent->Activate(true);
 		LiveTask = OriginalTask.Get(true);
