@@ -131,9 +131,17 @@ protected:
 	UFUNCTION()
 	virtual void OnDeathStarted(AActor* OwningActor);
 
-	/** 死亡演出结束：隐藏角色。销毁与复活由外部决定，本类不代劳。 */
+	/** 接收 Health 的死亡结束事实，下一帧再交给蓝图处理，允许同次广播先完成自动替补。 */
 	UFUNCTION()
 	virtual void OnDeathFinished(AActor* OwningActor);
+
+	/**
+	 * 死亡结束广播后的下一帧调用，各端独立执行。共享角色蓝图决定隐藏、销毁或保留 Pawn。
+	 * @return 蓝图已处理时返回 true；未实现或返回 false 会明确诊断，不执行默认销毁。
+	 */
+	UFUNCTION(BlueprintNativeEvent, Category = "GGYGO|Character|Death", meta = (DisplayName = "Handle Death Finished"))
+	bool K2_HandleDeathFinished();
+	virtual bool K2_HandleDeathFinished_Implementation();
 
 	/**
 	 * 关闭移动与碰撞。死亡开始时调用。
@@ -143,10 +151,17 @@ protected:
 	 */
 	void DisableMovementAndCollision();
 
-	/** 卸下 ASC 关联并清理。死亡结束时调用。 */
+	/**
+	 * 供死亡处理蓝图选择的清理原语：各端释放本 Pawn 的 ASC 关联并隐藏；仅权威端解除控制并安排销毁。
+	 * 在 Handle Death Finished 中调用时，已晚于死亡结束及自动替补广播。保留旧有 0.1 秒 LifeSpan。
+	 */
+	UFUNCTION(BlueprintCallable, Category = "GGYGO|Character|Death", meta = (BlueprintProtected = "true"))
 	void UninitAndDestroy();
 
 private:
+	/** TimerManager 持有本 Actor 的弱绑定，Actor 失效后不会执行旧回调。 */
+	void HandleDeathFinishedNextTick();
+
 	/** 客户端收到整体碰撞开关后应用同一值。 */
 	UFUNCTION()
 	void OnRep_ReplicatedActorEnableCollision();

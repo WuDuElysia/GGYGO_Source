@@ -12,9 +12,12 @@
 #include "Components/CapsuleComponent.h"
 #include "GameFramework/CharacterMovementComponent.h"
 #include "GameFramework/Controller.h"
+#include "Logging/LogMacros.h"
 #include "Net/UnrealNetwork.h"
 
 #include UE_INLINE_GENERATED_CPP_BY_NAME(GGYGOCharacterBase)
+
+DEFINE_LOG_CATEGORY_STATIC(LogGGYGOCharacterDeath, Log, All);
 
 AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitializer)
 	// 把 ACharacter 自带的 CMC 换成项目 CMC。
@@ -187,10 +190,27 @@ void AGGYGOCharacterBase::OnDeathStarted(AActor* OwningActor)
 
 void AGGYGOCharacterBase::OnDeathFinished(AActor* OwningActor)
 {
-	// 下一帧再清理，不在本帧立刻做。
+	// 下一帧再交给蓝图决定 Pawn 的去留。
 	// 本函数是从 HealthComponent 的委托广播里被调用的，
 	// 此刻同一个广播的其它订阅者还没执行完，立即销毁会让它们访问已失效的对象。
-	GetWorld()->GetTimerManager().SetTimerForNextTick(this, &ThisClass::UninitAndDestroy);
+	GetWorld()->GetTimerManager().SetTimerForNextTick(this, &ThisClass::HandleDeathFinishedNextTick);
+}
+
+bool AGGYGOCharacterBase::K2_HandleDeathFinished_Implementation()
+{
+	return false;
+}
+
+void AGGYGOCharacterBase::HandleDeathFinishedNextTick()
+{
+	// 蓝图可以销毁本 Pawn；返栈后只用调用前保存的路径诊断，不再读取角色资源。
+	const FString CharacterPath = GetPathName();
+	if (!K2_HandleDeathFinished())
+	{
+		UE_LOG(LogGGYGOCharacterDeath, Error,
+			TEXT("[Character.Death] Pawn=%s: Handle Death Finished 未配置或未确认处理；请配置共享角色蓝图。"),
+			*CharacterPath);
+	}
 }
 
 void AGGYGOCharacterBase::DisableMovementAndCollision()
