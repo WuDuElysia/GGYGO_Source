@@ -1832,6 +1832,8 @@ bool UGGYGOPlayerComboAbility::BeginStep(const FGGYGOAbilityActivationHandle& Or
 			if (ThisClass* Self = ResolveOriginalCaller()) { Self->HandleMontageInterrupted(Original, Tag, Data); }
 		});
 	Callbacks.OnCancelled = Callbacks.OnInterrupted;
+	// 原 GA 已进入 Cancel 时由 GAS 完成本次结束，Montage Task 的通知不再重入 Cancel。
+	Callbacks.bNotifyNativeOnOwnerCancellation = false;
 	Callbacks.OnBlendOut = FGGYGOPlayMontageAndWaitForEventDelegate::CreateLambda(
 		[ResolveOriginalCaller, Original](FGameplayTag Tag, FGameplayEventData Data)
 		{

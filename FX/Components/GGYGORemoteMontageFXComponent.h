@@ -38,6 +38,8 @@ protected:
 private:
 	void HandleLocalStartReady();
 	bool CanPresent() const;
+	/** 同时提交组件与原 Niagara 渲染代理状态，不额外推进模拟。 */
+	void SetPresentationRenderingEnabled(bool bEnabled);
 	void RestoreAge(float DeltaSeconds, ELevelTick TickType, FActorComponentTickFunction* TickFunction);
 	void FailPresentation(const FString& Reason);
 	void HandleEffectFailed(UGGYGOFXNiagaraComponent* Component, const FString& Reason);

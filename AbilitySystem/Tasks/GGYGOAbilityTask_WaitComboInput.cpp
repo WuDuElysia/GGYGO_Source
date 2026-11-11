@@ -338,6 +338,8 @@ void UGGYGOAbilityTask_WaitComboInput::HandleTargetData(
 	{
 		if (Task->bInitialReceived) return;
 		Task->bInitialReceived = true;
+		// 首次数据已验收，后续续击是可选输入，不再保留原生的远端必需数据等待。
+		Task->ClearWaitingOnRemotePlayerData();
 	}
 	else
 	{

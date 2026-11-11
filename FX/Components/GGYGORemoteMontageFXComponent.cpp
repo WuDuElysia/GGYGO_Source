@@ -6,6 +6,7 @@
 #include "GameFramework/GameStateBase.h"
 #include "NiagaraSystem.h"
 #include "NiagaraSystemInstanceController.h"
+#include "NiagaraSceneProxy.h"
 #include "UObject/StrongObjectPtr.h"
 
 DEFINE_LOG_CATEGORY_STATIC(LogGGYGORemoteFX, Log, All);
@@ -31,7 +32,7 @@ void UGGYGORemoteMontageFXComponent::InitializePresentation(UGGYGOMontageFXPubli
 	bOriginalForceSolo = GetForceSolo();
 	bOriginalRendering = GetRenderingEnabled();
 	OriginalAgeMode = GetAgeUpdateMode();
-	SetRenderingEnabled(false);
+	SetPresentationRenderingEnabled(false);
 	SetCanRenderWhileSeeking(false);
 	SetForceSolo(true);
 	SetAgeUpdateMode(ENiagaraAgeUpdateMode::DesiredAge);
@@ -241,7 +242,18 @@ void UGGYGORemoteMontageFXComponent::RefreshSourceReferences(const FGGYGOMontage
 
 void UGGYGORemoteMontageFXComponent::TickComponent(float Delta, ELevelTick TickType, FActorComponentTickFunction* Tick)
 {
-	if (bTransferred) { Super::TickComponent(Delta, TickType, Tick); return; }
+	if (bTransferred)
+	{
+#if WITH_EDITOR
+		const TWeakObjectPtr<ThisClass> Self(this);
+#endif
+		Super::TickComponent(Delta, TickType, Tick);
+#if WITH_EDITOR
+		if (Self.IsValid() && !IsBeingDestroyed() && bObservationTailTransferred)
+		{ AppendObservation(EGGYGOMontageFXObservationKind::Snapshot); }
+#endif
+		return;
+	}
 	const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> Owner = ResourceOwner;
 	const uint64 Key = Playback.Occurrence;
 	const uint64 Generation = ResourceGeneration;
@@ -258,14 +270,21 @@ void UGGYGORemoteMontageFXComponent::TickComponent(float Delta, ELevelTick TickT
 	}
 }
 
+void UGGYGORemoteMontageFXComponent::SetPresentationRenderingEnabled(bool bEnabled)
+{
+	SetRenderingEnabled(bEnabled);
+	// Niagara 的 setter 只改组件字段。原 Tick 已提交隐藏时，完成追赶必须同帧更新代理。
+	if (SceneProxy) { static_cast<FNiagaraSceneProxy*>(SceneProxy)->SetRenderingEnabled_GT(bEnabled); }
+}
+
 void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType, FActorComponentTickFunction* Tick)
 {
 	const FString RuntimeFailure = GetEffectFailure();
 	if (!RuntimeFailure.IsEmpty()) { FailPresentation(RuntimeFailure); return; }
 	if (bLocalProducer && !CanPresent()) { DestroyComponent(); return; }
-	if (bReached) { Super::TickComponent(Delta, TickType, Tick); return; }
+	if (bReached && bLocalProducer) { Super::TickComponent(Delta, TickType, Tick); return; }
 	if (!CanPresent())
-	{ SetRenderingEnabled(false); return; } // 缺条目尚无 Terminal：保持隐藏等准确终结。
+	{ SetPresentationRenderingEnabled(false); return; } // 缺条目尚无 Terminal：保持隐藏等准确终结。
 	if (!IsValid(Playback.Mesh) || !Playback.Mesh->IsRegistered()) { return; }
 	FString CompilationError;
 	if (!UGGYGOAbilityTask_PlayNiagaraEffect::ValidateCompiledSystem(Playback.System, CompilationError))
@@ -285,6 +304,7 @@ void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType
 	if (!FMath::IsFinite(Step) || Step <= 0.f || Age / Step >= MAX_int32)
 	{ FailPresentation(TEXT("Remote native seek step or age range is invalid.")); return; }
 	const TWeakObjectPtr<ThisClass> Self(this);
+	SetPresentationRenderingEnabled(false);
 	SetDesiredAge(static_cast<float>(Age));
 	if (!bActivationRequested)
 	{
@@ -308,10 +328,17 @@ void UGGYGORemoteMontageFXComponent::RestoreAge(float Delta, ELevelTick TickType
 	bReached = true;
 	// 公共 setter 同时清除原生 seek 标记；不读取/改写私有 bIsSeeking。
 	SetDesiredAge(static_cast<float>(Age));
-	SetAgeUpdateMode(OriginalAgeMode);
-	SetRenderingEnabled(bOriginalRendering);
-	if (!Self.IsValid() || !CanPresent()) { return; }
-	SetForceSolo(bOriginalForceSolo);
+	if (bLocalProducer) { SetAgeUpdateMode(OriginalAgeMode); }
+	SetPresentationRenderingEnabled(bOriginalRendering);
+	if (bLocalProducer)
+	{
+		if (Self.IsValid() && CanPresent()) { SetForceSolo(bOriginalForceSolo); }
+		return;
+	}
+	// 此组件已经在本帧的 Solo Tick 中消费到 Age。立即转入 WorldManager 的批量
+	// Simulation 会允许同帧再消费一次 Delta；组件及其活尾始终由原 Solo Tick 推进。
+	// 活动期间每帧继续按原 Begin 求 DesiredAge，避免 TickDeltaTime 被原生 MaxDeltaTime
+	// 截短后持续落后服务器时钟。超出本帧追赶预算仍保持隐藏，不把 reached 当成当前 Age。
 }
 
 EGGYGONiagaraEffectStopMode UGGYGORemoteMontageFXComponent::GetStopMode(EGGYGOMontageFXCloseReason Reason) const
@@ -322,6 +349,18 @@ EGGYGONiagaraEffectStopMode UGGYGORemoteMontageFXComponent::GetStopMode(EGGYGOMo
 void UGGYGORemoteMontageFXComponent::ReleasePresentation(EGGYGONiagaraEffectStopMode Mode)
 {
 	if (bTransferred) { return; }
+	// 归还后只有原生尾粒子继续，退出服务器 Age 追赶并恢复资产的时间模式。
+	if (!bLocalProducer)
+	{
+		SetAgeUpdateMode(OriginalAgeMode);
+		if (bReached && (Mode == EGGYGONiagaraEffectStopMode::DeactivateKeepAttached
+			|| Mode == EGGYGONiagaraEffectStopMode::DeactivateDetachKeepWorld))
+		{
+			// 上一帧可能因追赶预算不足而隐藏；已到达过的原活尾不能继承 seek 的隐藏状态。
+			SetDesiredAge(GetDesiredAge());
+			SetPresentationRenderingEnabled(bOriginalRendering);
+		}
+	}
 	if (bLocalProducer)
 	{
 		const TStrongObjectPtr<UGGYGOMontageFXPublicationOwner> Owner(ResourceOwner.Get());

@@ -18,6 +18,7 @@
 
 #include "AbilitySystemBlueprintLibrary.h"
 #include "AbilitySystemGlobals.h"
+#include "CoreGlobals.h"
 #include "Engine/HitResult.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/Controller.h"
@@ -25,6 +26,7 @@
 #include "GameFramework/Pawn.h"
 #include "GameFramework/PlayerController.h"
 #include "GameplayAbilitySpec.h"
+#include "HAL/PlatformStackWalk.h"
 
 #if WITH_EDITOR
 #include "Misc/DataValidation.h"
@@ -976,6 +978,21 @@ void UGGYGOGameplayAbility::EndAbility(const FGameplayAbilitySpecHandle Handle, 
 	}
 	const FGGYGOAbilityActivationHandle Ending = CurrentActivation;
 	bEndingActivation = true;
+	if (bWasCancelled && Ending.HasActivation() && UE_LOG_ACTIVE(LogGGYGOAbilitySystem, Verbose)
+		&& ActorInfo->IsNetAuthority())
+	{
+		// 记录首次实际进入清理的原激活。原生 Cancel、复制入口和直接 End 由当前调用栈区分。
+		const auto& Original = *Ending.Proof;
+		ANSICHAR Callstack[16384] = {};
+		FPlatformStackWalk::StackWalkAndDump(Callstack, UE_ARRAY_COUNT(Callstack), 1);
+		UE_LOG(LogGGYGOAbilitySystem, Verbose,
+			TEXT("[AbilitySystem.AuthorityCancellation] Boundary=EndAbility Frame=%llu Ability='%s' ASC='%s' Avatar='%s' ActivationSerial=%llu OriginalSpec='%s' OriginalPredictionKey='%s' EndSpec='%s' EndPredictionKey='%s' ReplicateEnd=%d WasCancelled=%d RemoteInstanceEnded=%d\nCallstack:\n%s"),
+			static_cast<unsigned long long>(GFrameCounter), *GetPathName(), *GetPathNameSafe(Original.ASC.Get()),
+			*GetPathNameSafe(ActorInfo->AvatarActor.Get()), static_cast<unsigned long long>(Original.Serial),
+			*Original.SpecHandle.ToString(), *Original.ActivationKey.ToString(), *Handle.ToString(),
+			*ActivationInfo.GetActivationPredictionKey().ToString(), bReplicateEndAbility, bWasCancelled,
+			RemoteInstanceEnded, ANSI_TO_TCHAR(Callstack));
+	}
 	CleanupAbilityResourcesForTermination(FGGYGOAbilityTerminationContext(Ending, bWasCancelled));
 	Super::EndAbility(Handle, ActorInfo, ActivationInfo, bReplicateEndAbility, bWasCancelled);
 	// 正常路径已在 ASC::NotifyAbilityEnded 中退役；原生没有到达 ASC 通知（如 ASC 失效）时在此退役。

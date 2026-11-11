@@ -33,6 +33,14 @@ void UGGYGOMontageFXReplicationComponent::GetLifetimeReplicatedProps(TArray<FLif
 	DOREPLIFETIME_CONDITION_NOTIFY(ThisClass, State, COND_None, REPNOTIFY_Always);
 }
 
+#if WITH_EDITOR
+UGGYGOMontageFXReplicationComponent::FOnPublisherRegistered& UGGYGOMontageFXReplicationComponent::OnPublisherRegistered()
+{
+	static FOnPublisherRegistered Event;
+	return Event;
+}
+#endif
+
 void UGGYGOMontageFXReplicationComponent::OnRegister()
 {
 	Super::OnRegister();
@@ -41,7 +49,28 @@ void UGGYGOMontageFXReplicationComponent::OnRegister()
 		// 同一 State 跨重注册复用原 LocalOwner；Initialize 只推进注册代次。
 		PublicationOwner = UGGYGOMontageFXPublicationOwner::RegisterHost(this, State,
 			FGGYGOMontageFXSendTerminal::CreateUObject(this, &ThisClass::SendTerminal));
+#if WITH_EDITOR
+		if (auto& Event = OnPublisherRegistered(); Event.IsBound())
+		{
+			const TWeakObjectPtr<ThisClass> OriginalHost(this);
+			const TWeakObjectPtr<UGGYGOMontageFXPublicationOwner> OriginalOwner(PublicationOwner.Get());
+			const uint64 Registration = PublicationOwner->GetRegistrationSerial();
+			Event.Broadcast(*this, *PublicationOwner);
+			// 外部订阅返栈后不能替另一注册代次应用状态。
+			if (!OriginalHost.IsValid() || !IsRegistered() || !OriginalOwner.IsValid()
+				|| PublicationOwner != OriginalOwner.Get() || PublicationOwner->GetRegistrationSerial() != Registration)
+			{ return; }
+		}
+#endif
 	}
+#if WITH_EDITOR
+	if (bReplicatedStatePendingObservation)
+	{
+		bReplicatedStatePendingObservation = false;
+		PublicationOwner->ReceiveReplicatedState();
+		return;
+	}
+#endif
 	PublicationOwner->ReceiveState();
 }
 
@@ -57,7 +86,12 @@ void UGGYGOMontageFXReplicationComponent::OnUnregister()
 
 void UGGYGOMontageFXReplicationComponent::OnRep_State()
 {
+#if WITH_EDITOR
+	if (UGGYGOMontageFXPublicationOwner* Owner = PublicationOwner) { Owner->ReceiveReplicatedState(); }
+	else { bReplicatedStatePendingObservation = true; }
+#else
 	if (UGGYGOMontageFXPublicationOwner* Owner = PublicationOwner) { Owner->ReceiveState(); }
+#endif
 }
 
 void UGGYGOMontageFXReplicationComponent::SendTerminal(const FGGYGOMontageFXTerminal& Terminal)

@@ -32,6 +32,13 @@ public:
 	/** 当前注册的发行者；未注册时为 nullptr。 */
 	UGGYGOMontageFXPublicationOwner* GetPublicationOwner() const { return PublicationOwner; }
 
+#if WITH_EDITOR
+	DECLARE_EVENT_TwoParams(UGGYGOMontageFXReplicationComponent, FOnPublisherRegistered,
+		UGGYGOMontageFXReplicationComponent&, UGGYGOMontageFXPublicationOwner&);
+	/** 原 owner 已安装，原状态尚未应用。订阅者仅安装值观察窗，并按原 World 过滤。 */
+	static FOnPublisherRegistered& OnPublisherRegistered();
+#endif
+
 	/**
 	 * 权威端发布原 GA/Task 的同步 Begin 事实。要求原 GA 的 ASC 与本组件同属一个 Owner、
 	 * 原激活仍是当前激活、Task 属于该 GA 且 Begin 事实来自它，Mesh 与 Avatar 一致。
@@ -73,4 +80,8 @@ private:
 	TObjectPtr<UGGYGOMontageFXPublicationOwner> PublicationOwner;
 	UPROPERTY(ReplicatedUsing = OnRep_State)
 	FGGYGOMontageFXState State;
+#if WITH_EDITOR
+	/** OnRep 早于注册时只记实际来源；原 State 仍在注册入口按原流程应用。 */
+	bool bReplicatedStatePendingObservation = false;
+#endif
 };

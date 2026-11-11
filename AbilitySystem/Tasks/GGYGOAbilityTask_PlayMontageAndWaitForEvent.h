@@ -309,6 +309,8 @@ public:
 		FGGYGOMontageNotifyFactDelegate NotifyReceived;
 		FGGYGOMontageWindowFactDelegate WindowReceived;
 		FGGYGOMontageTaskFailureDelegate OnFailed;
+		/** GA 已进入原生 Cancel 时是否调用 C++ OnCancelled。Task 自身失败及 BP 通知仍按原规则派发。 */
+		bool bNotifyNativeOnOwnerCancellation = true;
 	};
 
 	/** One nonempty registration, only in native AwaitingActivation before ReadyForActivation.
@@ -453,7 +455,8 @@ private:
 	/** Common original-source envelope for Ended/blend-out/section facts, including queued facts. */
 	bool CanDispatchOriginalInstanceFact(const FGGYGOMontagePlayGuardIdentity& Original) const;
 	/** Native snapshot first, then recheck the original task before its existing BP callback. */
-	void DispatchOriginalCallback(ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData);
+	void DispatchOriginalCallback(ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData,
+		bool bFromOwnerCancellation = false);
 	void DispatchOriginalSectionFact(const FGGYGOMontageSectionFact& Fact,
 		const FGGYGOMontagePlayGuardIdentity& Original);
 	const FGGYGOMontageNotifyDeclaration* FindConfiguredMontageNotify(FName NotifyName) const;

@@ -99,7 +99,7 @@ enum class EGGYGOMontageFXObservationKind : uint8
 {
 	Snapshot, Published, TerminalDispatched, TerminalReceived, RemoteCreated,
 	ResourceChanged, TailTransferred, NaturalCompleted, ComponentUnregistered,
-	ComponentDestroyed, PublisherClosed
+	ComponentDestroyed, PublisherClosed, StateReceived
 };
 
 struct GGYGO_API FGGYGOMontageFXObservationFact
@@ -162,6 +162,8 @@ struct GGYGO_API FGGYGOMontageFXObservationFact
 	bool bFailed = false;
 	/** 仅由原组件 OnComponentDestroyed 写出；弱引用失效不能生成此事实。 */
 	bool bComponentDestroyed = false;
+	/** 仅 StateReceived 携带该次被接受的原复制快照全键；空数组也表示完整接收。 */
+	TArray<uint64> ActiveOccurrences;
 };
 
 /** Editor 持有的有限收件窗。Runtime 仅弱引用，写值不调用观察者；Stop 立即清空。
@@ -185,6 +187,7 @@ private:
 	int32 Capacity = 0;
 	bool bStopped = false;
 	bool bOverflowed = false;
+	bool bIncludeStateReceipts = false;
 	TArray<FGGYGOMontageFXObservationFact> Pending;
 };
 #endif
@@ -285,8 +288,10 @@ public:
 
 	EGGYGOMontageFXLocalResourceFact ReadLocalResourceFact(AActor* Avatar) const;
 #if WITH_EDITOR
-	/** 先安装弱窗再采快照；容量为 1..4096，溢出明确失败。无需本地 GA。 */
-	TSharedPtr<FGGYGOMontageFXObservation> BeginObservation(int32 MaxRecords, FString& OutDiagnostic);
+	/** 先安装弱窗再采快照；容量为 1..4096，溢出明确失败。无需本地 GA。
+	 * 可额外记录真实 OnRep 的完整状态，先于该状态的资源调和；窗固定原注册代次。 */
+	TSharedPtr<FGGYGOMontageFXObservation> BeginObservation(int32 MaxRecords, FString& OutDiagnostic,
+		bool bIncludeStateReceipts = false);
 	/** 只读原 owner/registration 的当前事实，不推进模拟、不等待异步 Tick。 */
 	bool CaptureObservation(const TSharedPtr<FGGYGOMontageFXObservation>& Window, FString& OutDiagnostic) const;
 #endif
@@ -328,8 +333,12 @@ public:
 private:
 	struct FState;
 	TUniquePtr<FState> Data;
+	void ApplyReceivedState(bool bFromReplication);
 #if WITH_EDITOR
+	friend class UGGYGOMontageFXReplicationComponent;
 	friend class UGGYGORemoteMontageFXComponent;
+	void ReceiveReplicatedState();
+	void AppendReplicatedStateObservation();
 	void FillObservationContext(FGGYGOMontageFXObservationFact& Fact) const;
 	void CaptureObservationFact(uint64 Occurrence, FGGYGOMontageFXObservationFact& Fact) const;
 	void AppendObservation(FGGYGOMontageFXObservationFact Fact);

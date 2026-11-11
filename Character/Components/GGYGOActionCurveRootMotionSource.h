@@ -49,6 +49,8 @@ struct GGYGO_API FRootMotionSource_GGYGOActionCurve : public FRootMotionSource
 	/** Derived from successful original final-range evaluation; native application still has to consume it. */
 	bool bPreparedNaturalEnd = false;
 
+	/** 立即撤销原生贡献，保留此源的 LocalID 直至原生清理。 */
+	void NeutralizeForRemoval();
 	virtual FRootMotionSource* Clone() const override;
 	virtual bool Matches(const FRootMotionSource* Other) const override;
 	virtual bool MatchesAndHasSameState(const FRootMotionSource* Other) const override;

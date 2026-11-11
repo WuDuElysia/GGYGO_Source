@@ -384,10 +384,15 @@ void UGGYGOMontageFXPublicationOwner::AppendObservation(FGGYGOMontageFXObservati
 	ObservationWindows.RemoveAll([](const auto& Weak)
 	{ const auto Window = Weak.Pin(); return !Window.IsValid() || !Window->IsActive(); });
 	for (const auto& Weak : ObservationWindows)
-	{ if (const auto Window = Weak.Pin()) { Window->Add(Fact); } }
+	{
+		if (const auto Window = Weak.Pin(); Window.IsValid()
+			&& (Fact.Kind != EGGYGOMontageFXObservationKind::StateReceived || Window->bIncludeStateReceipts))
+		{ Window->Add(Fact); }
+	}
 }
 
-TSharedPtr<FGGYGOMontageFXObservation> UGGYGOMontageFXPublicationOwner::BeginObservation(int32 MaxRecords, FString& Error)
+TSharedPtr<FGGYGOMontageFXObservation> UGGYGOMontageFXPublicationOwner::BeginObservation(
+	int32 MaxRecords, FString& Error, bool bIncludeStateReceipts)
 {
 	check(IsInGameThread());
 	Error.Reset();
@@ -402,6 +407,7 @@ TSharedPtr<FGGYGOMontageFXObservation> UGGYGOMontageFXPublicationOwner::BeginObs
 	Window->WorldObjectId = Data->World->GetUniqueID();
 	Window->Registration = Data->Registration;
 	Window->Capacity = MaxRecords;
+	Window->bIncludeStateReceipts = bIncludeStateReceipts;
 	ObservationWindows.RemoveAll([](const auto& Weak)
 	{ const auto Existing = Weak.Pin(); return !Existing.IsValid() || !Existing->IsActive(); });
 	ObservationWindows.Add(Window);
@@ -454,6 +460,22 @@ bool UGGYGOMontageFXPublicationOwner::CaptureObservation(
 	}
 	if (!Window->IsActive()) { Error = TEXT("FX 当前快照超过原观察窗容量。"); return false; }
 	return true;
+}
+
+void UGGYGOMontageFXPublicationOwner::AppendReplicatedStateObservation()
+{
+	if (!ObservationWindows.ContainsByPredicate([](const auto& Weak)
+	{
+		const auto Window = Weak.Pin();
+		return Window.IsValid() && Window->IsActive() && Window->bIncludeStateReceipts;
+	})) { return; }
+	FGGYGOMontageFXObservationFact Fact;
+	Fact.Kind = EGGYGOMontageFXObservationKind::StateReceived;
+	Fact.ActiveOccurrences.Reserve(Data->Snapshot->ActiveRecords.Num());
+	for (const auto& Record : Data->Snapshot->ActiveRecords)
+	{ Fact.ActiveOccurrences.Add(Record.Occurrence); }
+	Fact.ActiveOccurrences.Sort();
+	AppendObservation(MoveTemp(Fact));
 }
 #endif
 
@@ -584,9 +606,24 @@ bool UGGYGOMontageFXPublicationOwner::CanCollectClosedKey(uint64 Received, uint6
 
 void UGGYGOMontageFXPublicationOwner::ReceiveState()
 {
+	ApplyReceivedState(false);
+}
+
+#if WITH_EDITOR
+void UGGYGOMontageFXPublicationOwner::ReceiveReplicatedState()
+{
+	ApplyReceivedState(true);
+}
+#endif
+
+void UGGYGOMontageFXPublicationOwner::ApplyReceivedState([[maybe_unused]] bool bFromReplication)
+{
 	if (Data->bClosed || !Data->Snapshot || !Data->Issuer.IsValid()) { return; }
 	if (Data->Snapshot->StateRevision < Data->ReceivedRevision) { return; }
 	Data->ReceivedRevision = Data->Snapshot->StateRevision;
+#if WITH_EDITOR
+	if (bFromReplication) { AppendReplicatedStateObservation(); }
+#endif
 	FlushResourceChanges();
 }
 

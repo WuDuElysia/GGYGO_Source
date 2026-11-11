@@ -281,7 +281,7 @@ bool UGGYGOAbilityTask_PlayMontageAndWaitForEvent::CanDispatchOriginalInstanceFa
 }
 
 void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalCallback(
-	ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData)
+	ENativeCallback Kind, FGameplayTag EventTag, FGameplayEventData EventData, bool bFromOwnerCancellation)
 {
 	const TWeakObjectPtr<UGGYGOAbilityTask_PlayMontageAndWaitForEvent> OriginalTask(this);
 	const TWeakObjectPtr<UGameplayAbility> OriginalAbility(Ability);
@@ -299,7 +299,7 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::DispatchOriginalCallback(
 	// This immutable registration is the callback snapshot. Copying its shared reference does not
 	// copy user functors; unregister/OnDestroy may detach the member while this call owns its copy.
 	TSharedPtr<FNativeCallbackRegistration> NativeSnapshot = NativeCallbackRegistration;
-	if (NativeSnapshot.IsValid())
+	if (NativeSnapshot.IsValid() && (!bFromOwnerCancellation || NativeSnapshot->Callbacks.bNotifyNativeOnOwnerCancellation))
 	{
 		const FGGYGOPlayMontageAndWaitForEventDelegate* Callback = nullptr;
 		switch (Kind)
@@ -1310,7 +1310,8 @@ void UGGYGOAbilityTask_PlayMontageAndWaitForEvent::OnAbilityCancelled()
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* Task = OriginalTask.Get();
 	if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished)
 	{
-		Task->DispatchOriginalCallback(ENativeCallback::Cancelled, FGameplayTag(), FGameplayEventData());
+		Task->DispatchOriginalCallback(ENativeCallback::Cancelled, FGameplayTag(), FGameplayEventData(),
+			/*bFromOwnerCancellation=*/true);
 	}
 	Task = OriginalTask.Get();
 	if (Task && !Task->bEndingTask && Task->GetState() != EGameplayTaskState::Finished) { Task->EndTask(); }

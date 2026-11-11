@@ -437,29 +437,51 @@ bool FGGYGOActionMotionExecution::ValidateMontageActionRuntime(
 	// It is not the consumed-final-interval fact, and never looks up a successor instance.
 	if (Source.bCompletionRequested && CompletedMontageActionResource == Resource) return true;
 	FAnimMontageInstance* Instance = Anim ? Anim->GetMontageInstanceForID(Resource->MontageInstanceId) : nullptr;
+	const FName SectionName = Instance ? Instance->GetCurrentSection() : NAME_None;
 	const FGGYGOActionMotionSourceSection* CurrentSection = Instance
-		? Source.OriginalBinding->FindSection(Instance->GetCurrentSection()) : nullptr;
-	// Only the original Task's non-interrupted native BlendOut fact permits stopped playback.
-	// UE still advances during that configured blend window, then holds End - KINDA_SMALL_NUMBER/2.
-	// A stopped hold can consume only the final native interval; a pause/foreign Stop has no grant.
+		? Source.OriginalBinding->FindSection(SectionName) : nullptr;
+	// 原 Task 已认证自然 BlendOut。UE 正向播完无后继的末段时，停在段末减半个 KINDA_SMALL_NUMBER。
+	// 到达该夹点后，原 RMS 继续用真实原生区间排空剩余曲线，动画位置不参与位移或完成判定。
 	const bool bNaturalBlendOut = Instance && CurrentSection && Instance->IsStopped()
 		&& MontageActionNaturalBlendOutResource == Resource && Source.OriginalBinding->Sections.Num() > 0
 		&& CurrentSection == &Source.OriginalBinding->Sections.Last()
 		&& FMath::IsFinite(Instance->GetPosition())
 		&& (Instance->IsPlaying()
-			|| (FMath::IsNearlyEqual(Instance->GetPosition(), Source.OriginalBinding->MontageEndSeconds, UE_KINDA_SMALL_NUMBER)
-				&& Source.GetTime() + SimulationTime >= Source.Duration));
-	if (!Instance || Instance->Montage != Source.OriginalBinding->Montage.Get()
-		|| !FMath::IsFinite(Instance->GetPosition()) || !CurrentSection
-		|| Instance->GetPosition() < CurrentSection->MontageStartSeconds
-		|| Instance->GetPosition() > CurrentSection->MontageEndSeconds
-		|| ((!Instance->IsActive() || !Instance->IsPlaying()) && !bNaturalBlendOut)
-		|| !FMath::IsFinite(Instance->GetPlayRate()) || Instance->GetPlayRate() != Resource->InstancePlayRate
-		|| (!Source.bCompletionRequested && ActiveMontageActionResource != Resource))
+			|| (Instance->GetNextSection().IsNone()
+				&& Instance->GetPosition() == CurrentSection->MontageEndSeconds - UE_KINDA_SMALL_NUMBER / 2.0f));
+	const auto RejectPlayback = [&](const TCHAR* FirstFailedCheck)
 	{
-		OutError = TEXT("original runtime identity/playback/rate was retired, replaced, paused or dynamically changed");
+		const auto& Binding = *Source.OriginalBinding;
+		const FString Playback = Instance
+			? FString::Printf(TEXT("ActualInstance=%d ActualMontage='%s' Position=%.9g CurrentSection='%s' ActualRate=%.9g Active=%d Playing=%d Stopped=%d"),
+				Instance->GetInstanceID(), *GetPathNameSafe(Instance->Montage.Get()), Instance->GetPosition(), *SectionName.ToString(),
+				Instance->GetPlayRate(), Instance->IsActive(), Instance->IsPlaying(), Instance->IsStopped())
+			: FString(TEXT("InstanceAvailable=0"));
+		const FString SectionRange = CurrentSection
+			? FString::Printf(TEXT("[%.9g,%.9g]"), CurrentSection->MontageStartSeconds, CurrentSection->MontageEndSeconds)
+			: FString(TEXT("Unavailable"));
+		OutError = FString::Printf(
+			TEXT("original runtime identity/playback/rate was retired, replaced, paused or dynamically changed. FirstFailedCheck=%s Frame=%llu Handle=%d NativeId=%u AnimInstance='%s' ")
+			TEXT("OriginalInstance=%d BindingMontage='%s' BindingSlot='%s' BindingSection='%s' BindingRange=[%.9g,%.9g] ExpectedRate=%.9g %s SectionRange=%s ")
+			TEXT("NativeTime=%.9g SimulationTime=%.9g Duration=%.9g NaturalBlendOutMatches=%d NaturalBlendOutAllowed=%d CompletionRequested=%d ActiveHandle=%d ActiveResourceMatches=%d"),
+			FirstFailedCheck, static_cast<unsigned long long>(GFrameCounter), Resource->Handle, static_cast<uint32>(Source.LocalID), *GetPathNameSafe(Anim),
+			Resource->MontageInstanceId, *GetPathNameSafe(Binding.Montage.Get()), *Binding.SlotName.ToString(), *Binding.SectionName.ToString(),
+			Binding.MontageStartSeconds, Binding.MontageEndSeconds, Resource->InstancePlayRate, *Playback, *SectionRange,
+			Source.GetTime(), SimulationTime, Source.Duration, MontageActionNaturalBlendOutResource == Resource, bNaturalBlendOut,
+			Source.bCompletionRequested, ActiveActionMotionHandle, ActiveMontageActionResource == Resource);
 		return false;
-	}
+	};
+	if (!Instance) return RejectPlayback(TEXT("OriginalInstanceMissing"));
+	if (Instance->Montage != Source.OriginalBinding->Montage.Get()) return RejectPlayback(TEXT("OriginalMontageMismatch"));
+	if (!FMath::IsFinite(Instance->GetPosition())) return RejectPlayback(TEXT("PositionNotFinite"));
+	if (!CurrentSection) return RejectPlayback(TEXT("CurrentSectionMissingFromBinding"));
+	if (Instance->GetPosition() < CurrentSection->MontageStartSeconds) return RejectPlayback(TEXT("PositionBeforeSection"));
+	if (Instance->GetPosition() > CurrentSection->MontageEndSeconds) return RejectPlayback(TEXT("PositionAfterSection"));
+	if ((!Instance->IsActive() || !Instance->IsPlaying()) && !bNaturalBlendOut)
+		return RejectPlayback(Instance->IsActive() ? TEXT("InstanceNotPlayingWithoutNaturalBlendOut") : TEXT("InstanceInactiveWithoutNaturalBlendOut"));
+	if (!FMath::IsFinite(Instance->GetPlayRate())) return RejectPlayback(TEXT("PlayRateNotFinite"));
+	if (Instance->GetPlayRate() != Resource->InstancePlayRate) return RejectPlayback(TEXT("PlayRateMismatch"));
+	if (!Source.bCompletionRequested && ActiveMontageActionResource != Resource) return RejectPlayback(TEXT("ActiveResourceMismatch"));
 	return true;
 }
 
@@ -671,10 +693,7 @@ void FGGYGOActionMotionExecution::NeutralizeActionSource(
 			if (!Base.IsValid() || Base->GetScriptStruct() != FRootMotionSource_GGYGOActionCurve::StaticStruct()) continue;
 			auto* Source = static_cast<FRootMotionSource_GGYGOActionCurve*>(Base.Get());
 			if (Source->OriginalResource != OriginalResource) continue;
-			Source->bExplicitlyCancelled = true;
-			Source->RootMotionParams.Set(FTransform::Identity);
-			Source->AccumulateMode = ERootMotionAccumulateMode::Additive;
-			Source->Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+			Source->NeutralizeForRemoval();
 		}
 	};
 	Retire(Movement.CurrentRootMotion.RootMotionSources);

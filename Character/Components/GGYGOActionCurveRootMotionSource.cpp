@@ -17,6 +17,15 @@ FRootMotionSource_GGYGOActionCurve::FRootMotionSource_GGYGOActionCurve()
 	Settings.SetFlag(ERootMotionSourceSettingsFlags::IgnoreZAccumulate);
 }
 
+void FRootMotionSource_GGYGOActionCurve::NeutralizeForRemoval()
+{
+	bExplicitlyCancelled = true;
+	RootMotionParams.Set(FTransform::Identity);
+	// 原生累加遍历仍可看见待移除的源。零 Additive 不占用 Override 槽。
+	AccumulateMode = ERootMotionAccumulateMode::Additive;
+	Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+}
+
 FRootMotionSource* FRootMotionSource_GGYGOActionCurve::Clone() const
 {
 	return new FRootMotionSource_GGYGOActionCurve(*this);
@@ -24,9 +33,27 @@ FRootMotionSource* FRootMotionSource_GGYGOActionCurve::Clone() const
 
 bool FRootMotionSource_GGYGOActionCurve::Matches(const FRootMotionSource* Other) const
 {
-	if (!FRootMotionSource::Matches(Other)) return false;
+	if (!Other || Other->GetScriptStruct() != GetScriptStruct()) return false;
 	const auto* Typed = static_cast<const FRootMotionSource_GGYGOActionCurve*>(Other);
 	if (SourceMode != Typed->SourceMode) return false;
+	if (!FRootMotionSource::Matches(Other))
+	{
+		const auto IsNeutralized = [](const FRootMotionSource_GGYGOActionCurve& Source)
+		{
+			return Source.AccumulateMode == ERootMotionAccumulateMode::Additive && Source.bExplicitlyCancelled
+				&& Source.Status.HasFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
+		};
+		// 原生寻找新映射时把入站 ID 清为 Invalid。只允许已有映射的同一源跨取消状态匹配。
+		if (SourceMode != EGGYGOActionCurveSourceMode::OriginalMontage
+			|| LocalID == static_cast<uint16>(ERootMotionSourceID::Invalid) || LocalID != Typed->LocalID
+			|| !((AccumulateMode == ERootMotionAccumulateMode::Override && IsNeutralized(*Typed))
+				|| (Typed->AccumulateMode == ERootMotionAccumulateMode::Override && IsNeutralized(*this)))) return false;
+		// 只在临时比较值中对齐累加模式，其余身份字段仍由原生 Matches 核对。
+		FRootMotionSource_GGYGOActionCurve MatchView;
+		static_cast<FRootMotionSource&>(MatchView) = *Other;
+		MatchView.AccumulateMode = AccumulateMode;
+		if (!FRootMotionSource::Matches(&MatchView)) return false;
+	}
 	if (OriginalResource.IsValid() && Typed->OriginalResource.IsValid()
 		&& OriginalResource != Typed->OriginalResource) return false;
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage)
@@ -60,7 +87,7 @@ bool FRootMotionSource_GGYGOActionCurve::UpdateStateFrom(const FRootMotionSource
 	// 基底是同一原 RMS 的可纠正状态，不作另一个动作身份；原生复制/回放继续沿原时钟。
 	if (SourceMode == EGGYGOActionCurveSourceMode::OriginalMontage) EntryActorRotation = Typed->EntryActorRotation;
 	bCompletionRequested = Typed->bCompletionRequested;
-	bExplicitlyCancelled |= Typed->bExplicitlyCancelled;
+	if (Typed->bExplicitlyCancelled) NeutralizeForRemoval();
 	// Keep the recipient's original local identity. An imported source cannot adopt a current Montage.
 	return true;
 }
@@ -75,14 +102,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		bPreparedRotationConsumed = false;
 		PreparedSourceIntervals.Reset();
 		bPreparedNaturalEnd = false;
-		const auto Retire = [this]()
-		{
-			bExplicitlyCancelled = true;
-			RootMotionParams.Set(FTransform::Identity);
-			AccumulateMode = ERootMotionAccumulateMode::Additive;
-			Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
-		};
-		if (bExplicitlyCancelled) { Retire(); return; }
+		if (bExplicitlyCancelled) { NeutralizeForRemoval(); return; }
 		FString Error;
 		const UGGYGOCharacterMovementComponent* CMC = Cast<UGGYGOCharacterMovementComponent>(&MoveComponent);
 		if (!CMC || !CMC->ValidateMontageActionRuntime(*this, SimulationTime, Error)
@@ -97,7 +117,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 				*Character.GetPathName(), OriginalBinding.IsValid() ? *GetPathNameSafe(OriginalBinding->Montage.Get()) : TEXT("None"),
 				OriginalBinding.IsValid() ? *OriginalBinding->SlotName.ToString() : TEXT("None"),
 				OriginalBinding.IsValid() ? *OriginalBinding->SectionName.ToString() : TEXT("None"), *Error);
-			Retire();
+			NeutralizeForRemoval();
 			if (CMC) const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource, Error);
 			return;
 		}
@@ -109,7 +129,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		if (!GGYGOActionMotionEvaluation::EvaluateInterval(*OriginalBinding, From, To, RotationMode, Evaluation, Error))
 		{
 			UE_LOG(LogRootMotion, Error, TEXT("%s"), *Error);
-			Retire();
+			NeutralizeForRemoval();
 			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource, Error);
 			return;
 		}
@@ -119,7 +139,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		{
 			UE_LOG(LogRootMotion, Error, TEXT("[Movement.ActionMotion] Owner='%s' Montage='%s' Reason='scaled interval is not finite'"),
 				*Character.GetPathName(), *GetPathNameSafe(OriginalBinding->Montage.Get()));
-			Retire();
+			NeutralizeForRemoval();
 			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource,
 				TEXT("[Movement.ActionMotion] scaled original position interval is not finite"));
 			return;
@@ -127,7 +147,7 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		const float NativeEnd = GetTime() + SimulationTime;
 		if (!FMath::IsFinite(NativeEnd))
 		{
-			Retire();
+			NeutralizeForRemoval();
 			const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailMontageActionMotion(OriginalResource,
 				TEXT("[Movement.ActionMotion] original native clock overflowed"));
 			return;
@@ -146,21 +166,14 @@ void FRootMotionSource_GGYGOActionCurve::PrepareRootMotion(float SimulationTime,
 		bPreparedNaturalEnd = To == OriginalBinding->MontageEndSeconds && GetTime() >= Duration;
 		return;
 	}
-	const auto RetireProfile = [this]()
-	{
-		bExplicitlyCancelled = true;
-		RootMotionParams.Set(FTransform::Identity);
-		AccumulateMode = ERootMotionAccumulateMode::Additive;
-		Status.SetFlag(ERootMotionSourceStatusFlags::MarkedForRemoval);
-	};
-	if (bExplicitlyCancelled) { RetireProfile(); return; }
+	if (bExplicitlyCancelled) { NeutralizeForRemoval(); return; }
 	const auto* CMC = Cast<UGGYGOCharacterMovementComponent>(&MoveComponent);
 	const auto FailProfile = [&](const FString& Reason)
 	{
 		UE_LOG(LogRootMotion, Error, TEXT("[Movement.ActionMotion] Owner='%s' Profile='%s' Curve='%s' Reason='%s'"),
 			*Character.GetPathName(), OriginalResource.IsValid() ? *GetPathNameSafe(OriginalResource->Profile.Get()) : TEXT("Standalone"),
 			*GetPathNameSafe(TranslationCurve.Get()), *Reason);
-		RetireProfile();
+		NeutralizeForRemoval();
 		if (CMC) const_cast<UGGYGOCharacterMovementComponent*>(CMC)->FailProfileActionMotion(OriginalResource, Reason);
 	};
 	if (SourceMode != EGGYGOActionCurveSourceMode::Profile)
