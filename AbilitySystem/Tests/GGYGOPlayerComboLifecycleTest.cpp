@@ -1,6 +1,7 @@
 #include "AbilitySystem/Tests/GGYGOPlayerComboLifecycleTestTypes.h"
 
 #include "AbilitySystem/Abilities/GGYGOComboCorrection.h"
+#include "AbilitySystem/Abilities/GGYGOMontageActionResources.h"
 #include "AbilitySystem/Tests/GGYGOMontageTaskTestTypes.h"
 #include "AbilitySystem/Attributes/GGYGOCombatSet.h"
 #include "AbilitySystem/Attributes/GGYGOHealthSet.h"
@@ -913,6 +914,90 @@ namespace
 		return FGameplayAbilityTargetDataHandle(new FGGYGOComboCorrectionData(
 			Revision, RequestId, ServerStep, Position, bWindowOpen, bWindowClosed, bAccepted));
 	}
+}
+
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboFXAttachmentEntryTest,
+	"GGYGO.AbilitySystem.PlayerCombo.FX.AttachmentEntry",
+	EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FGGYGOPlayerComboFXAttachmentEntryTest::RunTest(const FString& Parameters)
+{
+	struct FCase
+	{
+		const TCHAR* Name;
+		bool bWorld;
+		bool bInherit;
+		bool bValidDefault;
+		bool bExpectedSuccess;
+	};
+	const FCase Cases[] = {
+		{TEXT("Attached 全覆盖忽略无效默认挂点"), false, false, false, true},
+		{TEXT("Attached 有继承者拒绝无效默认挂点"), false, true, false, false},
+		{TEXT("World 拒绝无效起点"), true, true, false, false},
+		{TEXT("World 接受有效起点"), true, true, true, true}
+	};
+	for (const FCase& Case : Cases)
+	{
+		FGGYGOComboLifecycleTestWorld TestWorld;
+		FGGYGOPlayerComboLifecycleFixture Fixture;
+		if (!InitializeFixture(*this, TestWorld, Fixture)) { return false; }
+		FGGYGOComboStep& Step = Fixture.UseSingleStepForTest();
+		Step.NextStepIndex = INDEX_NONE;
+		FGGYGOComboStepFX& FX = Step.FX;
+		FX.Mode = EGGYGOComboFXMode::MontageWindow;
+		FX.Space = Case.bWorld ? EGGYGONiagaraEffectSpace::World : EGGYGONiagaraEffectSpace::Attached;
+		FX.SocketName = Case.bValidDefault ? Fixture.TraceStartBone : FName(TEXT("GGYGO.Test.MissingFXSocket"));
+		FX.BeginEventTag = GGYGOGameplayTags::Event_Montage_FXWindowBegin;
+		FX.EndEventTag = GGYGOGameplayTags::Event_Montage_FXWindowEnd;
+		FX.NormalStopMode = EGGYGONiagaraEffectStopMode::DestroyImmediately;
+		FX.AbortStopMode = EGGYGONiagaraEffectStopMode::DestroyImmediately;
+		FX.RemoteSeekDeltaSeconds = 0.01f;
+		FX.RemoteMaxSimTimeSeconds = 0.002f;
+		FX.SystemUnits.SetNum(2);
+		for (int32 Index = 0; Index < FX.SystemUnits.Num(); ++Index)
+		{
+			FGGYGONiagaraEffectUnit& Unit = FX.SystemUnits[Index];
+			Unit.System = NewObject<UNiagaraSystem>(Fixture.Ability);
+			Unit.FieldSettings.Mode = EGGYGOFXFieldMode::NoCustomField;
+			Unit.bOverrideAttachment = !Case.bWorld && !(Case.bInherit && Index == 1);
+			Unit.SocketName = Index == 0 ? Fixture.TraceStartBone : Fixture.TraceEndBone;
+		}
+		auto* Window = NewObject<UGGYGOAnimNotifyState_GameplayEventWindow>(Fixture.Montage);
+		Window->InitializeEventTags(FX.BeginEventTag, FX.EndEventTag);
+		Window->NotifyStateBehaviorFlags = static_cast<uint8>(EAnimNotifyStateBehaviorFlags::NoMergeOnConcurrentPlay);
+		FAnimNotifyEvent Event;
+		Event.NotifyStateClass = Window;
+		Event.MontageTickType = EMontageNotifyTickType::Queued;
+		Event.Link(Fixture.Montage, 0.2f);
+		Event.SetDuration(0.2f);
+		Fixture.Montage->Notifies.Add(Event);
+		static_cast<UAnimSequenceBase*>(Fixture.Montage)->RefreshCacheData();
+		FString Error;
+		if (!TestTrue(TEXT("夹具 FX 作者声明有效"), Fixture.Ability->ValidateComboConfiguration(Error)))
+		{
+			AddError(Error);
+			return false;
+		}
+		TestEqual(FString::Printf(TEXT("%s：窗口与入场共用的当前 Mesh 校验"), Case.Name),
+			FGGYGOMontageActionResources::ValidateFXSocketsOnMesh(FX, *Fixture.Mesh, Error), Case.bExpectedSuccess);
+		if (!Case.bExpectedSuccess)
+		{
+			TestTrue(TEXT("拒绝诊断包含实际缺失挂点"), Error.Contains(FX.SocketName.ToString()));
+			AddExpectedMessagePlain(TEXT("configuration rejected: FX"), ELogVerbosity::Error,
+				EAutomationExpectedMessageFlags::Contains, 1);
+		}
+		// 真正经 PlayerInput → Hero → ASC → ReadStepStartInputs；本测试停在 0.2 秒 FX 窗口前。
+		const auto Activation = Fixture.ActivateFromInputForTest(*this);
+		TestEqual(FString::Printf(TEXT("%s：真实输入入场结果"), Case.Name),
+			Activation.bNativeAccepted, Case.bExpectedSuccess);
+		TestEqual(TEXT("只有通过实际挂点校验的动作才能播放 Montage"),
+			Fixture.AnimInstance->GetSuccessfulGuardReturnCountForTest(), Case.bExpectedSuccess ? 1 : 0);
+		TestEqual(TEXT("原生 Montage Task 与入场结果一致"), Fixture.GetMontageTask() != nullptr, Case.bExpectedSuccess);
+		if (Fixture.Ability->IsActive()) { Fixture.Ability->FinishForTest(); }
+		TestEqual(TEXT("入口测试收尾不残留 Task"), Fixture.Ability->GetActiveTaskCountForTest(), 0);
+		TestFalse(TEXT("入口测试收尾归还 CMC 动作"), Fixture.Movement->HasActiveActionMotion());
+	}
+	return true;
 }
 
 IMPLEMENT_SIMPLE_AUTOMATION_TEST(FGGYGOPlayerComboObservationSourceTest,

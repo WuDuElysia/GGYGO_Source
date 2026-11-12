@@ -1657,12 +1657,12 @@ bool UGGYGOPlayerComboAbility::ReadStepStartInputs(const FGGYGOAbilityActivation
 		return false;
 	}
 	// Socket 与 TraceShape 依赖当前 Mesh 资产，换装后可能变化，所以每段起播时核对。
+	FString FXSocketError;
 	if (Step.FX.Mode == EGGYGOComboFXMode::MontageWindow
-		&& !Step.FX.SocketName.IsNone() && !ActiveMesh->DoesSocketExist(Step.FX.SocketName))
+		&& !FGGYGOMontageActionResources::ValidateFXSocketsOnMesh(Step.FX, *ActiveMesh, FXSocketError))
 	{
-		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("[Combat.PlayerCombo.FX] Ability='%s' Step=%d Montage='%s' System='%s' Mesh='%s' Socket='%s' configuration rejected: Required original Mesh socket does not exist"),
-			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *GetPathNameSafe(Step.FX.System),
-			*GetPathNameSafe(ActiveMesh), *Step.FX.SocketName.ToString());
+		UE_LOG(LogGGYGOAbilitySystem, Error, TEXT("[Combat.PlayerCombo.FX] Ability='%s' Step=%d Montage='%s' configuration rejected: %s"),
+			*GetPathNameSafe(this), Index, *GetPathNameSafe(Step.Montage), *FXSocketError);
 		RequestAbilityEnd(Original, true, true);
 		return false;
 	}

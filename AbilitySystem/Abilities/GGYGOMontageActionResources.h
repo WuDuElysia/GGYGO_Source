@@ -46,6 +46,9 @@ struct GGYGO_API FGGYGOMontageActionResources
 	static bool ValidateFXConfiguration(const UAnimMontage* Montage, const FGGYGOComboStepFX& Config,
 		float RangeStart, float RangeEnd, FString& OutError,
 		FGGYGOMontageFXWindowDeclaration* OutWindow = nullptr);
+	/** 核对当前 Mesh 实际使用的挂点：Attached 解析每个单元，World 保留动作起点。 */
+	static bool ValidateFXSocketsOnMesh(const FGGYGOComboStepFX& Config,
+		const USkeletalMeshComponent& Mesh, FString& OutError);
 	bool AdoptTask(UGGYGOAbilityTask_PlayMontageAndWaitForEvent* OriginalTask);
 	UGGYGOAbilityTask_PlayMontageAndWaitForEvent* GetTask() const;
 	UGGYGOAbilityTask_PlayNiagaraEffect* GetFXTask() const;

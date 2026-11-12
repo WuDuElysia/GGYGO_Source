@@ -50,6 +50,35 @@ namespace
 	}
 }
 
+bool FGGYGOMontageActionResources::ValidateFXSocketsOnMesh(const FGGYGOComboStepFX& Config,
+	const USkeletalMeshComponent& Mesh, FString& OutError)
+{
+	OutError.Reset();
+	if (Config.Space == EGGYGONiagaraEffectSpace::World)
+	{
+		if (!Config.SocketName.IsNone() && !Mesh.DoesSocketExist(Config.SocketName))
+		{
+			OutError = FString::Printf(TEXT("FX World 起点 [%s:%s] 不存在。"),
+				*Mesh.GetPathName(), *Config.SocketName.ToString());
+			return false;
+		}
+		return true;
+	}
+	for (const FGGYGONiagaraEffectUnit& Unit : GetFXUnits(Config))
+	{
+		FName Socket;
+		FTransform Transform;
+		Unit.ResolveAttachment(Config.SocketName, Config.LocalTransform, Socket, Transform);
+		if (!Socket.IsNone() && !Mesh.DoesSocketExist(Socket))
+		{
+			OutError = FString::Printf(TEXT("FX 单元 '%s' 的挂点 [%s:%s] 不存在。"),
+				*GetPathNameSafe(Unit.System), *Mesh.GetPathName(), *Socket.ToString());
+			return false;
+		}
+	}
+	return true;
+}
+
 /** 读取作者配置，不建立窗口计时或运行期有效缓存。 */
 bool FGGYGOMontageActionResources::ValidateFXConfiguration(const UAnimMontage* Montage, const FGGYGOComboStepFX& FX, float RangeStart, float RangeEnd,
 	FString& OutError, FGGYGOMontageFXWindowDeclaration* OutWindow)
@@ -422,13 +451,13 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 	}
 	if (bFXBeginConsumed || bFXWindowClosed) { return true; }
 	bFXBeginConsumed = true;
-	if (GetFXTask() || !IsValid(Mesh)
-		|| (!FX.SocketName.IsNone() && !Mesh->DoesSocketExist(FX.SocketName)))
+	if (GetFXTask() || !IsValid(Mesh))
 	{
-		OutError = FString::Printf(TEXT("Required Mesh/socket [%s:%s] is invalid or an earlier FX Task was not released."),
-			*GetPathNameSafe(Mesh), *FX.SocketName.ToString());
+		OutError = FString::Printf(TEXT("Required Mesh [%s] is invalid or an earlier FX Task was not released."),
+			*GetPathNameSafe(Mesh));
 		return false;
 	}
+	if (!ValidateFXSocketsOnMesh(FX, *Mesh, OutError)) { return false; }
 	UGGYGOAbilitySystemComponent* const Issuer = Owner ? Owner->GetGGYGOAbilitySystemComponentFromActorInfo() : nullptr;
 	const TWeakObjectPtr<UAbilitySystemComponent> OriginalIssuer(Issuer);
 	const TWeakObjectPtr<AActor> OriginalAvatar(Mesh->GetOwner());
@@ -449,21 +478,6 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 	}
 	if (!IsCurrent()) { return true; }
 	const TArray<FGGYGONiagaraEffectUnit> Units = GetFXUnits(FX);
-	if (FX.Space == EGGYGONiagaraEffectSpace::Attached)
-	{
-		for (const FGGYGONiagaraEffectUnit& Unit : Units)
-		{
-			FName UnitSocket;
-			FTransform UnitTransform;
-			Unit.ResolveAttachment(FX.SocketName, PlaybackTransform, UnitSocket, UnitTransform);
-			if (!UnitSocket.IsNone() && !Mesh->DoesSocketExist(UnitSocket))
-			{
-				OutError = FString::Printf(TEXT("FX 单元 '%s' 的挂点 [%s:%s] 不存在。"),
-					*GetPathNameSafe(Unit.System), *GetPathNameSafe(Mesh), *UnitSocket.ToString());
-				return false;
-			}
-		}
-	}
 	if (!PublishFXWindow(Owner, Issuer, OriginalAvatar.Get(), Fact, Units, PlaybackTransform, IsCurrent, OutError)) { return false; }
 	if (!IsCurrent() || bFXWindowClosed) { return true; }
 	UGGYGOAbilityTask_PlayNiagaraEffect* const StartedTask = UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffects(
