@@ -115,6 +115,13 @@ FString DescribeNiagaraScripts(const UNiagaraSystem* System)
 }
 }
 
+void FGGYGONiagaraEffectUnit::ResolveAttachment(FName DefaultSocket, const FTransform& DefaultTransform,
+	FName& OutSocket, FTransform& OutTransform) const
+{
+	OutSocket = bOverrideAttachment ? SocketName : DefaultSocket;
+	OutTransform = bOverrideAttachment ? LocalTransform : DefaultTransform;
+}
+
 UGGYGOAbilityTask_PlayNiagaraEffect* UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffect(
 	UGameplayAbility* OwningAbility, FName TaskInstanceName, UNiagaraSystem* System,
 	EGGYGONiagaraEffectSpace Space, USceneComponent* AttachComponent, FName SocketName,
@@ -215,7 +222,15 @@ bool UGGYGOAbilityTask_PlayNiagaraEffect::ValidateConfigurations(const TArray<FG
 	for (int32 Index = 0; Index < Units.Num(); ++Index)
 	{
 		const FGGYGONiagaraEffectUnit& Unit = Units[Index];
-		if (!ValidateConfiguration(Unit.System, Space, Transform, OutFailureReason)
+		if (Unit.bOverrideAttachment && Space != EGGYGONiagaraEffectSpace::Attached)
+		{
+			OutFailureReason = FString::Printf(TEXT("Unit[%d] 独立挂点只适用于 Attached 空间。"), Index);
+			return false;
+		}
+		FName UnitSocket;
+		FTransform UnitTransform;
+		Unit.ResolveAttachment(NAME_None, Transform, UnitSocket, UnitTransform);
+		if (!ValidateConfiguration(Unit.System, Space, UnitTransform, OutFailureReason)
 			|| !Unit.FieldSettings.ValidateConfiguration(OutFailureReason))
 		{
 			OutFailureReason = FString::Printf(TEXT("Unit[%d] '%s': %s"), Index,
@@ -343,12 +358,23 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 	USceneComponent* const AttachComponent = RequestedAttachComponent.Get();
 	if (RequestedSpace == EGGYGONiagaraEffectSpace::Attached)
 	{
-		if (!IsValid(AttachComponent) || !AttachComponent->IsRegistered() || AttachComponent->GetWorld() != World
-			|| (!RequestedSocketName.IsNone() && !AttachComponent->DoesSocketExist(RequestedSocketName)))
+		if (!IsValid(AttachComponent) || !AttachComponent->IsRegistered() || AttachComponent->GetWorld() != World)
 		{
-			FailAndEndTask(FString::Printf(TEXT("Required attachment [%s:%s] must be registered in the original Avatar World with its configured Socket."),
-				*GetPathNameSafe(AttachComponent), *RequestedSocketName.ToString()));
+			FailAndEndTask(FString::Printf(TEXT("Required attachment [%s] must be registered in the original Avatar World."),
+				*GetPathNameSafe(AttachComponent)));
 			return;
+		}
+		for (const FGGYGONiagaraEffectUnit& Unit : RequestedUnits)
+		{
+			FName UnitSocket;
+			FTransform UnitTransform;
+			Unit.ResolveAttachment(RequestedSocketName, RequestedTransform, UnitSocket, UnitTransform);
+			if (!UnitSocket.IsNone() && !AttachComponent->DoesSocketExist(UnitSocket))
+			{
+				FailAndEndTask(FString::Printf(TEXT("FX 单元 '%s' 的挂点 [%s:%s] 不存在。"),
+					*GetPathNameSafe(Unit.System), *GetPathNameSafe(AttachComponent), *UnitSocket.ToString()));
+				return;
+			}
 		}
 	}
 	else if (!RequestedAttachComponent.IsExplicitlyNull() || !RequestedSocketName.IsNone())
@@ -445,8 +471,11 @@ void UGGYGOAbilityTask_PlayNiagaraEffect::ActivateNative()
 		}
 		else
 		{
-			CreatedComponent->SetupAttachment(AttachComponent, LiveTask->RequestedSocketName);
-			CreatedComponent->SetRelativeTransform(LiveTask->RequestedTransform);
+			FName UnitSocket;
+			FTransform UnitTransform;
+			Unit.ResolveAttachment(LiveTask->RequestedSocketName, LiveTask->RequestedTransform, UnitSocket, UnitTransform);
+			CreatedComponent->SetupAttachment(AttachComponent, UnitSocket);
+			CreatedComponent->SetRelativeTransform(UnitTransform);
 		}
 		CreatedComponent->RegisterComponentWithWorld(World);
 		LiveTask = OriginalTask.Get(true);

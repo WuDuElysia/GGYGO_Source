@@ -449,6 +449,21 @@ bool FGGYGOMontageActionResources::ConsumeFXWindow(UGGYGOGameplayAbility* Owner,
 	}
 	if (!IsCurrent()) { return true; }
 	const TArray<FGGYGONiagaraEffectUnit> Units = GetFXUnits(FX);
+	if (FX.Space == EGGYGONiagaraEffectSpace::Attached)
+	{
+		for (const FGGYGONiagaraEffectUnit& Unit : Units)
+		{
+			FName UnitSocket;
+			FTransform UnitTransform;
+			Unit.ResolveAttachment(FX.SocketName, PlaybackTransform, UnitSocket, UnitTransform);
+			if (!UnitSocket.IsNone() && !Mesh->DoesSocketExist(UnitSocket))
+			{
+				OutError = FString::Printf(TEXT("FX 单元 '%s' 的挂点 [%s:%s] 不存在。"),
+					*GetPathNameSafe(Unit.System), *GetPathNameSafe(Mesh), *UnitSocket.ToString());
+				return false;
+			}
+		}
+	}
 	if (!PublishFXWindow(Owner, Issuer, OriginalAvatar.Get(), Fact, Units, PlaybackTransform, IsCurrent, OutError)) { return false; }
 	if (!IsCurrent() || bFXWindowClosed) { return true; }
 	UGGYGOAbilityTask_PlayNiagaraEffect* const StartedTask = UGGYGOAbilityTask_PlayNiagaraEffect::PlayNiagaraEffects(
@@ -533,14 +548,14 @@ bool FGGYGOMontageActionResources::PublishFXWindow(UGGYGOGameplayAbility* Owner,
 	Record.Avatar = Avatar;
 	Record.Mesh = Fact.Mesh;
 	Record.Space = FX.Space;
-	Record.SocketName = FX.Space == EGGYGONiagaraEffectSpace::Attached ? FX.SocketName : NAME_None;
-	Record.Transform = PlaybackTransform;
 	Record.NormalStopMode = FX.NormalStopMode;
 	Record.AbortStopMode = FX.AbortStopMode;
 	Record.RemoteSeekDeltaSeconds = FX.RemoteSeekDeltaSeconds;
 	Record.RemoteMaxSimTimeSeconds = FX.RemoteMaxSimTimeSeconds;
 	for (const FGGYGONiagaraEffectUnit& Unit : Units)
 	{
+		Unit.ResolveAttachment(FX.Space == EGGYGONiagaraEffectSpace::Attached ? FX.SocketName : NAME_None,
+			PlaybackTransform, Record.SocketName, Record.Transform);
 		Record.System = Unit.System;
 		Record.FieldSettings = Unit.FieldSettings;
 		FGGYGOMontageFXLease NewLease;

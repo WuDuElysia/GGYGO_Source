@@ -30,6 +30,16 @@ struct GGYGO_API FGGYGONiagaraEffectUnit
 	GENERATED_BODY()
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX") TObjectPtr<UNiagaraSystem> System = nullptr;
 	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX|Field") FGGYGOFXFieldSettings FieldSettings;
+	/** 仅用于 Attached；未启用时继承动作窗的 Socket 和相对变换。配置来自作者资产。 */
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX|Attachment") bool bOverrideAttachment = false;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX|Attachment", meta = (EditCondition = "bOverrideAttachment"))
+	FName SocketName = NAME_None;
+	UPROPERTY(EditDefaultsOnly, BlueprintReadOnly, Category = "FX|Attachment", meta = (EditCondition = "bOverrideAttachment"))
+	FTransform LocalTransform = FTransform::Identity;
+
+	/** 本地创建与网络发布共用的纯配置解析；未启用覆盖时完整保留调用方输入。 */
+	void ResolveAttachment(FName DefaultSocket, const FTransform& DefaultTransform,
+		FName& OutSocket, FTransform& OutTransform) const;
 };
 DECLARE_DELEGATE_OneParam(FGGYGOMontageFXLocalStartReadyDelegate, const FGGYGOMontageFXLocalStartReadyFact&);
 
