@@ -1127,6 +1127,9 @@ private:
 	bool bLocomotionSteeringDiagnosticReported = false;
 
 protected:
+	/** 同轴落到不可走角色胶囊时，在原物理区间内扫掠滑离；其余碰撞继续原生处理。 */
+	virtual void HandleImpact(const FHitResult& Impact, float TimeSlice = 0.0f, const FVector& MoveDelta = FVector::ZeroVector) override;
+
 	/** 订阅原 Extension 的身份通知；真实 Ready/Released 维护唯一派生 ASC 缓存。 */
 	void CacheAbilitySystemComponent();
 

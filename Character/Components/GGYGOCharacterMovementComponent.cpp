@@ -18,6 +18,7 @@
 #include "Character/Components/GGYGOPawnExtensionComponent.h"
 #include "Character/Data/GGYGOMovementSet.h"
 #include "Components/SkeletalMeshComponent.h"
+#include "Components/CapsuleComponent.h"
 #include "GameFramework/Character.h"
 #include "GameFramework/PlayerController.h"
 #include "Engine/NetConnection.h"
@@ -477,6 +478,33 @@ void UGGYGOCharacterMovementComponent::StopMovementImmediately()
 	NativeVelocityBeforeRootMotion.Reset();
 	bNativeVelocityIntervalCanRetain = false;
 	Super::StopMovementImmediately();
+}
+
+void UGGYGOCharacterMovementComponent::HandleImpact(const FHitResult& Impact, float TimeSlice, const FVector& MoveDelta)
+{
+	Super::HandleImpact(Impact, TimeSlice, MoveDelta);
+	// 原生碰撞通知可改变角色或移动模式，返栈后只处理仍在自由下落的胶囊。
+	if (!HasValidData() || !IsFalling() || HasAnimRootMotion() || CurrentRootMotion.HasOverrideVelocity()) return;
+	const ACharacter* OtherCharacter = Cast<ACharacter>(Impact.GetActor());
+	if (!OtherCharacter || Impact.GetComponent() != OtherCharacter->GetCapsuleComponent()
+		|| OtherCharacter->GetCapsuleComponent()->GetWalkableSlopeOverride().GetWalkableSlopeBehavior() != WalkableSlope_Unwalkable) return;
+	if (TimeSlice <= 0.0f || FVector::DotProduct(MoveDelta, GetGravityDirection()) <= 0.0f
+		|| FVector::DotProduct(Impact.Normal, -GetGravityDirection()) <= 0.0f
+		|| !ProjectToGravityFloor(Velocity).IsNearlyZero()) return;
+	// PhysFalling 会清零平方长度不超过该阈值的水平速度；极小偏心同样可能停在顶面。
+	if (ComputeSlideVector(Velocity, 1.0f, Impact.Normal, Impact).SizeSquared() > UE_KINDA_SMALL_NUMBER * 10.0f) return;
+
+	// 同轴顶面法线使原生滑动向量为零。用本碰撞剩余时间的重力步长做水平扫掠，
+	// 在所属物理区间离开退化点；不排跨 move 冲量，校正重放按同一碰撞重新计算。
+	FVector SlideDirection = ProjectToGravityFloor(Impact.Normal).GetSafeNormal();
+	if (SlideDirection.IsNearlyZero())
+		SlideDirection = ProjectToGravityFloor(UpdatedComponent->GetForwardVector()).GetSafeNormal();
+	if (SlideDirection.IsNearlyZero())
+		SlideDirection = ProjectToGravityFloor(UpdatedComponent->GetRightVector()).GetSafeNormal();
+	const float SlideTime = TimeSlice * (1.0f - Impact.Time);
+	FHitResult SlideHit;
+	SafeMoveUpdatedComponent(SlideDirection * FMath::Abs(GetGravityZ()) * SlideTime * SlideTime,
+		UpdatedComponent->GetComponentQuat(), true, SlideHit);
 }
 
 void UGGYGOCharacterMovementComponent::SetUpdatedComponent(USceneComponent* NewUpdatedComponent)

@@ -33,6 +33,9 @@ AGGYGOCharacterBase::AGGYGOCharacterBase(const FObjectInitializer& ObjectInitial
 	PrimaryActorTick.bCanEverTick = false;
 	PrimaryActorTick.bStartWithTickEnabled = false;
 
+	// 角色胶囊互相阻挡，但不是可落脚地面；仅禁止 StepUp 不能阻止从上方落地。
+	GetCapsuleComponent()->SetWalkableSlopeOverride(FWalkableSlopeOverride(WalkableSlope_Unwalkable, 0.0f));
+
 	// ===== 协调者 =====
 	PawnExtComponent = CreateDefaultSubobject<UGGYGOPawnExtensionComponent>(TEXT("PawnExtensionComponent"));
 
