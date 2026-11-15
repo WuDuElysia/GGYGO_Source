@@ -24,11 +24,6 @@ namespace
 			OutError = TEXT("Engine exit requested; native cleanup/registration cannot be confirmed.");
 			return false;
 		}
-		if (!FGameFeatureStateHandleReferenceController::IsLifetimeControlEnabled())
-		{
-			OutError = TEXT("GameFeatureStateHandle.Enabled is disabled; cleanup/registration cannot be confirmed.");
-			return false;
-		}
 		return true;
 	}
 

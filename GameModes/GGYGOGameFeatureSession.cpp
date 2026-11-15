@@ -21,11 +21,6 @@ namespace
 			OutError = TEXT("Native Active operations require GT before engine exit.");
 			return nullptr;
 		}
-		if (!FGameFeatureStateHandleReferenceController::IsLifetimeControlEnabled())
-		{
-			OutError = TEXT("GameFeatureStateHandle.Enabled is disabled; native ownership cannot be confirmed.");
-			return nullptr;
-		}
 		UGameFeaturesSubsystem* Subsystem = IsValid(GEngine) ? GEngine->GetEngineSubsystem<UGameFeaturesSubsystem>() : nullptr;
 		if (!IsValid(Subsystem))
 		{
