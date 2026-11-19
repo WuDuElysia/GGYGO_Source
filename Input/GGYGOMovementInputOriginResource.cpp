@@ -1,4 +1,7 @@
 #include "Input/GGYGOMovementInputOriginResource.h"
+#include "Input/GGYGOPlayerInput.h"
+#include "Engine/Engine.h"
+#include "Engine/World.h"
 
 #include "CoreGlobals.h"
 #include "Engine/LocalPlayer.h"
@@ -161,8 +164,64 @@ bool UGGYGOMovementInputOriginResource::InitializeFromPlayerAdded(ULocalPlayer* 
 		return Reject(TEXT("LatePlayerAdded"), TEXT("A controller existed before or during PlayerAdded; initial input birth cannot be reconstructed."), OutError);
 	}
 	QualificationStage = EInitialQualificationStage::Available;
+	FCoreUObjectDelegates::PreLoadMapWithContext.AddUObject(this, &ThisClass::OnPreLoadMap);
+	FWorldDelegates::OnWorldBeginTearDown.AddUObject(this, &ThisClass::OnWorldTearDown);
+	FCoreUObjectDelegates::PostLoadMapWithWorld.AddUObject(this, &ThisClass::OnPostLoadMap);
 	OutError.Reset();
 	return true;
+}
+
+void UGGYGOMovementInputOriginResource::OnPreLoadMap(const FWorldContext& Context, const FString& MapName)
+{
+	if (!IsLifecycleCurrent()) { return; }
+	// LoadMap 同步成对广播，失败时 Post 只有空 World。按调用顺序保留所属 Context。
+	LoadMapContexts.Add(Context.ContextHandle);
+	if (Context.OwningGameInstance != OriginalPlayer->GetGameInstance()) { return; }
+	WorldTravel = {};
+	UWorld* SourceWorld = Context.World();
+	if (SourceWorld && SourceWorld->GetNetMode() == NM_Standalone && IsRegisteredProducerCurrent(RegisteredProducer.Get())
+		&& RegisteredController->GetWorld() == SourceWorld)
+	{
+		WorldTravel.Context = Context.ContextHandle;
+		WorldTravel.Destination = UWorld::RemovePIEPrefix(MapName);
+		WorldTravel.SourceWorld = SourceWorld;
+		WorldTravel.SourceInput = RegisteredProducer;
+	}
+}
+
+void UGGYGOMovementInputOriginResource::OnWorldTearDown(UWorld* World)
+{
+	if (WorldTravel.SourceWorld.Get() != World || !World || WorldTravel.Releases.IsSet()) { return; }
+	UGGYGOPlayerInput* Source = Cast<UGGYGOPlayerInput>(WorldTravel.SourceInput.Get());
+	if (IsRegisteredProducerCurrent(Source) && (Source->ProducerOriginResource.Get() == this
+		|| (Source->ProducerOriginResource.IsExplicitlyNull() && GetQualification(Source) == EGGYGOMovementInputOriginQualification::Cold)))
+	{
+		Source->CollectTravelReleases(WorldTravel.Releases.Emplace());
+	}
+}
+
+void UGGYGOMovementInputOriginResource::BeginWorldTravelSpawn(UWorld* World)
+{
+	if (!WorldTravel.Releases.IsSet() || !World || World->GetNetMode() != NM_Standalone || !IsLifecycleCurrent()) { return; }
+	const FWorldContext* Context = GEngine->GetWorldContextFromWorld(World);
+	if (Context && Context->ContextHandle == WorldTravel.Context && Context->OwningGameInstance == OriginalPlayer->GetGameInstance()
+		&& World != WorldTravel.SourceWorld.Get() && UWorld::RemovePIEPrefix(World->GetPackage()->GetName()) == WorldTravel.Destination)
+	{
+		WorldTravel.SpawnWorld = World;
+	}
+}
+
+void UGGYGOMovementInputOriginResource::EndWorldTravelSpawn(UWorld* World)
+{
+	if (World && WorldTravel.SpawnWorld.Get() == World) { WorldTravel = {}; }
+}
+
+void UGGYGOMovementInputOriginResource::OnPostLoadMap(UWorld* World)
+{
+	if (!LoadMapContexts.IsEmpty() && LoadMapContexts.Pop(EAllowShrinking::No) == WorldTravel.Context)
+	{
+		WorldTravel = {};
+	}
 }
 
 void UGGYGOMovementInputOriginResource::NotifyPlayerRemoved(ULocalPlayer* Player)
@@ -174,6 +233,11 @@ void UGGYGOMovementInputOriginResource::NotifyPlayerRemoved(ULocalPlayer* Player
 		return;
 	}
 	bLifecycleActive = false;
+	WorldTravel = {};
+	LoadMapContexts.Reset();
+	FCoreUObjectDelegates::PreLoadMapWithContext.RemoveAll(this);
+	FWorldDelegates::OnWorldBeginTearDown.RemoveAll(this);
+	FCoreUObjectDelegates::PostLoadMapWithWorld.RemoveAll(this);
 	bPlayerAddedHandled = true;
 	SealInitialQualification(TEXT("PlayerRemoved"));
 	SealCreationScope();
@@ -280,6 +344,12 @@ bool UGGYGOMovementInputOriginResource::BeginNativeCreation(APlayerController* C
 	CreationScope.Ticket.CreationSerial = ++LastCreationSerial;
 	CreationScope.Controller = Controller;
 	CreationScope.ConfiguredClass = ConfiguredClass;
+	if (WorldTravel.Releases.IsSet() && WorldTravel.SpawnWorld.Get() == Controller->GetWorld()
+		&& WorldTravel.SourceInput.HasSameIndexAndSerialNumber(RegisteredProducer))
+	{
+		CreationScope.TravelReleases = MoveTemp(WorldTravel.Releases);
+		WorldTravel = {};
+	}
 	OutTicket = CreationScope.Ticket;
 	OutNeedsCreation = true;
 	OutError.Reset();
@@ -364,7 +434,17 @@ bool UGGYGOMovementInputOriginResource::CompleteNativeCreation(const FCreationTi
 	}
 	RegisteredController = CreationScope.Controller;
 	RegisteredProducer = ActualProducer;
+	auto TravelReleases = MoveTemp(CreationScope.TravelReleases);
 	SealCreationScope();
+	if (TravelReleases.IsSet() && GetQualification(ActualProducer) == EGGYGOMovementInputOriginQualification::Rearm)
+	{
+		if (UGGYGOPlayerInput* Input = Cast<UGGYGOPlayerInput>(ActualProducer))
+		{
+			Input->AdoptTravelReleases(*this, TravelReleases.GetValue());
+			UE_LOG(LogGGYGOMovementInputOrigin, Log, TEXT("WorldTravel Rearm: %s，待真实释放的键/设备数 %d"),
+				*GetPathNameSafe(Input), TravelReleases->Num());
+		}
+	}
 	OutError.Reset();
 	return true;
 }

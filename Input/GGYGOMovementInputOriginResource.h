@@ -1,6 +1,7 @@
 #pragma once
 
 #include "CoreMinimal.h"
+#include "InputCoreTypes.h"
 #include "Input/GGYGOMovementInputTypes.h"
 #include "UObject/Object.h"
 
@@ -10,6 +11,15 @@ class APlayerController;
 class ULocalPlayer;
 class UPlayerInput;
 class UGGYGOMovementInputOriginResource;
+struct FWorldContext;
+
+/** 跨图只携带仍须观察释放的键与设备，不携带物理值或旧请求。 */
+struct FGGYGOTravelKeyRelease
+{
+	FKey Key;
+	FInputDeviceId Device;
+	bool bMovementParticipant = false;
+};
 
 /** Resource scope identity; unrelated to PlayerInput source/request/event serials. */
 struct FGGYGOMovementInputCreationTicket
@@ -43,6 +53,8 @@ public:
 	void NotifyPlayerRemoved(ULocalPlayer* Player);
 	/** Host calls before native notification's external delegates and after SpawnPlayActor. */
 	void NotifyControllerChanged(APlayerController* Controller);
+	void BeginWorldTravelSpawn(UWorld* World);
+	void EndWorldTravelSpawn(UWorld* World);
 
 	/** Existing exact registration succeeds with no ticket and OutNeedsCreation=false. */
 	bool BeginNativeCreation(APlayerController* Controller, UClass* ConfiguredClass,
@@ -73,6 +85,7 @@ private:
 		TWeakObjectPtr<UPlayerInput> ConstructedProducer;
 		bool bHasRecordedProducer = false;
 		bool bFailed = false;
+		TOptional<TArray<FGGYGOTravelKeyRelease>> TravelReleases;
 		FName FailureReason = NAME_None;
 	};
 
@@ -89,6 +102,21 @@ private:
 	FString DescribeError(FName Reason, const FString& Detail) const;
 	void ReportOnce(FName Reason, const FString& Detail);
 	void ReportErrorOnce(FName Reason, const FString& Error);
+
+	void OnPreLoadMap(const FWorldContext& Context, const FString& MapName);
+	void OnWorldTearDown(UWorld* World);
+	void OnPostLoadMap(UWorld* World);
+	struct FWorldTravel
+	{
+		FName Context;
+		FString Destination;
+		TWeakObjectPtr<UWorld> SourceWorld;
+		TWeakObjectPtr<UWorld> SpawnWorld;
+		TWeakObjectPtr<UPlayerInput> SourceInput;
+		TOptional<TArray<FGGYGOTravelKeyRelease>> Releases;
+	};
+	FWorldTravel WorldTravel;
+	TArray<FName> LoadMapContexts;
 
 	TWeakObjectPtr<ULocalPlayer> OriginalPlayer;
 	TWeakObjectPtr<APlayerController> RegisteredController;

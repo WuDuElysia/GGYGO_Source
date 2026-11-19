@@ -409,9 +409,11 @@ void UGGYGOLocalPlayer::ReceivedPlayerController(APlayerController* NewControlle
 bool UGGYGOLocalPlayer::SpawnPlayActor(const FString& URL, FString& OutError, UWorld* InWorld)
 {
 	const TWeakObjectPtr<UGGYGOMovementInputOriginResource> OriginalResource(MovementInputOriginResource.Get());
+	if (OriginalResource.IsValid()) { OriginalResource->BeginWorldTravelSpawn(InWorld); }
 	const bool bSpawned = Super::SpawnPlayActor(URL, OutError, InWorld);
 	if (UGGYGOMovementInputOriginResource* Resource = OriginalResource.Get())
 	{
+		Resource->EndWorldTravelSpawn(InWorld);
 		// The client dummy path assigns directly and does not call ReceivedPlayerController.
 		Resource->NotifyControllerChanged(PlayerController.Get());
 	}

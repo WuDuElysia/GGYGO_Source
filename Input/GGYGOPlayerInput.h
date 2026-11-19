@@ -24,6 +24,7 @@ class UEnhancedInputLocalPlayerSubsystem;
 class UEnhancedInputUserSettings;
 class UGGYGOLocalPlayer;
 class UGGYGOMovementInputOriginResource;
+struct FGGYGOTravelKeyRelease;
 struct FKeyEvent;
 
 /** One immutable session per native delegate subscription, including callbacks already in flight. */
@@ -122,6 +123,9 @@ protected:
 	virtual void EvaluateBlockedInputComponent(UInputComponent* Component) override;
 
 private:
+	friend class UGGYGOMovementInputOriginResource;
+	void CollectTravelReleases(TArray<FGGYGOTravelKeyRelease>& OutReleases) const;
+	void AdoptTravelReleases(UGGYGOMovementInputOriginResource& Origin, const TArray<FGGYGOTravelKeyRelease>& Releases);
 	static EGGYGOMovementInputEvaluationState ValidateMovementInputEvaluationToken(
 		const FGGYGOMovementInputEvaluationToken& OriginalToken,
 		UGGYGOPlayerInput*& OutProducer, FString& OutError);

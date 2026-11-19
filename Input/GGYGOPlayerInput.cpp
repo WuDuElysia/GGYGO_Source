@@ -603,6 +603,50 @@ TWeakObjectPtr<UGGYGOMovementInputOriginResource> UGGYGOPlayerInput::SnapshotOri
 		: TWeakObjectPtr<UGGYGOMovementInputOriginResource>();
 }
 
+void UGGYGOPlayerInput::CollectTravelReleases(TArray<FGGYGOTravelKeyRelease>& OutReleases) const
+{
+	for (const FPhysicalSource& Source : PhysicalSources)
+	{
+		if (ReadPhysicalSourceProof(Source) != ESourceProof::Neutral)
+		{
+			const FMovementSourceObligation* Obligation = FindMovementSourceObligation(Source);
+			OutReleases.Add({Source.Key, Source.Device, Obligation && Obligation->bParticipant});
+		}
+	}
+	// 连续转图时，新端可能尚未收到此设备的任何原生事件。
+	for (const FMovementSourceObligation& Obligation : MovementSourceObligations)
+	{
+		if (Obligation.ReleaseAfterObservationRevision.IsSet() && !FindPhysicalSource(Obligation.Key, Obligation.Device))
+		{
+			OutReleases.Add({Obligation.Key, Obligation.Device, Obligation.bParticipant});
+		}
+	}
+}
+
+void UGGYGOPlayerInput::AdoptTravelReleases(UGGYGOMovementInputOriginResource& Origin, const TArray<FGGYGOTravelKeyRelease>& Releases)
+{
+	// 只由同一 LocalPlayer 的真实跨图创建票据调用。新对象从 Rearm 开始，无 Cold 权限。
+	ProducerOriginResource = &Origin;
+	for (const FGGYGOTravelKeyRelease& Release : Releases)
+	{
+		FMovementSourceObligation* Existing = MovementSourceObligations.FindByPredicate(
+			[&Release](const auto& Item) { return Item.Key == Release.Key && Item.Device == Release.Device; });
+		if (!Existing)
+		{
+			Existing = &MovementSourceObligations.AddDefaulted_GetRef();
+			Existing->Key = Release.Key;
+			Existing->Device = Release.Device;
+		}
+		Existing->bParticipant |= Release.bMovementParticipant;
+		if (!Existing->ReleaseAfterObservationRevision.IsSet())
+		{
+			// 新生产者的序号从零开始。只有它看到的同键、同设备的真实释放能清除屏障。
+			Existing->ReleaseAfterObservationRevision = 0;
+			Existing->ReleaseReason = TEXT("WorldTravel");
+		}
+	}
+}
+
 bool UGGYGOPlayerInput::CaptureOriginalOrigin(FString& OutError)
 {
 	if (ProducerOriginResource.IsExplicitlyNull())
@@ -820,6 +864,15 @@ bool UGGYGOPlayerInput::IsMappedMovementSource(const FKey& Key) const
 
 void UGGYGOPlayerInput::AdoptKnownMovementSources()
 {
+	// 切图时仍按住的键可能只在目的地图映射到移动。目标端未观察过该键时仍须等待原设备释放。
+	for (FMovementSourceObligation& Obligation : MovementSourceObligations)
+	{
+		if (Obligation.ReleaseAfterObservationRevision.IsSet() && !FindPhysicalSource(Obligation.Key, Obligation.Device)
+			&& IsMappedMovementSource(Obligation.Key))
+		{
+			Obligation.bParticipant = true;
+		}
+	}
 	for (const FPhysicalSource& Source : PhysicalSources)
 	{
 		if (!IsMappedMovementSource(Source.Key))
@@ -2127,6 +2180,7 @@ void UGGYGOPlayerInput::EvaluateInputDelegates(const TArray<UInputComponent*>& I
 		const FString PawnPath = GetPathNameSafe(Producer->SessionPawn.Get());
 		const FString ProducerPath = Producer->GetPathName();
 		const FString ActionPath = GetPathNameSafe(Producer->SessionAction.Get());
+		const uint64 PhysicalRequest = Producer->ActiveRequestSerial;
 		FVector2D Axis;
 		FString ValueDiagnostic;
 		const bool bValueReadable = Producer->ReadEvaluatedMovementInputActionValue(Axis, ValueDiagnostic)
@@ -2135,12 +2189,12 @@ void UGGYGOPlayerInput::EvaluateInputDelegates(const TArray<UInputComponent*>& I
 			? FString::Printf(TEXT("(X=%.17g,Y=%.17g)"), Axis.X, Axis.Y) : FString(TEXT("Unavailable"));
 		// 日志 sink 也可外调；从此只用局部纯值及原 observer 快照，不再访问 Producer。
 		UE_LOG(LogGGYGOMovementInput, Verbose,
-			TEXT("[Input.MovementEvaluation] Phase=Completed World='%s' PC='%s' Pawn='%s' PlayerInput='%s' Action='%s' SessionSerial=%llu EvaluationSerial=%llu EntryFrame=%llu CompletedFrame=%llu ObservationRevision=%llu ValueState=%s ActionValue='%s' ValueDiagnostic='%s'"),
+			TEXT("[Input.MovementEvaluation] Phase=Completed World='%s' PC='%s' Pawn='%s' PlayerInput='%s' Action='%s' SessionSerial=%llu EvaluationSerial=%llu EntryFrame=%llu CompletedFrame=%llu ObservationRevision=%llu ValueState=%s ActionValue='%s' ValueDiagnostic='%s' PhysicalRequest=%llu"),
 			*WorldPath, *ControllerPath, *PawnPath, *ProducerPath, *ActionPath,
 			static_cast<unsigned long long>(OriginalSession.SessionSerial), static_cast<unsigned long long>(EvaluationSerial),
 			static_cast<unsigned long long>(EvaluationFrame), static_cast<unsigned long long>(CompletedFrame),
 			static_cast<unsigned long long>(EvaluationObservationRevision), bValueReadable ? TEXT("Readable") : TEXT("Unavailable"),
-			*ActionValue, *ValueDiagnostic);
+			*ActionValue, *ValueDiagnostic, static_cast<unsigned long long>(PhysicalRequest));
 	}
 	Observers.Broadcast(EGGYGOMovementInputEvaluationState::Completed, FString());
 }
